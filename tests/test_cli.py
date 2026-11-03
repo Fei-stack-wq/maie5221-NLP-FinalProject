@@ -69,6 +69,42 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("DEEPSEEK_API_KEY", output)
 
+    def test_orchestrate_serial_with_mock(self) -> None:
+        code, output = self._run(
+            [
+                "orchestrate",
+                "整理笔记并写摘要",
+                "--mock",
+                str(REPO / "examples" / "mock_plan.json"),
+                "--runs-dir",
+                str(self.base / "runs"),
+            ]
+        )
+        self.assertEqual(code, 0, output)
+        self.assertIn("子任务完成率", output)
+        run_dir = next(p for p in (self.base / "runs").iterdir() if p.is_dir())
+        self.assertTrue((run_dir / "plan.json").exists())
+        self.assertTrue((run_dir / "board.json").exists())
+        report = (run_dir / "report.md").read_text(encoding="utf-8")
+        self.assertIn("子任务", report)
+        self.assertIn("总体目标", report)
+
+    def test_orchestrate_parallel_with_mock_is_rejected(self) -> None:
+        code, output = self._run(
+            [
+                "orchestrate",
+                "随便",
+                "--mock",
+                str(REPO / "examples" / "mock_plan.json"),
+                "--scheduler",
+                "parallel",
+                "--runs-dir",
+                str(self.base / "runs"),
+            ]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("不是线程安全", output)
+
     def test_report_command(self) -> None:
         self._run(["demo", "--runs-dir", str(self.base / "runs")])
         run_dir = next(p for p in (self.base / "runs").iterdir() if p.is_dir())

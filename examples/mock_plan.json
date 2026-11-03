@@ -1,0 +1,29 @@
+[
+  {
+    "text": "{\"subtasks\":[{\"id\":\"s1\",\"objective\":\"把要点整理成 notes.md\",\"assignee\":\"worker\",\"deps\":[],\"acceptance\":\"notes.md 存在且非空\"},{\"id\":\"s2\",\"objective\":\"基于笔记写 summary.md\",\"assignee\":\"writer\",\"deps\":[\"s1\"],\"acceptance\":\"summary.md 存在且非空\"}]}"
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write_file",
+        "arguments": {
+          "path": "notes.md",
+          "content": "# 笔记\n\n- 多智能体编排的两种调度：串行（serial）与分层并发（parallel）\n- 规划必须校验：id 唯一、依赖无环、成员存在；失败要能降级\n- 子任务失败只阻塞下游，不拖垮整张图\n"
+        }
+      }
+    ]
+  },
+  {"text": "s1 完成：notes.md 已生成，包含三条要点。"},
+  {
+    "tool_calls": [
+      {
+        "name": "write_file",
+        "arguments": {
+          "path": "summary.md",
+          "content": "# 摘要\n\n串行调度零竞态、顺序可复现，适合先跑通指标；分层并发缩短墙钟，代价是 trace 交织与预算竞争。\n"
+        }
+      }
+    ]
+  },
+  {"text": "s2 完成：summary.md 已生成。"}
+]

@@ -1,0 +1,30 @@
+[
+  {
+    "text": "{\"subtasks\":[{\"id\":\"s1\",\"objective\":\"整理资料并交给子任务处理\",\"assignee\":\"worker\",\"deps\":[],\"acceptance\":\"notes.md 存在且非空\"}]}"
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "delegate_task",
+        "arguments": {
+          "objective": "把资料写成 notes.md",
+          "assignee": "writer",
+          "acceptance": "notes.md 存在且非空"
+        }
+      }
+    ]
+  },
+  {
+    "tool_calls": [
+      {
+        "name": "write_file",
+        "arguments": {
+          "path": "notes.md",
+          "content": "# 子任务产物\n\n这份文件是被委派的子任务写出来的，说明 delegate_task 真的派出去执行了。\n"
+        }
+      }
+    ]
+  },
+  {"text": "子任务完成：notes.md 已生成。"},
+  {"text": "母任务完成：已把写作子任务委派给 writer，并收到其产物。"}
+]

@@ -187,6 +187,19 @@ class Budget(BaseModel):
     tokens_left: int = 200_000
     actions_left: int = 48
 
+    @classmethod
+    def from_limits(cls, limits: Limits, *, factor: float = 1.0) -> "Budget":
+        """按 Limits 造一份预算。factor < 1 用于给子任务打折。"""
+        return cls(
+            steps_left=max(1, int(limits.max_steps * factor)),
+            seconds_left=limits.max_seconds * factor,
+            tokens_left=int(limits.max_total_tokens * factor),
+            actions_left=max(
+                1,
+                int(limits.max_steps * max(1, limits.max_tool_calls_per_step) * factor),
+            ),
+        )
+
     def spend(
         self,
         *,

@@ -17,7 +17,16 @@
 -> per-agent 记忆与演化 -> HITL 闸门 -> 批量评测。不要一次性全上。
 """
 
+from .bus import Message, MessageBus
 from .config import Limits, Settings
+from .orchestrator import (
+    AgentCard,
+    Board,
+    OrchestrationResult,
+    Orchestrator,
+    PlanError,
+    SubTask,
+)
 from .rao import (
     Acceptance,
     Action,
@@ -33,7 +42,7 @@ from .rao import (
 )
 from .schemas import LLMResponse, RunResult, ToolCall, ToolResult, ToolSpec, Usage
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Limits",
@@ -56,5 +65,15 @@ __all__ = [
     "StepRecord",
     "accept_files",
     "evaluate_acceptance",
+    # 编排（v0.3）
+    "AgentCard",
+    "Board",
+    "OrchestrationResult",
+    "Orchestrator",
+    "PlanError",
+    "SubTask",
+    # 总线（v0.4）
+    "Message",
+    "MessageBus",
     "__version__",
 ]

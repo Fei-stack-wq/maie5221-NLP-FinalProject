@@ -16,13 +16,19 @@ MAIE5221 NLP 期末项目的起步骨架：**一个能跑、能读、能扩展�
 不需要 API key、不需要联网：
 
 ```powershell
-python -m miniagent demo                     # 走一遍完整工具调用闭环
+python -m miniagent demo                     # 单 agent：走一遍完整工具调用闭环
 python -m miniagent eval --tasks examples/tasks.jsonl --mock examples/mock_task.json
+python -m miniagent orchestrate "整理笔记并写摘要" --mock examples/mock_plan.json
+python -m miniagent orchestrate "整理资料" --mock examples/mock_delegate.json --delegate
 ```
 
-第二条会打印 **任务完成率 / 平均耗时 / P95 / token**，并在 `runs/<run_id>/` 下生成
-`trace.jsonl`（每个事件的完整记录）和 `report.md`（能直接贴进报告的表格）。
+- `demo` / `eval`：单 agent，打印 **任务完成率 / 平均耗时 / P95 / token**。
+- `orchestrate`：**目标 → 子任务图 → 调度**。`--scheduler` 可选
+  `serial`（默认、可复现）/ `parallel`（按层并发）/ `evented`（依赖完成即解锁）；
+  `--delegate` 允许 agent 用 `delegate_task` 再派子任务（深度默认 2）。
+- 编排运行时报告会同时给 **子任务完成率**、**总体目标**，以及 `bus.jsonl` 里的群聊记录。
 
+所有产物在 `runs/<run_id>/`：`trace.jsonl`、`plan.json`、`board.json`、`report.md`。
 环境要求：Python 3.10+，`pip install -r requirements.txt`（只依赖 pydantic）。
 
 ---
@@ -31,22 +37,23 @@ python -m miniagent eval --tasks examples/tasks.jsonl --mock examples/mock_task.
 
 | 顺序 | 文件 | 行数 | 你会看到什么 |
 |---|---|---|---|
-| 1 | [miniagent/rao.py](miniagent/rao.py) | ~670 | **原子单元**。决策闭集、Observation 归一、预算、循环检测、验收、错误分类 |
-| 2 | [miniagent/agent.py](miniagent/agent.py) | ~250 | 薄壳：循环 + 预算 + 验收 + 终态映射（只驱动 RAO，不写工具逻辑） |
-| 3 | [miniagent/tools.py](miniagent/tools.py) | ~400 | 工具协议、参数校验、错误吸收、SSRF 防护 |
-| 4 | [miniagent/sandbox.py](miniagent/sandbox.py) | ~105 | 路径越狱防护（隔离的第一道门） |
-| 5 | [miniagent/providers.py](miniagent/providers.py) | ~275 | 真实 HTTP 调用 + 可复现的 ScriptedProvider |
-| 6 | [miniagent/metrics.py](miniagent/metrics.py) | ~160 | 完成率/耗时/token 的计算口径 |
-| 7 | [miniagent/schemas.py](miniagent/schemas.py) | ~145 | 数据契约（改这里要想清楚） |
-| 8 | [miniagent/cli.py](miniagent/cli.py) | ~320 | 一次 run 的组装方式 |
-| 9 | [miniagent/config.py](miniagent/config.py) | ~60 | 护栏的默认值与理由 |
+| 1 | [miniagent/rao.py](miniagent/rao.py) | ~690 | **原子单元**。决策闭集、Observation 归一、预算、循环检测、验收、错误分类 |
+| 2 | [miniagent/agent.py](miniagent/agent.py) | ~260 | 薄壳：循环 + 预算 + 验收 + 终态映射（只驱动 RAO，不写工具逻辑） |
+| 3 | [miniagent/orchestrator.py](miniagent/orchestrator.py) | ~810 | **编排**：计划校验与降级、能力路由、S1/S2/S3 调度、黑板、委派 |
+| 4 | [miniagent/bus.py](miniagent/bus.py) | ~140 | 消息总线：群聊/私信/委派事件，落 `bus.jsonl` |
+| 5 | [miniagent/tools.py](miniagent/tools.py) | ~400 | 工具协议、参数校验、错误吸收、SSRF 防护 |
+| 6 | [miniagent/sandbox.py](miniagent/sandbox.py) | ~105 | 路径越狱防护（隔离的第一道门） |
+| 7 | [miniagent/providers.py](miniagent/providers.py) | ~275 | 真实 HTTP 调用 + 可复现的 ScriptedProvider |
+| 8 | [miniagent/metrics.py](miniagent/metrics.py) | ~230 | 完成率/耗时/token 口径（含子任务层与总体目标） |
+| 9 | [miniagent/schemas.py](miniagent/schemas.py) | ~145 | 数据契约（改这里要想清楚） |
+| 10 | [miniagent/cli.py](miniagent/cli.py) | ~420 | 一次 run 的组装方式 |
+| 11 | [miniagent/config.py](miniagent/config.py) | ~60 | 护栏的默认值与理由 |
 
 配套文档：
-- [docs/architecture.md](docs/architecture.md) — **系统架构设计**（RAO 原子、四层架构、接口契约、指标口径）
+- [docs/architecture.md](docs/architecture.md) — **系统架构设计**（分层、组件、接口契约、指标口径）
+- [docs/scheduler.md](docs/scheduler.md) — **调度器设计**（S1 串行 / S2 分层并发 / S3 事件驱动、失败语义、预算、选型）
 - [docs/rao-spec.md](docs/rao-spec.md) — **RAO 契约规范**（字段、错误码、终止谓词、单步测试方法）
-- [docs/team-division.md](docs/team-division.md) — 小组分工参考（2–4 人）+ W1 任务卡
 - [docs/requirements-analysis.md](docs/requirements-analysis.md) — 课程要求逐条拆解
-- [docs/agent-dev-primer.md](docs/agent-dev-primer.md) — 从 Web 开发转过来的知识地图
 
 ---
 
@@ -153,10 +160,11 @@ python -m miniagent run "调研 ReAct 方法并写一份 notes.md 笔记"
 python -m unittest discover -s tests -t . -v
 ```
 
-66 个用例覆盖：**RAO 单步断言**（决策闭集、观察归一、产物索引、预算扣减、循环告警/终止、
-HITL 有/无人、委派有/无编排器、验收通过/打回/失败）、沙箱越狱（`../`、绝对路径、符号链接）、
-工具参数校验、护栏（超步数/超时）、错误吸收、模型响应解析（非法 JSON / 空 choices / BOM 剧本）、
-指标口径、CLI 端到端。
+96 个用例覆盖：**RAO 单步断言**（决策闭集、观察归一、产物索引、预算扣减、循环告警/终止、
+HITL 有/无人、委派有/无编排器、验收通过/打回/失败）、**编排与调度**（计划校验与降级、S1 执行顺序、
+失败只阻塞下游、S2 并发重叠与并发上限、**S3 依赖完成即解锁**、深/浅层依赖、委派与深度上限）、
+**消息总线**（订阅/广播/落盘/订阅者异常隔离）、沙箱越狱、工具参数校验、护栏（超步数/超时）、
+错误吸收、模型响应解析（非法 JSON / 空 choices / BOM 剧本）、指标口径、CLI 端到端。
 
 > 注意：测试的临时目录写在 `build/tmp`（已 gitignore）。有些受限机器上系统 temp 不可写，
 > 用 `tempfile` 会全线 PermissionError —— 这是踩过的坑。

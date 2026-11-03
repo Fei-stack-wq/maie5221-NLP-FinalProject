@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import Counter
 from datetime import datetime
@@ -30,6 +31,9 @@ class Tracer:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.trace_path = self.run_dir / "trace.jsonl"
         self._handle = self.trace_path.open("a", encoding="utf-8")
+        # 并发调度（S2）时多个 agent 线程同时写同一文件，必须串行化，
+        # 否则会出现半行 JSON —— 那是汇总脚本最难查的一类脏数据。
+        self._lock = threading.Lock()
 
     def event(self, kind: str, **payload: Any) -> None:
         record = {
@@ -38,8 +42,10 @@ class Tracer:
             "kind": kind,
             **payload,
         }
-        self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        self._handle.flush()  # 崩溃时也要保住已有证据
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            self._handle.write(line)
+            self._handle.flush()  # 崩溃时也要保住已有证据
 
     def close(self) -> None:
         if not self._handle.closed:
@@ -78,7 +84,14 @@ def _percentile(sorted_values: list[float], ratio: float) -> float:
 def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """从事件流里算出报告需要的那几个数。"""
     events = list(events)
-    ends = [event for event in events if event.get("kind") == "task_end"]
+    # 总体目标走 level="goal"（编排器写），其余 task_end 是子任务/单任务。
+    # 两者混在一起算，完成率就没有意义了。
+    ends = [
+        event
+        for event in events
+        if event.get("kind") == "task_end" and event.get("level") != "goal"
+    ]
+    goals = [event for event in events if event.get("kind") == "orchestration_end"]
     steps = [event for event in events if event.get("kind") == "step"]
 
     total = len(ends)
@@ -92,6 +105,16 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         for event in steps
     )
 
+    # 子任务层（编排器运行时才有）：课程要求同时报告"子任务完成率"与"总体完成率"
+    sub_ends = [event for event in events if event.get("kind") == "subtask_end"]
+    sub_done = [event for event in sub_ends if event.get("status") == "done"]
+    sub_durations = sorted(float(event.get("duration_ms") or 0.0) for event in sub_ends)
+    sub_failures = Counter(
+        str(event.get("error") or event.get("status"))
+        for event in sub_ends
+        if event.get("status") != "done"
+    )
+
     return {
         "total_tasks": total,
         "completed": len(completed),
@@ -103,6 +126,17 @@ def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens": tokens,
         "mean_tokens_per_task": round(tokens / total) if total else 0,
         "failure_modes": dict(failures),
+        "subtask_total": len(sub_ends),
+        "subtask_completed": len(sub_done),
+        "subtask_completion_rate": (len(sub_done) / len(sub_ends)) if sub_ends else 0.0,
+        "subtask_mean_duration_ms": (
+            round(sum(sub_durations) / len(sub_durations), 2) if sub_durations else 0.0
+        ),
+        "subtask_failure_modes": dict(sub_failures),
+        "goal_status": str((goals[-1] if goals else {}).get("status") or ""),
+        "goal_duration_ms": round(
+            float((goals[-1] if goals else {}).get("duration_ms") or 0.0), 2
+        ),
     }
 
 
@@ -111,7 +145,11 @@ def render_report(run_dir: Path | str, write: bool = True) -> str:
     run_dir = Path(run_dir)
     events = load_events(run_dir)
     summary = summarize(events)
-    ends = [event for event in events if event.get("kind") == "task_end"]
+    ends = [
+        event
+        for event in events
+        if event.get("kind") == "task_end" and event.get("level") != "goal"
+    ]
 
     lines = [
         f"# 运行报告：{run_dir.name}",
@@ -138,6 +176,39 @@ def render_report(run_dir: Path | str, write: bool = True) -> str:
         lines += [f"| {reason} | {count} |" for reason, count in summary["failure_modes"].items()]
     else:
         lines.append("无失败任务。")
+
+    sub_ends = [event for event in events if event.get("kind") == "subtask_end"]
+    if sub_ends:
+        lines += [
+            "",
+            "## 总体目标",
+            "",
+            f"- 状态：**{summary['goal_status'] or '-'}**",
+            f"- 耗时：{summary['goal_duration_ms'] / 1000:.2f} s",
+            "",
+            "## 子任务",
+            "",
+            f"- 子任务完成率：**{summary['subtask_completion_rate']:.1%}**"
+            f"（{summary['subtask_completed']}/{summary['subtask_total']}）",
+            f"- 平均子任务耗时：{summary['subtask_mean_duration_ms'] / 1000:.2f} s",
+            "",
+            "| 子任务 | agent | 状态 | 步数 | 耗时(s) | token |",
+            "|---|---|---|---|---|---|",
+        ]
+        for event in sub_ends:
+            lines.append(
+                "| {sid} | {agent} | {status} | {steps} | {duration:.2f} | {tokens} |".format(
+                    sid=event.get("subtask", "-"),
+                    agent=event.get("assignee", "-"),
+                    status=event.get("status", "-"),
+                    steps=event.get("steps", 0),
+                    duration=float(event.get("duration_ms") or 0) / 1000,
+                    tokens=event.get("tokens", 0),
+                )
+            )
+        if summary["subtask_failure_modes"]:
+            lines += ["", "失败子任务原因："]
+            lines += [f"- {reason}：{count} 次" for reason, count in summary["subtask_failure_modes"].items()]
 
     lines += ["", "## 逐任务明细", "", "| 任务 | agent | 状态 | 步数 | 工具调用 | 耗时(s) | token |", "|---|---|---|---|---|---|---|"]
     for event in ends:

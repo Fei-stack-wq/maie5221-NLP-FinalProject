@@ -25,6 +25,7 @@ from .config import Settings
 from .metrics import Tracer, load_events, render_report, summarize
 from .providers import DeepSeekProvider, Provider, ScriptedProvider
 from .rao import Acceptance, accept_files
+from .orchestrator import Orchestrator
 from .sandbox import Sandbox
 from .tools import build_default_registry
 
@@ -94,6 +95,26 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--agent", default="worker")
     evaluate.add_argument("--yes", action="store_true")
 
+    orchestrate = sub.add_parser(
+        "orchestrate", help="把一句目标拆成子任务图并调度执行（S1 串行 / S2 分层并发）"
+    )
+    orchestrate.add_argument("goal", help="自然语言目标")
+    orchestrate.add_argument(
+        "--scheduler", choices=["serial", "parallel", "evented"], default="serial",
+        help="serial=一次一个（默认、可复现）；parallel=按层并发；evented=依赖完成即解锁",
+    )
+    orchestrate.add_argument("--max-parallel", type=int, default=3, help="并发上限")
+    orchestrate.add_argument(
+        "--delegate", action="store_true",
+        help="允许 agent 用 delegate_task 把子任务再委派出去（深度默认 2）",
+    )
+    orchestrate.add_argument(
+        "--mock", metavar="SCRIPT.json",
+        help="剧本文件（按 plan→子任务 顺序排列；仅 serial 可用）",
+    )
+    orchestrate.add_argument("--runs-dir", default=str(settings.runs_dir))
+    orchestrate.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+
     report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
     report.add_argument("run_dir")
 
@@ -105,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_run(args, settings)
     if args.command == "eval":
         return _cmd_eval(args, settings)
+    if args.command == "orchestrate":
+        return _cmd_orchestrate(args, settings)
     if args.command == "report":
         return _cmd_report(args)
     parser.print_help()
@@ -163,6 +186,68 @@ def _cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
         agent_name=args.agent,
         auto_approve=args.yes,
     )
+
+
+def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
+    # 先校验再建目录：被拒绝的命令不该在工作区留下空 run 目录
+    if args.mock and args.scheduler != "serial":
+        print(
+            "[错误] --mock 用的 ScriptedProvider 带游标、不是线程安全的；"
+            "并行/事件驱动模式请用真实模型，或注入自定义 provider。",
+            file=sys.stderr,
+        )
+        return 2
+    run_dir = _new_run_dir(Path(args.runs_dir))
+    try:
+        provider = _make_provider_factory(args.mock, settings)()
+    except Exception as exc:
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+
+    tracer = Tracer(run_dir)
+    orchestrator = Orchestrator(
+        provider=provider,
+        settings=settings,
+        run_dir=run_dir,
+        tracer=tracer,
+        enable_delegation=args.delegate,
+        approve=(lambda _prompt: True) if args.yes else None,
+        human_handler=(
+            (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
+            if args.yes
+            else None
+        ),
+    )
+    try:
+        result = orchestrator.run(
+            args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel
+        )
+    finally:
+        tracer.close()
+
+    print(f"\n目标：{result.goal}")
+    print(
+        f"调度：{result.scheduler} | 状态：{result.status}"
+        f" | 总耗时 {result.duration_ms / 1000:.2f}s | token {result.tokens}"
+    )
+    print("子任务：")
+    for task in result.subtasks:
+        mark = {"done": "✅", "blocked": "⏭", "skipped": "⏭"}.get(task.status, "❌")
+        suffix = f" | {task.error}" if task.error else ""
+        print(
+            f"  {mark} {task.id} [{task.assignee}] {task.status}"
+            f" | {task.duration_ms / 1000:.2f}s | {task.steps} 步"
+            f" | {task.tokens} token{suffix}"
+        )
+    print(f"子任务完成率：{result.completion_rate:.1%} ({result.completed}/{result.total})")
+
+    if orchestrator.bus and orchestrator.bus.count:
+        print("\n群聊频道（bus.jsonl，最近 10 条）：")
+        print(orchestrator.bus.transcript(limit=10))
+
+    print("\n" + render_report(run_dir))
+    print(f"运行目录：{run_dir.resolve()}")
+    return 0 if result.status == "completed" else 1
 
 
 def _cmd_report(args: argparse.Namespace) -> int:

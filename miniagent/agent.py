@@ -88,7 +88,15 @@ class Agent:
         task: str,
         task_id: str | None = None,
         acceptance: Acceptance | None = None,
+        budget: Budget | None = None,
+        on_step: Callable[[StepRecord, RAOState], None] | None = None,
     ) -> RunResult:
+        """跑完一个任务。
+
+        ``budget`` 由调度器注入（编排一个多子任务计划时共享大局预算）；
+        不传则按 ``settings.limits`` 新建。
+        ``on_step`` 是给调度器的钩子：每步结束立刻回调，用于写黑板、检查依赖。
+        """
         task_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
         limits = self.settings.limits
         started = time.perf_counter()
@@ -101,7 +109,7 @@ class Agent:
                 {"role": "user", "content": task},
             ],
         )
-        budget = Budget(
+        budget = budget or Budget(
             steps_left=limits.max_steps,
             seconds_left=limits.max_seconds,
             tokens_left=limits.max_total_tokens,
@@ -134,6 +142,8 @@ class Agent:
 
                 budget.spend(steps=1)
                 record = self.unit.step(state, budget)
+                if on_step is not None:
+                    on_step(record, state)
                 usage = usage.merged(
                     Usage(
                         prompt_tokens=record.prompt_tokens,

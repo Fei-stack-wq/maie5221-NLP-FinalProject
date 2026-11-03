@@ -2,11 +2,11 @@
 
 | 项 | 内容 |
 |---|---|
-| 版本 | v1.1 |
+| 版本 | v1.3 |
 | 日期 | 2026-11-03 |
 | 状态 | L0–L1 已实现并测试，L2–L4 设计中 |
 | 对应课程要求 | 2.1 通信与协作 / 2.2 记忆演化与隔离 / 2.3 行动空间 / 2.5 UI / 2.6 模型主干 / 评估指标 |
-| 代码基线 | `miniagent/`（RAO 原子 + 单 agent 运行时，66 个测试） |
+| 代码基线 | `miniagent/`（RAO 原子 + 单 agent 运行时 + 编排器 + 总线，96 个测试） |
 | 细化文档 | [RAO 契约规范](rao-spec.md) |
 
 ---
@@ -110,7 +110,7 @@ class RAOState(BaseModel):
     scratch: dict[str, Any]      # repeat 计数、acceptance 失败次数
 ```
 
-`Budget` 四维（steps / seconds / tokens / actions）由运行时持有、RAO 只消费；`fork(ratio)` 用于向子任务切分预算（默认各半）。
+`Budget` 四维（steps / seconds / tokens / actions）由运行时持有、RAO 只消费；`fork(ratio)` 预留给**嵌套委派**（子 agent 再派子任务）。当前编排器给每个子任务一份独立预算（`Limits × 0.8`），并用**全局 token/时间池**兜底：子任务实际用量回扣，池空则剩余任务标 `skipped`。
 
 ### 2.3 状态机
 
@@ -213,8 +213,8 @@ flowchart TB
 |---|---|---|---|
 | L0 RAO | 单步决策与执行契约 | 不关心任务从哪来 | ✅ 已实现（`rao.py`，闭集决策/观察归一/预算/循环检测） |
 | L1 循环 | 预算、重试、上下文装配、终止 | 不决定任务拆分 | ✅ 已实现（`agent.py`）——上下文压缩仍属 P2 |
-| L2 任务 | 目标 → 子任务 DAG → 调度 | 不实现工具 | ⏳ `orchestrator.py` |
-| L3 组织 | 多 agent 群聊、委派、黑板、HITL | 不直接执行工具 | ⏳ `bus.py` |
+| L2 任务 | 目标 → 子任务 DAG → 调度 | 不实现工具 | ✅ 已实现（`orchestrator.py`：serial + layered） |
+| L3 组织 | 多 agent 群聊、委派、黑板、HITL | 不直接执行工具 | ✅ 部分（`bus.py`：群聊/委派已通；HITL 持久化待做） |
 | L4 观测 | trace、指标、评测、报告 | 不改变行为 | ✅ 部分（`metrics.py`） |
 | 横切：记忆 | 检索注入 + 结束后蒸馏写入 | 不参与调度 | ⏳ `memory.py` |
 | 横切：沙箱 | 路径与进程隔离 | 不决定权限策略 | ✅ 软隔离（`sandbox.py`） |
@@ -226,15 +226,15 @@ flowchart TB
 
 ### 4.1 接入层：CLI
 
-- 命令：`demo`（离线闭环）、`run`（单任务）、`eval`（批量指标）、`report`（汇总）。
+- 命令：`demo`（离线闭环）、`run`（单任务）、`orchestrate`（目标 → 子任务图 → 调度）、`eval`（批量指标）、`report`（汇总）。
 - 三种运行模式贯穿全局：`interactive`（每步可看）/ `semi`（只在危险操作与歧义处停）/ `unattended`（自动批准并记录）。
 - 输出原则：**默认只打印结论与指标**；`--verbose` 才打逐步事件。演示时用 `--verbose` 讲 RAO 的每一步。
 
-### 4.2 消息总线与黑板（L3）
+### 4.2 消息总线与黑板（L3，已实现 `bus.py`）
 
 | 概念 | 内容 | 存储 |
 |---|---|---|
-| 消息总线 | `Message{sender, recipients[], kind, content, task_id}`；kind ∈ chat / delegate / report / hitl_request | `runs/<id>/bus.jsonl` |
+| 消息总线 | `Message{sender, recipients[], kind, content, task_id}`；kind ∈ chat / report / delegate_request / delegate_result / system | `runs/<id>/bus.jsonl` |
 | 黑板 | 任务状态、产物索引、当前决策、冲突记录 | 内存 + `runs/<id>/board.json` 快照 |
 
 分工原则：**总线记"谁说了什么"，黑板记"现在是什么状态"**。不要把状态塞进聊天记录——那会让重放变成猜谜。
@@ -242,6 +242,9 @@ flowchart TB
 群聊的"发言权"由调度器授予（一次只有一个 agent 在 RAO 循环里跑），避免多个 agent 同时写同一文件。
 
 ### 4.3 编排器（L2/L3）
+
+**调度算法、失败语义、预算、指标口径与选型记录见 [scheduler.md](scheduler.md)**（S1 串行 /
+S2 分层并发 / S3 事件驱动）。本节只交代它在整体架构中的位置。
 
 四个子职责，串成一条流水线：
 
@@ -284,7 +287,7 @@ sequenceDiagram
 **Scheduler**：
 - 按拓扑层分批，层内并行，受 `max_parallel` 与模型并发上限约束。
 - 失败重试 1 次（换 worker 或同 worker），仍失败标记 `failed`，下游任务标 `blocked`（不要全图失败）。
-- 每个子任务的时间上限是剩余预算的一部分（默认 `remaining * 0.6 / 待执行任务数`）。
+- 每个子任务拿到 `Limits × 0.8` 的独立预算；全局另有 token/时间池，子任务实际用量回扣，耗尽则剩余任务标 `skipped`。
 
 ### 4.4 Agent 运行时（L1）
 
@@ -348,6 +351,10 @@ step_reduction = (steps_before − steps_after) / steps_before
 | `tool_result` | step, tool, ok, error_class, artifacts[], preview | 失败分类与产物索引 |
 | `acceptance` | step, ok, reason | 验收结论（为什么算完成/没完成） |
 | `task_end` | status, duration_ms, steps, tool_calls, tokens, error | 完成率与耗时 |
+| `plan` | subtasks[]（id/assignee/deps/objective）, attempts | 计划是否合规、拆成了什么 |
+| `plan_invalid` / `plan_degraded` | error, attempt | 计划失败与降级（报告里要写） |
+| `subtask_start` / `subtask_end` | subtask, assignee, status, duration_ms, tokens | **子任务完成率**（课程要求） |
+| `orchestration_end` | status, total, completed, duration_ms, tokens | **总体目标完成率** |
 
 **指标口径（精确，不许各算各的）**：
 
@@ -409,10 +416,11 @@ class Agent:                         # L1：已实现 miniagent/agent.py（薄�
     def run(self, task: str, task_id: str | None = None,
             acceptance: Acceptance | None = None) -> RunResult: ...
 
-class Orchestrator:                  # L2/L3：新增 orchestrator.py
-    def plan(self, goal: str, roster: list[AgentCard]) -> list[SubTask]: ...
-    def dispatch(self, tasks: list[SubTask]) -> dict[str, RunResult]: ...
-    def run(self, goal: str, mode: Mode) -> RunResult: ...
+class Orchestrator:                  # L2/L3：已实现 miniagent/orchestrator.py
+    def plan(self, goal: str) -> list[SubTask]: ...        # LLM 出计划 + 校验 + 降级
+    def run(self, goal: str, scheduler: str = "serial",
+            max_parallel: int = 3) -> OrchestrationResult: ...
+    # 内部：_dispatch_serial（S1）/ _dispatch_layered（S2）
 
 class Memory:                        # 横切：新增 memory.py
     def record(self, rec: MemoryRecord) -> None: ...
@@ -483,8 +491,8 @@ class Acceptance(Protocol):          # 已实现：accept_files / 自定义函�
 |---|---|---|---|
 | P0 | 单 agent 隐式 RAO + 工具 + 沙箱 + 指标 | `agent.py` `tools.py` `sandbox.py` `metrics.py` | ✅ 已完成 |
 | P1 | **RAO 显式化**：`rao.py`（Decision/Observation/StepRecord/RAOUnit）+ 验收函数 + 循环检测 + 错误分类 | `rao.py`（新）、`agent.py`、`cli.py` | ✅ **已完成**（21 个单步测试） |
-| P2 | 任务层：Planner + DAG 调度 + 降级 | `orchestrator.py`（新） | ← **下一步** |
-| P3 | 组织层：总线 + 黑板 + 委派 + HITL 三档 | `bus.py`（新）、`orchestrator.py` | ⏳ |
+| P2 | 任务层：Planner + DAG 调度 + 降级 + 失败局部传播 | `orchestrator.py`（新） | ✅ **已完成**（S1 串行 + S2 分层并发） |
+| P3 | 组织层：总线 + 群聊 + 委派 + HITL 持久化 | `bus.py`（新）、`orchestrator.py` | ✅ 部分完成（总线/群聊/委派已通；HITL 持久化留待 P4） |
 | P4 | 记忆与演化 + A/B 实验 | `memory.py`（新） | ⏳ |
 | P5 | 批量评测 + 基线对照 + 报告 | `evals/`、`metrics.py` | ⏳ |
 
@@ -514,8 +522,8 @@ class Acceptance(Protocol):          # 已实现：accept_files / 自定义函�
 miniagent/
 ├─ rao.py            # L0：Decision / Observation / Budget / RAOUnit（已实现）
 ├─ agent.py          # L1：循环驱动 + 预算 + 验收 + 终态映射
-├─ orchestrator.py   # L2/L3：Planner / Router / Scheduler（P2）
-├─ bus.py            # L3：消息总线 + 黑板（P3）
+├─ orchestrator.py   # L2/L3：Planner / Router / Scheduler（S1 串行 + S2 分层并发，已实现）
+├─ bus.py            # L3：消息总线（群聊/私信/委派事件，已实现）
 ├─ memory.py         # 横切：三层记忆 + 演化（P4）
 ├─ tools.py          # 工具注册表与默认工具集
 ├─ sandbox.py        # 路径隔离（L1）
@@ -526,8 +534,8 @@ miniagent/
 └─ cli.py            # demo / run / eval / report
 evals/               # 任务集与批量评测（P5）
 runs/                # 每次运行的产物与 trace
-docs/                # 本文档 + RAO 规范 + 要求分析 + 分工
-tests/               # 66 个用例（含 rao 单步测试）
+docs/                # 本文档 + RAO 规范 + 调度器设计 + 要求分析 + 分工
+tests/               # 96 个用例（RAO 单步 + 编排调度 + 总线 + CLI）
 ```
 
 ## 附录 B：术语表
@@ -549,3 +557,5 @@ tests/               # 66 个用例（含 rao 单步测试）
 |---|---|---|
 | v1.0 | 2026-11-03 | 初稿：确立 RAO 原子、四层架构、验收驱动的完成判定 |
 | v1.1 | 2026-11-03 | P1 落地：`rao.py` 实现（闭集决策、观察归一、预算、循环检测、验收、错误分类）；`agent.py` 改为薄壳；事件表与接口契约按实现校正；新增 [rao-spec.md](rao-spec.md) |
+| v1.2 | 2026-11-03 | P2 落地：`orchestrator.py`（计划校验+降级、能力路由、S1 串行拓扑、S2 分层并发、失败局部传播、黑板）；指标新增子任务层与总体目标口径；补调度器选型对比 |
+| v1.3 | 2026-11-03 | P3 部分落地：`bus.py`（群聊/私信/委派事件）、S3 事件驱动调度、`delegate_task` 真委派（限深）；调度器细节独立成 [scheduler.md](scheduler.md)，§4.3 改为引用 |
