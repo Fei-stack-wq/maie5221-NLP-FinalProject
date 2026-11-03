@@ -1,0 +1,322 @@
+"""命令行入口。
+
+用法（在仓库根目录）：
+    python -m miniagent demo                       # 离线演示，不需要 API key
+    python -m miniagent run "写一份关于 X 的笔记"     # 真实调用 DeepSeek
+    python -m miniagent eval --tasks examples/tasks.jsonl
+    python -m miniagent report runs/<run_id>
+
+设计原则：UI 只是"触发一次 run + 看结果"。课程明确说复杂前端不加分，
+所以这里只做到"能跑、能看、能出报告"。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable
+
+from .agent import Agent
+from .config import Settings
+from .metrics import Tracer, load_events, render_report, summarize
+from .providers import DeepSeekProvider, Provider, ScriptedProvider
+from .rao import Acceptance, accept_files
+from .sandbox import Sandbox
+from .tools import build_default_registry
+
+# 离线演示剧本：完整走一遍「列目录 -> 写文件 -> 读文件 -> 执行代码 -> 最终答复」。
+# 它同时是一份"模型该长什么样"的说明书，写 prompt 时可以对照。
+DEMO_SCRIPT: list[dict[str, Any]] = [
+    {"tool_calls": [{"name": "list_dir", "arguments": {"path": "."}}]},
+    {
+        "tool_calls": [
+            {
+                "name": "write_file",
+                "arguments": {
+                    "path": "notes.md",
+                    "content": (
+                        "# 演示产物\n\n"
+                        "这个文件是 `ScriptedProvider` 驱动 agent 循环写出来的，全程没有联网、没有 API key。\n\n"
+                        "## 它证明了什么\n"
+                        "- 工具调用闭环（模型给参数 -> 代码执行 -> 结果回传）\n"
+                        "- 沙箱路径限制（写不到工作区之外）\n"
+                        "- 指标采集（每个 step 都有 token 与耗时）\n"
+                    ),
+                },
+            }
+        ]
+    },
+    {"tool_calls": [{"name": "read_file", "arguments": {"path": "notes.md"}}]},
+    {"tool_calls": [{"name": "run_python", "arguments": {"code": "print(2 ** 10)"}}]},
+    {
+        "text": (
+            "## 完成\n\n"
+            "- 生成 `notes.md`\n"
+            "- 回读验证成功\n"
+            "- 沙箱内 Python 可执行（2**10 = 1024）\n\n"
+            "详见同目录下的 `trace.jsonl` 与 `report.md`。"
+        )
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    _enable_utf8()
+    settings = Settings.from_env()
+
+    parser = argparse.ArgumentParser(
+        prog="miniagent",
+        description="多智能体最小骨架：单 agent 循环 + 工具 + 沙箱 + 指标",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    demo = sub.add_parser("demo", help="离线演示（ScriptedProvider，无需 API key）")
+    demo.add_argument("--runs-dir", default=str(settings.runs_dir))
+    demo.add_argument("--agent", default="demo-agent")
+    demo.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+
+    run = sub.add_parser("run", help="运行一个任务（默认真实调用 DeepSeek）")
+    run.add_argument("task", help="自然语言任务描述")
+    run.add_argument("--agent", default="worker")
+    run.add_argument("--mock", metavar="SCRIPT.json", help="用剧本文件代替真实模型")
+    run.add_argument("--runs-dir", default=str(settings.runs_dir))
+    run.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+
+    evaluate = sub.add_parser("eval", help="批量评测：输出完成率与耗时")
+    evaluate.add_argument("--tasks", default="examples/tasks.jsonl", help="任务集 JSONL")
+    evaluate.add_argument("--mock", metavar="SCRIPT.json", help="用剧本文件代替真实模型")
+    evaluate.add_argument("--runs-dir", default=str(settings.runs_dir))
+    evaluate.add_argument("--agent", default="worker")
+    evaluate.add_argument("--yes", action="store_true")
+
+    report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
+    report.add_argument("run_dir")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "demo":
+        return _cmd_demo(args, settings)
+    if args.command == "run":
+        return _cmd_run(args, settings)
+    if args.command == "eval":
+        return _cmd_eval(args, settings)
+    if args.command == "report":
+        return _cmd_report(args)
+    parser.print_help()
+    return 1
+
+
+# ---------------------------------------------------------------------------
+def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
+    run_dir = _new_run_dir(Path(args.runs_dir))
+    return _execute(
+        tasks=[{"task_id": "demo-1", "task": "演示一次完整的 agent 工具调用闭环。"}],
+        provider_factory=lambda: ScriptedProvider(DEMO_SCRIPT),
+        run_dir=run_dir,
+        settings=settings,
+        agent_name=args.agent,
+        auto_approve=args.yes,
+        # 演示验收：只要 notes.md 存在且非空就算完成。
+        # 把 "completed" 从"模型说完了"改成"产物真的在"，这是指标可信的前提。
+        acceptance=accept_files("notes.md"),
+    )
+
+
+def _cmd_run(args: argparse.Namespace, settings: Settings) -> int:
+    run_dir = _new_run_dir(Path(args.runs_dir))
+    try:
+        provider_factory = _make_provider_factory(args.mock, settings)
+    except Exception as exc:  # 没配 key 时给出可操作的提示，而不是堆栈
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+    return _execute(
+        tasks=[{"task_id": "run-1", "task": args.task}],
+        provider_factory=provider_factory,
+        run_dir=run_dir,
+        settings=settings,
+        agent_name=args.agent,
+        auto_approve=args.yes,
+    )
+
+
+def _cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
+    tasks = _load_tasks(Path(args.tasks))
+    if not tasks:
+        print(f"[错误] 任务集为空或不存在：{args.tasks}", file=sys.stderr)
+        return 2
+    run_dir = _new_run_dir(Path(args.runs_dir))
+    try:
+        provider_factory = _make_provider_factory(args.mock, settings)
+    except Exception as exc:
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+    return _execute(
+        tasks=tasks,
+        provider_factory=provider_factory,
+        run_dir=run_dir,
+        settings=settings,
+        agent_name=args.agent,
+        auto_approve=args.yes,
+    )
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    if not (run_dir / "trace.jsonl").exists():
+        print(f"[错误] 找不到 trace：{run_dir / 'trace.jsonl'}", file=sys.stderr)
+        return 2
+    print(render_report(run_dir))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+def _execute(
+    tasks: list[dict[str, str]],
+    provider_factory: Callable[[], Provider],
+    run_dir: Path,
+    settings: Settings,
+    agent_name: str,
+    auto_approve: bool,
+    acceptance: Acceptance | None = None,
+) -> int:
+    """跑一批任务，然后打印指标。批量跑是"完成率"这个指标的唯一来源。
+
+    ``provider_factory`` 而不是 provider 实例：每个任务都必须是干净的状态。
+    之前用同一个 ScriptedProvider 跑 3 个任务，后两个直接"剧本耗尽"，
+    却被算成 completed —— 指标虚高，是最危险的一类 bug。
+    """
+    results = []
+    with Tracer(run_dir) as tracer:
+        for index, item in enumerate(tasks, start=1):
+            task_id = item.get("task_id") or f"task-{index}"
+            provider = provider_factory()  # 每个任务一份全新的模型状态
+            # 每个 agent 一个私有沙箱目录（同一 agent 的不同任务也分开，便于复现）
+            sandbox = Sandbox(
+                run_dir / "agents" / f"{agent_name}-{task_id}", agent_name=agent_name
+            )
+            agent = Agent(
+                name=agent_name,
+                provider=provider,
+                registry=build_default_registry(),
+                sandbox=sandbox,
+                settings=settings,
+                tracer=tracer,
+                approve=(lambda _prompt: True) if auto_approve else None,
+                # 无人值守模式：人类闸门自动放行，但会在 trace 里留下记录
+                human_handler=(
+                    (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
+                    if auto_approve
+                    else None
+                ),
+            )
+
+            print(f"\n=== [{index}/{len(tasks)}] {task_id} ===")
+            print(f"任务：{item['task'][:120]}")
+            result = agent.run(item["task"], task_id=task_id, acceptance=acceptance)
+            results.append(result)
+
+            status_text = "✅ completed" if result.succeeded else f"❌ {result.status}"
+            print(
+                f"结果：{status_text}"
+                f" | 步数 {result.steps}"
+                f" | 工具 {result.tool_calls}"
+                f" | 耗时 {result.duration_ms / 1000:.2f}s"
+                f" | token {result.usage.total}"
+            )
+            if result.error:
+                print(f"原因：{result.error}")
+            if result.answer:
+                preview = result.answer.strip().splitlines()[:6]
+                print("答复：" + "\n      ".join(preview))
+            print(f"沙箱：{result.sandbox}")
+
+    summary = summarize(load_events(run_dir))
+    print("\n" + "=" * 60)
+    print("汇总指标")
+    print("=" * 60)
+    print(f"任务完成率 : {summary['completion_rate']:.1%}  ({summary['completed']}/{summary['total_tasks']})")
+    print(f"平均耗时   : {summary['mean_duration_ms'] / 1000:.2f}s   P95 {summary['p95_duration_ms'] / 1000:.2f}s")
+    print(f"平均步数   : {summary['mean_steps']}")
+    print(f"总 token   : {summary['total_tokens']}")
+    if summary["failure_modes"]:
+        print(f"失败模式   : {summary['failure_modes']}")
+
+    # 落盘：报告里的数字必须与上面打印的完全一致（同一个 summarize 函数）
+    render_report(run_dir)
+
+    print(f"\n运行目录   : {run_dir.resolve()}")
+    print(f"报告       : {(run_dir / 'report.md').resolve()}")
+
+    ok = all(result.succeeded for result in results)
+    return 0 if ok else 1
+
+
+def _make_provider_factory(
+    mock_path: str | None, settings: Settings
+) -> Callable[[], Provider]:
+    """返回一个"每次调用都产出一个干净 provider"的工厂。
+
+    真实 provider 是无状态的，复用同一个实例没问题；
+    ScriptedProvider 有游标，必须每条任务重新读一遍剧本。
+    """
+    if mock_path:
+        path = Path(mock_path)
+        ScriptedProvider.from_json(path)  # 先解析一次：剧本格式错误要在这里暴露
+        return lambda: ScriptedProvider.from_json(path)
+
+    provider = DeepSeekProvider(
+        api_key=settings.api_key,
+        base_url=settings.base_url,
+        model=settings.model,
+    )
+    return lambda: provider
+
+
+def _new_run_dir(base: Path) -> Path:
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    path = base / run_id
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_tasks(path: Path) -> list[dict[str, str]]:
+    """任务集格式：每行一个 JSON 对象 {"task_id": "...", "task": "..."}。"""
+    if not path.exists():
+        return []
+    tasks: list[dict[str, str]] = []
+    # utf-8-sig：兼容 Windows 编辑器写出的 BOM
+    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"[警告] 第 {line_number} 行不是合法 JSON，已跳过", file=sys.stderr)
+            continue
+        if isinstance(payload, str):  # 允许直接写一行文本
+            payload = {"task": payload}
+        payload.setdefault("task_id", f"task-{line_number}")
+        if payload.get("task"):
+            tasks.append({"task_id": str(payload["task_id"]), "task": str(payload["task"])})
+    return tasks
+
+
+def _enable_utf8() -> None:
+    """Windows 控制台默认不是 UTF-8，中文输出会乱码。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

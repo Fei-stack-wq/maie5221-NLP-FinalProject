@@ -1,0 +1,16 @@
+[
+  {"tool_calls": [{"name": "list_dir", "arguments": {"path": "."}}]},
+  {
+    "tool_calls": [
+      {
+        "name": "write_file",
+        "arguments": {
+          "path": "result.md",
+          "content": "# 结果\n\n这个文件由 `examples/mock_task.json` 剧本驱动生成，全程离线。\n\n- 用于测试 `run --mock` 与 `eval --mock`\n- 每个任务都会拿到一份全新的剧本副本，互不干扰\n"
+        }
+      }
+    ]
+  },
+  {"tool_calls": [{"name": "read_file", "arguments": {"path": "result.md"}}]},
+  {"text": "已完成：产物为 result.md，内容回读正常。"}
+]

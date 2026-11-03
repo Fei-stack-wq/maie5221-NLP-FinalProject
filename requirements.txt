@@ -1,0 +1,6 @@
+# Python 3.10+
+# 只依赖 pydantic：LLM 调用用标准库 urllib 实现，换 SDK 只是可选项。
+pydantic>=2.7,<3
+
+# 可选：想用官方 SDK 代替 urllib 时再取消注释
+# openai>=1.40
