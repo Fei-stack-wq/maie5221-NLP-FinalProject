@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # DeepSeek 当前模型名（2026-10）。flash 便宜快，适合路由/摘要/多数子任务；
-# v4-pro 更强更贵，适合规划和难题。详见 docs/agent-dev-primer.md 第 6 节。
+# v4-pro 更强更贵，适合规划和难题。价格与选型见 README「成本与模型选择」。
 DEFAULT_MODEL = "deepseek-flash"
 
 

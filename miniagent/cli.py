@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="miniagent",
-        description="多智能体最小骨架：单 agent 循环 + 工具 + 沙箱 + 指标",
+        description="多智能体协作系统：RAO 原子 + 编排调度 + 消息总线 + 指标",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--yes", action="store_true")
 
     orchestrate = sub.add_parser(
-        "orchestrate", help="把一句目标拆成子任务图并调度执行（S1 串行 / S2 分层并发）"
+        "orchestrate", help="把一句目标拆成子任务图并调度执行（S1 串行 / S2 分层并发 / S3 事件驱动）"
     )
     orchestrate.add_argument("goal", help="自然语言目标")
     orchestrate.add_argument(
