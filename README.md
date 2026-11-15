@@ -7,7 +7,7 @@
 UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
 
 ```
-版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 96 个测试（离线可跑）
+版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 204 个测试（离线可跑）
 ```
 
 ---
@@ -135,6 +135,10 @@ CLI
 | [docs/architecture.md](docs/architecture.md) | 系统架构：分层、组件状态、事件表、接口契约、安全模型、课程要求对照 |
 | [docs/scheduler.md](docs/scheduler.md)       | 调度器：S1/S2/S3 算法、失败语义、预算、指标口径、选型与实测        |
 | [docs/rao-spec.md](docs/rao-spec.md)         | RAO 契约：字段、15 个错误码、终止谓词、单步测试方法                |
+| [docs/agent-studio-integration.md](docs/agent-studio-integration.md) | 个人 Agent 工作室接入评估：代码核验、现有差距、对象边界与阶段建议（提案） |
+| [docs/agent-studio-development-plan.md](docs/agent-studio-development-plan.md) | 分阶段开发计划：修复优先级、模块接口、验收门槛、协作分工与首批 PR（提案） |
+| [docs/m0-01-data-contracts.md](docs/m0-01-data-contracts.md) | M0-01 核心数据契约 v1：字段、状态、读写职责及独立数据层 API/测试边界 |
+| [docs/m0-01-computer-maintenance-example.md](docs/m0-01-computer-maintenance-example.md) | M0-01 完整电脑维护数据示例：任务、验收、预算、工件、审批与恢复（虚构数据） |
 
 ---
 
@@ -172,9 +176,17 @@ CLI
 python -m unittest discover -s tests -t . -v
 ```
 
-96 个用例，全部离线（不需要 key、不联网）：RAO 单步断言、沙箱越狱、工具参数校验、
+204 个用例，全部离线（不需要 key、不联网）。其中原有 96 项：RAO 单步断言、沙箱越狱、工具参数校验、
 护栏（超步数/超时）、验收打回、计划校验与降级、S1/S2/S3 调度差异、失败局部传播、
 委派与深度上限、总线订阅/广播、指标口径、CLI 端到端。
+
+新增 108 项覆盖 M0-01 核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。
+
+新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它只提供不可变数据快照、校验和纯状态转换，尚未接入 Agent/RAO/Orchestrator。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
+
+```sh
+python -m unittest discover -s tests -p 'test_contract*.py' -t . -v
+```
 
 开发约定：
 
