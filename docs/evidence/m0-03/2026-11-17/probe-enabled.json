@@ -1,0 +1,75 @@
+{
+  "status": "passed",
+  "live_verified": true,
+  "evidence_level": "L2",
+  "reason_code": "ok",
+  "model": "deepseek-flash",
+  "thinking": "enabled",
+  "logical_calls": 3,
+  "calls": [
+    {
+      "call": 1,
+      "model": "deepseek-flash",
+      "finish_reason": "tool_calls",
+      "request_attempts": 1,
+      "request_id": "81b58ddf-8a38-4759-b2ab-e60cae08ed76",
+      "has_reasoning": true,
+      "usage": {
+        "prompt_tokens": 425,
+        "completion_tokens": 32,
+        "source": "reported",
+        "reported_total_tokens": 457,
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 425,
+        "reasoning_tokens": 0
+      }
+    },
+    {
+      "call": 2,
+      "model": "deepseek-flash",
+      "finish_reason": "tool_calls",
+      "request_attempts": 1,
+      "request_id": "79a7a7fb-9907-48f8-8f26-0683cbbae458",
+      "has_reasoning": true,
+      "usage": {
+        "prompt_tokens": 505,
+        "completion_tokens": 77,
+        "source": "reported",
+        "reported_total_tokens": 582,
+        "prompt_cache_hit_tokens": 256,
+        "prompt_cache_miss_tokens": 249,
+        "reasoning_tokens": 7
+      }
+    },
+    {
+      "call": 3,
+      "model": "deepseek-flash",
+      "finish_reason": "stop",
+      "request_attempts": 1,
+      "request_id": "b4d8d601-7d23-4222-9b85-d92f55999f00",
+      "has_reasoning": true,
+      "usage": {
+        "prompt_tokens": 598,
+        "completion_tokens": 4,
+        "source": "reported",
+        "reported_total_tokens": 602,
+        "prompt_cache_hit_tokens": 384,
+        "prompt_cache_miss_tokens": 214,
+        "reasoning_tokens": 0
+      }
+    }
+  ],
+  "verification": {
+    "started_at_utc": "20261117T103158Z",
+    "duration_ms": 4805.16,
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "thinking": "enabled",
+    "reasoning_effort": "high",
+    "max_output_tokens": 4096,
+    "request_timeout_seconds": 60.0,
+    "request_deadline_seconds": 120.0,
+    "max_retries": 2,
+    "temperature": null
+  }
+}

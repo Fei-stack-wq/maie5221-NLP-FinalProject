@@ -1,201 +1,266 @@
-"""LLM Provider：把"调模型"收敛到一个接口，便于 Mock 与切换。
+"""DeepSeek Chat Completions and deterministic offline providers.
 
-对应课程要求 2.6：只能用 DeepSeek 或 HKGAI，禁止 OpenAI/Anthropic。
-=> 所以 provider 是**可替换的一层**，而不是散落在各处的 HTTP 调用。
-
-两个实现：
-  - ``DeepSeekProvider``：真实调用，OpenAI 兼容协议（用标准库 urllib，不装 SDK 也能跑）
-  - ``ScriptedProvider``：按剧本返回固定响应。不需要 API key、不联网、100% 可复现。
-    单元测试和 key 还没发下来时全靠它。
+The transport retries only HTTP. Tools run later in RAO, so a retried model
+request cannot replay local tool side effects. Private reasoning stays in the
+protocol history and is never included in public error messages.
 """
-
 from __future__ import annotations
 
 import json
+import math
 import time
-import urllib.error
-import urllib.request
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_MODEL, validate_provider_options
+from .provider_http import HTTPResult, ProviderError, post_json
 from .schemas import LLMResponse, ToolCall, ToolSpec, Usage
-
-
-class ProviderError(RuntimeError):
-    """模型调用失败（网络、鉴权、限流、返回格式不对）。"""
 
 
 class Provider(ABC):
     name: str = "provider"
+    transport: str = "unknown"
 
     @abstractmethod
-    def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[ToolSpec] | None = None,
-        temperature: float = 0.0,
-    ) -> LLMResponse:
-        """发一次对话请求，返回归一化后的 LLMResponse。"""
+    def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+             temperature: float = 0.0) -> LLMResponse:
+        """Return one response; never execute tools in this method."""
 
 
-# ---------------------------------------------------------------------------
-# 真实 provider
-# ---------------------------------------------------------------------------
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ProviderError(message, code="invalid_response")
+
+
+def _strict_json_object(text: str) -> dict[str, Any]:
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def constant(_value):
+        raise ValueError("non-finite JSON number")
+
+    def finite_float(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-finite JSON number")
+        return number
+
+    result = json.loads(text, object_pairs_hook=pairs, parse_constant=constant,
+                        parse_float=finite_float)
+    if not isinstance(result, dict):
+        raise ValueError("arguments must be a JSON object")
+    return result
+
+
 class DeepSeekProvider(Provider):
-    """DeepSeek Chat Completions（OpenAI 兼容）。
+    """Non-streaming official API adapter with explicit thinking configuration.
 
-    生产环境你可以直接换成 ``openai`` SDK，一行等价：
-
-        client = OpenAI(api_key=..., base_url="https://api.deepseek.com")
-        resp = client.chat.completions.create(model=..., messages=..., tools=...)
-
-    这里用 urllib 写，是为了让你看清线上到底发了什么、收到了什么 ——
-    调试 agent 时，"模型实际看到了什么"永远是第一现场。
+    max_retries means additional HTTP attempts, not total attempts. The request
+    deadline is separate from the future root BudgetLedger. Environment values
+    are read by Settings/CLI, never implicitly by this constructor.
     """
-
     name = "deepseek"
-    RETRYABLE_STATUS = {408, 409, 429, 500, 502, 503, 504}
+    transport = "http"
+    FINISH_REASONS = {"stop", "tool_calls", "length", "content_filter",
+                      "insufficient_system_resource", "aborted"}
 
     def __init__(
-        self,
-        api_key: str,
-        base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-flash",
-        timeout: float = 120.0,
-        max_retries: int = 3,
+        self, api_key: str, base_url: str = "https://api.deepseek.com",
+        model: str = DEFAULT_MODEL, timeout: float = 60.0, max_retries: int = 2,
+        *, thinking: str = "disabled", reasoning_effort: str = "high",
+        max_output_tokens: int = 4096, deadline_seconds: float = 120.0,
     ) -> None:
-        if not api_key:
+        if type(api_key) is not str or not api_key.strip():
             raise ProviderError(
-                "缺少 DEEPSEEK_API_KEY。请复制 .env.example 为 .env 并填入密钥，"
-                "或先用 `python -m miniagent demo` 走离线脚本模式。"
+                "缺少 DEEPSEEK_API_KEY。请设置本机环境变量；.env 不会自动加载。"
+                "也可运行 `python -m miniagent demo` 使用离线模式。",
+                code="missing_api_key",
             )
+        try:
+            validate_provider_options(
+                model=model, base_url=base_url, thinking=thinking,
+                reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens,
+                request_timeout_seconds=timeout, request_deadline_seconds=deadline_seconds,
+                max_retries=max_retries,
+            )
+        except ValueError as exc:
+            raise ProviderError(str(exc), code="invalid_config") from None
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.timeout = timeout
-        self.max_retries = max_retries
+        self.model, self.thinking = model, thinking
+        self.reasoning_effort, self.max_output_tokens = reasoning_effort, max_output_tokens
+        self.timeout, self.deadline_seconds, self.max_retries = timeout, deadline_seconds, max_retries
 
-    def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[ToolSpec] | None = None,
-        temperature: float = 0.0,
-    ) -> LLMResponse:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-        }
-        # temperature=0 时故意不传：思考模式下该参数无效，传了反而容易误解。
-        if temperature:
-            payload["temperature"] = temperature
-        if tools:
-            payload["tools"] = [spec.to_api() for spec in tools]
-            payload["tool_choice"] = "auto"
-
-        started = time.perf_counter()
-        data = self._post_with_retry(payload)
-        latency_ms = (time.perf_counter() - started) * 1000
-        return self._parse(data, latency_ms)
-
-    # ------------------------------------------------------------------ HTTP
-    def _post_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
-        last_error: Exception | None = None
-        for attempt in range(self.max_retries):
-            try:
-                return self._post(payload)
-            except _Retryable as exc:
-                last_error = exc
-                # 指数退避：0.5s, 1s, 2s。真实项目还必须加上抖动，避免所有人同时重试。
-                time.sleep(0.5 * (2**attempt))
-        raise ProviderError(f"调用 DeepSeek 失败（已重试 {self.max_retries} 次）：{last_error}")
-
-    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-        )
+    def _build_payload(self, messages: list[dict[str, Any]],
+                       tools: list[ToolSpec] | None, temperature: float) -> dict[str, Any]:
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:800]
-            if exc.code in self.RETRYABLE_STATUS:
-                raise _Retryable(f"HTTP {exc.code}: {detail}") from exc
-            raise ProviderError(f"HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise _Retryable(f"网络错误: {exc.reason}") from exc
-
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ProviderError(f"响应不是合法 JSON: {raw[:400]}") from exc
-
-    # ----------------------------------------------------------------- 解析
-    def _parse(self, data: dict[str, Any], latency_ms: float) -> LLMResponse:
-        choices = data.get("choices") or []
-        if not choices:
-            raise ProviderError(f"响应里没有 choices: {json.dumps(data, ensure_ascii=False)[:400]}")
-
-        choice = choices[0]
-        message = choice.get("message") or {}
-        usage = data.get("usage") or {}
-
-        tool_calls: list[ToolCall] = []
-        for index, call in enumerate(message.get("tool_calls") or []):
-            function = call.get("function") or {}
-            raw_arguments = function.get("arguments")
-            if isinstance(raw_arguments, dict):  # 少数实现直接给对象
-                arguments, raw_text, parse_error = raw_arguments, json.dumps(
-                    raw_arguments, ensure_ascii=False
-                ), None
-            else:
-                raw_text = "" if raw_arguments is None else str(raw_arguments)
-                try:
-                    arguments = json.loads(raw_text) if raw_text.strip() else {}
-                    parse_error = None if isinstance(arguments, dict) else "参数不是 JSON 对象"
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                except json.JSONDecodeError as exc:
-                    arguments, parse_error = {}, f"参数不是合法 JSON: {exc}"
-
-            tool_calls.append(
-                ToolCall(
-                    id=str(call.get("id") or f"call_{index}"),
-                    name=str(function.get("name") or ""),
-                    arguments=arguments,
-                    raw_arguments=raw_text,
-                    parse_error=parse_error,
-                )
+            validate_provider_options(
+                model=self.model, base_url=self.base_url, thinking=self.thinking,
+                reasoning_effort=self.reasoning_effort, max_output_tokens=self.max_output_tokens,
+                request_timeout_seconds=self.timeout, request_deadline_seconds=self.deadline_seconds,
+                max_retries=self.max_retries, temperature=temperature,
             )
+            # Own a complete snapshot before HTTP retry starts. No mutation of
+            # the caller's history, and no rereading changing objects on retry.
+            history = json.loads(json.dumps(messages, ensure_ascii=False, allow_nan=False))
+            self._validate_history(history, require_reasoning=bool(tools) and self.thinking == "enabled")
+            payload = {"model": self.model, "messages": history, "stream": False,
+                       "thinking": {"type": self.thinking}, "max_tokens": self.max_output_tokens}
+            if self.thinking == "enabled":
+                payload["reasoning_effort"] = self.reasoning_effort
+            else:
+                payload["temperature"] = temperature  # zero is an explicit choice
+            if tools:
+                payload["tools"] = [tool.to_api() for tool in tools]
+                payload["tool_choice"] = "auto"
+            return payload
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            raise ProviderError("Invalid DeepSeek request configuration or message history", code="invalid_request") from None
 
-        return LLMResponse(
-            text=message.get("content") or "",
-            tool_calls=tool_calls,
-            usage=Usage(
-                prompt_tokens=int(usage.get("prompt_tokens") or 0),
-                completion_tokens=int(usage.get("completion_tokens") or 0),
-            ),
-            finish_reason=str(choice.get("finish_reason") or ""),
-            latency_ms=round(latency_ms, 2),
-            model=str(data.get("model") or self.model),
+    @staticmethod
+    def _validate_history(history: Any, *, require_reasoning: bool) -> None:
+        if not isinstance(history, list) or not history:
+            raise ValueError("messages must be nonempty")
+        pending: set[str] = set()
+        for message in history:
+            if not isinstance(message, dict):
+                raise ValueError("invalid message")
+            role = message.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError("unsupported role")
+            content = message.get("content")
+            if not isinstance(content, str) and not (role == "assistant" and content is None):
+                raise ValueError("text-only adapter requires text content")
+            if role == "tool":
+                identity = message.get("tool_call_id")
+                if not isinstance(identity, str) or identity not in pending:
+                    raise ValueError("orphan or duplicate tool result")
+                pending.remove(identity)
+                continue
+            if pending:
+                raise ValueError("tool batch has unanswered calls")
+            if role == "assistant":
+                if require_reasoning and not isinstance(message.get("reasoning_content"), str):
+                    raise ValueError("thinking tool history requires reasoning_content")
+                if "reasoning_content" in message and message["reasoning_content"] is not None and not isinstance(message["reasoning_content"], str):
+                    raise ValueError("invalid reasoning field")
+                calls = message.get("tool_calls", [])
+                if not isinstance(calls, list):
+                    raise ValueError("tool_calls must be an array")
+                for call in calls:
+                    if not isinstance(call, dict) or call.get("type") != "function":
+                        raise ValueError("unsupported tool call")
+                    identity = call.get("id")
+                    function = call.get("function")
+                    if (not isinstance(identity, str) or not identity.strip() or identity in pending
+                            or not isinstance(function, dict) or not isinstance(function.get("name"), str)
+                            or not function["name"].strip() or not isinstance(function.get("arguments"), str)):
+                        raise ValueError("invalid tool call")
+                    pending.add(identity)
+        if pending:
+            raise ValueError("tool batch has unanswered calls")
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+             temperature: float = 0.0) -> LLMResponse:
+        payload = self._build_payload(messages, tools, temperature)
+        started = time.perf_counter()
+        result = self._post_with_retry(payload)
+        try:
+            response = self._parse(result.data, (time.perf_counter() - started) * 1000)
+            if self.thinking == "enabled" and tools and response.reasoning_content is None:
+                raise ProviderError("Thinking tool response is missing reasoning_content", code="invalid_response")
+        except ProviderError as exc:
+            exc.attempts = result.attempts
+            raise
+        return response.model_copy(update={"request_attempts": result.attempts})
+
+    def _post_with_retry(self, payload: dict[str, Any]) -> HTTPResult:
+        return post_json(
+            f"{self.base_url}/chat/completions", payload, api_key=self.api_key,
+            timeout=self.timeout, deadline_seconds=self.deadline_seconds,
+            max_retries=self.max_retries,
         )
 
+    def _parse(self, data: dict[str, Any], latency_ms: float) -> LLMResponse:
+        _require(isinstance(data, dict), "DeepSeek response must be an object")
+        choices = data.get("choices")
+        _require(isinstance(choices, list) and len(choices) == 1, "DeepSeek response requires exactly one choice")
+        choice = choices[0]
+        _require(isinstance(choice, dict), "Invalid DeepSeek choice")
+        message = choice.get("message")
+        _require(isinstance(message, dict) and message.get("role") == "assistant", "Invalid assistant response envelope")
+        _require("content" in message, "Missing assistant content field")
+        content = message.get("content")
+        reasoning = message.get("reasoning_content")
+        _require(content is None or isinstance(content, str), "Invalid assistant content type")
+        _require(reasoning is None or isinstance(reasoning, str), "Invalid reasoning_content type")
+        finish = choice.get("finish_reason")
+        _require(isinstance(finish, str) and finish in self.FINISH_REASONS, "Invalid response finish_reason")
+        calls = message.get("tool_calls", [])
+        _require(isinstance(calls, list), "Invalid tool_calls array")
+        _require(finish != "tool_calls" or bool(calls), "tool_calls finish without calls")
+        _require(finish != "stop" or not calls, "stop finish conflicts with tool calls")
+        parsed, identities = [], set()
+        for call in calls:
+            _require(isinstance(call, dict) and call.get("type") == "function", "Unsupported tool call type")
+            identity = call.get("id")
+            function = call.get("function")
+            _require(isinstance(identity, str) and bool(identity.strip()) and identity not in identities,
+                     "Missing or duplicate tool call id")
+            identities.add(identity)
+            _require(isinstance(function, dict), "Invalid tool function envelope")
+            name, raw = function.get("name"), function.get("arguments")
+            _require(isinstance(name, str) and bool(name.strip()), "Invalid tool function name")
+            _require(isinstance(raw, str), "Tool arguments must be an original JSON string")
+            try:
+                arguments, parse_error = _strict_json_object(raw), None
+            except (ValueError, RecursionError):
+                arguments, parse_error = {}, "参数必须是无重复键、有限数值的有效 JSON 对象"
+            parsed.append(ToolCall(id=identity, type="function", name=name,
+                                   arguments=arguments, raw_arguments=raw, parse_error=parse_error))
+        usage = self._parse_usage(data.get("usage"))
+        request_id, model = data.get("id"), data.get("model", self.model)
+        _require(request_id is None or isinstance(request_id, str), "Invalid request id")
+        _require(isinstance(model, str) and bool(model.strip()), "Invalid response model")
+        return LLMResponse(
+            text=content or "", content_is_null=content is None, reasoning_content=reasoning,
+            tool_calls=parsed, usage=usage, finish_reason=finish,
+            latency_ms=round(latency_ms, 2), model=model, request_id=request_id,
+        )
 
-class _Retryable(Exception):
-    """内部标记：这个错误值得重试（限流/5xx/网络抖动）。"""
+    @staticmethod
+    def _parse_usage(raw: Any) -> Usage:
+        if raw is None:
+            return Usage(source="unknown")
+        _require(isinstance(raw, dict), "Invalid usage object")
+        def count(value, required=False):
+            if value is None and not required:
+                return None
+            _require(type(value) is int and value >= 0, "Usage counts must be nonnegative integers")
+            return value
+        prompt = count(raw.get("prompt_tokens"), required=True)
+        completion = count(raw.get("completion_tokens"), required=True)
+        total = count(raw.get("total_tokens"))
+        _require(total is None or total == prompt + completion, "Inconsistent total usage")
+        hit, miss = count(raw.get("prompt_cache_hit_tokens")), count(raw.get("prompt_cache_miss_tokens"))
+        _require(hit is None or hit <= prompt, "Invalid prompt cache usage")
+        _require(miss is None or miss <= prompt, "Invalid prompt cache usage")
+        _require(hit is None or miss is None or hit + miss == prompt, "Inconsistent prompt cache usage")
+        details = raw.get("completion_tokens_details")
+        _require(details is None or isinstance(details, dict), "Invalid completion usage details")
+        reasoning = count(details.get("reasoning_tokens")) if details else None
+        _require(reasoning is None or reasoning <= completion, "Invalid reasoning usage")
+        return Usage(prompt_tokens=prompt, completion_tokens=completion, source="reported",
+                     reported_total_tokens=total, prompt_cache_hit_tokens=hit,
+                     prompt_cache_miss_tokens=miss, reasoning_tokens=reasoning)
 
 
-# ---------------------------------------------------------------------------
-# 离线 provider
-# ---------------------------------------------------------------------------
 class ScriptedProvider(Provider):
     """按剧本返回固定响应 —— 离线、免费、完全确定性。
 
@@ -211,6 +276,7 @@ class ScriptedProvider(Provider):
     """
 
     name = "scripted"
+    transport = "offline"
 
     def __init__(self, script: list[dict[str, Any]], model: str = "scripted") -> None:
         self.script = list(script)
@@ -247,7 +313,7 @@ class ScriptedProvider(Provider):
             raise ProviderError(str(item["error"]))
 
         prompt_tokens = sum(len(str(m.get("content") or "")) for m in messages) // 2 + 16
-        usage = Usage(prompt_tokens=prompt_tokens, completion_tokens=32)
+        usage = Usage(prompt_tokens=prompt_tokens, completion_tokens=32, source="estimated")
 
         if item.get("tool_calls"):
             calls = [

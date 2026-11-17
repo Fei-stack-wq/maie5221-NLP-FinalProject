@@ -24,7 +24,7 @@ from urllib.parse import quote
 from .agent import Agent
 from .config import Settings
 from .metrics import Tracer, load_events, render_report, summarize
-from .providers import DeepSeekProvider, Provider, ScriptedProvider
+from .providers import DeepSeekProvider, Provider, ProviderError, ScriptedProvider
 from .acceptance import AcceptanceInput, accept_files
 from .orchestrator import Orchestrator
 from .sandbox import Sandbox
@@ -70,7 +70,11 @@ DEMO_SCRIPT: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     _enable_utf8()
-    settings = Settings.from_env()
+    try:
+        settings = Settings.from_env()
+    except ValueError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
 
     parser = argparse.ArgumentParser(
         prog="miniagent",
@@ -120,11 +124,17 @@ def main(argv: list[str] | None = None) -> int:
     orchestrate.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
     orchestrate.add_argument("--acceptance", metavar="CHECKS.json", help="独立 root 与各子任务的文件验收规则")
 
+    smoke = sub.add_parser("provider-smoke", help="有界、无副作用的真实模型多轮工具协议探针")
+    smoke.add_argument("--thinking", choices=["enabled", "disabled"], default=settings.thinking)
+    smoke.add_argument("--output", default="build/provider-smoke.json", help="仅保存脱敏元数据")
+
     report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
     report.add_argument("run_dir")
 
     args = parser.parse_args(argv)
 
+    if args.command == "provider-smoke":
+        return _cmd_provider_smoke(args, settings)
     if args.command == "demo":
         return _cmd_demo(args, settings)
     if args.command == "run":
@@ -389,8 +399,37 @@ def _make_provider_factory(
         api_key=settings.api_key,
         base_url=settings.base_url,
         model=settings.model,
+        thinking=settings.thinking, reasoning_effort=settings.reasoning_effort,
+        max_output_tokens=settings.max_output_tokens,
+        timeout=settings.request_timeout_seconds,
+        deadline_seconds=settings.request_deadline_seconds,
+        max_retries=settings.max_retries,
     )
     return lambda: provider
+
+
+def _cmd_provider_smoke(args: argparse.Namespace, settings: Settings) -> int:
+    from dataclasses import replace
+    from .provider_smoke import run_provider_smoke
+
+    settings = replace(settings, thinking=args.thinking)
+    try:
+        provider = _make_provider_factory(None, settings)()
+    except ProviderError as exc:
+        report = {"status": "not_run", "evidence_level": "L2", "live_verified": False,
+                  "reason_code": exc.code, "model": settings.model,
+                  "thinking": settings.thinking, "calls": []}
+    else:
+        report = run_provider_smoke(provider, live=True, temperature=settings.temperature)
+    path = Path(args.output)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        print("无法写入探针报告，请检查输出路径与权限。", file=sys.stderr)
+        return 2
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["status"] == "passed" else (2 if report["status"] == "not_run" else 1)
 
 
 def _new_run_dir(base: Path) -> Path:

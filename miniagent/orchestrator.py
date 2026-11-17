@@ -45,7 +45,7 @@ from .bus import MessageBus
 from .config import Settings
 from .contracts.acceptance import AcceptanceReport, AcceptanceSpec, validate_report
 from .metrics import Tracer
-from .providers import Provider
+from .providers import Provider, ProviderError
 from .rao import Budget, ErrorClass, Observation
 from .sandbox import Sandbox
 from .schemas import RunResult
@@ -423,14 +423,32 @@ class Orchestrator:
                         "content": f"上一次输出不合规：{last_error}\n请只输出合法 JSON，不要解释。",
                     }
                 )
-            response = self.provider.chat(messages, None, temperature=0.0)
+            try:
+                response = self.provider.chat(messages, None, temperature=0.0)
+            except ProviderError as exc:
+                self._event(
+                    "provider_error", task_id=self._root_id, attempt_id=self._root_attempt_id,
+                    level="goal", call_id=f"plan-error-{uuid.uuid4().hex}",
+                    transport=self.provider.transport,
+                    code=exc.code, http_status=exc.status_code,
+                    request_attempts=exc.attempts, usage_source="unknown",
+                )
+                raise
             self._planner_tokens += response.usage.total
             self._event(
                 "plan_usage", task_id=self._root_id, attempt_id=self._root_attempt_id,
                 level="goal", call_id=f"plan-{uuid.uuid4().hex}",
                 prompt_tokens=response.usage.prompt_tokens,
                 completion_tokens=response.usage.completion_tokens,
+                transport=self.provider.transport,
+                usage_source=response.usage.source,
+                finish_reason=response.finish_reason, model=response.model,
+                request_attempts=response.request_attempts, request_id=response.request_id,
             )
+            # A truncated-but-parseable plan is still an incomplete response.
+            # Do not silently fall back and dispatch workers after provider failure.
+            if response.finish_reason not in {"", "stop"} or response.tool_calls:
+                raise ProviderError("Planner response did not finish normally", code="invalid_response")
             try:
                 tasks = validate_plan(
                     extract_json(response.text), self.roster, self.max_subtasks, self.default_agent

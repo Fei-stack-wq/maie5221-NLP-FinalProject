@@ -25,16 +25,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from .config import Limits
 from .providers import Provider
 from .sandbox import Sandbox
-from .schemas import LLMResponse, ToolResult, ToolSpec
+from .schemas import LLMResponse, RequestAttempts, ToolResult, ToolSpec, Usage, UsageSource
 from .tools import ToolContext, ToolRegistry
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,7 @@ class ErrorClass:
     T_LOOP = "T_LOOP"                              # 检测到重复动作
     T_BUDGET = "T_BUDGET"                          # 预算耗尽
     T_ABORT = "T_ABORT"                            # 主动中止
+    T_PROTOCOL = "T_PROTOCOL"                      # 响应协议异常/截断；已收到的用量仍记录
 
 
 def classify_failure(content: str) -> str:
@@ -113,9 +115,10 @@ class Action(BaseModel):
     """决策里的一个具体动作。"""
 
     id: str = ""
+    type: Literal["function"] = "function"
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
-    raw_arguments: str = ""
+    raw_arguments: str | None = None
     parse_error: str | None = None
 
     @property
@@ -134,6 +137,7 @@ class Decision(BaseModel):
     question: str = ""
     delegate: dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
+    protocol_error: str | None = None
 
 
 class Observation(BaseModel):
@@ -256,6 +260,11 @@ class StepRecord(BaseModel):
     tool_calls: int = 0
     answer: str = ""
     terminate_reason: str | None = None
+    finish_reason: str = ""
+    model: str = ""
+    usage_source: UsageSource = "reported"
+    request_attempts: RequestAttempts = 1
+    request_id: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -369,6 +378,60 @@ class RAOUnit:
         return specs
 
     # ---------------------------------------------------------------- Reason
+    @staticmethod
+    def _assistant_message(response: LLMResponse) -> tuple[dict[str, Any] | None, str | None]:
+        """Validate the whole envelope before any action can have side effects.
+
+        Native providers validate earlier. This additional boundary also covers
+        custom providers and unchecked Pydantic construction/copy operations.
+        Error messages deliberately omit the response and reasoning contents.
+        """
+        try:
+            checked = LLMResponse.model_validate(response.model_dump(mode="python", warnings=False))
+            ids = [call.id for call in checked.tool_calls]
+            if any(not identity.strip() for identity in ids) or len(ids) != len(set(ids)):
+                return None, "工具调用 ID 缺失或重复，未执行本轮动作。"
+            if any(not call.name.strip() for call in checked.tool_calls):
+                return None, "工具名称为空，未执行本轮动作。"
+            if checked.content_is_null and checked.text:
+                return None, "响应的空 content 标记与文本不一致。"
+            return checked.to_assistant_message(), None
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            return None, "模型响应不符合消息/工具调用协议，未执行本轮动作。"
+
+    @staticmethod
+    def _arguments(raw: str | None, supplied: dict[str, Any], error: str | None) -> tuple[dict[str, Any], str | None]:
+        """Use exactly the JSON sent back in history as the executable arguments."""
+        if error:
+            return {}, error
+
+        def invalid_constant(_value: str) -> None:
+            raise ValueError("non-finite JSON number")
+
+        def finite_float(encoded: str) -> float:
+            number = float(encoded)
+            if not math.isfinite(number):
+                raise ValueError("non-finite JSON number")
+            return number
+
+        def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            value: dict[str, Any] = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate JSON key")
+                value[key] = item
+            return value
+
+        try:
+            encoded = json.dumps(supplied, ensure_ascii=False, allow_nan=False) if raw is None else raw
+            value = json.loads(encoded, parse_constant=invalid_constant,
+                               parse_float=finite_float, object_pairs_hook=unique_keys)
+            if not isinstance(value, dict):
+                return {}, "参数不是 JSON 对象"
+            return value, None
+        except (ValueError, TypeError, RecursionError):
+            return {}, "参数不是合法 JSON 对象"
+
     def decide(self, state: RAOState) -> tuple[Decision, LLMResponse]:
         response = self.provider.chat(
             state.history, self.tool_specs(), temperature=self.temperature
@@ -381,17 +444,31 @@ class RAOUnit:
         注意：`ask_human` / `delegate_task` / `abort_task` 在协议上仍是工具调用，
         这里只把它们标记出来，真正的语义在 Act 阶段处理（要回 tool 消息保持协议合法）。
         """
+        _message, error = self._assistant_message(response)
+        if error:
+            return Decision(kind="act", reason=error, protocol_error=error)
+        # Use the validated nested objects as well, rather than reading an
+        # unchecked model_copy/model_construct payload after validating a copy.
+        response = LLMResponse.model_validate(response.model_dump(mode="python", warnings=False))
+        if response.finish_reason not in {"", "stop", "tool_calls"}:
+            reason = "模型响应被截断或未正常结束，未执行动作且不接受为最终答复。"
+            return Decision(kind="act", reason=reason, protocol_error=reason)
+        if ((response.tool_calls and response.finish_reason == "stop")
+                or (not response.tool_calls and response.finish_reason == "tool_calls")):
+            reason = "finish_reason 与实际工具调用不一致。"
+            return Decision(kind="act", reason=reason, protocol_error=reason)
         if response.tool_calls:
-            actions = [
-                Action(
+            actions = []
+            for call in response.tool_calls:
+                arguments, parse_error = self._arguments(call.raw_arguments, call.arguments, call.parse_error)
+                actions.append(Action(
                     id=call.id,
+                    type=call.type,
                     tool=call.name,
-                    arguments=call.arguments,
+                    arguments=arguments,
                     raw_arguments=call.raw_arguments,
-                    parse_error=call.parse_error,
-                )
-                for call in response.tool_calls
-            ]
+                    parse_error=parse_error,
+                ))
             head = (response.text or "").strip().splitlines()
             return Decision(
                 kind="act",
@@ -413,8 +490,23 @@ class RAOUnit:
         terminate: str | None = None
         step_id = f"{state.task_id}:s{state.step_index}"
 
+        # Direct callers of act() must obey the same all-or-nothing envelope
+        # check. A bad ID/type in a later call cannot follow an earlier write.
+        try:
+            actions = [Action.model_validate(action.model_dump(mode="python", warnings=False))
+                       for action in decision.actions]
+            ids = [action.id for action in actions]
+            if (any(not identity.strip() for identity in ids) or len(ids) != len(set(ids))
+                    or any(not action.tool.strip() for action in actions)):
+                raise ValueError("invalid action identity")
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            obs = Observation(step_id=step_id, source="provider", ok=False,
+                              error_class=ErrorClass.T_PROTOCOL,
+                              content="动作协议无效，未执行本轮动作。", ts=time.time())
+            return "act", [obs], ErrorClass.T_PROTOCOL
+
         # 空动作：模型什么都没做
-        if not decision.actions:
+        if not actions:
             obs = Observation(
                 step_id=step_id,
                 source="system",
@@ -428,10 +520,19 @@ class RAOUnit:
 
         kind = "act"
         repeat = state.scratch.setdefault("repeat", {"sig": "", "count": 0})
+        feedback: list[dict[str, str]] = []
 
-        for index, action in enumerate(decision.actions):
-            call_id = action.id or f"{step_id}:a{index}"
-            if index >= self.max_actions_per_step:
+        for index, action in enumerate(actions):
+            call_id = action.id
+            arguments, parse_error = self._arguments(action.raw_arguments, action.arguments, action.parse_error)
+            action = action.model_copy(update={"arguments": arguments, "parse_error": parse_error})
+            if terminate:
+                obs = Observation(
+                    step_id=step_id, source=action.tool, ok=False,
+                    error_class=ErrorClass.A_SKIPPED,
+                    content="未执行：前序动作已终止本轮任务。", ts=time.time(),
+                )
+            elif index >= self.max_actions_per_step:
                 obs = Observation(
                     step_id=step_id,
                     source=action.tool,
@@ -439,6 +540,13 @@ class RAOUnit:
                     error_class=ErrorClass.A_SKIPPED,
                     content="未执行：超过单步动作上限，请减少一次生成的数量。",
                     ts=time.time(),
+                )
+            elif budget.actions_left <= 0:
+                terminate = ErrorClass.T_BUDGET
+                obs = Observation(
+                    step_id=step_id, source=action.tool, ok=False,
+                    error_class=ErrorClass.A_SKIPPED,
+                    content="未执行：动作总数预算已耗尽。", ts=time.time(),
                 )
             elif action.parse_error:
                 obs = Observation(
@@ -471,7 +579,7 @@ class RAOUnit:
                 if repeat["count"] >= self.loop_stop:
                     terminate = ErrorClass.T_LOOP
                 elif repeat["count"] >= self.loop_warn:
-                    state.history.append(
+                    feedback.append(
                         {
                             "role": "user",
                             "content": (
@@ -482,11 +590,11 @@ class RAOUnit:
                     )
 
             observations.append(obs)
-            if call_id:
-                state.history.append(obs.to_message(call_id))
-            if terminate:
-                break
+            state.history.append(obs.to_message(call_id))
 
+        # Keep all tool results adjacent to their assistant batch. Interleaving
+        # a user warning before the final result breaks subsequent requests.
+        state.history.extend(feedback)
         return kind, observations, terminate
 
     # --------------------------------------------------------------- Observe
@@ -613,16 +721,40 @@ class RAOUnit:
         state.step_index += 1
 
         decision, response = self.decide(state)
-        budget.spend(tokens=response.usage.total)
+        try:
+            raw_usage = getattr(response, "usage", None)
+            if isinstance(raw_usage, Usage):
+                raw_usage = raw_usage.model_dump(mode="python", warnings=False)
+            usage = Usage.model_validate(raw_usage)
+        except (ValueError, TypeError, AttributeError):
+            usage = Usage(source="unknown")
+        budget.spend(tokens=usage.total)
 
         terminate: str | None = None
         observations: list[Observation] = []
         kind = decision.kind
 
-        if decision.kind == "answer":
-            state.history.append({"role": "assistant", "content": decision.answer})
-        else:
-            state.history.append(response.to_assistant_message())
+        message, envelope_error = self._assistant_message(response)
+        if message is not None:
+            state.history.append(message)
+        protocol_error = decision.protocol_error or envelope_error
+        if protocol_error:
+            terminate = ErrorClass.T_PROTOCOL
+            observations.append(Observation(
+                step_id=f"{state.task_id}:s{state.step_index}", source="provider", ok=False,
+                error_class=ErrorClass.T_PROTOCOL, content=protocol_error, ts=time.time(),
+            ))
+            # A well-formed but incomplete response can be retained as history;
+            # none of its calls may execute, but each still needs a tool result.
+            for call in (message or {}).get("tool_calls", []):
+                obs = Observation(
+                    step_id=f"{state.task_id}:s{state.step_index}", source=call["function"]["name"],
+                    ok=False, error_class=ErrorClass.A_SKIPPED,
+                    content="未执行：本轮模型响应未正常结束。", ts=time.time(),
+                )
+                observations.append(obs)
+                state.history.append(obs.to_message(call["id"]))
+        elif decision.kind != "answer":
             kind, observations, terminate = self.act(state, decision, budget)
 
         failed = [obs for obs in observations if not obs.ok]
@@ -634,15 +766,22 @@ class RAOUnit:
             ok=not failed,
             error_class=failed[0].error_class if failed else None,
             latency_ms=round((time.perf_counter() - started) * 1000, 2),
-            prompt_tokens=response.usage.prompt_tokens,
-            completion_tokens=response.usage.completion_tokens,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
             tool_calls=sum(
                 1
                 for obs in observations
                 if obs.source not in CONTROL_TOOLS and obs.error_class is None
             ),
-            answer=decision.answer if decision.kind == "answer" else "",
+            answer=decision.answer if decision.kind == "answer" and not protocol_error else "",
             terminate_reason=terminate,
+            finish_reason=getattr(response, "finish_reason", "") if isinstance(getattr(response, "finish_reason", ""), str) else "",
+            model=getattr(response, "model", "") if isinstance(getattr(response, "model", ""), str) else "",
+            usage_source=usage.source,
+            request_attempts=(getattr(response, "request_attempts", 1)
+                              if type(getattr(response, "request_attempts", 1)) is int
+                              and getattr(response, "request_attempts", 1) >= 1 else 1),
+            request_id=getattr(response, "request_id", None) if isinstance(getattr(response, "request_id", None), str) else None,
         )
 
 

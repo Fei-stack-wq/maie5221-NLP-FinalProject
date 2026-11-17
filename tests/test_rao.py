@@ -79,19 +79,6 @@ class RaoStepTest(unittest.TestCase):
     def test_act_observation_carries_artifacts(self) -> None:
         unit = _unit(self.root, [])
         state = _state()
-        state.history.append(
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "c1",
-                        "type": "function",
-                        "function": {"name": "write_file", "arguments": "{}"},
-                    }
-                ],
-            }
-        )
         unit.provider = ScriptedProvider(
             [
                 {

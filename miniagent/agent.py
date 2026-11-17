@@ -157,10 +157,9 @@ class Agent:
                 budget.spend(steps=1)
                 record = self.unit.step(state, budget)
                 usage = usage.merged(
-                    Usage(
-                        prompt_tokens=record.prompt_tokens,
-                        completion_tokens=record.completion_tokens,
-                    )
+                    Usage(prompt_tokens=record.prompt_tokens,
+                          completion_tokens=record.completion_tokens,
+                          source="unknown" if record.request_attempts > 1 else record.usage_source)
                 )
                 tool_calls += record.tool_calls
                 self._trace_step(identity, record)
@@ -216,6 +215,15 @@ class Agent:
                         }
                     )
         except ProviderError as exc:
+            if self.tracer:
+                self.tracer.event(
+                    "provider_error", **identity, call_id=f"error-{uuid.uuid4().hex}",
+                    transport=self.provider.transport,
+                    code=exc.code, http_status=exc.status_code,
+                    request_attempts=exc.attempts, usage_source="unknown",
+                )
+            if exc.attempts:
+                usage = usage.merged(Usage(source="unknown"))
             status, error = "error", f"模型调用失败：{exc}"
         except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
             status, error = "error", f"{type(exc).__name__}: {exc}"
@@ -249,6 +257,7 @@ class Agent:
                 tool_calls=result.tool_calls,
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
+                usage_source=usage.source,
                 error=result.error,
                 acceptance_spec=acceptance_spec.model_dump(mode="json") if acceptance_spec else None,
                 acceptance_report=acceptance_report.model_dump(mode="json") if acceptance_report else None,
@@ -260,6 +269,8 @@ class Agent:
     @staticmethod
     def _terminate(reason: str) -> tuple[str, str]:
         """把 RAO 的终止原因映射为 (error, status)。"""
+        if reason == ErrorClass.T_PROTOCOL:
+            return "模型响应协议不完整或异常终止（T_PROTOCOL）", "error"
         if reason == ErrorClass.T_ABORT:
             return "任务被主动中止", "aborted"
         if reason == ErrorClass.T_LOOP:
@@ -280,6 +291,12 @@ class Agent:
             latency_ms=record.latency_ms,
             prompt_tokens=record.prompt_tokens,
             completion_tokens=record.completion_tokens,
+            transport=self.provider.transport,
+            usage_source=record.usage_source,
+            finish_reason=record.finish_reason,
+            model=record.model,
+            request_attempts=record.request_attempts,
+            request_id=record.request_id,
         )
         for obs in record.observations:
             self.tracer.event(

@@ -88,7 +88,8 @@ def _percentile(sorted_values: list[float], ratio: float) -> float:
 _STARTS = {"task_start", "subtask_start", "orchestration_start"}
 _ENDS = {"task_end", "subtask_end", "orchestration_end"}
 _REGISTRATIONS = {"case_registered", "task_registered"}
-_TASK_EVENTS = _STARTS | _ENDS | _REGISTRATIONS | {"acceptance", "step", "plan_usage"}
+_USAGE_EVENTS = {"step", "plan_usage", "provider_error"}
+_TASK_EVENTS = _STARTS | _ENDS | _REGISTRATIONS | {"acceptance"} | _USAGE_EVENTS
 _SUCCESS = {"completed", "done"}
 
 
@@ -148,7 +149,7 @@ class _Task:
                 self.attempts.setdefault(identity, _Attempt(identity, position))
             return
         attempt = self.attempts.setdefault(identity, _Attempt(identity, position))
-        if kind in _STARTS or kind in {"step", "plan_usage", "acceptance"}:
+        if kind in _STARTS or kind in _USAGE_EVENTS or kind == "acceptance":
             attempt.started = True
         if kind in _ENDS:
             attempt.terminals.append((position, event))
@@ -292,14 +293,47 @@ def _usage_key(event: dict[str, Any], root_id: str, task_id: str) -> tuple:
     return identity + ("event", _fingerprint(event))
 
 
-def _usage(event: dict[str, Any]) -> tuple[int, bool]:
+@dataclass(frozen=True)
+class _UsageMeasurement:
+    tokens: int
+    estimated: bool
+    unknown: bool
+    attempts: int
+    unknown_attempts: int
+    missing_attempt_count: bool = False
+
+
+def _usage(event: dict[str, Any]) -> _UsageMeasurement:
     payload = event.get("usage") if isinstance(event.get("usage"), dict) else event
     values = [payload.get("prompt_tokens"), payload.get("completion_tokens")]
-    if all(type(value) is int and value >= 0 for value in values):
-        return sum(values), True
-    # Keep a disclosed partial count, without treating missing/invalid fields as
-    # evidence of zero usage. Aggregate task_end token totals are never added.
-    return sum(value for value in values if type(value) is int and value >= 0), False
+    tokens = sum(value for value in values if type(value) is int and value >= 0)
+    complete = all(type(value) is int and value >= 0 for value in values)
+    failed = event.get("kind") == "provider_error"
+    source = event.get("usage_source", payload.get("source", "reported"))
+    if failed or type(source) is not str or source not in {"reported", "estimated", "unknown"}:
+        source = "unknown"
+    # A logical provider call is not proof of an HTTP request: scripted/local
+    # providers use the same response schema. Legacy traces without transport
+    # provenance retain their token information but cannot establish HTTP cost.
+    transport = event.get("transport")
+    unknown_usage = source == "unknown" or not complete
+    if transport == "offline":
+        return _UsageMeasurement(tokens, source == "estimated", unknown_usage, 0, 0)
+    if transport != "http":
+        return _UsageMeasurement(tokens, source == "estimated", unknown_usage, 0, 0, True)
+    # An explicit HTTP transport still needs a recorded attempt count. Zero is
+    # valid only for a failure before any HTTP attempt was admitted.
+    attempts = event.get("request_attempts")
+    if type(attempts) is not int or attempts < (0 if failed else 1):
+        return _UsageMeasurement(tokens, source == "estimated", True, 0, 0, True)
+    unknown_attempts = attempts if failed else (
+        attempts - 1 + int(unknown_usage)
+    )
+    # Preserve partial/estimated numbers, but do not label unknown usage as a
+    # real zero. Failed HTTP retries have no usage receipt even if the final
+    # successful response reports its own tokens accurately.
+    return _UsageMeasurement(tokens, source == "estimated", unknown_attempts > 0,
+                             attempts, unknown_attempts)
 
 
 def summarize(
@@ -367,7 +401,7 @@ def summarize(
         else:
             task = root(root_id)
         task.observe(event, position)
-        if kind in {"step", "plan_usage"}:
+        if kind in _USAGE_EVENTS:
             key = _usage_key(event, root_id, task_id)
             # Identical replay costs nothing extra. A later copy may contain a
             # finalized provider usage receipt for the same model call.
@@ -377,19 +411,24 @@ def summarize(
 
     all_goals = {identity: _outcome(task) for identity, task in roots.items()}
     all_subtasks = {identity: _outcome(task) for identity, task in children.items()}
-    total_tokens = unknown_usage = step_count = 0
+    total_tokens = unknown_usage = estimated_usage = step_count = 0
+    http_attempts = unknown_attempts = missing_attempt_counts = 0
     for event, root_id, task_id in usage_events.values():
-        tokens, known = _usage(event)
-        total_tokens += tokens
-        unknown_usage += not known
+        usage = _usage(event)
+        total_tokens += usage.tokens
+        unknown_usage += usage.unknown
+        estimated_usage += usage.estimated
+        http_attempts += usage.attempts
+        unknown_attempts += usage.unknown_attempts
+        missing_attempt_counts += usage.missing_attempt_count
         is_step = event.get("kind") == "step"
         step_count += is_step
         if root_id in all_goals:
-            all_goals[root_id]["tokens"] += tokens
+            all_goals[root_id]["tokens"] += usage.tokens
             all_goals[root_id]["steps"] += is_step
         child = all_subtasks.get((root_id, task_id))
         if child is not None:
-            child["tokens"] += tokens
+            child["tokens"] += usage.tokens
             child["steps"] += is_step
 
     selected = set(expected) if expected is not None else set(all_goals)
@@ -428,6 +467,9 @@ def summarize(
         "mean_steps": round(sum(row["steps"] for row in goals) / total, 2) if total else 0.0,
         "step_count": step_count, "model_usage_events": len(usage_events),
         "total_tokens": total_tokens, "usage_unknown_calls": unknown_usage,
+        "usage_estimated_calls": estimated_usage, "http_attempts": http_attempts,
+        "usage_unknown_attempts": unknown_attempts,
+        "http_attempts_unknown_calls": missing_attempt_counts,
         "mean_tokens_per_task": round(sum(row["tokens"] for row in goals) / total) if total else 0,
         "failure_modes": failures,
         "subtask_total": sub_total, "subtask_completed": sub_completed,
@@ -474,11 +516,16 @@ def render_report(
         f"| 活跃时间 | {seconds(summary['active_duration_ms'])} |",
         f"| 等待时间 | {seconds(summary['wait_duration_ms'])} |",
         f"| 平均步数 | {summary['mean_steps']} |",
-        f"| 已记录 token | {summary['total_tokens']} |",
+        f"| 已记录 token（含估算/已知部分） | {summary['total_tokens']} |",
         f"| 平均 token/任务 | {summary['mean_tokens_per_task']} |",
         f"| 用量记录不完整的调用数 | {summary['usage_unknown_calls']} |",
+        f"| 使用估算用量的调用数 | {summary['usage_estimated_calls']} |",
+        f"| 已记录 HTTP 尝试数 | {summary['http_attempts']} |",
+        f"| 用量未知的 HTTP 尝试数 | {summary['usage_unknown_attempts']} |",
+        f"| HTTP 尝试次数不可确定的调用数 | {summary['http_attempts_unknown_calls']} |",
         "",
         "耗时合计是各 root 各次运行记录之和，不是并发批次的墙钟时间。成功要求正常结束且有身份匹配的 passed 验收报告。",
+        "token 保留服务端记录、估算及已知部分；估算不等于实测，未知不等于零。仅明确标记为 HTTP 的调用计入 HTTP 尝试数；离线调用为零，传输类型或次数缺失则标记不可确定。成功请求此前失败的 HTTP 尝试、最终失败请求的全部 HTTP 尝试均可能有未报告用量；这里只汇总记录，不是完整账单或预算 ledger。",
         "",
         "## 总体目标",
         "",

@@ -7,7 +7,7 @@
 UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
 
 ```
-版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 296 个测试（离线可跑）
+版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 417 个测试（离线可跑）
 ```
 
 ---
@@ -45,13 +45,17 @@ python -m miniagent orchestrate "整理笔记并写摘要" --mock examples/mock_
 python -m miniagent orchestrate "整理资料" --mock examples/mock_delegate.json --delegate
 ```
 
-接真实模型：
+接真实模型（DeepSeek 官方 API；2026-11-17 已通过 thinking 关闭/开启两种线上探针）：
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "sk-..."
+python -m miniagent provider-smoke --thinking disabled --output build/probe-disabled.json
+python -m miniagent provider-smoke --thinking enabled --output build/probe-enabled.json
 python -m miniagent run "调研 ReAct 并写一份 notes.md"
 python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-parallel 2
 ```
+
+默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 4096 token；请求重试与 deadline 可配置。`.env` 不自动加载，变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
 
 > `--mock` 只能配 `--scheduler serial`：`ScriptedProvider` 带游标、不是线程安全的，
 > 并发/事件驱动请用真实模型（或用 `agent_factory` 注入独立 provider）。
@@ -143,6 +147,7 @@ CLI
 | [docs/m0-01-data-contracts.md](docs/m0-01-data-contracts.md) | M0-01 核心数据契约 v1：字段、状态、读写职责及独立数据层 API/测试边界 |
 | [docs/m0-01-computer-maintenance-example.md](docs/m0-01-computer-maintenance-example.md) | M0-01 完整电脑维护数据示例：任务、验收、预算、工件、审批与恢复（虚构数据） |
 | [docs/m0-02-acceptance-and-metrics.md](docs/m0-02-acceptance-and-metrics.md) | M0-02 运行期独立验收、root 检查、trace v2、逻辑任务指标与 CLI 验收规则 |
+| [docs/m0-03-provider-protocol.md](docs/m0-03-provider-protocol.md) | DeepSeek thinking/工具协议、请求重试与 deadline、用量来源、L1/L2 探针证据 |
 
 ---
 
@@ -180,11 +185,11 @@ CLI
 python -m unittest discover -s tests -t . -v
 ```
 
-296 个用例，全部离线（不需要 key、不联网）。最初 96 项覆盖：RAO 单步断言、沙箱越狱、工具参数校验、
+417 个用例，全部离线（不需要 key、不联网）。最初 96 项覆盖：RAO 单步断言、沙箱越狱、工具参数校验、
 护栏（超步数/超时）、验收打回、计划校验与降级、S1/S2/S3 调度差异、失败局部传播、
 委派与深度上限、总线订阅/广播、指标口径、CLI 端到端。
 
-M0-01 的 108 项测试覆盖核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。M0-02 再新增 92 项运行期验收和统计测试；原有“无验收也算成功”的预期已迁移为未验证。
+M0-01 的 108 项测试覆盖核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。M0-02 再新增 92 项运行期验收和统计测试；原有“无验收也算成功”的预期已迁移为未验证。M0-03 新增 121 项测试，补充请求协议、thinking 历史、批次回写、重试、超时、用量来源与无副作用探针测试；离线与线上证据分别保存；2026-11-17 另完成两种模式的真实 API 往返，见 [线上记录](docs/m0-03-provider-protocol.md#61-2026-11-17-线上实测记录)。
 
 新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它提供不可变数据快照、校验和纯状态转换；M0-02 已接入运行期 AcceptanceSpec/Report，其余持久化、预算账本和执行恢复仍待后续模块。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
 
