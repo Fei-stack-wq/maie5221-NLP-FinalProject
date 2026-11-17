@@ -36,6 +36,11 @@ ROSTER = [
 ]
 
 
+def _scheduler_acceptance(_workspace: Path) -> tuple[bool, str]:
+    """Trusted fixture for scheduling-only tests; artifact checks live separately."""
+    return True, "scheduler fixture accepted by the test harness"
+
+
 def _text(text: str) -> LLMResponse:
     return LLMResponse(
         text=text, finish_reason="stop", usage=Usage(prompt_tokens=20, completion_tokens=10)
@@ -134,6 +139,8 @@ class OrchestratorTest(unittest.TestCase):
     def _orchestrator(self, provider: Provider, **kwargs) -> Orchestrator:
         settings = Settings()
         settings.limits = kwargs.pop("limits", Limits())
+        kwargs.setdefault("default_acceptance", _scheduler_acceptance)
+        kwargs.setdefault("root_acceptance", _scheduler_acceptance)
         return Orchestrator(
             provider=provider,
             settings=settings,
@@ -399,6 +406,8 @@ class EventedRunTest(unittest.TestCase):
     def _orchestrator(self, provider: Provider, **kwargs) -> Orchestrator:
         settings = Settings()
         settings.limits = kwargs.pop("limits", Limits())
+        kwargs.setdefault("default_acceptance", _scheduler_acceptance)
+        kwargs.setdefault("root_acceptance", _scheduler_acceptance)
         return Orchestrator(
             provider=provider, settings=settings, roster=ROSTER, run_dir=self.run_dir, **kwargs
         )
@@ -481,6 +490,8 @@ class DelegationTest(unittest.TestCase):
 
     def _run(self, **kwargs) -> tuple[object, list[str]]:
         settings = Settings()
+        kwargs.setdefault("default_acceptance", _scheduler_acceptance)
+        kwargs.setdefault("root_acceptance", _scheduler_acceptance)
         orchestrator = Orchestrator(
             provider=self._provider(),
             settings=settings,

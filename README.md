@@ -7,7 +7,7 @@
 UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
 
 ```
-版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 204 个测试（离线可跑）
+版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 296 个测试（离线可跑）
 ```
 
 ---
@@ -36,10 +36,10 @@ pip install -r requirements.txt          # 只有 pydantic
 python -m miniagent demo
 
 # 2) 批量指标：任务完成率 / 平均耗时 / P95 / token
-python -m miniagent eval --tasks examples/tasks.jsonl --mock examples/mock_task.json
+python -m miniagent eval --tasks examples/verified_mock_tasks.jsonl --mock examples/mock_task.json
 
 # 3) 目标 → 子任务图 → 调度（默认串行，可复现）
-python -m miniagent orchestrate "整理笔记并写摘要" --mock examples/mock_plan.json
+python -m miniagent orchestrate "整理笔记并写摘要" --mock examples/mock_plan.json --acceptance examples/acceptance-plan.json
 
 # 4) 委派：agent 把写作子任务派给 writer
 python -m miniagent orchestrate "整理资料" --mock examples/mock_delegate.json --delegate
@@ -56,6 +56,8 @@ python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-p
 > `--mock` 只能配 `--scheduler serial`：`ScriptedProvider` 带游标、不是线程安全的，
 > 并发/事件驱动请用真实模型（或用 `agent_factory` 注入独立 provider）。
 
+没有配置独立验收时，答复和产物仍保留，但结果为 `unverified`，不会计入成功。原 `examples/tasks.jsonl` 和无验收的委派演示属于这种情况。文件检查器当前需要 POSIX no-follow 能力，Windows 上会明确报错；接口、配置与平台边界见 [M0-02 说明](docs/m0-02-acceptance-and-metrics.md)。
+
 每次运行在 `runs/<run_id>/` 下留下：
 
 ```
@@ -64,7 +66,8 @@ plan.json     子任务图（降级时标记 degraded）
 board.json    黑板快照（每步摘要、产物、错误类）
 bus.jsonl     群聊/委派消息
 report.md     可直接贴进报告的表
-agents/<agent>-<task>/   该子任务的私有工作区
+agents/<agent>-<id>/    单任务工作区
+workspaces/<attempt>/agents/task-<subtask>/   编排子任务工作区
 ```
 
 ---
@@ -139,16 +142,17 @@ CLI
 | [docs/agent-studio-development-plan.md](docs/agent-studio-development-plan.md) | 分阶段开发计划：修复优先级、模块接口、验收门槛、协作分工与首批 PR（提案） |
 | [docs/m0-01-data-contracts.md](docs/m0-01-data-contracts.md) | M0-01 核心数据契约 v1：字段、状态、读写职责及独立数据层 API/测试边界 |
 | [docs/m0-01-computer-maintenance-example.md](docs/m0-01-computer-maintenance-example.md) | M0-01 完整电脑维护数据示例：任务、验收、预算、工件、审批与恢复（虚构数据） |
+| [docs/m0-02-acceptance-and-metrics.md](docs/m0-02-acceptance-and-metrics.md) | M0-02 运行期独立验收、root 检查、trace v2、逻辑任务指标与 CLI 验收规则 |
 
 ---
 
 ## 指标口径
 
 ```
-任务完成率     = completed 的 task_end（不含 level=goal）/ 总数
-子任务完成率   = done 的 subtask_end / 全部 subtask_end
-总体目标       = orchestration_end.status
-执行时间       = 单任务墙钟；批量另报 P50 / P95
+任务完成率     = 有有效验收报告及证据、正常完成的逻辑 root / 全部指定或登记 root
+子任务完成率   = verified done 的逻辑 child / 全部创建的逻辑 child
+总体目标       = 逐 root 独立验收；重试不增加题数，缺终态/未启动仍在分母
+执行时间       = 分别统计 root 墙钟和子任务耗时；未知活跃/等待时间保持未记录
 失败分类       = 按 error_class 计数（R_ 决策 / A_ 执行 / O_ 观察 / T_ 终止）
 ```
 
@@ -176,13 +180,13 @@ CLI
 python -m unittest discover -s tests -t . -v
 ```
 
-204 个用例，全部离线（不需要 key、不联网）。其中原有 96 项：RAO 单步断言、沙箱越狱、工具参数校验、
+296 个用例，全部离线（不需要 key、不联网）。最初 96 项覆盖：RAO 单步断言、沙箱越狱、工具参数校验、
 护栏（超步数/超时）、验收打回、计划校验与降级、S1/S2/S3 调度差异、失败局部传播、
 委派与深度上限、总线订阅/广播、指标口径、CLI 端到端。
 
-新增 108 项覆盖 M0-01 核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。
+M0-01 的 108 项测试覆盖核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。M0-02 再新增 92 项运行期验收和统计测试；原有“无验收也算成功”的预期已迁移为未验证。
 
-新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它只提供不可变数据快照、校验和纯状态转换，尚未接入 Agent/RAO/Orchestrator。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
+新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它提供不可变数据快照、校验和纯状态转换；M0-02 已接入运行期 AcceptanceSpec/Report，其余持久化、预算账本和执行恢复仍待后续模块。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
 
 ```sh
 python -m unittest discover -s tests -p 'test_contract*.py' -t . -v

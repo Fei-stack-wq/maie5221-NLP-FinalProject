@@ -18,17 +18,16 @@ import uuid
 from typing import Callable
 
 from .config import Settings
+from .acceptance import AcceptanceInput, bind, evaluate
 from .metrics import Tracer
 from .providers import Provider, ProviderError
 from .rao import (
-    Acceptance,
     Budget,
     ErrorClass,
     RAO_SYSTEM_SUFFIX,
     RAOState,
     RAOUnit,
     StepRecord,
-    evaluate_acceptance,
 )
 from .sandbox import Sandbox
 from .schemas import RunResult, Usage
@@ -87,9 +86,12 @@ class Agent:
         self,
         task: str,
         task_id: str | None = None,
-        acceptance: Acceptance | None = None,
+        acceptance: AcceptanceInput = None,
         budget: Budget | None = None,
         on_step: Callable[[StepRecord, RAOState], None] | None = None,
+        root_id: str | None = None,
+        parent_task_id: str | None = None,
+        attempt_id: str | None = None,
     ) -> RunResult:
         """跑完一个任务。
 
@@ -98,6 +100,13 @@ class Agent:
         ``on_step`` 是给调度器的钩子：每步结束立刻回调，用于写黑板、检查依赖。
         """
         task_id = task_id or f"task-{uuid.uuid4().hex[:8]}"
+        attempt_id = attempt_id or f"attempt-{uuid.uuid4().hex}"
+        identity = {
+            "schema_version": 2, "task_id": task_id,
+            "root_id": root_id or task_id, "attempt_id": attempt_id,
+            "parent_task_id": parent_task_id,
+            "level": "subtask" if root_id is not None and root_id != task_id else "goal",
+        }
         limits = self.settings.limits
         started = time.perf_counter()
 
@@ -122,11 +131,15 @@ class Agent:
         status = "limit_exceeded"
         answer = ""
         error = ""
+        acceptance_spec = None
+        acceptance_report = None
+        acceptance_evidence = []
 
         if self.tracer:
+            self.tracer.event("task_registered", **identity, agent=self.name, task=task)
             self.tracer.event(
                 "task_start",
-                task_id=task_id,
+                **identity,
                 agent=self.name,
                 task=task,
                 sandbox=self.sandbox.root.as_posix(),
@@ -134,6 +147,7 @@ class Agent:
             )
 
         try:
+            acceptance = bind(acceptance, self.sandbox.root, task_id=task_id, objective=task)
             while True:
                 budget.seconds_left = limits.max_seconds - (time.perf_counter() - started)
                 if budget.exhausted:
@@ -142,8 +156,6 @@ class Agent:
 
                 budget.spend(steps=1)
                 record = self.unit.step(state, budget)
-                if on_step is not None:
-                    on_step(record, state)
                 usage = usage.merged(
                     Usage(
                         prompt_tokens=record.prompt_tokens,
@@ -151,7 +163,9 @@ class Agent:
                     )
                 )
                 tool_calls += record.tool_calls
-                self._trace_step(task_id, record)
+                self._trace_step(identity, record)
+                if on_step is not None:
+                    on_step(record, state)
 
                 # ① 终止原因（循环 / 主动放弃）
                 if record.terminate_reason:
@@ -161,17 +175,30 @@ class Agent:
                 # ② 模型给出最终答复 → 必须过验收
                 if record.decision_kind == "answer":
                     answer = record.answer
-                    ok, why = evaluate_acceptance(acceptance, self.sandbox.root)
+                    evaluation = evaluate(
+                        acceptance, self.sandbox.root, task_id=task_id,
+                        attempt_id=attempt_id, objective=task,
+                    )
+                    acceptance_spec = evaluation.spec
+                    acceptance_report = evaluation.report
+                    payload = evaluation.trace_payload()
+                    acceptance_evidence = payload.get("receipts", [])
+                    verdict = acceptance_report.verdict
+                    why = acceptance_report.reason or "验收通过"
                     if self.tracer:
                         self.tracer.event(
                             "acceptance",
-                            task_id=task_id,
+                            **identity,
                             step=record.step,
-                            ok=ok,
+                            ok=verdict == "passed",
                             reason=why,
+                            **payload,
                         )
-                    if ok:
+                    if verdict == "passed":
                         status = "completed"
+                        break
+                    if verdict in {"unverified", "error"}:
+                        status, error = verdict, why
                         break
                     acceptance_failures += 1
                     if acceptance_failures > self.max_acceptance_retries:
@@ -196,6 +223,7 @@ class Agent:
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         result = RunResult(
             task_id=task_id,
+            attempt_id=attempt_id,
             agent=self.name,
             status=status,  # type: ignore[arg-type]
             answer=answer,
@@ -205,12 +233,15 @@ class Agent:
             tool_calls=tool_calls,
             usage=usage,
             sandbox=self.sandbox.root.as_posix(),
+            acceptance_spec=acceptance_spec,
+            acceptance_report=acceptance_report,
+            acceptance_evidence=acceptance_evidence,
         )
 
         if self.tracer:
             self.tracer.event(
                 "task_end",
-                task_id=task_id,
+                **identity,
                 agent=self.name,
                 status=result.status,
                 duration_ms=result.duration_ms,
@@ -219,6 +250,9 @@ class Agent:
                 prompt_tokens=usage.prompt_tokens,
                 completion_tokens=usage.completion_tokens,
                 error=result.error,
+                acceptance_spec=acceptance_spec.model_dump(mode="json") if acceptance_spec else None,
+                acceptance_report=acceptance_report.model_dump(mode="json") if acceptance_report else None,
+                acceptance_evidence=acceptance_evidence,
             )
         return result
 
@@ -232,12 +266,12 @@ class Agent:
             return "检测到重复动作，已终止（T_LOOP）", "limit_exceeded"
         return f"终止原因：{reason}", "limit_exceeded"
 
-    def _trace_step(self, task_id: str, record: StepRecord) -> None:
+    def _trace_step(self, identity: dict, record: StepRecord) -> None:
         if not self.tracer:
             return
         self.tracer.event(
             "step",
-            task_id=task_id,
+            **identity,
             step=record.step,
             decision=record.decision_kind,
             tools=record.tool_names,
@@ -250,7 +284,7 @@ class Agent:
         for obs in record.observations:
             self.tracer.event(
                 "tool_result",
-                task_id=task_id,
+                **identity,
                 step=record.step,
                 tool=obs.source,
                 ok=obs.ok,

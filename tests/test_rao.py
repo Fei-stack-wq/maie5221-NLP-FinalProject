@@ -279,9 +279,9 @@ class ContractTest(unittest.TestCase):
         finally:
             cleanup(base)
 
-    def test_acceptance_none_is_soft_pass(self) -> None:
+    def test_acceptance_none_is_not_verified(self) -> None:
         ok, reason = evaluate_acceptance(None, Path("."))
-        self.assertTrue(ok)
+        self.assertFalse(ok)
         self.assertEqual(reason, "no-acceptance")
 
     def test_acceptance_exception_fails_safe(self) -> None:

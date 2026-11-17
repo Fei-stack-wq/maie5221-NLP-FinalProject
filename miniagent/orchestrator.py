@@ -29,19 +29,24 @@ import json
 import re
 import threading
 import time
+import tempfile
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
 from .agent import Agent
+from .acceptance import AcceptanceInput, bind, evaluate
+from .acceptance_evidence import validate_evidence
 from .bus import MessageBus
 from .config import Settings
+from .contracts.acceptance import AcceptanceReport, AcceptanceSpec, validate_report
 from .metrics import Tracer
 from .providers import Provider
-from .rao import Acceptance, Budget, ErrorClass, Observation
+from .rao import Budget, ErrorClass, Observation
 from .sandbox import Sandbox
 from .schemas import RunResult
 from .tools import build_default_registry
@@ -63,7 +68,12 @@ class AgentCard(BaseModel):
 
 class SubTask(BaseModel):
     id: str
+    """Plan-local ID. task_id identifies the same logical task across its traces."""
+    task_id: str = ""
+    root_id: str = ""
+    attempt_id: str = ""
     parent_id: str | None = None
+    """Global parent task ID; planned tasks have the root as parent."""
     objective: str
     assignee: str = "worker"
     deps: list[str] = Field(default_factory=list)
@@ -71,7 +81,7 @@ class SubTask(BaseModel):
     """自然语言验收标准（给人看、也喂给执行者）。代码级验收由 acceptances 注入。"""
 
     status: str = "pending"
-    """pending / running / done / failed / blocked / skipped"""
+    """pending / running / done / failed / error / unverified / blocked / skipped"""
 
     result: str = ""
     error: str = ""
@@ -79,10 +89,15 @@ class SubTask(BaseModel):
     tool_calls: int = 0
     duration_ms: float = 0.0
     tokens: int = 0
+    workspace: str = ""
+    execution_status: str = ""
+    acceptance_report: AcceptanceReport | None = None
+    acceptance_spec: AcceptanceSpec | None = None
+    acceptance_evidence: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def finished(self) -> bool:
-        return self.status in {"done", "failed", "blocked", "skipped"}
+        return self.status in {"done", "failed", "error", "unverified", "blocked", "skipped"}
 
 
 class PlanError(ValueError):
@@ -91,12 +106,39 @@ class PlanError(ValueError):
 
 class OrchestrationResult(BaseModel):
     goal: str
-    status: str = "failed"  # completed / partial / failed
+    task_id: str = ""
+    root_id: str = ""
+    attempt_id: str = ""
+    status: str = "error"
+    error: str = ""
     scheduler: str = "serial"
     duration_ms: float = 0.0
     tokens: int = 0
     run_dir: str = ""
+    workspace: str = ""
     subtasks: list[SubTask] = Field(default_factory=list)
+    acceptance_report: AcceptanceReport | None = None
+    acceptance_spec: AcceptanceSpec | None = None
+    acceptance_evidence: list[dict[str, Any]] = Field(default_factory=list)
+
+    @property
+    def succeeded(self) -> bool:
+        report = self.acceptance_report
+        if self.status != "completed" or report is None or report.verdict != "passed":
+            return False
+        if (
+            self.task_id != self.root_id or report.task_id != self.root_id
+            or not self.attempt_id or report.attempt_id != self.attempt_id
+        ):
+            return False
+        try:
+            report = AcceptanceReport.model_validate(report)
+            spec = AcceptanceSpec.model_validate(self.acceptance_spec)
+            validate_report(spec, report)
+            validate_evidence(spec, report, self.acceptance_evidence)
+        except ValueError:
+            return False
+        return True
 
     @property
     def total(self) -> int:
@@ -277,7 +319,7 @@ class Board:
             return None
         payload = {
             "goal": goal,
-            "subtasks": [task.model_dump() for task in tasks],
+            "subtasks": [task.model_dump(mode="json") for task in tasks],
             "records": self.records,
         }
         path = self.run_dir / "board.json"
@@ -303,8 +345,9 @@ class Orchestrator:
         tracer: Tracer | None = None,
         approve: Callable[[str], bool] | None = None,
         human_handler: Callable[[str], str | None] | None = None,
-        acceptances: dict[str, Acceptance] | None = None,
-        default_acceptance: Acceptance | None = None,
+        acceptances: dict[str, AcceptanceInput] | None = None,
+        default_acceptance: AcceptanceInput = None,
+        root_acceptance: AcceptanceInput = None,
         agent_factory: Callable[[SubTask], Agent] | None = None,
         bus: MessageBus | None = None,
         enable_delegation: bool = False,
@@ -331,17 +374,37 @@ class Orchestrator:
         self.human_handler = human_handler
         self.acceptances = acceptances or {}
         self.default_acceptance = default_acceptance
+        self.root_acceptance = root_acceptance
         self.agent_factory = agent_factory
         self._own_tracer = tracer is None
         self.tracer = tracer or (Tracer(self.run_dir) if self.run_dir else None)
         self._global_budget = Budget.from_limits(settings.limits)
         self._lock = threading.Lock()
         self._subtask_tokens = 0
+        self._planner_tokens = 0
         self.bus = bus or (MessageBus(self.run_dir) if self.run_dir else None)
         self.enable_delegation = enable_delegation
         self.max_delegation_depth = max_delegation_depth
         self._board: Board | None = None
         self._ctx = threading.local()  # 记录"当前正在跑哪个子任务、嵌套多深"
+        self._root_id: str | None = None
+        self._root_attempt_id: str | None = None
+        self._workspace: Path | None = None
+        self._all_tasks: list[SubTask] = []
+        self._registered_ids: set[str] = set()
+        self._ended_ids: set[str] = set()
+        self._delegate_sequence = 0
+        self._tracer_closed = False
+        self._run_lock = threading.Lock()
+
+    def _event(self, kind: str, **payload: Any) -> None:
+        if self.tracer:
+            self.tracer.event(kind, **{
+                "schema_version": 2,
+                "root_id": self._root_id,
+                "root_attempt_id": self._root_attempt_id,
+                **payload,
+            })
 
     # ------------------------------------------------------------------ 规划
     def plan(self, goal: str) -> list[SubTask]:
@@ -361,6 +424,13 @@ class Orchestrator:
                     }
                 )
             response = self.provider.chat(messages, None, temperature=0.0)
+            self._planner_tokens += response.usage.total
+            self._event(
+                "plan_usage", task_id=self._root_id, attempt_id=self._root_attempt_id,
+                level="goal", call_id=f"plan-{uuid.uuid4().hex}",
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+            )
             try:
                 tasks = validate_plan(
                     extract_json(response.text), self.roster, self.max_subtasks, self.default_agent
@@ -368,13 +438,13 @@ class Orchestrator:
             except PlanError as exc:
                 last_error = str(exc)
                 if self.tracer:
-                    self.tracer.event(
+                    self._event(
                         "plan_invalid", goal=goal, attempt=attempt + 1, error=last_error
                     )
                 continue
 
             if self.tracer:
-                self.tracer.event(
+                self._event(
                     "plan",
                     goal=goal,
                     attempts=attempt + 1,
@@ -396,20 +466,53 @@ class Orchestrator:
             )
         ]
         if self.tracer:
-            self.tracer.event("plan_degraded", goal=goal, error=last_error)
+            self._event("plan_degraded", goal=goal, error=last_error)
         self._save_plan(fallback, goal, degraded=True)
         return fallback
 
     def _save_plan(self, tasks: list[SubTask], goal: str, *, degraded: bool) -> None:
-        if self.run_dir is None:
-            return
         payload = {
             "goal": goal,
             "degraded": degraded,
-            "subtasks": [task.model_dump() for task in tasks],
+            "subtasks": [task.model_dump(mode="json") for task in tasks],
         }
-        (self.run_dir / "plan.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        for directory in {self.run_dir, self._workspace} - {None}:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "plan.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    def _register_task(self, task: SubTask, parent_id: str | None = None) -> None:
+        """Register logical children before execution, including delegated work."""
+        with self._lock:
+            if task.id in self._registered_ids:
+                raise ValueError(f"duplicate subtask ID: {task.id}")
+            task.root_id = self._root_id or ""
+            task.task_id = f"{self._root_id}:{task.id}"
+            task.parent_id = parent_id or self._root_id
+            self._registered_ids.add(task.id)
+            self._all_tasks.append(task)
+        self._event(
+            "task_registered", task_id=task.task_id, subtask=task.id,
+            parent_task_id=task.parent_id, level="subtask", assignee=task.assignee,
+            objective=task.objective, deps=task.deps,
+        )
+
+    def _end_subtask(self, task: SubTask) -> None:
+        with self._lock:
+            if task.task_id in self._ended_ids:
+                return
+            self._ended_ids.add(task.task_id)
+        self._event(
+            "subtask_end", task_id=task.task_id, subtask=task.id,
+            attempt_id=task.attempt_id or None, parent_task_id=task.parent_id,
+            level="subtask", assignee=task.assignee, status=task.status,
+            execution_status=task.execution_status, duration_ms=task.duration_ms,
+            steps=task.steps, tool_calls=task.tool_calls, tokens=task.tokens,
+            error=task.error, workspace=task.workspace,
+            acceptance_spec=task.acceptance_spec.model_dump(mode="json") if task.acceptance_spec else None,
+            acceptance_report=task.acceptance_report.model_dump(mode="json") if task.acceptance_report else None,
+            acceptance_evidence=task.acceptance_evidence,
         )
 
     # ------------------------------------------------------------------ 调度
@@ -419,79 +522,151 @@ class Orchestrator:
         scheduler: str = "serial",
         max_parallel: int | None = None,
         task_id: str | None = None,
+        goal_id: str | None = None,
     ) -> OrchestrationResult:
-        task_id = task_id or f"orch-{uuid.uuid4().hex[:8]}"
+        if goal_id is not None and task_id is not None and goal_id != task_id:
+            raise ValueError("goal_id and task_id must name the same logical goal")
+        root_id = goal_id if goal_id is not None else task_id
+        if root_id is not None and (not isinstance(root_id, str) or not root_id.strip()):
+            raise ValueError("goal_id/task_id must be a nonblank string")
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("one Orchestrator cannot run concurrent goals")
+        try:
+            return self._run(goal, scheduler, max_parallel, root_id or f"orch-{uuid.uuid4().hex}")
+        finally:
+            self._run_lock.release()
+
+    def _run(
+        self, goal: str, scheduler: str, max_parallel: int | None, root_id: str,
+    ) -> OrchestrationResult:
         started = time.perf_counter()
-        board = Board(self.run_dir)
+        self._root_id = root_id
+        self._root_attempt_id = f"attempt-{uuid.uuid4().hex}"
+        self._all_tasks = []
+        self._registered_ids = set()
+        self._ended_ids = set()
+        self._delegate_sequence = 0
+        self._subtask_tokens = self._planner_tokens = 0
+        self._global_budget = Budget.from_limits(self.settings.limits)
+        self._workspace = None
+        self._board = None
+        if self._own_tracer and self._tracer_closed and self.run_dir:
+            self.tracer = Tracer(self.run_dir)
+            self._tracer_closed = False
+        identity = {
+            "task_id": root_id, "attempt_id": self._root_attempt_id,
+            "level": "goal", "parent_task_id": None,
+        }
+        self._event("case_registered", **identity, goal=goal)
+        self._event("orchestration_start", **identity, goal=goal, scheduler=scheduler)
+        execution_error = ""
+        bound_acceptance = None
+        try:
+            if self.run_dir:
+                self._workspace = self.run_dir / "workspaces" / self._root_attempt_id
+                self._workspace.mkdir(parents=True, exist_ok=False)
+            else:
+                self._workspace = Path(tempfile.mkdtemp(prefix="miniagent-orchestration-"))
+            bound_acceptance = bind(
+                self.root_acceptance, self._workspace, task_id=root_id, objective=goal,
+            )
+            board = self._board = Board(self._workspace)
+            tasks = self.plan(goal)
+            for task in tasks:
+                self._register_task(task)
+            if self.bus:
+                self.bus.post("orchestrator", f"目标：{goal}", kind="system", task_id=root_id)
+            if scheduler == "evented":
+                self._dispatch_evented(tasks, board, max_parallel or self.max_parallel)
+            elif scheduler == "parallel":
+                self._dispatch_layered(tasks, board, max_parallel or self.max_parallel)
+            elif scheduler == "serial":
+                self._dispatch_serial(tasks, board)
+            else:
+                raise ValueError(f"unknown scheduler: {scheduler}")
+        except Exception as exc:
+            execution_error = f"{type(exc).__name__}: {exc}"
+            for task in self._all_tasks:
+                if not task.finished:
+                    task.status = "error" if task.status == "running" else "skipped"
+                    task.error = f"编排中断：{execution_error}"
+                    self._end_subtask(task)
 
-        if self.tracer:
-            self.tracer.event("orchestration_start", goal=goal, task_id=task_id, scheduler=scheduler)
-
-        tasks = self.plan(goal)
-        self._board = board
-        if self.bus:
-            self.bus.post("orchestrator", f"目标：{goal}", kind="system", task_id=task_id)
-        if scheduler == "evented":
-            self._dispatch_evented(tasks, board, max_parallel or self.max_parallel)
-        elif scheduler == "parallel":
-            self._dispatch_layered(tasks, board, max_parallel or self.max_parallel)
+        if self._board is not None:
+            try:
+                saved = self._board.save(self._all_tasks, goal)
+                if self.run_dir is not None and saved is not None:
+                    (self.run_dir / "board.json").write_text(saved.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception as exc:
+                execution_error = execution_error or f"{type(exc).__name__}: {exc}"
+        try:
+            evaluation = evaluate(
+                bound_acceptance, self._workspace or Path("."),
+                task_id=root_id, attempt_id=self._root_attempt_id, objective=goal,
+            )
+        except Exception as exc:
+            execution_error = execution_error or f"{type(exc).__name__}: {exc}"
+            evaluation = evaluate(
+                None, self._workspace or Path("."), task_id=root_id,
+                attempt_id=self._root_attempt_id, objective=goal,
+            )
+        payload = evaluation.trace_payload()
+        self._event("acceptance", **identity, **payload)
+        completed = sum(1 for task in self._all_tasks if task.status == "done")
+        verdict = evaluation.report.verdict
+        if execution_error or verdict == "error":
+            status = "error"
+        elif verdict == "failed":
+            status = "failed_acceptance"
+        elif verdict == "unverified":
+            status = "unverified"
         else:
-            self._dispatch_serial(tasks, board)
-
+            status = "completed" if completed == len(self._all_tasks) else ("partial" if completed else "failed")
+        error = execution_error or evaluation.report.reason or ""
+        if not error and status != "completed":
+            error = f"子任务未全部完成（{completed}/{len(self._all_tasks)}）"
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
-        completed = sum(1 for task in tasks if task.status == "done")
-        status = "completed" if completed == len(tasks) else ("partial" if completed else "failed")
         result = OrchestrationResult(
-            goal=goal,
-            status=status,
+            goal=goal, task_id=root_id, root_id=root_id, attempt_id=self._root_attempt_id,
+            status=status, error=error,
             scheduler=scheduler,
             duration_ms=duration_ms,
-            tokens=self._subtask_tokens,
+            tokens=self._subtask_tokens + self._planner_tokens,
             run_dir=str(self.run_dir) if self.run_dir else "",
-            subtasks=tasks,
+            workspace=str(self._workspace) if self._workspace else "",
+            subtasks=self._all_tasks,
+            acceptance_spec=evaluation.spec, acceptance_report=evaluation.report,
+            acceptance_evidence=payload.get("receipts", []),
         )
-
-        board.save(tasks, goal)
-        if self.tracer:
-            # 顶层记一条 task_end，让 metrics 的"总体目标完成率"也能算出来；
-            # 子任务层用 subtask_end 单独统计（课程要求两者都报）。
-            self.tracer.event(
-                "task_end",
-                task_id=task_id,
-                agent="orchestrator",
-                level="goal",  # 与子任务级 task_end 区分：指标里两者不能混算
-                status="completed" if status == "completed" else "failed",
-                duration_ms=duration_ms,
-                steps=sum(task.steps for task in tasks),
-                tool_calls=sum(task.tool_calls for task in tasks),
-                prompt_tokens=0,
-                completion_tokens=self._subtask_tokens,
-                error="" if status == "completed" else f"子任务未全部完成（{completed}/{len(tasks)}）",
-            )
-            self.tracer.event(
-                "orchestration_end",
-                task_id=task_id,
-                status=status,
-                duration_ms=duration_ms,
-                total=len(tasks),
-                completed=completed,
-                tokens=self._subtask_tokens,
-            )
+        terminal = {
+            **identity, "agent": "orchestrator", "status": status,
+            "error": error, "execution_error": execution_error,
+            "duration_ms": duration_ms, "workspace": result.workspace,
+            "steps": sum(task.steps for task in self._all_tasks),
+            "tool_calls": sum(task.tool_calls for task in self._all_tasks),
+            "acceptance_spec": payload.get("spec"), "acceptance_report": payload.get("report"),
+            "acceptance_evidence": result.acceptance_evidence,
+        }
+        self._event("task_end", **terminal)
+        self._event(
+            "orchestration_end", **terminal, total=result.total,
+            completed=completed, tokens=result.tokens,
+        )
         if self.bus:
             self.bus.post(
                 "orchestrator",
-                f"目标结束：{status}（{completed}/{len(tasks)}）",
+                f"目标结束：{status}（{completed}/{result.total}）",
                 kind="system",
-                task_id=task_id,
+                task_id=root_id,
             )
-        if self._own_tracer and self.tracer:
-            self.tracer.close()
+        self.close()
         return result
 
     def close(self) -> None:
         """只做了 plan() 没做 run() 时，手动释放自己创建的 tracer。"""
         if self._own_tracer and self.tracer:
             self.tracer.close()
+            self._tracer_closed = True
 
     # -------------------------------------------------------------- S1 串行
     def _dispatch_serial(self, tasks: list[SubTask], board: Board) -> None:
@@ -526,16 +701,13 @@ class Orchestrator:
     def _block_if_deps_failed(self, task: SubTask, tasks: list[SubTask]) -> bool:
         by_id = {item.id: item for item in tasks}
         broken = [
-            dep for dep in task.deps if by_id[dep].status in {"failed", "blocked", "skipped"}
+            dep for dep in task.deps if by_id[dep].status != "done"
         ]
         if not broken:
             return False
         task.status = "blocked"
         task.error = f"上游未完成：{', '.join(broken)}"
-        if self.tracer:
-            self.tracer.event(
-                "subtask_end", subtask=task.id, status="blocked", error=task.error
-            )
+        self._end_subtask(task)
         return True
 
     def _execute(self, task: SubTask, board: Board, depth: int = 0) -> None:
@@ -544,31 +716,28 @@ class Orchestrator:
         if self._global_exhausted():
             task.status = "skipped"
             task.error = "全局预算耗尽"
-            if self.tracer:
-                self.tracer.event("subtask_end", subtask=task.id, status="skipped", error=task.error)
+            self._end_subtask(task)
             return
 
         # 记录本任务在"委派树"里的位置；委派出去的子任务会看到 depth+1
-        previous = (getattr(self._ctx, "task_id", None), getattr(self._ctx, "depth", 0))
-        self._ctx.task_id = task.id
+        previous = (getattr(self._ctx, "task", None), getattr(self._ctx, "depth", 0))
+        self._ctx.task = task
         self._ctx.depth = depth
 
         task.status = "running"
+        task.attempt_id = f"attempt-{uuid.uuid4().hex}"
         started = time.perf_counter()
-        if self.tracer:
-            self.tracer.event(
-                "subtask_start",
-                subtask=task.id,
-                assignee=task.assignee,
-                deps=task.deps,
-                objective=task.objective,
-            )
+        self._event(
+            "subtask_start", task_id=task.task_id, attempt_id=task.attempt_id,
+            parent_task_id=task.parent_id, level="subtask", subtask=task.id,
+            assignee=task.assignee, deps=task.deps, objective=task.objective,
+        )
         if self.bus:
             self.bus.post(
                 "orchestrator",
                 f"开始 {task.id} → {task.assignee}",
                 kind="system",
-                task_id=task.id,
+                task_id=task.task_id,
                 recipients=[task.assignee],
             )
 
@@ -576,54 +745,65 @@ class Orchestrator:
             agent = self.agent_factory(task) if self.agent_factory else self._build_agent(task)
             result: RunResult = agent.run(
                 task.objective,
-                task_id=task.id,
+                task_id=task.task_id,
+                root_id=task.root_id,
+                parent_task_id=task.parent_id,
+                attempt_id=task.attempt_id,
                 acceptance=self._acceptance_for(task),
                 budget=Budget.from_limits(self.settings.limits, factor=0.8),
                 on_step=lambda record, _state: board.record(task.id, record),
             )
-            task.status = "done" if result.status == "completed" else "failed"
+            if result.task_id != task.task_id or result.attempt_id != task.attempt_id:
+                raise ValueError("agent result task/attempt identity does not match dispatched work")
+            task.execution_status = result.status
+            if result.succeeded:
+                task.status = "done"
+            elif result.status == "unverified" or result.status == "completed":
+                task.status = "unverified"
+            elif result.status == "error":
+                task.status = "error"
+            else:
+                task.status = "failed"
             task.result = result.answer
             task.error = result.error
             task.steps = result.steps
             task.tool_calls = result.tool_calls
             task.tokens = result.usage.total
+            task.workspace = result.sandbox
+            task.acceptance_spec = result.acceptance_spec
+            task.acceptance_report = result.acceptance_report
+            task.acceptance_evidence = result.acceptance_evidence
         except Exception as exc:  # 单个子任务炸掉不能拖垮整张图
-            task.status = "failed"
+            task.status = "error"
+            task.execution_status = "error"
             task.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._ctx.task, self._ctx.depth = previous
 
         task.duration_ms = round((time.perf_counter() - started) * 1000, 2)
         with self._lock:
             self._subtask_tokens += task.tokens
             self._global_budget.spend(tokens=task.tokens, seconds=task.duration_ms / 1000)
 
-        if self.tracer:
-            self.tracer.event(
-                "subtask_end",
-                subtask=task.id,
-                assignee=task.assignee,
-                status=task.status,
-                duration_ms=task.duration_ms,
-                steps=task.steps,
-                tokens=task.tokens,
-                error=task.error,
-            )
+        self._end_subtask(task)
         if self.bus:
             self.bus.post(
                 task.assignee,
                 f"{task.id} {task.status}",
                 kind="system",
-                task_id=task.id,
+                task_id=task.task_id,
                 status=task.status,
             )
             if task.result:
                 # 每个 agent 的最终答复都会进群聊频道 —— 这就是最朴素的"多 agent 群聊"
-                self.bus.post(task.assignee, task.result, kind="report", task_id=task.id)
-
-        self._ctx.task_id, self._ctx.depth = previous
+                self.bus.post(task.assignee, task.result, kind="report", task_id=task.task_id)
 
     # ------------------------------------------------------------------ 组装
     def _build_agent(self, task: SubTask) -> Agent:
-        root = (self.run_dir or Path("runs")) / "agents" / f"{task.assignee}-{task.id}"
+        if self._workspace is None:
+            raise RuntimeError("child agents require an active orchestration workspace")
+        root = self._workspace / "agents" / ("task-" + quote(task.id, safe=""))
+        task.workspace = str(root)
         return Agent(
             name=task.assignee,
             provider=self.provider,
@@ -665,10 +845,7 @@ class Orchestrator:
                         continue
                     if self._global_exhausted():
                         task.status, task.error = "skipped", "全局预算耗尽"
-                        if self.tracer:
-                            self.tracer.event(
-                                "subtask_end", subtask=task.id, status="skipped", error=task.error
-                            )
+                        self._end_subtask(task)
                         self._propagate_block(task, dependents)
                         continue
                     inflight[pool.submit(self._execute, task, board)] = task
@@ -702,20 +879,13 @@ class Orchestrator:
                 continue
             child.status = "blocked"
             child.error = f"上游 {task.id} 未完成"
-            if self.tracer:
-                self.tracer.event(
-                    "subtask_end",
-                    subtask=child.id,
-                    assignee=child.assignee,
-                    status="blocked",
-                    error=child.error,
-                )
+            self._end_subtask(child)
             if self.bus:
                 self.bus.post(
                     "orchestrator",
                     f"{child.id} 被阻塞（上游 {task.id}）",
                     kind="system",
-                    task_id=child.id,
+                    task_id=child.task_id,
                     recipients=[child.assignee],
                 )
             queue.extend(dependents.get(child.id, []))
@@ -723,7 +893,8 @@ class Orchestrator:
     # ------------------------------------------------------------------ 委派
     def _handle_delegate(self, payload: dict[str, Any]) -> Observation:
         """RAO 的 ``delegate_task`` 落到这里：真的去跑一个子任务（递归、限深）。"""
-        parent = str(getattr(self._ctx, "task_id", "") or "agent")
+        parent_task = getattr(self._ctx, "task", None)
+        parent = parent_task.task_id if parent_task is not None else "agent"
         depth = int(getattr(self._ctx, "depth", 0) or 0)
         step_id = f"{parent}:delegate"
         objective = str(payload.get("objective") or "").strip()
@@ -736,7 +907,7 @@ class Orchestrator:
                 error_class=ErrorClass.A_INVALID_ARGS,
                 content="delegate_task 缺少 objective，无法委派。",
             )
-        if not self.enable_delegation or self._board is None:
+        if not self.enable_delegation or self._board is None or parent_task is None:
             return Observation(
                 step_id=step_id,
                 source="delegate",
@@ -753,8 +924,14 @@ class Orchestrator:
                 content=f"委派深度已达上限（{self.max_delegation_depth}），请自行完成。",
             )
 
+        with self._lock:
+            while True:
+                self._delegate_sequence += 1
+                child_id = f"{parent_task.id}.d{depth + 1}.{self._delegate_sequence}"
+                if child_id not in self._registered_ids:
+                    break
         child = SubTask(
-            id=f"{parent}.d{depth + 1}",
+            id=child_id,
             objective=objective,
             assignee=route(
                 str(payload.get("assignee") or ""), objective, self.roster, self.default_agent
@@ -762,12 +939,13 @@ class Orchestrator:
             acceptance=str(payload.get("acceptance") or "").strip()
             or "产出非空、包含结论的 Markdown 文件",
         )
+        self._register_task(child, parent_id=parent)
         if self.bus:
             self.bus.post(
                 parent,
                 objective,
                 kind="delegate_request",
-                task_id=child.id,
+                task_id=child.task_id,
                 recipients=[child.assignee],
             )
         self._execute(child, self._board, depth + 1)
@@ -776,7 +954,7 @@ class Orchestrator:
                 child.assignee,
                 f"{child.id} {child.status}",
                 kind="delegate_result",
-                task_id=child.id,
+                task_id=child.task_id,
                 recipients=[parent],
             )
         ok = child.status == "done"
@@ -788,7 +966,7 @@ class Orchestrator:
             error_class=None if ok else ErrorClass.A_TOOL_ERROR,
         )
 
-    def _acceptance_for(self, task: SubTask) -> Acceptance | None:
+    def _acceptance_for(self, task: SubTask) -> AcceptanceInput:
         return self.acceptances.get(task.id, self.default_acceptance)
 
     def _global_exhausted(self) -> bool:

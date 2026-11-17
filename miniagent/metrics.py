@@ -1,29 +1,30 @@
-"""Tracer / 指标汇总。
+"""Trace-derived logical task metrics with explicit acceptance evidence.
 
-对应课程要求「系统框架必须在评估过程中自动跟踪并报告」：
-  - 任务完成率：completed / total
-  - 执行时间：每个任务的 duration_ms，以及均值/P95
-
-为什么一开始就要有：报告里的每个数字都必须能追溯到某次 run 的某条 trace。
-事后补日志是补不出来的 —— 因为你会忘记当时到底发生了什么。
+This validates recorded reports, not the external facts asserted by evaluators.
+Missing terminal events remain in the denominator. Historical ``completed``
+labels without a bound report never become verified successes.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
+
+from .contracts.acceptance import AcceptanceReport, AcceptanceSpec, validate_report
+from .acceptance_evidence import validate_evidence
 
 
 class Tracer:
     """把每一个事件追加写入 ``run_dir/trace.jsonl``（一行一个 JSON）。
 
-    用 JSONL 而不是数据库：可读、可 grep、可直接贴进报告、永不写坏。
-    数据量大了再换 SQLite —— 这个项目大概率用不上。
+    JSONL 是审计记录；崩溃可能留下半行，不替代事务存储。
     """
 
     def __init__(self, run_dir: Path | str) -> None:
@@ -37,6 +38,7 @@ class Tracer:
 
     def event(self, kind: str, **payload: Any) -> None:
         record = {
+            "schema_version": 2,
             "ts": round(time.time(), 4),
             "iso": datetime.now().isoformat(timespec="milliseconds"),
             "kind": kind,
@@ -68,7 +70,9 @@ def load_events(run_dir: Path | str) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            events.append(json.loads(line))
+            record = json.loads(line)
+            if isinstance(record, dict):
+                events.append(record)
         except json.JSONDecodeError:
             continue  # 半行（进程被杀）不该让报告脚本崩掉
     return events
@@ -81,75 +85,377 @@ def _percentile(sorted_values: list[float], ratio: float) -> float:
     return sorted_values[index]
 
 
-def summarize(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """从事件流里算出报告需要的那几个数。"""
-    events = list(events)
-    # 总体目标走 level="goal"（编排器写），其余 task_end 是子任务/单任务。
-    # 两者混在一起算，完成率就没有意义了。
-    ends = [
-        event
-        for event in events
-        if event.get("kind") == "task_end" and event.get("level") != "goal"
-    ]
-    goals = [event for event in events if event.get("kind") == "orchestration_end"]
-    steps = [event for event in events if event.get("kind") == "step"]
+_STARTS = {"task_start", "subtask_start", "orchestration_start"}
+_ENDS = {"task_end", "subtask_end", "orchestration_end"}
+_REGISTRATIONS = {"case_registered", "task_registered"}
+_TASK_EVENTS = _STARTS | _ENDS | _REGISTRATIONS | {"acceptance", "step", "plan_usage"}
+_SUCCESS = {"completed", "done"}
 
-    total = len(ends)
-    completed = [event for event in ends if event.get("status") == "completed"]
-    durations = sorted(float(event.get("duration_ms") or 0.0) for event in ends)
-    failures = Counter(
-        str(event.get("error") or event.get("status")) for event in ends if event.get("status") != "completed"
-    )
-    tokens = sum(
-        int(event.get("prompt_tokens") or 0) + int(event.get("completion_tokens") or 0)
-        for event in steps
-    )
 
-    # 子任务层（编排器运行时才有）：课程要求同时报告"子任务完成率"与"总体完成率"
-    sub_ends = [event for event in events if event.get("kind") == "subtask_end"]
-    sub_done = [event for event in sub_ends if event.get("status") == "done"]
-    sub_durations = sorted(float(event.get("duration_ms") or 0.0) for event in sub_ends)
-    sub_failures = Counter(
-        str(event.get("error") or event.get("status"))
-        for event in sub_ends
-        if event.get("status") != "done"
-    )
+def _id(value: Any) -> str:
+    return value if isinstance(value, str) and value.strip() else ""
 
+
+def _number(value: Any) -> float | None:
+    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
+
+
+def _fingerprint(event: dict[str, Any]) -> str:
+    return json.dumps(event, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _case_id(case: str | dict[str, Any]) -> str:
+    if isinstance(case, str):
+        identity = _id(case)
+    elif isinstance(case, dict):
+        identity = _id(case.get("root_id") or case.get("task_id") or case.get("id"))
+    else:
+        identity = ""
+    if not identity:
+        raise ValueError("expected_cases entries require a non-blank root/task ID")
+    return identity
+
+
+@dataclass
+class _Attempt:
+    identity: str
+    order: int
+    started: bool = False
+    terminals: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
+    acceptance: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
+
+
+@dataclass
+class _Task:
+    root_id: str
+    task_id: str
+    level: str
+    parent_task_id: str | None = None
+    agent: str = ""
+    attempts: dict[str, _Attempt] = field(default_factory=dict)
+
+    def observe(self, event: dict[str, Any], position: int) -> None:
+        self.agent = str(event.get("assignee") or event.get("agent") or self.agent)
+        parent = _id(event.get("parent_task_id") or event.get("parent_id"))
+        if parent:
+            self.parent_task_id = parent
+        kind = event.get("kind")
+        identity = _id(event.get("attempt_id"))
+        if kind in _REGISTRATIONS:
+            if identity:
+                self.attempts.setdefault(identity, _Attempt(identity, position))
+            return
+        attempt = self.attempts.setdefault(identity, _Attempt(identity, position))
+        if kind in _STARTS or kind in {"step", "plan_usage", "acceptance"}:
+            attempt.started = True
+        if kind in _ENDS:
+            attempt.terminals.append((position, event))
+        elif kind == "acceptance":
+            attempt.acceptance.append((position, event))
+
+
+def _terminal(attempt: _Attempt) -> tuple[int, dict[str, Any]] | None:
+    if not attempt.terminals:
+        return None
+    # A controller projection is more complete than the nested agent's end
+    # event, but both describe the same logical task and attempt.
+    return max(attempt.terminals, key=lambda pair: (
+        pair[1].get("kind") in {"orchestration_end", "subtask_end"}, pair[0],
+    ))
+
+
+def _verification(task: _Task, attempt: _Attempt, end: dict[str, Any], position: int) -> tuple[bool, str, str | None]:
+    if type(end.get("schema_version")) is not int or end.get("schema_version") != 2:
+        return False, "legacy_completion_without_verified_report", None
+    if not attempt.identity or end.get("task_id") != task.task_id or end.get("root_id") != task.root_id:
+        return False, "acceptance_identity_missing_or_mismatched", None
+    source = end
+    if "acceptance_report" not in end:
+        prior = [event for index, event in attempt.acceptance if index <= position]
+        if prior:
+            source = prior[-1]
+    raw_report = source.get("acceptance_report", source.get("report"))
+    raw_spec = source.get("acceptance_spec", source.get("spec"))
+    if raw_report is None:
+        return False, "missing_acceptance_report", None
+    try:
+        report = AcceptanceReport.model_validate(raw_report)
+        spec = AcceptanceSpec.model_validate(raw_spec) if raw_spec is not None else None
+        validate_report(spec, report)
+        if report.task_id != task.task_id or report.attempt_id != attempt.identity:
+            return False, "acceptance_identity_mismatch", report.report_id
+        if report.verdict != "passed":
+            return False, f"acceptance_{report.verdict}", report.report_id
+        if spec is None:
+            return False, "missing_acceptance_spec", report.report_id
+        target_ids = set(spec.target.resource_ids)
+        if not target_ids.issubset({value.resource_id for value in report.evaluated_resource_versions}):
+            return False, "acceptance_target_not_covered", report.report_id
+        receipts = []
+        direct = end.get("acceptance_evidence")
+        if direct is not None:
+            if not isinstance(direct, (list, tuple)):
+                return False, "invalid_acceptance_evidence", report.report_id
+            receipts.extend(direct)
+        for index, event in attempt.acceptance:
+            if index > position:
+                continue
+            event_report = event.get("acceptance_report", event.get("report"))
+            if not isinstance(event_report, dict) or event_report.get("report_id") != report.report_id:
+                continue
+            if AcceptanceReport.model_validate(event_report) != report:
+                return False, "conflicting_acceptance_report", report.report_id
+            event_spec = event.get("acceptance_spec", event.get("spec"))
+            if AcceptanceSpec.model_validate(event_spec) != spec:
+                return False, "conflicting_acceptance_spec", report.report_id
+            event_receipts = event.get("receipts", event.get("acceptance_evidence", []))
+            if not isinstance(event_receipts, (list, tuple)):
+                return False, "invalid_acceptance_evidence", report.report_id
+            receipts.extend(event_receipts)
+        try:
+            validate_evidence(spec, report, receipts)
+        except (ValueError, TypeError):
+            return False, "invalid_acceptance_evidence", report.report_id
+        return True, "", report.report_id
+    except (ValueError, TypeError):
+        return False, "invalid_acceptance_report", None
+
+
+def _duration(attempts: list[_Attempt], field_name: str) -> tuple[float | None, float]:
+    known: list[float] = []
+    complete = bool(attempts)
+    for attempt in attempts:
+        terminal = _terminal(attempt)
+        value = _number(terminal[1].get(field_name)) if terminal else None
+        if value is None:
+            complete = False
+        else:
+            known.append(value)
+    subtotal = round(sum(known), 2)
+    return (subtotal if complete else None), subtotal
+
+
+def _outcome(task: _Task) -> dict[str, Any]:
+    attempts = sorted(task.attempts.values(), key=lambda attempt: attempt.order)
+    current = attempts[-1] if attempts else None
+    terminal = _terminal(current) if current else None
+    status = "incomplete" if current and current.started else "not_started"
+    raw_status = status
+    reason = "missing_terminal_event" if status == "incomplete" else "case_not_started"
+    verified, report_id = False, None
+    if terminal:
+        position, end = terminal
+        raw_status = str(end.get("status") or "error")
+        status = raw_status
+        reason = str(end.get("error") or end.get("reason") or "")
+        candidate, validation_reason, report_id = _verification(task, current, end, position)
+        if raw_status in _SUCCESS:
+            verified = candidate
+            # A fatal/non-success terminal cannot be erased by another success
+            # for the same attempt. A real retry must have a new attempt ID.
+            conflicting = any(
+                other.get("schema_version") == 2 and other.get("status") not in _SUCCESS
+                for _, other in current.terminals
+            )
+            if conflicting:
+                verified, status, reason = False, "error", "conflicting_terminal_events"
+            elif verified:
+                status = "completed" if task.level == "goal" else "done"
+            else:
+                status, reason = "unverified", reason or validation_reason
+    duration, known_duration = _duration(attempts, "duration_ms")
+    active, _ = _duration(attempts, "active_duration_ms")
+    waiting, _ = _duration(attempts, "wait_duration_ms")
+    tools, _ = _duration(attempts, "tool_calls")
     return {
-        "total_tasks": total,
-        "completed": len(completed),
-        "completion_rate": (len(completed) / total) if total else 0.0,
-        "total_duration_ms": round(sum(durations), 2),
-        "mean_duration_ms": round(sum(durations) / total, 2) if total else 0.0,
-        "p95_duration_ms": round(_percentile(durations, 0.95), 2),
-        "mean_steps": round(len(steps) / total, 2) if total else 0.0,
-        "total_tokens": tokens,
-        "mean_tokens_per_task": round(tokens / total) if total else 0,
-        "failure_modes": dict(failures),
-        "subtask_total": len(sub_ends),
-        "subtask_completed": len(sub_done),
-        "subtask_completion_rate": (len(sub_done) / len(sub_ends)) if sub_ends else 0.0,
-        "subtask_mean_duration_ms": (
-            round(sum(sub_durations) / len(sub_durations), 2) if sub_durations else 0.0
-        ),
-        "subtask_failure_modes": dict(sub_failures),
-        "goal_status": str((goals[-1] if goals else {}).get("status") or ""),
-        "goal_duration_ms": round(
-            float((goals[-1] if goals else {}).get("duration_ms") or 0.0), 2
-        ),
+        "root_id": task.root_id, "task_id": task.task_id, "level": task.level,
+        "parent_task_id": task.parent_task_id, "agent": task.agent,
+        "attempt_id": current.identity if current else None,
+        "attempts": len(attempts), "status": status, "source_status": raw_status,
+        "verified": verified, "report_id": report_id, "error": reason,
+        "duration_ms": duration, "known_duration_ms": known_duration,
+        "active_duration_ms": active, "wait_duration_ms": waiting,
+        "tool_calls": int(tools) if tools is not None else None,
+        "steps": 0, "tokens": 0,
     }
 
 
-def render_report(run_dir: Path | str, write: bool = True) -> str:
-    """生成一份可以直接贴进交报告的 Markdown 表。"""
+def _usage_key(event: dict[str, Any], root_id: str, task_id: str) -> tuple:
+    identity = (root_id, task_id, _id(event.get("attempt_id")), _id(event.get("run_id")))
+    if _id(event.get("call_id")):
+        return identity + ("call", event["call_id"])
+    sequence = event.get("step") if event.get("kind") == "step" else event.get("plan_attempt", event.get("attempt"))
+    if sequence is not None:
+        return identity + (event.get("kind"), str(sequence))
+    return identity + ("event", _fingerprint(event))
+
+
+def _usage(event: dict[str, Any]) -> tuple[int, bool]:
+    payload = event.get("usage") if isinstance(event.get("usage"), dict) else event
+    values = [payload.get("prompt_tokens"), payload.get("completion_tokens")]
+    if all(type(value) is int and value >= 0 for value in values):
+        return sum(values), True
+    # Keep a disclosed partial count, without treating missing/invalid fields as
+    # evidence of zero usage. Aggregate task_end token totals are never added.
+    return sum(value for value in values if type(value) is int and value >= 0), False
+
+
+def summarize(
+    events: Iterable[dict[str, Any]],
+    expected_cases: Iterable[str | dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Summarize roots and logical children, not terminal-event occurrences.
+
+    ``expected_cases`` is an optional fixed manifest of root IDs or dictionaries
+    containing root_id/task_id/id. When supplied, extra observed roots are listed
+    separately and cannot change Goal TCR. Otherwise registration/start/end
+    events establish the denominator. Retry attempts never add logical tasks.
+    Duration totals are sums of recorded per-attempt wall durations, not the
+    wall duration of a concurrent batch. Unknown active/wait time stays null.
+    """
+    events = [event for event in events if isinstance(event, dict)]
+    expected = list(dict.fromkeys(_case_id(case) for case in expected_cases)) if expected_cases is not None else None
+    roots: dict[str, _Task] = {}
+    children: dict[tuple[str, str], _Task] = {}
+
+    def root(identity: str) -> _Task:
+        return roots.setdefault(identity, _Task(identity, identity, "goal"))
+
+    for identity in expected or ():
+        root(identity)
+    legacy_roots = {
+        _id(event.get("root_id") or event.get("task_id"))
+        for event in events if event.get("kind") in {"orchestration_start", "orchestration_end"}
+    } - {""}
+    legacy_subtasks = {
+        _id(event.get("task_id") or event.get("subtask"))
+        for event in events if event.get("kind") in {"subtask_start", "subtask_end"}
+    } - {""}
+    context_root = ""
+    usage_events: dict[tuple, tuple[dict[str, Any], str, str]] = {}
+    for position, event in enumerate(events):
+        kind = event.get("kind")
+        if kind not in _TASK_EVENTS:
+            continue
+        task_id = _id(event.get("task_id") or event.get("subtask"))
+        root_id = _id(event.get("root_id"))
+        if kind in {"orchestration_start", "orchestration_end", "case_registered"}:
+            root_id = root_id or task_id
+            task_id = root_id
+            level = "goal"
+        elif event.get("level") == "goal":
+            root_id = root_id or task_id
+            level = "goal"
+        elif event.get("level") == "subtask" or kind in {"subtask_start", "subtask_end"} or (root_id and root_id != task_id):
+            level = "subtask"
+        elif not root_id and task_id in legacy_subtasks:
+            level = "subtask"
+        else:
+            level = "goal"
+            root_id = root_id or task_id
+        if not task_id:
+            continue
+        if kind == "orchestration_start":
+            context_root = root_id
+        if level == "subtask":
+            root_id = root_id or context_root or (next(iter(legacy_roots)) if len(legacy_roots) == 1 else "")
+            if root_id:
+                root(root_id)
+            task = children.setdefault((root_id, task_id), _Task(root_id, task_id, level))
+        else:
+            task = root(root_id)
+        task.observe(event, position)
+        if kind in {"step", "plan_usage"}:
+            key = _usage_key(event, root_id, task_id)
+            # Identical replay costs nothing extra. A later copy may contain a
+            # finalized provider usage receipt for the same model call.
+            usage_events[key] = (event, root_id, task_id)
+        if kind == "orchestration_end" and context_root == root_id:
+            context_root = ""
+
+    all_goals = {identity: _outcome(task) for identity, task in roots.items()}
+    all_subtasks = {identity: _outcome(task) for identity, task in children.items()}
+    total_tokens = unknown_usage = step_count = 0
+    for event, root_id, task_id in usage_events.values():
+        tokens, known = _usage(event)
+        total_tokens += tokens
+        unknown_usage += not known
+        is_step = event.get("kind") == "step"
+        step_count += is_step
+        if root_id in all_goals:
+            all_goals[root_id]["tokens"] += tokens
+            all_goals[root_id]["steps"] += is_step
+        child = all_subtasks.get((root_id, task_id))
+        if child is not None:
+            child["tokens"] += tokens
+            child["steps"] += is_step
+
+    selected = set(expected) if expected is not None else set(all_goals)
+    goals = [row for identity, row in all_goals.items() if identity in selected]
+    unexpected = [row for identity, row in all_goals.items() if identity not in selected]
+    subtasks = [row for row in all_subtasks.values() if expected is None or row["root_id"] in selected]
+    durations = sorted(row["duration_ms"] for row in goals if row["duration_ms"] is not None)
+    sub_durations = sorted(row["duration_ms"] for row in subtasks if row["duration_ms"] is not None)
+    total, completed = len(goals), sum(row["verified"] for row in goals)
+    sub_total, sub_completed = len(subtasks), sum(row["verified"] for row in subtasks)
+    goal_counts = dict(Counter(row["status"] for row in goals))
+    sub_counts = dict(Counter(row["status"] for row in subtasks))
+    failures = dict(Counter(row["error"] or row["status"] for row in goals if not row["verified"]))
+    sub_failures = dict(Counter(row["error"] or row["status"] for row in subtasks if not row["verified"]))
+    root_duration = round(sum(row["known_duration_ms"] for row in goals), 2)
+    sub_duration = round(sum(row["known_duration_ms"] for row in subtasks), 2)
+
+    def clock_total(name: str) -> float | None:
+        values = [row[name] for row in goals]
+        return round(sum(values), 2) if values and all(value is not None for value in values) else None
+
+    return {
+        "total_tasks": total, "completed": completed,
+        "completion_rate": completed / total if total else 0.0,
+        "goal_total": total, "goal_completed": completed,
+        "goal_completion_rate": completed / total if total else 0.0,
+        "goals": goals, "unexpected_goals": unexpected, "subtasks": subtasks,
+        "goal_status_counts": goal_counts, "status_counts": goal_counts,
+        "subtask_status_counts": sub_counts,
+        "total_duration_ms": root_duration, "root_duration_sum_ms": root_duration,
+        "mean_duration_ms": round(sum(durations) / len(durations), 2) if durations else 0.0,
+        "p95_duration_ms": round(_percentile(durations, 0.95), 2),
+        "duration_known_count": len(durations), "duration_unknown_count": total - len(durations),
+        "active_duration_ms": clock_total("active_duration_ms"),
+        "wait_duration_ms": clock_total("wait_duration_ms"),
+        "mean_steps": round(sum(row["steps"] for row in goals) / total, 2) if total else 0.0,
+        "step_count": step_count, "model_usage_events": len(usage_events),
+        "total_tokens": total_tokens, "usage_unknown_calls": unknown_usage,
+        "mean_tokens_per_task": round(sum(row["tokens"] for row in goals) / total) if total else 0,
+        "failure_modes": failures,
+        "subtask_total": sub_total, "subtask_completed": sub_completed,
+        "subtask_completion_rate": sub_completed / sub_total if sub_total else 0.0,
+        "subtask_duration_sum_ms": sub_duration,
+        "subtask_mean_duration_ms": round(sum(sub_durations) / len(sub_durations), 2) if sub_durations else 0.0,
+        "subtask_duration_known_count": len(sub_durations),
+        "subtask_duration_unknown_count": sub_total - len(sub_durations),
+        "subtask_failure_modes": sub_failures,
+        "goal_status": goals[0]["status"] if total == 1 else ("multiple" if total else ""),
+        "goal_duration_ms": goals[0]["duration_ms"] if total == 1 else None,
+    }
+
+
+def render_report(
+    run_dir: Path | str, write: bool = True,
+    expected_cases: Iterable[str | dict[str, Any]] | None = None,
+) -> str:
+    """Render exactly the same root/subtask summary used by the CLI."""
     run_dir = Path(run_dir)
     events = load_events(run_dir)
-    summary = summarize(events)
-    ends = [
-        event
-        for event in events
-        if event.get("kind") == "task_end" and event.get("level") != "goal"
-    ]
+    summary = summarize(events, expected_cases=expected_cases)
+
+    def cell(value: Any) -> str:
+        return str(value).replace("|", "\\|").replace("\n", " ") if value is not None else "未记录"
+
+    def seconds(value: float | None) -> str:
+        return f"{value / 1000:.2f} s" if value is not None else "未记录"
 
     lines = [
         f"# 运行报告：{run_dir.name}",
@@ -158,71 +464,67 @@ def render_report(run_dir: Path | str, write: bool = True) -> str:
         "",
         "| 指标 | 数值 |",
         "|---|---|",
-        f"| 任务总数 | {summary['total_tasks']} |",
-        f"| 完成数 | {summary['completed']} |",
-        f"| **任务完成率** | **{summary['completion_rate']:.1%}** |",
-        f"| 总耗时 | {summary['total_duration_ms'] / 1000:.2f} s |",
-        f"| 平均耗时 | {summary['mean_duration_ms'] / 1000:.2f} s |",
-        f"| P95 耗时 | {summary['p95_duration_ms'] / 1000:.2f} s |",
+        f"| 指定/登记 root 任务总数 | {summary['total_tasks']} |",
+        f"| 独立验收通过数 | {summary['completed']} |",
+        f"| **任务完成率（Goal TCR）** | **{summary['completion_rate']:.1%}** |",
+        f"| root 已记录运行墙钟耗时合计 | {seconds(summary['total_duration_ms'])} |",
+        f"| 平均耗时（有完整记录的 root） | {seconds(summary['mean_duration_ms']) if summary['duration_known_count'] else '未记录'} |",
+        f"| P95 耗时（有完整记录的 root） | {seconds(summary['p95_duration_ms']) if summary['duration_known_count'] else '未记录'} |",
+        f"| 耗时未知 root 数 | {summary['duration_unknown_count']} |",
+        f"| 活跃时间 | {seconds(summary['active_duration_ms'])} |",
+        f"| 等待时间 | {seconds(summary['wait_duration_ms'])} |",
         f"| 平均步数 | {summary['mean_steps']} |",
-        f"| 总 token | {summary['total_tokens']} |",
+        f"| 已记录 token | {summary['total_tokens']} |",
         f"| 平均 token/任务 | {summary['mean_tokens_per_task']} |",
+        f"| 用量记录不完整的调用数 | {summary['usage_unknown_calls']} |",
+        "",
+        "耗时合计是各 root 各次运行记录之和，不是并发批次的墙钟时间。成功要求正常结束且有身份匹配的 passed 验收报告。",
+        "",
+        "## 总体目标",
+        "",
+        f"- Goal TCR：**{summary['goal_completion_rate']:.1%}**（{summary['goal_completed']}/{summary['goal_total']}）",
+        f"- 状态分布：{cell(summary['goal_status_counts'])}",
         "",
         "## 失败模式",
         "",
     ]
     if summary["failure_modes"]:
         lines += ["| 原因 | 次数 |", "|---|---|"]
-        lines += [f"| {reason} | {count} |" for reason, count in summary["failure_modes"].items()]
+        lines += [f"| {cell(reason)} | {count} |" for reason, count in summary["failure_modes"].items()]
     else:
         lines.append("无失败任务。")
 
-    sub_ends = [event for event in events if event.get("kind") == "subtask_end"]
-    if sub_ends:
+    if summary["subtasks"]:
         lines += [
-            "",
-            "## 总体目标",
-            "",
-            f"- 状态：**{summary['goal_status'] or '-'}**",
-            f"- 耗时：{summary['goal_duration_ms'] / 1000:.2f} s",
             "",
             "## 子任务",
             "",
             f"- 子任务完成率：**{summary['subtask_completion_rate']:.1%}**"
             f"（{summary['subtask_completed']}/{summary['subtask_total']}）",
-            f"- 平均子任务耗时：{summary['subtask_mean_duration_ms'] / 1000:.2f} s",
+            f"- 状态分布：{cell(summary['subtask_status_counts'])}",
+            f"- 子任务耗时相加：{seconds(summary['subtask_duration_sum_ms'])}（含并发及嵌套，不作为 root 墙钟耗时）",
             "",
-            "| 子任务 | agent | 状态 | 步数 | 耗时(s) | token |",
-            "|---|---|---|---|---|---|",
+            "| root | 子任务 | agent | 状态 | 尝试数 | 耗时 | token |",
+            "|---|---|---|---|---|---|---|",
         ]
-        for event in sub_ends:
-            lines.append(
-                "| {sid} | {agent} | {status} | {steps} | {duration:.2f} | {tokens} |".format(
-                    sid=event.get("subtask", "-"),
-                    agent=event.get("assignee", "-"),
-                    status=event.get("status", "-"),
-                    steps=event.get("steps", 0),
-                    duration=float(event.get("duration_ms") or 0) / 1000,
-                    tokens=event.get("tokens", 0),
-                )
-            )
+        for row in summary["subtasks"]:
+            lines.append("| " + " | ".join(cell(value) for value in (
+                row["root_id"] or "未标注", row["task_id"], row["agent"], row["status"],
+                row["attempts"], seconds(row["duration_ms"]), row["tokens"],
+            )) + " |")
         if summary["subtask_failure_modes"]:
             lines += ["", "失败子任务原因："]
-            lines += [f"- {reason}：{count} 次" for reason, count in summary["subtask_failure_modes"].items()]
+            lines += [f"- {cell(reason)}：{count} 次" for reason, count in summary["subtask_failure_modes"].items()]
 
-    lines += ["", "## 逐任务明细", "", "| 任务 | agent | 状态 | 步数 | 工具调用 | 耗时(s) | token |", "|---|---|---|---|---|---|---|"]
-    for event in ends:
-        lines.append(
-            "| {task} | {agent} | {status} | {steps} | {tools} | {duration:.2f} | {tokens} |".format(
-                task=event.get("task_id", "-"),
-                agent=event.get("agent", "-"),
-                status=event.get("status", "-"),
-                steps=event.get("steps", 0),
-                tools=event.get("tool_calls", 0),
-                duration=float(event.get("duration_ms") or 0) / 1000,
-                tokens=int(event.get("prompt_tokens") or 0) + int(event.get("completion_tokens") or 0),
-            )
-        )
+    lines += ["", "## 逐任务明细", "", "| root 任务 | 状态 | 尝试数 | 步数 | 工具调用 | 耗时 | token | 报告/原因 |", "|---|---|---|---|---|---|---|---|"]
+    for row in summary["goals"]:
+        lines.append("| " + " | ".join(cell(value) for value in (
+            row["task_id"], row["status"], row["attempts"], row["steps"], row["tool_calls"],
+            seconds(row["duration_ms"]), row["tokens"], row["report_id"] or row["error"],
+        )) + " |")
+    if summary["unexpected_goals"]:
+        lines += ["", "未列入指定评测题的 root（不改变 Goal TCR）："]
+        lines += [f"- {cell(row['task_id'])}：{cell(row['status'])}" for row in summary["unexpected_goals"]]
 
     report = "\n".join(lines) + "\n"
     if write:

@@ -47,12 +47,12 @@ class CliTest(unittest.TestCase):
                 str(self.base / "runs"),
             ]
         )
-        self.assertEqual(code, 0, output)
-        self.assertIn("(3/3)", output)
+        self.assertEqual(code, 1, output)
+        self.assertIn("(0/3)", output)
         run_dir = next(p for p in (self.base / "runs").iterdir() if p.is_dir())
         report = (run_dir / "report.md").read_text(encoding="utf-8")
         self.assertIn("任务完成率", report)
-        self.assertIn("100.0%", report)
+        self.assertIn("unverified", report)
 
     def test_run_without_key_reports_configuration_error(self) -> None:
         import os
@@ -80,7 +80,8 @@ class CliTest(unittest.TestCase):
                 str(self.base / "runs"),
             ]
         )
-        self.assertEqual(code, 0, output)
+        self.assertEqual(code, 1, output)
+        self.assertIn("unverified", output)
         self.assertIn("子任务完成率", output)
         run_dir = next(p for p in (self.base / "runs").iterdir() if p.is_dir())
         self.assertTrue((run_dir / "plan.json").exists())

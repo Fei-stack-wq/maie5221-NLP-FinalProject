@@ -1,6 +1,6 @@
 # M0-01 核心数据契约（v1）
 
-> 2026-11-15；原代码基线 `3e195e2067058d9034831912ef8204f6126fa3cd`。核心模型、字段校验、纯状态转换和完整快照校验已在独立的 `miniagent/contracts/` 包实现，使用边界见第 11 节。持久化、事务、真实授权和执行恢复仍是后续阶段；现有执行流程未接入新包。代码、测试与本文作为 M0-01 的同一交付维护。
+> 2026-11-15；原代码基线 `3e195e2067058d9034831912ef8204f6126fa3cd`。核心模型、字段校验、纯状态转换和完整快照校验已在独立的 `miniagent/contracts/` 包实现，使用边界见第 11 节。持久化、事务、真实授权和执行恢复仍是后续阶段；M0-01 阶段不接入执行流程；后续验收接入见 [M0-02](m0-02-acceptance-and-metrics.md)。代码、测试与本文作为 M0-01 的同一交付维护。
 > 上层计划：[个人 Agent 工作室开发计划](agent-studio-development-plan.md)。完整数据：[电脑维护任务示例](m0-01-computer-maintenance-example.md)。当前实现：[RAO](rao-spec.md)、[编排](scheduler.md)。
 
 ## 1. 范围与本次定细的决定
@@ -323,7 +323,7 @@ PendingDelegation 为 `{child_task_id:Id, tool_call_id:Id?, delivery_key:Id, del
 
 ### 11.1 模块与入口
 
-统一从 `miniagent.contracts` 显式导入；旧 `miniagent/schemas.py`、Agent、RAO、Orchestrator 和工具调用路径均未改动。新包没有数据库、网络、工具执行或自动状态推进副作用。
+统一从 `miniagent.contracts` 显式导入；M0-01 提交未改动旧 `miniagent/schemas.py`、Agent、RAO、Orchestrator 和工具调用路径。后续 M0-02 使用其中的 Spec/Report 接入运行期验收，其余契约服务边界保持不变。新包没有数据库、网络、工具执行或自动状态推进副作用。
 
 | 文件 | 实现职责 |
 |---|---|
@@ -370,7 +370,7 @@ wire_record = ready.model_dump(mode="json")
 - 预算允许记录真实超额消耗，不能为了满足 limit 丢掉实际 usage；unknown 保留占用。快照可拒绝预算耗尽后的 ready/retry，但并发预留、防重复扣费、实时 deadline 与活跃时间计费需要 BudgetLedger。
 - `expected_revision` 只是本次纯函数中的一致性条件，不是数据库原子 CAS。Task/Attempt/Run、Reply/Request、Action/Lease 等联合更新，以及幂等键去重、事件投递和外部状态核对，仍需后续存储事务与服务实现。纯数据层不保证外部动作恰好执行一次。
 
-### 11.3 已执行的验证
+### 11.3 M0-01 交付时执行的验证
 
 新增 108 项契约测试，原有 96 项回归测试保留且通过，共 204 项。契约测试直接解析完整电脑维护文档的 7 个 JSON 块，对 82 条核心记录逐条验证及 JSON 往返，并验证整个关联快照；示例 JSON 未为适配实现而改写。测试同时覆盖字段缺失/类型错误、非法转换与 revision 冲突、任务图环、验收证据与目标环境、预算 unknown/retry、工件 hash/授权撤销、拒绝/过期/错误审批链及历史 checkpoint 等反例。
 

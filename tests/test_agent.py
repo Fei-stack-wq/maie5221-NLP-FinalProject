@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from miniagent.agent import Agent
+from miniagent.acceptance import accept_files
 from miniagent.config import Limits, Settings
 from miniagent.providers import Provider, ProviderError, ScriptedProvider
 from miniagent.sandbox import Sandbox
@@ -45,7 +46,7 @@ class AgentLoopTest(unittest.TestCase):
                 {"text": "done"},
             ]
         )
-        result = self._agent(provider).run("写一个文件")
+        result = self._agent(provider).run("写一个文件", acceptance=accept_files("a.md", min_bytes=1))
         self.assertEqual(result.status, "completed", result.error)
         self.assertEqual(result.steps, 2)
         self.assertEqual(result.tool_calls, 1)
@@ -100,7 +101,7 @@ class AgentLoopTest(unittest.TestCase):
                 return LLMResponse(text="已改用正确参数")
 
         result = self._agent(_BadArgs()).run("坏参数测试")
-        self.assertEqual(result.status, "completed", result.error)
+        self.assertEqual(result.status, "unverified", result.error)
         self.assertEqual(result.tool_calls, 0)  # 参数非法，没有真正执行工具
 
     def test_unknown_tool_does_not_crash(self) -> None:
@@ -111,7 +112,7 @@ class AgentLoopTest(unittest.TestCase):
             ]
         )
         result = self._agent(provider).run("调一个不存在的工具")
-        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.status, "unverified")
         self.assertEqual(result.steps, 2)
 
     def test_time_budget_guard(self) -> None:

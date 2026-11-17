@@ -85,47 +85,25 @@ def classify_failure(content: str) -> str:
 # ---------------------------------------------------------------------------
 # 验收：完成判定的外部谓词（不接受"模型说完成了"）
 # ---------------------------------------------------------------------------
-Acceptance = Callable[[Path], "tuple[bool, str]"]
+# Re-export the compatible checker helpers; the runtime uses the four-state API.
+from .acceptance import Acceptance, AcceptanceInput, accept_files, evaluate
 
 
-def evaluate_acceptance(acceptance: Acceptance | None, workspace: Path) -> tuple[bool, str]:
-    """执行验收函数。没给验收函数时退化为"软完成"（由调用方在报告里说明）。"""
-    if acceptance is None:
-        return True, "no-acceptance"
-    try:
-        ok, reason = acceptance(workspace)
-    except Exception as exc:  # 验收函数自己崩了，算不通过，但不能把循环带走
-        return False, f"验收函数异常：{type(exc).__name__}: {exc}"
-    return bool(ok), str(reason)
+def evaluate_acceptance(acceptance: AcceptanceInput, workspace: Path) -> tuple[bool, str]:
+    """Compatibility predicate. Missing acceptance never means verified success.
 
-
-def accept_files(*names: str, min_bytes: int = 20, min_lines: int = 1) -> Acceptance:
-    """最常用的一类验收：产物存在、非空、有基本结构。
-
-    用法::
-
-        acceptance = accept_files("notes.md")
-        agent.run("写一份笔记", acceptance=acceptance)
+    Agent uses ``acceptance.evaluate`` so failed/unverified/error remain distinct.
     """
-
-    def check(workspace: Path) -> tuple[bool, str]:
-        missing: list[str] = []
-        thin: list[str] = []
-        for name in names:
-            path = workspace / name
-            if not path.exists() or not path.is_file():
-                missing.append(name)
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            if path.stat().st_size < min_bytes or len(text.splitlines()) < min_lines:
-                thin.append(name)
-        if missing:
-            return False, f"缺少产物：{', '.join(missing)}"
-        if thin:
-            return False, f"产物内容过少：{', '.join(thin)}"
-        return True, "产物齐全"
-
-    return check
+    outcome = evaluate(
+        acceptance, workspace, task_id="legacy-acceptance",
+        attempt_id="legacy-attempt", objective="Legacy acceptance check",
+    )
+    reason = outcome.report.reason or "验收通过"
+    if acceptance is None:
+        reason = "no-acceptance"
+    elif outcome.report.verdict == "error":
+        reason = f"验收函数异常：{reason}"
+    return outcome.report.verdict == "passed", reason
 
 
 # ---------------------------------------------------------------------------

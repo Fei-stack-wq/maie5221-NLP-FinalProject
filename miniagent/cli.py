@@ -19,14 +19,16 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 from .agent import Agent
 from .config import Settings
 from .metrics import Tracer, load_events, render_report, summarize
 from .providers import DeepSeekProvider, Provider, ScriptedProvider
-from .rao import Acceptance, accept_files
+from .acceptance import AcceptanceInput, accept_files
 from .orchestrator import Orchestrator
 from .sandbox import Sandbox
+from .schemas import RunResult
 from .tools import build_default_registry
 
 # 离线演示剧本：完整走一遍「列目录 -> 写文件 -> 读文件 -> 执行代码 -> 最终答复」。
@@ -87,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--mock", metavar="SCRIPT.json", help="用剧本文件代替真实模型")
     run.add_argument("--runs-dir", default=str(settings.runs_dir))
     run.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+    run.add_argument("--acceptance", metavar="CHECKS.json", help="由用户提供的文件验收规则")
 
     evaluate = sub.add_parser("eval", help="批量评测：输出完成率与耗时")
     evaluate.add_argument("--tasks", default="examples/tasks.jsonl", help="任务集 JSONL")
@@ -94,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--runs-dir", default=str(settings.runs_dir))
     evaluate.add_argument("--agent", default="worker")
     evaluate.add_argument("--yes", action="store_true")
+    evaluate.add_argument("--acceptance", metavar="CHECKS.json", help="默认文件验收规则；逐题 acceptance 字段优先")
 
     orchestrate = sub.add_parser(
         "orchestrate", help="把一句目标拆成子任务图并调度执行（S1 串行 / S2 分层并发 / S3 事件驱动）"
@@ -114,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     orchestrate.add_argument("--runs-dir", default=str(settings.runs_dir))
     orchestrate.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+    orchestrate.add_argument("--acceptance", metavar="CHECKS.json", help="独立 root 与各子任务的文件验收规则")
 
     report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
     report.add_argument("run_dir")
@@ -153,9 +158,11 @@ def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
 def _cmd_run(args: argparse.Namespace, settings: Settings) -> int:
     run_dir = _new_run_dir(Path(args.runs_dir))
     try:
+        acceptance = _load_acceptance(args.acceptance)
         provider_factory = _make_provider_factory(args.mock, settings)
     except Exception as exc:  # 没配 key 时给出可操作的提示，而不是堆栈
         print(f"[配置错误] {exc}", file=sys.stderr)
+        _record_batch_setup_error([{"task_id": "run-1", "task": args.task}], run_dir, exc)
         return 2
     return _execute(
         tasks=[{"task_id": "run-1", "task": args.task}],
@@ -164,19 +171,26 @@ def _cmd_run(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         agent_name=args.agent,
         auto_approve=args.yes,
+        acceptance=acceptance,
     )
 
 
 def _cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
-    tasks = _load_tasks(Path(args.tasks))
+    try:
+        tasks = _load_tasks(Path(args.tasks))
+    except (ValueError, OSError) as exc:
+        print(f"[任务集错误] {exc}", file=sys.stderr)
+        return 2
     if not tasks:
         print(f"[错误] 任务集为空或不存在：{args.tasks}", file=sys.stderr)
         return 2
     run_dir = _new_run_dir(Path(args.runs_dir))
     try:
+        acceptance = _load_acceptance(args.acceptance)
         provider_factory = _make_provider_factory(args.mock, settings)
     except Exception as exc:
         print(f"[配置错误] {exc}", file=sys.stderr)
+        _record_batch_setup_error(tasks, run_dir, exc)
         return 2
     return _execute(
         tasks=tasks,
@@ -185,6 +199,7 @@ def _cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         agent_name=args.agent,
         auto_approve=args.yes,
+        acceptance=acceptance,
     )
 
 
@@ -198,10 +213,13 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
         )
         return 2
     run_dir = _new_run_dir(Path(args.runs_dir))
+    goal_id = f"orch-{uuid.uuid4().hex}"
     try:
+        root_acceptance, acceptances = _load_orchestration_acceptance(args.acceptance)
         provider = _make_provider_factory(args.mock, settings)()
     except Exception as exc:
         print(f"[配置错误] {exc}", file=sys.stderr)
+        _record_batch_setup_error([{"task_id": goal_id, "task": args.goal}], run_dir, exc)
         return 2
 
     tracer = Tracer(run_dir)
@@ -210,6 +228,8 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         run_dir=run_dir,
         tracer=tracer,
+        root_acceptance=root_acceptance,
+        acceptances=acceptances,
         enable_delegation=args.delegate,
         approve=(lambda _prompt: True) if args.yes else None,
         human_handler=(
@@ -220,7 +240,7 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
     )
     try:
         result = orchestrator.run(
-            args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel
+            args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel, goal_id=goal_id
         )
     finally:
         tracer.close()
@@ -247,7 +267,7 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
 
     print("\n" + render_report(run_dir))
     print(f"运行目录：{run_dir.resolve()}")
-    return 0 if result.status == "completed" else 1
+    return 0 if result.succeeded else 1
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -261,13 +281,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------------------
 def _execute(
-    tasks: list[dict[str, str]],
+    tasks: list[dict[str, Any]],
     provider_factory: Callable[[], Provider],
     run_dir: Path,
     settings: Settings,
     agent_name: str,
     auto_approve: bool,
-    acceptance: Acceptance | None = None,
+    acceptance: AcceptanceInput = None,
 ) -> int:
     """跑一批任务，然后打印指标。批量跑是"完成率"这个指标的唯一来源。
 
@@ -278,31 +298,42 @@ def _execute(
     results = []
     with Tracer(run_dir) as tracer:
         for index, item in enumerate(tasks, start=1):
+            case_id = item.get("task_id") or f"task-{index}"
+            tracer.event(
+                "case_registered", schema_version=2, root_id=case_id,
+                task_id=case_id, level="goal", task=item["task"],
+            )
+        for index, item in enumerate(tasks, start=1):
             task_id = item.get("task_id") or f"task-{index}"
-            provider = provider_factory()  # 每个任务一份全新的模型状态
-            # 每个 agent 一个私有沙箱目录（同一 agent 的不同任务也分开，便于复现）
-            sandbox = Sandbox(
-                run_dir / "agents" / f"{agent_name}-{task_id}", agent_name=agent_name
-            )
-            agent = Agent(
-                name=agent_name,
-                provider=provider,
-                registry=build_default_registry(),
-                sandbox=sandbox,
-                settings=settings,
-                tracer=tracer,
-                approve=(lambda _prompt: True) if auto_approve else None,
-                # 无人值守模式：人类闸门自动放行，但会在 trace 里留下记录
-                human_handler=(
-                    (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-                    if auto_approve
-                    else None
-                ),
-            )
-
             print(f"\n=== [{index}/{len(tasks)}] {task_id} ===")
             print(f"任务：{item['task'][:120]}")
-            result = agent.run(item["task"], task_id=task_id, acceptance=acceptance)
+            try:
+                selected = _file_acceptance(item["acceptance"]) if "acceptance" in item else acceptance
+                provider = provider_factory()
+                # Directory identity is independent of caller-controlled task IDs.
+                directory = f"{quote(agent_name, safe='')}-{uuid.uuid4().hex}"
+                sandbox = Sandbox(run_dir / "agents" / directory, agent_name=agent_name)
+                agent = Agent(
+                    name=agent_name, provider=provider,
+                    registry=build_default_registry(), sandbox=sandbox,
+                    settings=settings, tracer=tracer,
+                    approve=(lambda _prompt: True) if auto_approve else None,
+                    human_handler=(
+                        (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
+                        if auto_approve else None
+                    ),
+                )
+                result = agent.run(item["task"], task_id=task_id, acceptance=selected)
+            except Exception as exc:
+                result = RunResult(
+                    task_id=task_id, attempt_id=f"setup-{uuid.uuid4().hex}",
+                    agent=agent_name, status="error",
+                    error=f"任务初始化失败：{type(exc).__name__}: {exc}",
+                )
+                tracer.event(
+                    "task_end", schema_version=2, level="goal", root_id=task_id,
+                    **result.model_dump(mode="json"),
+                )
             results.append(result)
 
             status_text = "✅ completed" if result.succeeded else f"❌ {result.status}"
@@ -369,26 +400,96 @@ def _new_run_dir(base: Path) -> Path:
     return path
 
 
-def _load_tasks(path: Path) -> list[dict[str, str]]:
-    """任务集格式：每行一个 JSON 对象 {"task_id": "...", "task": "..."}。"""
+def _file_acceptance(payload: Any) -> AcceptanceInput:
+    """Parse host-supplied deterministic checks; model plans never call this."""
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or set(payload) - {"files", "min_bytes", "min_lines"}:
+        raise ValueError("验收须为 files/min_bytes/min_lines 对象")
+    files = payload.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("验收 files 必须是非空数组")
+    names, contains, hashes = [], {}, {}
+    for item in files:
+        if not isinstance(item, dict) or set(item) - {"path", "contains", "sha256"}:
+            raise ValueError("每个 files 项只接受 path/contains/sha256")
+        name = item.get("path")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ValueError("验收文件 path 必须非空且不可重复")
+        names.append(name)
+        for key, values in (("contains", contains), ("sha256", hashes)):
+            if key in item:
+                if not isinstance(item[key], str) or not item[key]:
+                    raise ValueError(f"{key} 必须是非空字符串")
+                values[name] = item[key]
+    options = {key: payload.get(key, default) for key, default in (("min_bytes", 20), ("min_lines", 1))}
+    if any(type(value) is not int or value < 0 for value in options.values()):
+        raise ValueError("min_bytes/min_lines 必须是非负整数")
+    return accept_files(*names, **options, contains=contains, sha256=hashes)
+
+
+def _load_acceptance(filename: str | None) -> AcceptanceInput:
+    if filename is None:
+        return None
+    return _file_acceptance(json.loads(Path(filename).read_text(encoding="utf-8-sig")))
+
+
+def _load_orchestration_acceptance(filename: str | None) -> tuple[AcceptanceInput, dict[str, AcceptanceInput]]:
+    if filename is None:
+        return None, {}
+    payload = json.loads(Path(filename).read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict) or set(payload) - {"root", "subtasks"}:
+        raise ValueError("编排验收只接受 root 与 subtasks")
+    children = payload.get("subtasks", {})
+    if not isinstance(children, dict) or any(not isinstance(key, str) or not key.strip() for key in children):
+        raise ValueError("subtasks 必须是以子任务 ID 为键的验收对象")
+    return _file_acceptance(payload.get("root")), {
+        key: _file_acceptance(value) for key, value in children.items()
+    }
+
+
+def _record_batch_setup_error(tasks: list[dict[str, Any]], run_dir: Path, exc: Exception) -> None:
+    with Tracer(run_dir) as tracer:
+        for item in tasks:
+            task_id = item["task_id"]
+            tracer.event("case_registered", schema_version=2, root_id=task_id, task_id=task_id, level="goal", task=item["task"])
+            tracer.event(
+                "task_end", schema_version=2, level="goal", root_id=task_id,
+                task_id=task_id, attempt_id=f"setup-{uuid.uuid4().hex}",
+                status="error", error=f"配置错误：{type(exc).__name__}: {exc}",
+            )
+    render_report(run_dir)
+
+
+def _load_tasks(path: Path) -> list[dict[str, Any]]:
+    """Read a strict case manifest, including optional per-case acceptance.
+
+    Malformed or duplicate cases are rejected rather than silently disappearing
+    from the evaluation denominator.
+    """
     if not path.exists():
         return []
-    tasks: list[dict[str, str]] = []
-    # utf-8-sig：兼容 Windows 编辑器写出的 BOM
+    tasks: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
-            print(f"[警告] 第 {line_number} 行不是合法 JSON，已跳过", file=sys.stderr)
-            continue
-        if isinstance(payload, str):  # 允许直接写一行文本
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"第 {line_number} 行不是合法 JSON") from exc
+        if isinstance(payload, str):
             payload = {"task": payload}
-        payload.setdefault("task_id", f"task-{line_number}")
-        if payload.get("task"):
-            tasks.append({"task_id": str(payload["task_id"]), "task": str(payload["task"])})
+        if not isinstance(payload, dict) or set(payload) - {"task_id", "task", "acceptance"}:
+            raise ValueError(f"第 {line_number} 行须为 task_id/task/acceptance 对象")
+        task_id = payload.get("task_id", f"task-{line_number}")
+        if not isinstance(task_id, str) or not task_id.strip() or task_id in seen:
+            raise ValueError(f"第 {line_number} 行 task_id 为空、类型错误或重复")
+        if not isinstance(payload.get("task"), str) or not payload["task"].strip():
+            raise ValueError(f"第 {line_number} 行缺少有效 task")
+        seen.add(task_id)
+        tasks.append({**payload, "task_id": task_id})
     return tasks
 
 

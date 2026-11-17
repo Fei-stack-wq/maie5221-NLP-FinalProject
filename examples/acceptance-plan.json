@@ -1,0 +1,12 @@
+{
+  "subtasks": {
+    "s1": {"files": [{"path": "notes.md", "contains": "规划必须校验"}]},
+    "s2": {"files": [{"path": "summary.md", "contains": "串行调度"}]}
+  },
+  "root": {
+    "files": [
+      {"path": "agents/task-s1/notes.md", "contains": "规划必须校验"},
+      {"path": "agents/task-s2/summary.md", "contains": "缩短墙钟"}
+    ]
+  }
+}

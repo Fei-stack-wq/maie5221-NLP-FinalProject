@@ -1,5 +1,7 @@
 # 系统架构设计
 
+> 2026-11-16 更新：本文保留原架构基线，验收与指标已按 [M0-02](m0-02-acceptance-and-metrics.md) 更新；其余未接入的持久化、隔离与预算能力仍以分阶段计划为准。
+
 > 一个可运行的**多智能体协作系统**：以 RAO 为原子单元，在其上叠加运行时、编排器、消息总线与观测层。
 > 本文是系统级视图；**执行单元的字段级契约**见 [rao-spec.md](rao-spec.md)，
 > **调度算法与选型**见 [scheduler.md](scheduler.md)。
@@ -60,7 +62,7 @@
 2. **观察归一**：任何执行结果都是 `Observation`，失败带 `error_class`。
 3. **历史只追加**：`RAOState.history` append-only，便于重放与审计。
 4. **预算单调递减**：步数 / 时间 / token / 动作四个维度只减不增。
-5. **完成需验收**：无验收函数时才算"软完成"，且必须在报告里注明。
+5. **完成需验收**：无验收函数时为 `unverified`；只有有效 Spec/Report 与检查回执支持的正常完成才计入成功。
 6. **单一指标来源**：`trace.jsonl`。
 7. **工具不抛异常**：错误是一等公民，不是崩溃。
 
@@ -150,7 +152,8 @@ while 预算未耗尽:
 
 | 终态 | 触发 | 含义 |
 |---|---|---|
-| `completed` | 验收通过（无验收函数时软完成） | 成功 |
+| `completed` | 独立验收通过，且报告及回执可核对 | 成功 |
+| `unverified` | 缺少可用验收 | 保留候选结果，不计成功 |
 | `failed_acceptance` | 打回后仍不通过 | 模型说完成但产物不合格 |
 | `limit_exceeded` | 预算耗尽 / `T_LOOP` | 停损 |
 | `aborted` | 模型 `abort_task` | 主动放弃 |
@@ -305,10 +308,10 @@ agent 调 delegate_task(objective, assignee?, acceptance?)
 ### 11.2 口径（唯一实现：`metrics.summarize`）
 
 ```
-任务完成率     = completed 的 task_end（不含 level=goal）/ 总数
-子任务完成率   = done 的 subtask_end / 全部 subtask_end
-总体目标       = orchestration_end.status
-执行时间       = 单任务墙钟；批量另报 P50 / P95
+任务完成率     = verified 且正常结束的逻辑 root / 全部指定或登记 root
+子任务完成率   = verified done 的逻辑 child / 全部创建的逻辑 child
+总体目标       = 逐 root 独立验收，不由 child done 数量推导
+执行时间       = root 墙钟和子任务时间分别统计；未知活跃/等待时间保持未记录
 失败分类       = 按 error_class 计数（R_/A_/O_/T_）
 单位成本       = tokens/任务、工具调用/任务、步数/任务
 ```

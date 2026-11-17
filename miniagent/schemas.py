@@ -16,8 +16,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .contracts.acceptance import AcceptanceReport, AcceptanceSpec, validate_report
+from .acceptance_evidence import validate_evidence
+
 Status = Literal[
-    "completed",          # 通过验收（无验收函数时为软完成）
+    "completed",          # 有独立验收报告通过
+    "unverified",         # 已返回答复，但没有可用的独立验收证据
     "failed_acceptance",  # 模型说完成，但验收多次未通过
     "limit_exceeded",     # 预算耗尽 / 检测到循环
     "aborted",            # 模型主动放弃（abort_task）
@@ -126,6 +130,7 @@ class RunResult(BaseModel):
     """一个任务的最终结果 —— 也就是指标统计的基本单位。"""
 
     task_id: str
+    attempt_id: str = ""
     agent: str
     status: Status = "error"
     answer: str = ""
@@ -135,7 +140,22 @@ class RunResult(BaseModel):
     tool_calls: int = 0
     usage: Usage = Field(default_factory=Usage)
     sandbox: str = ""
+    acceptance_spec: AcceptanceSpec | None = None
+    acceptance_report: AcceptanceReport | None = None
+    acceptance_evidence: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
-        return self.status == "completed"
+        if self.status != "completed" or self.acceptance_report is None:
+            return False
+        try:
+            report = AcceptanceReport.model_validate(self.acceptance_report)
+            spec = AcceptanceSpec.model_validate(self.acceptance_spec)
+            if (report.verdict != "passed" or report.task_id != self.task_id
+                    or not self.attempt_id or report.attempt_id != self.attempt_id):
+                return False
+            validate_report(spec, report)
+            validate_evidence(spec, report, self.acceptance_evidence)
+        except ValueError:
+            return False
+        return True

@@ -154,6 +154,7 @@ class Action(BaseModel):
 | 谓词                  | 判定者                     | 结果 `status`       | `error`                       |
 | --------------------- | -------------------------- | --------------------- | ------------------------------- |
 | `T_accept` 通过     | 验收函数（代码）           | `completed`         | 空                              |
+| 未配置可用验收 | 运行期验收适配器 | `unverified` | 未验证原因 |
 | `T_accept` 多次失败 | 运行时（默认重试 1 次）    | `failed_acceptance` | `T_ACCEPTANCE_FAILED: <原因>` |
 | `T_budget`          | `Budget.exhausted`       | `limit_exceeded`    | 预算原因文本（含"最大步数"等）  |
 | `T_loop`            | RAO 重复计数 ≥5           | `limit_exceeded`    | 含 `T_LOOP`                   |
@@ -176,10 +177,12 @@ Acceptance = Callable[[Path], tuple[bool, str]]   # (workspace) -> (ok, reason)
 
 规则：
 
-1. **没有验收函数 = 软完成**，`status=completed`，但必须在报告里注明"该批次未启用验收"。
-2. 验收函数抛异常 → 判为不通过（`evaluate_acceptance` 兜底），不能把循环带走。
+1. **没有验收函数 = 未验证**，`status=unverified`，保留答复但不计入成功。
+2. 验收函数抛异常或返回非法类型 → `error`，不触发产物修复重试。兼容 `evaluate_acceptance` 只返回布尔判定；Agent 使用四态 Report 接口。
 3. 验收失败会以 `[验收未通过] <原因>` 注入历史，给模型一次修正机会（可配置重试次数）。
-4. 验收失败次数记入 `scratch`，避免无限打回。
+4. 验收失败次数由当前 `Agent.run` 计数，避免无限打回；同一 attempt 固定 Spec，保存每次 Report 和检查回执。持久恢复另属后续阶段。
+
+M0-02 已接入独立 AcceptanceSpec/Report、文件内容/hash 检查与回执闭包。完整 API、CLI 配置和 POSIX 文件检查限制见 [M0-02 说明](m0-02-acceptance-and-metrics.md)。
 
 ---
 
