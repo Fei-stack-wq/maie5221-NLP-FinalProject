@@ -24,7 +24,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
-from .studio_reviews import ReviewQueue, ReviewSession, digest
+from .studio_reviews import ReviewQueue, ReviewSession, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
@@ -1033,17 +1033,18 @@ class RoomCrew:
         progress.register_browser_replay(registry)
         session = None
         if inspecting:
-            def snapshot_matches():
+            def private_snapshot_issue():
                 manifest = {}
                 try:
                     copy_project(assignment, role, None, self.extensions, secret=self.settings.api_key, manifest=manifest)
-                except SnapshotError:
-                    return False
+                except SnapshotError as exc:
+                    return str(exc)
                 additional_evidence = set(review_notes.values())
                 if session:
                     additional_evidence.update(p for p, sha in session.source_files.items()
                                                if p not in review.files and manifest.get(p) == sha)
-                return {p: v for p, v in manifest.items() if p not in additional_evidence} == review.files
+                products = {p: v for p, v in manifest.items() if p not in additional_evidence}
+                return manifest_issue(review.files, products, exact=True, secret=self.settings.api_key)
 
             def promotion_issue():
                 evidence = progress.evidence()
@@ -1065,8 +1066,9 @@ class RoomCrew:
                 return None
 
             session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id,
-                                    snapshot_matches=snapshot_matches if private else None,
+                                    private_snapshot_issue=private_snapshot_issue if private else None,
                                     promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())
+            session.guard_file_tools(registry)
             registry.add(session.tool())
             registry.add(session.catalog_tool())
         member = Agent(name=role, provider=self.provider, registry=registry,
@@ -1223,7 +1225,7 @@ class RoomCrew:
 
         def handoff_issue():
             if session and not session.assessment:
-                return "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
+                return session.last_snapshot_issue or "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
             if session and session.assessment["verdict"] != "passed" and not progress.pending_paths():
                 # Finding an observable product failure is a valid outcome of a review.
                 return None
@@ -1274,8 +1276,8 @@ class RoomCrew:
         changes = []
         artifacts = []
         assessment = session.assessment if session else None
-        if assessment and not session.unchanged():
-            issue = "验收提交后候选文件已变化，原结论失效。"
+        if assessment and (snapshot_issue := session.snapshot_issue()):
+            issue = "验收提交后候选文件已变化，原结论失效。" + snapshot_issue
             assessment = None
         promotion = private and session and assessment and assessment["verdict"] == "passed"
         private_repair = private and not session

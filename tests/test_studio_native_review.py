@@ -33,12 +33,12 @@ class NativeReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps, *others):
+    def execute(self, steps, *others, **options):
         provider = RecordingProvider(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
             run = self.service.start(request("team",conversation=roster("lead","builder","inspector",*others),
                  objective="Build and independently verify the shipment label.",acceptance_files=[PATH],
-                 limits={"max_steps":90}))
+                 limits={"max_steps":90}, **options))
             detail = finished(self.service, run["id"])
         return detail, provider
 
@@ -62,6 +62,74 @@ class NativeReviewTest(unittest.TestCase):
         trace = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
         return [row for line in trace.read_text().splitlines()
                 if (row := json.loads(line))["kind"] == "reviewed_delivery_blocked"]
+
+    def test_review_file_tools_refuse_frozen_inputs_but_allow_a_new_note(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        project = self.root / "project"
+        project.mkdir()
+        inherited = project / "old_check.py"
+        inherited.write_text("print('original')\n")
+        # The auxiliary check existed before the author wrote the candidate.
+        # The review must protect both paths while still accepting fresh work.
+        attempted = [
+            write("sub/../old_check.py", "modified"),
+            tool("edit_file", path=PATH, old_text="warehouse", new_text="station"),
+            tool("append_file", path="old_check.py", content="extra"),
+            tool("delete_file", path=PATH),
+        ]
+        batch = {"tool_calls":[step["tool_calls"][0] for step in attempted]}
+        steps = self.start_review() + [batch, write("independent-note.md", "Checked the original label."),
+            submit(label, "passed"), {"text":"Reviewed original materials."}, {"text":"Delivered label."}]
+        detail, provider = self.execute(steps, workspace_path=str(project))
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(inherited.read_text(), "print('original')\n")
+        self.assertEqual((project / PATH).read_text(), label)
+        self.assertEqual((project / "independent-note.md").read_text(), "Checked the original label.")
+        results = [m for m in provider.requests[6][0] if m.get("role") == "tool"
+                   and "独立评审的冻结文件不可修改" in m.get("content", "")]
+        self.assertEqual(len(results), 4)
+        self.assertIn(hashlib.sha256(inherited.read_bytes()).hexdigest(), results[0]["content"])
+        self.assertIn("系统临时目录", results[0]["content"])
+
+    def test_command_change_to_inherited_check_is_reported_before_submit_and_blocks_handoff(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        project = self.root / "project"
+        project.mkdir()
+        inherited = project / "old_check.py"
+        inherited.write_text("print('original')\n")
+        altered = "print('changed')"
+        command = f"from pathlib import Path; Path('old_check.py').write_text({altered!r})"
+        steps = self.start_review() + [tool("run_python", code=command), submit(label, "passed"),
+            {"text":"[BLOCKED] Need a fresh frozen review copy."}, {"text":"[BLOCKED] Review pending."}]
+        detail, provider = self.execute(steps, workspace_path=str(project))
+        self.assertEqual(detail["run"]["status"], "failed")
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertFalse(reports[-1]["published"])
+        self.assertIsNone(reports[-1]["native_review"]["assessment"])
+        self.assertEqual(inherited.read_text(), "print('original')\n")
+        before_submit = str(provider.requests[6][0])
+        refusal = next(m["content"] for m in provider.requests[7][0]
+                       if m.get("role") == "tool" and "评审快照与绑定版本" in m.get("content", ""))
+        for feedback in (before_submit, refusal):
+            self.assertIn("old_check.py", feedback)
+            self.assertIn(hashlib.sha256(inherited.read_bytes()).hexdigest(), feedback)
+            self.assertIn(hashlib.sha256(altered.encode()).hexdigest(), feedback)
+            self.assertIn(version(label), feedback)
+            self.assertIn("从原冻结版本重新发起评审", feedback)
+
+    def test_same_batch_command_after_review_submission_invalidates_its_handoff(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        command = tool("run_python", code=f"from pathlib import Path; Path({PATH!r}).write_text('changed')")
+        batch = {"tool_calls":[submit(label, "passed")["tool_calls"][0], command["tool_calls"][0]]}
+        detail, _ = self.execute(self.start_review() + [batch, {"text":"Reviewed the label."},
+                                 {"text":"[BLOCKED] Review copy drifted."}])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertFalse(reports[-1]["published"])
+        self.assertIsNone(reports[-1]["native_review"]["assessment"])
+        self.assertIn("验收提交后候选文件已变化", reports[-1]["remaining_issue"])
+        self.assertIn(PATH, reports[-1]["remaining_issue"])
+        self.assertIn(hashlib.sha256(label.encode()).hexdigest(), reports[-1]["remaining_issue"])
 
     def test_confirmed_receipt_supersedes_prior_denial_at_coordinator_close(self):
         script = self.reviewed_label() + [{"text": "[BLOCKED] Independent verification never started."},

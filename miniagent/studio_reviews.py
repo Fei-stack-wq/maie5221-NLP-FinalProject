@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import partial
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .contracts.acceptance import CheckResult, Criterion
 from .contracts.base import EvidenceRef
 from .schemas import ToolResult
+from .studio_conversations import snapshot_location
 from .tools import Tool
 
 
@@ -313,12 +316,26 @@ class ReviewQueue:
         return review
 
 
+def manifest_issue(expected, actual, *, exact=False, secret=""):
+    """Return bounded, path-specific differences without exposing file contents."""
+    paths = expected.keys() | actual.keys() if exact else expected
+    changed = sorted(p for p in paths if actual.get(p) != expected.get(p)
+                     or (exact and (p in actual) != (p in expected)))
+    if not changed:
+        return None
+    rows = [f"{snapshot_location(Path(p), secret)} 原定 {expected.get(p) or '缺失'}，实际 {actual.get(p) or '缺失'}"
+            for p in changed[:5]]
+    if len(changed) > len(rows):
+        rows.append(f"另有 {len(changed) - len(rows)} 项不同")
+    return "；".join(rows)
+
+
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
-    def __init__(self, item, original, progress, attempt_id, *, snapshot_matches=None, promotion_issue=None, review_notes=()):
+    def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None, review_notes=()):
         self.item = item
         self.review_notes = set(review_notes)
-        self.snapshot_matches = snapshot_matches
+        self.private_snapshot_issue = private_snapshot_issue
         self.promotion_issue = promotion_issue
         self.original = original
         self.progress = progress
@@ -328,18 +345,43 @@ class ReviewSession:
         self.source_files = {}
         self.closing_needs = None
         self.closing_attempts = 0
+        self.last_snapshot_issue = None
+        self.frozen = {**original, **item.files}
+
+    def guard_file_tools(self, registry):
+        for name in ("write_file", "edit_file", "append_file", "delete_file"):
+            tool = registry.get(name)
+            if tool:
+                registry.add(replace(tool, fn=partial(self._guard_write, tool.fn)))
+
+    def _guard_write(self, original_tool, ctx, args):
+        path = ctx.sandbox.relative(ctx.sandbox.resolve(args["path"]))
+        if path in self.frozen:
+            return ToolResult.failure(f"独立评审的冻结文件不可修改 {snapshot_location(Path(path), '')}，"
+                                      f"原定 {self.frozen[path] or '缺失'}。请在系统临时目录另建检查脚本，"
+                                      "评审说明写入新的或宿主指定的附件路径。")
+        return original_tool(ctx, args)
+
+    def snapshot_issue(self):
+        manifest = self.progress.project_versions()
+        receipts = {}
+        if self.assessment:
+            receipts = {r["path"]: r["sha256"] for finding in self.assessment["results"] for r in finding["receipts"]
+                        if r["kind"] in {"review_note", "source"} and manifest.get(r["path"]) != r["sha256"]}
+        issue = manifest_issue(receipts, manifest)
+        if not issue:
+            if self.private_snapshot_issue:
+                issue = self.private_snapshot_issue()
+            else:
+                issue = manifest_issue(self.item.files, self.original) or manifest_issue(self.frozen, manifest)
+        if issue:
+            return (f"评审快照与绑定版本 {self.item.version} 不符。{issue}。停止使用改动后的副本签发结论，"
+                    "向负责人交接差异，从原冻结版本重新发起评审。需要修订原件时交回作者。")
+        return None
 
     def unchanged(self):
-        manifest = self.progress.project_versions()
-        if self.assessment:
-            for finding in self.assessment["results"]:
-                for item in finding["receipts"]:
-                    if item["kind"] in {"review_note", "source"} and manifest.get(item["path"]) != item["sha256"]:
-                        return False
-        if self.snapshot_matches is not None:
-            return self.snapshot_matches()
-        return (all(self.original.get(p) == v and manifest.get(p) == v for p, v in self.item.files.items())
-                and all(manifest.get(p) == v for p, v in self.original.items()))
+        self.last_snapshot_issue = self.snapshot_issue()
+        return self.last_snapshot_issue is None
 
     def observe(self, record):
         if self.closing_needs is not None and record.observations:
@@ -454,9 +496,11 @@ class ReviewSession:
         for receipt in self.receipts.values():
             label = receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt.get("check") or ""
             by_kind.setdefault(receipt["kind"], []).append([receipt["ref"], label[:110]])
-        return json.dumps({"recent_evidence":{k:v[-6:] for k,v in by_kind.items()},
-                           "needs":self.evidence_needs(), "catalog":"list_review_evidence"},
-                          ensure_ascii=False, separators=(",", ":"))
+        summary = {"recent_evidence":{k:v[-6:] for k,v in by_kind.items()},
+                   "needs":self.evidence_needs(), "catalog":"list_review_evidence"}
+        if self.last_snapshot_issue:
+            summary["snapshot_issue"] = self.last_snapshot_issue
+        return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
     def closing_options(self):
         needs = self.evidence_needs()
@@ -500,6 +544,7 @@ class ReviewSession:
         return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
                  + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
                  if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
+                "评审期间候选及工作副本中全部继承文件都须保持原字节，包括旧检查脚本。将临时脚本放入系统临时目录，另写评审附件。"
                 "用 submit_review 提交结构化结果；每项引用宿主回执 ID。变更请求写明责任分类与可执行修改。"
                 "业务标准本身不明确时选择 inconclusive/business。材料：" +
                 json.dumps(self.item.briefing(), ensure_ascii=False) +
@@ -556,8 +601,11 @@ class ReviewSession:
             request = Submission.model_validate(args)
             if self.assessment:
                 raise ValueError("本次验收已提交。")
-            if request.candidate_version != self.item.version or not self.unchanged():
-                raise ValueError("候选版本已改变，验收者须针对绑定的原件检查。")
+            if request.candidate_version != self.item.version:
+                raise ValueError(f"提交的候选版本已改变，请核对本次绑定版本 {self.item.version}。")
+            issue = self.snapshot_issue()
+            if issue:
+                raise ValueError(issue)
             rules = {r.id:r for r in self.item.criteria}
             retained = self.retained_findings()
             submitted = [r.criterion_id for r in request.results]

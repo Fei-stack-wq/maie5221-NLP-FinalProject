@@ -195,6 +195,12 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 这一补充参考 pytest 将 `nodeid`、`outcome`、异常 `longrepr` 和捕获输出分别保存的机制，尤其是 `TestReport.from_item_and_call` 对实际异常的判断；其回归确认异常在序列化后仍存在、导入包装错误不会盖住原始异常。Studio 使用既有工具身份和冻结候选，另外保存成员编辑过的脚本原文供第三方裁决；未复制上游代码或引入依赖。[pytest 8.3.5 的报告构造与异常分支](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py#L270-L403) · [异常保留与导入错误回归](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_reports.py#L390-L414) · [Studio 普通群入口的 191/9→200/0→独立裁决回归](../tests/test_private_candidate_review.py) · [步骤证据与停滞回归](../tests/test_crew_progress.py)
 
+### 独立评审期间的冻结文件
+
+验收者拿到的候选与工作副本中原有的文件全部按字节冻结，包括别的成员已发布的检查脚本。新探针可放在系统临时目录，需交接的评审说明使用新路径或宿主指定的附件路径。直接写入、编辑、追加或删除冻结文件时，文件工具立即返回原定 SHA-256。通过 Python 或命令改动继承文件后，下一轮提示和提交检查会显示变动路径及原定、实际摘要。验收者应把差异交接给负责人，由负责人从原冻结快照重新发起评审。确有产品或旧检查缺陷时，由作者另行修订并交接新版本。
+
+文件身份按路径和摘要匹配的做法参考 in-toto 的实现和匹配测试。Studio 在工具调用后和提交评审时检查本机工作副本。本项目的群工作流回归覆盖直接文件操作与间接命令改动。[in-toto 的路径及摘要匹配](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L727-L765) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549) · [Studio 群评审回归](../tests/test_studio_native_review.py)
+
 ### 负责人结案时的独立验收回执
 
 负责人收尾时，宿主检查公开工作区最新文件摘要与独立评审绑定的候选版本。用户列出的交付路径和结构化验收路径全部由已通过的评审覆盖，且成员、命令、业务问题和交付检查均已收束时，收尾输入会先列出评审人、候选版本、必需标准与文件 SHA-256。成员无额外自检标准时显示的 `unverified` 只描述该成员分工。相同操作后来成功时，早先的委派拒绝保留在轨迹，退出当前回合的纠正反馈。
