@@ -143,6 +143,8 @@ Shell 回执记录实际执行的命令、退出码、超时和输出裁剪；Py
 
 Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与截取输出。pytest 的 TestReport 将用例身份、结果与捕获的标准输出分开，原生退出码还能区分断言失败、用户中断、命令用法错误、缺少测试等情况。本项目复用这两个边界，并用工件摘要和执行范围约束跨成员复验。[Pi Bash 固定版本](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L388-L437) · [Pi 进程已退出而管道超时的回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/suite/regressions/11613-bash-timeout-after-shell-exit.test.ts#L16-L48) · [pytest TestReport](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py) · [pytest 退出码](https://docs.pytest.org/en/stable/reference/exit-codes.html)
 
+自定义检查可以静默结束，也可以自行选择语言与汇总格式。对于使用明确命令直接执行的脚本，宿主记录所运行的范围、脚本摘要、实际工具回执 ID 和退出码。相同范围在当前候选版本上退出 0，可让成员交接给独立验收者。该执行本身不会产生逐项通过结论，原来的待复验项仍随交接保留。验收者需要在相同工件版本上亲自重跑该命令，另行取得正面的断言证据并提交明确结论。候选文件变化会清除此前的执行回执。已观察的断言失败和用户配置的验收仍按各自规则处理。此处沿用 Pi 的进程回执接口，额外把脚本退出与独立验收分开记录。[Pi 执行与错误处理](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L388-L437)
+
 ### 同群独立成员的结构化验收与返工
 
 负责人把已交付的候选交给群内另一位成员时，可在 `delegate_task` 中提交 `review`。候选可用作者的任务 ID 或该角色最近一次公开交付定位。每条标准包含稳定 ID、描述、是否必需以及取证方式。检查文字内容、合同或版面可选 `inspect`；核对程序行为或可计算结果选 `execute`。宿主绑定原作者任务、完整候选文件的 SHA-256 清单及其版本摘要。普通讨论和仅需交付的委派维持原有流程。
@@ -173,3 +175,16 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 报告位于群事件 `member_report.handoff.native_review`。其中 `target` 跨修订不变，`candidate_version` 绑定本轮文件，`assessment` 记录验收者、尝试、逐项理由、证据和需执行的修复。重复同版、同缺口、同证据会显式停止。原先通过的候选被后续交付改动时，旧结论保留在历史事件，新版本重新进入验收。子候选的独立结论与群目标的最终验收分别展示。
 
 这一工作流借鉴 LangGraph evaluator–optimizer 的结构化反馈和条件路由，以及 A2A 区分任务、工件和等待用户输入的状态模型。实现沿用 Studio 的角色、任务记录、工具回执、预算和现有群运行器。[LangGraph evaluator–optimizer 示例](https://docs.langchain.com/oss/python/langgraph/workflows-agents#evaluator-optimizer) · [条件路由实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982) · [条件执行回归](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2947) · [A2A 任务状态与工件](https://github.com/a2aproject/A2A/blob/5f931b8a25fe66789f987ec4a55fc16ee9fe41ee/specification/a2a.proto#L167-L290) · [本项目普通群入口回归](../tests/test_studio_native_review.py)
+
+
+同一成员恢复自己的完整草稿后，宿主比较先前与当前可归属的失败检查 ID。实际关闭原失败项可继续由该成员修复。若所有原失败仍未关闭，下一次请求继续修这个草稿就转入冻结候选的独立验收。组长能按角色职责指定评审者；组长再次点名作者时，宿主优先选择已有独立评审记录的已计划成员，再按原计划选择其他可用成员。原分工目标、验收期望、候选摘要和本次改派均写入回执。
+
+针对成员临时编写的内联断言，宿主在能够完整提供探针代码、原失败回执与错误节选时，为每条探针绑定一个必需的独立执行标准。评审者需在冻结文件上实际运行断言，说明原失败与复验结果。原作者的失败仍可查阅。未能完整提供的探针、项目中的测试文件和用户配置的硬性检查继续走原验收规则。实现沿用 LangGraph 的按状态选择下一节点与独立评估的工作流，用未关闭的检查身份作为转交条件。[LangGraph 条件边实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982-L1013) · [条件路由测试](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2948) · [独立评估工作流](https://docs.langchain.com/oss/python/langgraph/workflows-agents#evaluator-optimizer)
+
+### 负责人结案时的独立验收回执
+
+负责人收尾时，宿主检查公开工作区最新文件摘要与独立评审绑定的候选版本。用户列出的交付路径和结构化验收路径全部由已通过的评审覆盖，且成员、命令、业务问题和交付检查均已收束时，收尾输入会先列出评审人、候选版本、必需标准与文件 SHA-256。成员无额外自检标准时显示的 `unverified` 只描述该成员分工。相同操作后来成功时，早先的委派拒绝保留在轨迹，退出当前回合的纠正反馈。
+
+若负责人依然回复 `[BLOCKED]`，在既有预算内给予一次纯文字核对机会，并在 `reviewed_delivery_blocked` 事件保存依据及处置结果。模型指出的独立验收以外的阻塞仍可成立，二次报告阻塞将原样结束任务。缺文件、显式验收未过、待答业务问题、未出版或已改变的候选都无法触发这种核对。最终交付继续经过 Studio 原有工作区和验收流程。
+
+此机制参考 Pydantic AI 将输出验证错误交还模型、在重试上限后保留失败的处理。本项目自行实现了基于同群发布版本和用户交付文件的资格判定，并使用原有预算和审计轨迹。[Pydantic AI 输出验证与反馈](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/pydantic_ai_slim/pydantic_ai/_output.py#L222) · [Pydantic AI 重试上限测试](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/tests/test_agent.py#L14684)

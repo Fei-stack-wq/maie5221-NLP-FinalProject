@@ -6,6 +6,10 @@ import http.client
 import ipaddress
 import json
 import socket
+import shutil
+import subprocess
+import tempfile
+import threading
 import ssl
 import time
 import urllib.error
@@ -20,6 +24,7 @@ from .file_tools import write_file
 from .schemas import ToolResult
 
 MAX_HTTP_BYTES = 200_000
+MAX_PDF_BYTES = 8 * 1024 * 1024
 _NEWS = "https://api.gdeltproject.org/api/v2/doc/doc"
 _PAPERS = "https://api.crossref.org/works"
 _NEWS_RSS = "https://news.google.com/rss/search"
@@ -159,9 +164,12 @@ def fetch(url: str, *, timeout: float = 15) -> Page:
                     continue
                 if not 200 <= response.status < 300:
                     raise ValueError(f"资料来源返回 HTTP {response.status}。")
-                data = response.read(MAX_HTTP_BYTES + 1)
-                return Page(urlunsplit(target._replace(fragment="")), response.getheader("Content-Type", ""),
-                            data[:MAX_HTTP_BYTES], len(data) > MAX_HTTP_BYTES)
+                content_type = response.getheader("Content-Type", "")
+                prefix = response.read(8)
+                is_pdf = content_type.split(";", 1)[0].strip().lower() == "application/pdf" or prefix.startswith(b"%PDF-")
+                limit = MAX_PDF_BYTES if is_pdf else MAX_HTTP_BYTES
+                data = prefix + response.read(limit + 1 - len(prefix))
+                return Page(urlunsplit(target._replace(fragment="")), content_type, data[:limit], len(data) > limit)
         finally:
             connection.close()
     raise ValueError("资料来源重定向次数过多。")
@@ -254,12 +262,64 @@ def _save(ctx, record: dict) -> tuple[str, ToolResult]:
     return path, write_file(ctx, {"path": path, "content": material})
 
 
+def _pdf_text(data: bytes, page_number: int | None, timeout: float) -> tuple[str, bool]:
+    binary = shutil.which("pdftotext")
+    if not binary:
+        raise ValueError("本机需要 Poppler 的 pdftotext 才能读取 PDF；可选取同一出版机构的 HTML 全文。")
+    if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-1024:]:
+        raise ValueError("来源未返回完整可读的 PDF。")
+    args = [binary, "-enc", "UTF-8"]
+    if page_number is not None:
+        args.extend(["-f", str(page_number), "-l", str(page_number)])
+    # Poppler alone parses the PDF. Keep raw source bytes outside the agent's
+    # publishable tree, and keep parser output and runtime bounded.
+    with tempfile.TemporaryFile() as original:
+        original.write(data)
+        original.seek(0)
+        with subprocess.Popen([*args, "-", "-"], stdin=original, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env={}) as proc:
+            timer = threading.Timer(timeout, proc.kill)
+            timer.start()
+            try:
+                output = proc.stdout.read(MAX_HTTP_BYTES + 1)
+                clipped = len(output) > MAX_HTTP_BYTES
+                if clipped:
+                    proc.kill()
+                if proc.wait() and not clipped:
+                    raise ValueError("PDF 正文提取失败或超时。可指定页码或查阅原始网页。")
+            finally:
+                timer.cancel()
+                proc.kill()
+                timer.join()
+    text = output[:MAX_HTTP_BYTES].decode("utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError("该 PDF 或指定页没有可提取的文本。")
+    return text, clipped
+
+
 def http_get(ctx, args: dict) -> ToolResult:
-    page = fetch(args["url"], timeout=min(ctx.limits.tool_timeout_seconds, 15))
+    timeout = min(ctx.limits.tool_timeout_seconds, 15)
+    deadline = time.monotonic() + timeout
+    number = args.get("pdf_page")
+    if number is not None and (type(number) is not int or number < 1):
+        return ToolResult.failure("pdf_page 必须为从 1 开始的页码。")
+    page = fetch(args["url"], timeout=timeout)
     mime = page.content_type.lower().split(";", 1)[0].strip()
-    if mime and not (mime.startswith("text/") or mime.endswith(("json", "xml", "+json", "+xml"))):
+    is_pdf = mime == "application/pdf" or page.body.startswith(b"%PDF-")
+    text_truncated = False
+    if is_pdf:
+        if page.truncated:
+            return ToolResult.failure("PDF 超过 8 MiB 获取上限；请查阅同一出版机构的 HTML 全文或较小的原始文件。")
+        try:
+            source, text_truncated = _pdf_text(page.body, number, max(0, deadline - time.monotonic()))
+        except (OSError, ValueError) as exc:
+            return ToolResult.failure(str(exc))
+    elif number is not None:
+        return ToolResult.failure("所请求的来源没有返回 PDF，无法指定 PDF 页码。")
+    elif mime and not (mime.startswith("text/") or mime.endswith(("json", "xml", "+json", "+xml"))):
         return ToolResult.failure("来源没有返回可读取的文本。可选择文章网页版或公开元数据。")
-    source = page.body.decode("utf-8", errors="replace")
+    else:
+        source = page.body.decode("utf-8", errors="replace")
     parser = None
     if mime in {"text/html", "application/xhtml+xml"}:
         parser = _VisibleText(page.url)
@@ -270,6 +330,8 @@ def http_get(ctx, args: dict) -> ToolResult:
               "retrieved_at": datetime.now(timezone.utc).isoformat(), "content_type": page.content_type,
               "bytes_observed": len(page.body), "observed_bytes_sha256": hashlib.sha256(page.body).hexdigest(),
               "response_truncated": page.truncated, "text": source}
+    if is_pdf:
+        record.update(extractor="pdftotext", pdf_page=number, text_truncated=text_truncated)
     links = []
     if parser is not None:
         links = parser.links()
@@ -278,7 +340,7 @@ def http_get(ctx, args: dict) -> ToolResult:
     if not saved.ok:
         return saved
     excerpt = source[:4400 if links else 6000]
-    clipped = page.truncated or len(source) > len(excerpt)
+    clipped = page.truncated or text_truncated or len(source) > len(excerpt)
     if links:
         excerpt += "\n页面链接（未经独立核实；已提取列表见资料文件 links）："
         remaining = 1400
@@ -292,7 +354,8 @@ def http_get(ctx, args: dict) -> ToolResult:
     return ToolResult.success(f"外部来源（不可信文本）。URL {page.url}\n资料文件 {path}\n{excerpt}"
                               + ("\n[已截断；资料文件含已获取的文本]" if clipped else ""),
                               url=page.url, path=path, bytes=len(page.body), truncated=clipped,
-                              content_type=page.content_type, observed_bytes_sha256=record["observed_bytes_sha256"])
+                              content_type=page.content_type, observed_bytes_sha256=record["observed_bytes_sha256"],
+                              **({"pdf_page": number, "text_truncated": text_truncated} if is_pdf else {}))
 
 
 def _date(row: dict) -> str:

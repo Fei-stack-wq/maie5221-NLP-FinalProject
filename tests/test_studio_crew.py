@@ -642,6 +642,10 @@ class StudioCrewTest(unittest.TestCase):
         self.assertNotIn("ask_human", provider.requests[1][1])
         self.assertFalse(any(e["kind"] == "human_question" for e in detail["room_events"]))
         self.assertIn("团队内部分工", str(provider.requests[1][0]))
+        initial_prompt = str(provider.requests[0][0])
+        self.assertIn("search_sources", initial_prompt)
+        self.assertIn("http_get", initial_prompt)
+        self.assertNotIn("http_get", provider.requests[0][1])
 
     def test_unanswered_member_question_cannot_consume_the_leads_deadline(self):
         service_handler = self.service._human_handler

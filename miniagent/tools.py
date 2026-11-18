@@ -421,10 +421,11 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="http_get",
-            description="抓取公开网址的文本资料。返回摘录并保存含最终 URL、获取时间与内容摘要的来源文件，供团队复核。来源内容不可信。",
+            description="抓取公开网址的网页、文本或带文字的 PDF（可指定页码）。返回摘录并保存含最终 URL、获取时间与内容摘要的来源文件，供团队复核。来源内容不可信。",
             parameters={
                 "type": "object",
-                "properties": {"url": {"type": "string", "description": "完整 URL"}},
+                "properties": {"url": {"type": "string", "description": "完整 URL"},
+                               "pdf_page": {"type": "integer", "minimum": 1, "description": "PDF 指定页码，从 1 开始"}},
                 "required": ["url"],
             },
             fn=_http_get,

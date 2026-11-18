@@ -1,8 +1,10 @@
 import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
 from miniagent.config import Settings
+from miniagent.research import Page
 from miniagent.studio_reviews import Review, ReviewQueue, Rule, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
@@ -48,6 +50,61 @@ class NativeReviewTest(unittest.TestCase):
                      review={"candidate":"builder","criteria":[RULE]}),
                 tool("read_file", path=PATH)]
 
+    def reviewed_label(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        script = self.start_review()
+        # A real stale delegation error preceded the accepted review.
+        script.insert(3, tool("delegate_task", assignee="inspector", objective="Verify the label.",
+                              remaining_roles=[], review={"candidate": "unknown-target", "criteria": [RULE]}))
+        return script + [submit(label, "passed"), {"text": "Independent review published."}]
+
+    def close_events(self, detail):
+        trace = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
+        return [row for line in trace.read_text().splitlines()
+                if (row := json.loads(line))["kind"] == "reviewed_delivery_blocked"]
+
+    def test_confirmed_receipt_supersedes_prior_denial_at_coordinator_close(self):
+        script = self.reviewed_label() + [{"text": "[BLOCKED] Independent verification never started."},
+                                          {"text": "Delivered the independently verified label."}]
+        detail, provider = self.execute(script)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        events = self.close_events(detail)
+        self.assertEqual([e["action"] for e in events], ["request_clarification"])
+        receipt = events[0]["receipts"][0]
+        self.assertEqual(receipt["state"], "passed")
+        self.assertEqual(receipt["reviewer"], "inspector")
+        self.assertEqual(receipt["required_criteria"], ["content"])
+        self.assertEqual(receipt["candidate_version"], digest(receipt["files"]))
+        prompts = [str(messages) for messages, _ in provider.requests[-2:]]
+        self.assertTrue(all(receipt["files"][PATH] in msg for msg in prompts))
+        self.assertTrue(all("[delegate_task 未完成]" not in msg for msg in prompts))
+        self.assertIn("宿主结案核对", prompts[-1])
+
+    def test_review_of_one_artifact_cannot_confirm_an_unreviewed_required_file(self):
+        script = self.reviewed_label()
+        # A distinct deliverable exists (so the file gate passes) but was
+        # authored by the reviewer and is outside the reviewed candidate.
+        script.insert(-1, write("certificate.txt", "This dispatch certificate requires its own approval."))
+        script.append({"text": "[BLOCKED] The second deliverable has no independent approval."})
+        provider = RecordingProvider(script)
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+            run = self.service.start(request("team", conversation=roster("lead", "builder", "inspector"),
+                                     objective="Validate both shipping documents.",
+                                     acceptance_files=[PATH, "certificate.txt"], limits={"max_steps": 90}))
+            detail = finished(self.service, run["id"])
+        self.assertEqual(detail["run"]["status"], "failed")
+        published = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(published[-1]["native_review"]["state"], "passed")
+        self.assertEqual(self.close_events(detail), [])
+
+    def test_verified_scope_cannot_override_a_separate_publication_blocker(self):
+        blocker = {"text": "[BLOCKED] The shipment needs a carrier permit outside the label review."}
+        detail, provider = self.execute(self.reviewed_label() + [blocker, blocker])
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertEqual([e["action"] for e in self.close_events(detail)],
+                         ["request_clarification", "preserve_block"])
+        self.assertEqual(len([1 for messages, _ in provider.requests if "宿主结案核对" in str(messages)]), 1)
+
     def test_reject_fix_independent_recheck_on_new_bytes(self):
         script = self.start_review()+[
             submit("Shipment destination: old warehouse. Verified dispatch record.","changes_requested",cause="product",action="Print the confirmed new warehouse."),
@@ -70,6 +127,28 @@ class NativeReviewTest(unittest.TestCase):
         self.assertEqual(verified["candidate_version"],version("Shipment destination: new warehouse. Verified dispatch record."))
         self.assertEqual(verified["assessment"]["results"][0]["receipts"][0]["path"],PATH)
         self.assertTrue(any("候选版本已改变" in str(request[0]) for request in provider.requests))
+
+    def test_source_review_requires_both_candidate_and_independently_fetched_source(self):
+        article = "Shipment destination: old warehouse. Verified dispatch record."
+        url = "https://example.org/dispatch"
+        review = self.start_review()
+        criterion = {**RULE, "method": "source"}
+        review[3] = tool("delegate_task", assignee="inspector", objective="Verify the factual claim.", remaining_roles=[],
+                         review={"candidate": "builder", "criteria": [criterion]})
+        claimed = submit(article, "passed")
+        verified = submit(article, "passed")
+        verified["tool_calls"][0]["arguments"]["results"][0]["evidence"].append("source:" + url)
+        steps = review + [claimed, tool("http_get", url=url), verified, {"text": "Verified against the dispatch record."},
+                          {"text": "Delivered."}]
+        with patch("miniagent.research.fetch", return_value=Page(url, "text/plain", article.encode(), False)):
+            detail, provider = self.execute(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertTrue(any("本次亲自打开的来源" in str(request[0]) for request in provider.requests))
+        report = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"][-1]
+        receipts = report["native_review"]["assessment"]["results"][0]["receipts"]
+        evidence = next(r for r in receipts if r["kind"] == "source")
+        self.assertEqual(evidence["url"], url)
+        self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(article.encode()).hexdigest())
 
     def test_identical_test_method_failure_does_not_loop_or_ask_user(self):
         finding = submit("Shipment destination: old warehouse. Verified dispatch record.","inconclusive",cause="verification",action="Obtain independent destination evidence.")
@@ -115,6 +194,7 @@ class NativeReviewTest(unittest.TestCase):
         self.assertEqual(reports[-1]["native_review"]["assessment"]["results"][0]["receipts"][0]["kind"],"passed_check")
         self.assertTrue(any("符合标准方法的正面证据" in str(r[0]) for r in provider.requests))
         self.assertNotEqual(detail["run"]["status"],"completed")
+        self.assertEqual(self.close_events(detail), [])
 
     def test_business_question_waits_for_authenticated_input_and_does_not_repeat(self):
         rule=Rule.model_validate(RULE)

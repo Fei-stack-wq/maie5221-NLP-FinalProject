@@ -330,6 +330,7 @@ class StepPolicy:
     seconds_reserve: float = 0
     allowed_write_paths: frozenset[str] | None = None
     required_tool: str | None = None
+    reviewed_delivery: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
         if self.required_tool is not None and self.required_tool not in (self.allowed_tools or ()):
@@ -801,10 +802,18 @@ class RAOUnit:
                 )
             elif action.tool in CONTROL_TOOLS and self.enable_control_tools:
                 kind, obs, terminate = self._run_control(action, state, step_id)
-                if obs.source == "human" and obs.ok:
-                    state.scratch.setdefault("human_replies", []).append((obs.meta["question"], obs.content))
-                elif not obs.ok:
-                    state.scratch["delivery_feedback"] = f"[{action.tool} 未完成] {obs.content[:1000]}"
+                if obs.ok:
+                    if obs.source == "human":
+                        state.scratch.setdefault("human_replies", []).append((obs.meta["question"], obs.content))
+                    # The failure remains in history. A later successful call
+                    # supersedes its transient instruction in compact prompts.
+                    previous = state.scratch.pop("control_feedback:" + action.tool, None)
+                    if previous and state.scratch.get("delivery_feedback") == previous:
+                        state.scratch.pop("delivery_feedback")
+                else:
+                    control_error = f"[{action.tool} 未完成] {obs.content[:1000]}"
+                    state.scratch["control_feedback:" + action.tool] = control_error
+                    state.scratch["delivery_feedback"] = control_error
             else:
                 result = self.registry.dispatch(
                     action.tool,

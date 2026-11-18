@@ -112,6 +112,19 @@ class ProjectDataTest(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             self.copy()
 
+    def test_factcheck_handoff_can_cite_a_studio_task_without_masking_credentials(self):
+        task = "task-" + "ab012cde" * 4
+        report = self.agent / "factcheck.md"
+        report.write_text("Reviewed (" + task + ").")
+        self.assertEqual((self.copy() / report.name).read_text(), report.read_text())
+        for value in ("sk-" + "ab012cde" * 4, task + "extra", "extra" + task, self.service.settings.api_key):
+            report.write_text(task + " " + value)
+            with self.subTest(), self.assertRaisesRegex(SnapshotError, "服务凭据"):
+                self.copy()
+        from miniagent.project_data import validate_project_data
+        with self.assertRaisesRegex(ValueError, "服务凭据"):
+            validate_project_data("factcheck.md", task.encode(), secret=task[2:], reject_credentials=True)
+
     def test_member_or_legacy_text_snapshot_rejects_credentials_before_transfer(self):
         project_file = self.agent / "settings.txt"
         for fake in ("sk-" + "x" * 40, self.service.settings.api_key):

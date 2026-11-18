@@ -749,6 +749,52 @@ print("FAIL lines:", [line for line in lines if "FAIL" in line] or "none")
         self.observe("run_shell", "PASS yes", args={"command":"python3 dummy.py"}, meta={"exit_code":0})
         self.assertFalse(self.p.evidence()["check_signals"])
 
+    def test_quiet_script_new_revision_can_reach_peer_but_its_exit_is_not_a_verdict(self):
+        target = self.root / "test_inventory.py"
+        target.write_text("raise ValueError('wrong value')\n")
+        self.observe("write_file", args={"path": target.name})
+        cmd = "python3 test_inventory.py"
+        registry = build_default_registry()
+        ctx = ToolContext(Sandbox(self.root), Limits())
+        def run(command):
+            args = {"command": command}
+            result = registry.dispatch("run_shell", args, ctx)
+            self.observe("run_shell", result.content, ok=result.ok, args=args, meta=result.meta)
+            return result
+        self.assertTrue(run(cmd + " 2>&1 | tail -80").ok)
+        [pending] = self.p.evidence()["pending_verification"]
+        self.assertTrue(self.p.blocked_reason())
+
+        target.write_text("from pathlib import Path\n"
+                          "remaining = len(Path('module.py').read_text())\n"
+                          "print('[1] inventaire terminé')\n"
+                          "raise SystemExit(0 if remaining else 1)\n")
+        self.observe("edit_file", args={"path": target.name})
+        for indirect in [cmd + " subset", cmd + " | tail -1", cmd + "; echo ok"]:
+            self.assertTrue(run(indirect).ok)
+            self.assertTrue(self.p.blocked_reason())
+        self.assertTrue(run(cmd).ok)
+        evidence = self.p.evidence()
+        self.assertIsNone(self.p.blocked_reason())
+        self.assertFalse(evidence["check_signals"])
+        self.assertFalse(evidence["complete_verification"])
+        self.assertFalse(self.p.review_evidence())
+        [subject] = evidence["pending_verification"]
+        self.assertNotEqual(subject["current_sha256"], pending["at_sha256"])
+        receipt = evidence["script_exits"][subject["scope"]]
+        self.assertEqual(receipt["sha256"], subject["current_sha256"])
+        self.assertEqual(receipt["exit_code"], 0)
+        self.assertIn("独立", self.p.steering())
+        self.src.write_text("a different candidate version")
+        self.observe("edit_file", args={"path": self.src.name})
+        self.assertFalse(self.p.evidence()["script_exits"])
+        self.assertTrue(self.p.blocked_reason())
+        self.assertTrue(run(cmd).ok)
+        self.observe("run_shell", "interrupted", args={"command": cmd}, ok=False,
+                     meta={"exit_code": -9, "timed_out": True})
+        self.assertFalse(self.p.evidence()["script_exits"])
+        self.assertTrue(self.p.blocked_reason())
+
     def test_echo_wrapper_only_certifies_the_final_child_exit_receipt(self):
         path = self.root / "test_inventory.py"
         path.write_text("assert 2 == 2")

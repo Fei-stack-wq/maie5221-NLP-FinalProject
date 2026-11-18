@@ -45,3 +45,23 @@ class RevisedMemberChecksTest(unittest.TestCase):
         self.assertIn("candidate", crew.pending_check_reviews)
         self.assertFalse(crew._record_check_reviews("qa", "other", attestation, verified, {"test_inventory.py":"v3"}, []))
         self.assertEqual(crew._record_check_reviews("release", "other", attestation, verified, {"test_inventory.py":"v3"}, []), ["candidate"])
+
+    def test_independent_assertion_and_same_version_script_exit_can_close_opaque_run(self):
+        crew = object.__new__(RoomCrew)
+        crew.pending_check_reviews = {}
+        subject = {"scope": "a", "check": "python3 custom.py", "path": "custom.py", "current_sha256": "new"}
+        crew._record_check_reviews("author", "original", "", {"pending_verification": [subject]}, {}, [])
+        note = "[CHECKED original] verified baseline and all business rules"
+        receipt = {"path": "custom.py", "sha256": "new", "exit_code": 0}
+        assertion = {"check_signals": ["unittest · 12 tests OK"]}
+        files = {"custom.py": "new"}
+        for scope, override in [("other", {}), ("a", {"sha256": "old"}), ("a", {"path": "other.py"}),
+                                ("a", {"exit_code": 1})]:
+            ev = {**assertion, "script_exits": {scope: {**receipt, **override}}}
+            self.assertFalse(crew._record_check_reviews("qa", "q", note, ev, files, []))
+        executed = {"script_exits": {"a": receipt}}
+        self.assertFalse(crew._record_check_reviews("qa", "q", note, executed, files, []))
+        verified = {**assertion, **executed}
+        self.assertFalse(crew._record_check_reviews("author", "q", note, verified, files, []))
+        self.assertFalse(crew._record_check_reviews("qa", "q", "no attestation", verified, files, []))
+        self.assertEqual(crew._record_check_reviews("qa", "q", note, verified, files, []), ["original"])

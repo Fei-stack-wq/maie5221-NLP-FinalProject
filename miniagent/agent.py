@@ -229,6 +229,7 @@ class Agent:
         tool_calls = 0
         acceptance_failures = 0
         answer_guard_retries = 0
+        reviewed_close_retried = False
         rejected_text_turns = 0
         status = "limit_exceeded"
         answer = ""
@@ -534,6 +535,20 @@ class Agent:
                 # ② 模型给出最终答复 → 必须过验收
                 if record.decision_kind == "answer":
                     if step_policy is not None and record.answer.lstrip().startswith("[BLOCKED]"):
+                        if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
+                            retry = (not reviewed_close_retried and budget.has_steps(1)
+                                     and budget.has_tokens(1) and budget.seconds_left > 0)
+                            if self.tracer:
+                                self.tracer.event("reviewed_delivery_blocked", **identity, step=record.step,
+                                                  action="request_clarification" if retry else "preserve_block",
+                                                  receipts=list(policy.reviewed_delivery))
+                            if retry:
+                                reviewed_close_retried = True
+                                state.scratch["delivery_feedback"] = (
+                                    "[宿主结案核对] 你刚刚报了阻塞。当前文件的独立验收已成功发布，"
+                                    "请根据下列版本回执重新汇总。如果另有真实阻塞，请保留 [BLOCKED] "
+                                    "并具体说明超出这些标准的哪项请求尚未满足。")
+                                continue
                         answer = record.answer
                         status, error = "error", answer
                         break

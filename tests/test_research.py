@@ -1,6 +1,7 @@
 """Research discovery and traceable source handoff without external network."""
 import hashlib
 import json
+import shutil
 import socket
 import unittest
 import urllib.error
@@ -54,6 +55,52 @@ class ResearchTest(unittest.TestCase):
         self.assertTrue(data["links_truncated"])
         self.assertLessEqual(len(data["links"]), 160)
         self.assertLess(len(result.content), 6500)
+
+    @unittest.skipUnless(shutil.which("pdftotext"), "Poppler is optional")
+    def test_public_pdf_is_read_by_page_and_only_text_evidence_is_published(self):
+        # A complete PDF with two text pages, an explicit cross-reference
+        # table, and no library dependency for creating the test fixture.
+        objects = [b"<< /Type /Catalog /Pages 2 0 R >>",
+                   b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"]
+        for content_id in (6, 7):
+            objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                           f"/Resources << /Font << /F 5 0 R >> >> /Contents {content_id} 0 R >>".encode())
+        objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        for title in ("Source one", "Course catalogue"):
+            stream = f"BT /F 12 Tf 10 100 Td ({title}) Tj ET".encode()
+            objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
+        body = bytearray(b"%PDF-1.4\n")
+        offsets = [0]
+        for index, item in enumerate(objects, 1):
+            offsets.append(len(body))
+            body.extend(f"{index} 0 obj\n".encode() + item + b"\nendobj\n")
+        xref = len(body)
+        body.extend(b"xref\n0 8\n0000000000 65535 f \n")
+        for offset in offsets[1:]:
+            body.extend(f"{offset:010} 00000 n \n".encode())
+        body.extend(f"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+        page = Page("https://campus.example/catalogue", "application/octet-stream", bytes(body), False)
+        with patch("miniagent.research.fetch", return_value=page):
+            result = self.registry.dispatch("http_get", {"url": page.url, "pdf_page": 2}, self.ctx)
+            self.assertTrue(result.ok, result.content)
+            evidence = json.loads((self.root / result.meta["path"]).read_text())
+            self.assertEqual(evidence["text"], "Course catalogue")
+            self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual((evidence["pdf_page"], evidence["extractor"], evidence["text_truncated"]),
+                             (2, "pdftotext", False))
+            self.assertFalse(self.registry.dispatch("http_get", {"url": page.url, "pdf_page": 12}, self.ctx).ok)
+        self.assertEqual([item for item in self.root.rglob("*") if item.is_file()],
+                         [self.root / result.meta["path"]])
+
+    def test_incomplete_pdf_and_missing_parser_cannot_create_a_source_receipt(self):
+        for body, truncated in ((b"%PDF-1.4", True), (b"invalid", False), (b"%PDF-1.4", False)):
+            page = Page("https://campus.example/file.pdf", "application/pdf", body, truncated)
+            with patch("miniagent.research.fetch", return_value=page):
+                result = self.registry.dispatch("http_get", {"url": page.url}, self.ctx)
+                self.assertFalse(result.ok)
+        with patch("miniagent.research.fetch", return_value=page), patch("miniagent.research.shutil.which", return_value=None):
+            self.assertIn("Poppler", self.registry.dispatch("http_get", {"url": page.url}, self.ctx).content)
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_news_discovery_fetch_and_handoff(self):
         article = "https://example.org/campus-event"

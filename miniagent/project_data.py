@@ -21,6 +21,9 @@ SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 # queries on live rows alone could miss previously stored provider secrets.
 _KEY_PATTERN = re.compile(rb"(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}|github_pat_[A-Za-z0-9_]{60,}|"
                           rb"gh[pousr]_[A-Za-z0-9]{36}|-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)")
+# Studio writes task-<UUID hex> into citations and handoff reports. Only
+# exclude a complete canonical identifier from generic text pattern matching.
+_STUDIO_TASK_ID = re.compile(rb"(?<![A-Za-z0-9_])task-[0-9a-f]{32}(?![A-Za-z0-9_-])")
 _TASKSTORE_SCHEMA = (b"CREATE TABLE creation_keys", b"CREATE INDEX records_task", b"CREATE INDEX outbox_pending")
 
 
@@ -84,8 +87,11 @@ def validate_project_data(name: str, data: bytes, *, secret: str = "", reject_cr
         if secret and any(secret.encode(encoding) in data for encoding in ("utf-8", "utf-16le", "utf-16be")):
             raise ValueError("数据库包含当前服务凭据，已拒绝交接。")
         return
-    if reject_credentials and (_KEY_PATTERN.search(data) or secret and secret.encode() in data):
-        raise ValueError("项目文件含可识别的服务凭据。")
+    if reject_credentials:
+        configured_key = secret and secret.encode() in data
+        generic_key = _KEY_PATTERN.search(data) and _KEY_PATTERN.search(_STUDIO_TASK_ID.sub(b"[task]", data))
+        if configured_key or generic_key:
+            raise ValueError("项目文件含可识别的服务凭据。")
     if b"\x00" in data:
         raise ValueError("项目文本包含二进制数据。")
     try:

@@ -548,9 +548,11 @@ class MemberProgress:
         self._inspected = set()
         self._passes = {}
         self._review_evidence = {}
+        self._inline_failures = {}
         self._diagnostic_checks = {}
         self._pending_verification = {}
         self._complete_verification = {}
+        self._script_exits = {}
         self._failures = {}
         self._prior_passes = []
         self._executions = self._shell_calls = self._browser_calls = self._clean_exits = 0
@@ -618,6 +620,9 @@ class MemberProgress:
         active = {"pass:" + _check_key(suite) for suite in self._passes} | {"fail:" + key for key in self._failures}
         return {ref:row for ref,row in self._review_evidence.items() if ref in active}
 
+    def inline_failures(self):
+        return {k:v for k,v in self._inline_failures.items() if k in self._failures}
+
     def project_versions(self):
         """Recheck candidate bytes using the same no-follow scan as member scheduling."""
         return self._scan()
@@ -650,6 +655,7 @@ class MemberProgress:
             self._prior_passes = list(dict.fromkeys([*self._prior_passes, *self._passes.values()]))[-4:]
             self._passes.clear()
             self._complete_verification.clear()
+            self._script_exits.clear()
             self._repeat_pass = False
             self._after_pass = 0
             self._reads.clear()
@@ -723,6 +729,19 @@ class MemberProgress:
                     missing_exit = exit_code is None
                     if missing_exit:
                         signal = _Check(command, "inconclusive", "")
+                if obs.source == "run_shell" and invocation and invocation.complete and invocation.script:
+                    # A custom reporter may be silent or use any language.
+                    # This receipt proves process completion, never a passed assertion.
+                    self._script_exits.pop(invocation.scope, None)
+                    if (not signal and not changed and invocation.script in self._current
+                            and obs.ok and type(exit_code) is int and exit_code == 0
+                            and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
+                        self._script_exits[invocation.scope] = {
+                            "check": invocation.caption, "path": invocation.script,
+                            "sha256": self._current[invocation.script], "exit_code": exit_code,
+                            "tool_call_id": obs.tool_call_id}
+                        if len(self._script_exits) > 32:
+                            del self._script_exits[next(iter(self._script_exits))]
                 if (not signal and invocation and invocation.complete and obs.source == "run_shell"
                         and _output_truncated(obs) and obs.ok and exit_code == 0
                         and not obs.meta.get("timed_out") and (
@@ -825,6 +844,13 @@ class MemberProgress:
                         for key, failure in failures.items():
                             self._review_evidence["fail:" + key] = {
                                 "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
+                        if obs.source == "run_browser" or (obs.source == "run_python" and command.startswith("assert ")):
+                            code = parameters.get("code", "")
+                            if obs.tool_call_id and 0 < len(code.encode()) <= 6000:
+                                self._inline_failures[suite_key] = {"code":code, "error":obs.content[-800:],
+                                    "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id}
+                                if len(self._inline_failures) > 16:
+                                    del self._inline_failures[next(iter(self._inline_failures))]
                         if run:
                             self._failed_runs[(case_suite, run.digest)] = run
                         self._passes.pop(suite, None)
@@ -837,7 +863,8 @@ class MemberProgress:
                         if full:
                             self._passes[suite] = label
                             self._review_evidence["pass:" + suite_key] = {
-                                "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id}
+                                "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id,
+                                "asserted":status != "runner_exit"}
                             if status != "runner_exit":
                                 self._failures.pop(suite_key, None)
                         for case in cases:
@@ -998,7 +1025,7 @@ class MemberProgress:
     def blocked_reason(self) -> str | None:
         if self._failures:
             return "仍有检查失败：" + "、".join(sorted(set(self._failures.values()))[:4])
-        if self._pending_verification and not self._passes:
+        if self._pending_verification and not (self._passes or self._pending_verification.keys() & self._script_exits.keys()):
             return "本版本尚无正常完成的检查。请直接运行以下检查并保留真实退出码：" + "、".join(
                 item["check"] for item in list(self._pending_verification.values())[:4])
         missing = sorted(self.required - self._current.keys())
@@ -1027,6 +1054,7 @@ class MemberProgress:
             "pending_verification": [{**item, "current_sha256": self._current.get(item["path"])}
                                      for item in self._pending_verification.values()],
             "complete_verification": dict(self._complete_verification),
+            "script_exits": dict(self._script_exits),
             "observed_failure": list(dict.fromkeys(self._failures.values()))[-4:],
             "stop_reason": self._stop,
             "prior_check_signals_before_edits": self._prior_passes,
@@ -1058,6 +1086,9 @@ class MemberProgress:
                     "请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。"
                     "已有文件可作输入，只有实际修改和检查才构成本轮交付证据。已观察记录：" + facts)
         if self._pending_verification and not self._failures:
+            if self._pending_verification.keys() & self._script_exits.keys():
+                return ("已取得对应脚本当前版本的正常退出回执。请交接工件，由独立成员复验原始需求。"
+                        "逐项断言仍待确认。已观察记录：" + facts)
             return ("此前的检查曾中断，请在工作目录直接完整运行对应脚本，保留真实退出码和输出。"
                     "已有当前版本的其他完整检查时，可注明未确认范围并交给独立成员复查。已观察记录：" + facts)
         if self._failures:
