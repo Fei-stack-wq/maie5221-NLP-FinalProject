@@ -753,9 +753,9 @@ class Agent:
         )
         for obs in record.observations:
             command_metrics = {}
-            if obs.source in {"run_shell", "run_python", "run_browser", "poll_process"}:
+            if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:
                 metrics = ("exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
-                           "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state")
+                           "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state", "replayed_tool_call_id")
                 command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
             self.tracer.event(
                 "tool_result",

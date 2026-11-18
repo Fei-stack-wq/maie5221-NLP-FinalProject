@@ -48,6 +48,43 @@ class StudioCrewTest(unittest.TestCase):
             detail = finished(self.service, run["id"])
         return detail, provider
 
+    def test_member_can_retry_its_original_browser_check_in_its_original_working_directory(self):
+        original = ("from pathlib import Path\npage.goto(Path('index.html').resolve().as_uri())\n"
+                    "assert page.locator('h1').inner_text() == 'Ready', 'page title mismatch'")
+        path = "site/index.html"
+        script = [tool("delegate_task", assignee="dev", objective="Deliver the ready status page.",
+                       deliverable_paths=[path], remaining_roles=["qa"]),
+                  write(path, "<!doctype html><html><body><h1>Broken</h1><p>Current service readiness.</p></body></html>"), tool("run_browser", code=original, cwd="site", timeout=12),
+                  tool("rerun_browser_check", tool_call_id="missing-call"),
+                  tool("rerun_browser_check", tool_call_id="call_3_0"),
+                  tool("run_browser", code="assert page.title() == ''"),
+                  tool("edit_file", path=path, old_text="Broken", new_text="Ready"),
+                  *[tool("read_file", path=f"absent-{i}.txt") for i in range(7)],
+                  tool("rerun_browser_check", tool_call_id="call_3_0"), {"text":"Original browser assertion now passes."},
+                  tool("delegate_task", assignee="qa", objective="Independently inspect the delivered page."),
+                  tool("rerun_browser_check", tool_call_id="call_3_0"),
+                  tool("read_file", path=path), {"text":"Independently read the ready page."},
+                  {"text":"Delivery complete."}]
+        detail, provider = self.execute(script, roster("lead", "dev", "qa"),
+                                       objective="Deliver a tested status page.", acceptance_files=[path], limits={"max_steps":90})
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(provider.requests[14][1], ["rerun_browser_check"])
+        trace = [json.loads(line) for line in (self.root / "runs" / detail["run"]["id"] / "trace.jsonl").read_text().splitlines()]
+        results = [e for e in trace if e["kind"] == "tool_result" and e["tool"] == "rerun_browser_check"]
+        self.assertEqual([r["ok"] for r in results], [False, False, True, False])
+        self.assertTrue(all("没有这条" in results[i]["preview"] for i in (0, 3)))
+        self.assertEqual([(r["replayed_tool_call_id"], r["cwd"], r["exit_code"]) for r in results[1:3]],
+                         [("call_3_0", "site", 1), ("call_3_0", "site", 0)])
+        dev = reports[0]
+        self.assertTrue(dev["published"])
+        self.assertEqual(dev["evidence"]["observed_failure"], [])
+        self.assertEqual(dev["evidence"]["replayable_browser_call_ids"], [])
+        self.assertIn("含浏览器断言的脚本退出 0", dev["evidence"]["check_signals"])
+        checkpoints = {e["step"]:e["checkpoint"] for e in trace if e["kind"] == "member_work_checkpoint" and e["task_id"] == dev["task_id"]}
+        self.assertTrue(checkpoints[3]["failed"] and checkpoints[5]["failed"])
+        self.assertFalse(any(r.get("replayed_tool_call_id") for r in (results[0], results[3])))
+
     def test_host_tool_inventory_can_be_read_without_a_human_or_grant_of_permission(self):
         from miniagent.studio_crew import RoomCrew
         crew = object.__new__(RoomCrew)

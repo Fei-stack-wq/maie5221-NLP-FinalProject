@@ -1017,6 +1017,7 @@ class RoomCrew:
                         review_notes[path] = directory + "/" + path
             required = sorted(review_notes.get(p, p) for p in required)
         progress = MemberProgress(workspace, required_paths=required, public_baseline=baseline)
+        progress.register_browser_replay(registry)
         session = None
         if inspecting:
             def snapshot_matches():
@@ -1112,6 +1113,7 @@ class RoomCrew:
                 work_receipt.update(step=record.step, files=evidence["files"][:12], removed=evidence["removed_files"][:6],
                                     versions=dict(list(changed_versions.items())[-6:]), reads=progress.read_checkpoint(),
                                     checks=evidence["check_signals"], failed=evidence["observed_failure"],
+                                    replayable_browser_call_ids=evidence["replayable_browser_call_ids"],
                                     script_exits=dict(list(evidence["script_exits"].items())[-4:]),
                                     superseded_member_checks=evidence.get("superseded_member_checks", []),
                                     diagnostic_checks=evidence["diagnostic_checks"], pending_verification=evidence["pending_verification"],
@@ -1124,6 +1126,8 @@ class RoomCrew:
         record_id = record.task_id
         handoff_limit = 6000 if allocated.tokens_left is None else min(6000, max(800, allocated.tokens_left // 48))
         group_decisions = self._handoff_decisions(min(1400, handoff_limit // 3))
+
+        closure_replay_offered = set()
 
         def member_policy(state, budget, *, preflight=False):
             bare = StepPolicy("handoff", allowed_tools=frozenset(), compact=True)
@@ -1160,6 +1164,14 @@ class RoomCrew:
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
+            replays = progress.browser_replays().keys() - closure_replay_offered
+            if (phase == "handoff" and replays and "rerun_browser_check" in work_tools
+                    and spendable.has_steps(2) and not spendable.exhausted):
+                pending_call = min(replays)
+                closure_replay_offered.add(pending_call)
+                return StepPolicy("work", "仍有原浏览器断言未复验。如已修复，请调用 rerun_browser_check 并引用原调用 ID："
+                                  + pending_call + "。若该断言有误，交接具体阻塞及独立复验需要。",
+                                  frozenset({"rerun_browser_check"}), token_reserve=reserve, seconds_reserve=handoff_seconds)
             if phase == "handoff" and session and not session.assessment:
                 allowed = session.closing_options() & work_tools
                 if not allowed or spendable.exhausted:

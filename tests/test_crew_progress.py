@@ -3,11 +3,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from miniagent.config import Limits
 from miniagent.crew_progress import MemberProgress
 from miniagent.rao import Budget, Observation, RAOState, StepRecord
 from miniagent.sandbox import Sandbox
+from miniagent.schemas import ToolResult
 from miniagent.tools import ToolContext, build_default_registry
 
 
@@ -21,11 +23,11 @@ class MemberProgressTest(unittest.TestCase):
         self.p = MemberProgress(self.root)
         self.budget = Budget(steps_left=30, actions_left=100, tokens_left=90_000, seconds_left=120)
 
-    def observe(self, tool="run_python", text="", *, args=None, ok=True, meta=None):
-        message = {"role": "assistant", "tool_calls": [{"id": "one", "function": {
+    def observe(self, tool="run_python", text="", *, args=None, ok=True, meta=None, call_id="one"):
+        message = {"role": "assistant", "tool_calls": [{"id": call_id, "function": {
             "name": tool, "arguments": json.dumps(args or {})}}]}
         state = RAOState(goal="", task_id="t", history=[message])
-        obs = Observation(step_id="s", source=tool, ok=ok, content=text, meta=meta or {}, tool_call_id="one")
+        obs = Observation(step_id="s", source=tool, ok=ok, content=text, meta=meta or {}, tool_call_id=call_id)
         self.p.observe(StepRecord(step=1, observations=[obs], prompt_tokens=500), state)
 
     def check(self, text, command="unittest discover", *, duration="1.123"):
@@ -482,6 +484,46 @@ class MemberProgressTest(unittest.TestCase):
         self.assertIsNone(self.p.blocked_reason())
         self.assertIn("含浏览器断言的脚本退出 0", self.p.evidence()["check_signals"])
         self.assertEqual(self.p.evidence()["executions"]["run_browser_calls"],5)
+
+    def test_each_unresolved_browser_scope_retains_one_replay_until_that_scope_passes(self):
+        registry = build_default_registry()
+        self.p.register_browser_replay(registry)
+        ctx = ToolContext(Sandbox(self.root), Limits())
+        probes = [{"code": f"assert page.title() == 'Case {i}'", "cwd":"."} for i in range(17)]
+        for i, args in enumerate(probes):
+            self.observe("run_browser", args=args, ok=False, meta={"exit_code":1}, call_id=f"original-{i}")
+        for i in range(40):
+            self.observe("run_browser", args=probes[0], ok=False, meta={"exit_code":1}, call_id=f"retry-{i}")
+        ids = {f"original-{i}" for i in range(len(probes))}
+        self.assertEqual(set(self.p.browser_replays()), ids)
+        self.assertEqual(len(self.p.failed_checks()), 17)
+
+        with patch.object(registry.get("run_browser"), "fn", return_value=ToolResult.success("ok", exit_code=0)) as run:
+            result = registry.dispatch("rerun_browser_check", {"tool_call_id":"original-0"}, ctx)
+        run.assert_called_once_with(ctx, probes[0])
+        self.observe("rerun_browser_check", result.content, args={"tool_call_id":"original-0"},
+                     ok=result.ok, meta=result.meta, call_id="fresh-receipt")
+        self.assertEqual(set(self.p.browser_replays()), ids - {"original-0"})
+        self.assertEqual(len(self.p.failed_checks()), 16)
+        self.assertFalse(registry.dispatch("rerun_browser_check", {"tool_call_id":"original-0"}, ctx).ok)
+
+    def test_browser_replay_requires_original_tool_workspace_and_unmodified_arguments(self):
+        self.observe("run_browser", "AssertionError", args={"code":"assert page.title() == 'Ready'"},
+                     meta={"exit_code":1}, ok=False)
+        readonly = build_default_registry(read_only=True)
+        self.p.register_browser_replay(readonly)
+        self.assertNotIn("rerun_browser_check", readonly.names())
+
+        registry = build_default_registry()
+        self.p.register_browser_replay(registry)
+        wrong = ToolContext(Sandbox(self.root / "another-member"), Limits())
+        self.assertFalse(registry.dispatch("rerun_browser_check", {"tool_call_id":"one"}, wrong).ok)
+        ctx = ToolContext(Sandbox(self.root), Limits())
+        for field, value in [("cwd","another-member"), ("timeout",600), ("code","assert True")]:
+            result = registry.dispatch("rerun_browser_check", {"tool_call_id":"one", field:value}, ctx)
+            self.assertFalse(result.ok)
+            self.assertIn("未知参数", result.content)
+        self.assertTrue(self.p.blocked_reason())
 
     _custom_script = """import sys
 failures = []

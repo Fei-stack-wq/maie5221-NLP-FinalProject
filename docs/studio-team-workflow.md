@@ -117,6 +117,10 @@ print("PASS: submitted the booking through the visible form")
 
 宿主借鉴 pytest 按稳定 node ID 更新 `lastfailed` 的做法。对于可识别的自定义逐项输出，它将工作目录、实际运行的脚本及参数与完整用例标题组合成检查身份。相同运行器可以改变日志名、使用文本筛选或去掉显示颜色。只看到一个通过项时，只核销该项。读取历史日志、混合执行多个脚本、可能改写结果的管道、不同的工作目录或运行参数都不能借用原检查身份。复杂 shell 仍使用原命令匹配。完整业务验收由独立验收器执行。[pytest 8.3.5 的状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [不同调用与子集复验用例](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [本项目回归](../tests/test_crew_progress.py)
 
+成员在当前分工执行的浏览器断言失败时，工作记录中的 `replayable_browser_call_ids` 给出仍待核实的原工具调用。修复后，成员可显式调用 `rerun_browser_check` 并传入原调用 ID。宿主在同一成员工作区取回原脚本、相对目录和超时参数，经过原有工具权限、截止时间和进程回收，再记录当前真实退出状态。不同脚本通过后，原检查继续待验。宿主为每个仍失败的断言身份保留一个原调用，同一断言反复失败仍沿用首个回执。通过后释放对应的复验入口，其他待核查项继续保留。交接时每个未验证的调用可获得一次定向复验机会。原检查仍失败时，成员须如实交接，由已有独立核查流程判断下一步。执行历史保留原失败和复验调用之间的关联。
+
+Playwright 的重试调度保留失败的测试对象，对可重试测试检查剩余次数并另行记录实际结果。Studio 借鉴这个身份和追踪方式，复验由成员主动发起，范围限定为当次工作区的浏览器调用。[Playwright 调度实现](https://github.com/microsoft/playwright/blob/54c711571a37de525377e6f3d3608c3e029b1829/packages/playwright/src/runner/dispatcher.ts#L502-L544) · [两次真实结果的重试测试](https://github.com/microsoft/playwright/blob/54c711571a37de525377e6f3d3608c3e029b1829/tests/playwright-test/retry.spec.ts#L19-L40)
+
 ### 开发成员修订自己的探索用例
 
 会议室预订系统的开发成员曾将三个预约时段的总长写成 180 分钟。实际建立的三个时段分别为 45、60、45 分钟，合计 150 分钟。成员在自己的脚本里改正该数值、剩余分钟和两个时间窗，完整重跑得到 58 个 PASS。由于四个旧 FAIL 的标题包含旧预期或实际值，调度器曾一直阻止移交。

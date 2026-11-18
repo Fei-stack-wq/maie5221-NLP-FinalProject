@@ -19,6 +19,8 @@ from typing import NamedTuple
 from .check_provenance import python_check_source, python_invocation, shell_invocation
 from .project_data import PROJECT_CACHE_DIRS
 from .rao import Budget, Observation, RAOState, StepRecord
+from .schemas import ToolResult
+from .tools import Tool
 
 
 _UNIT = re.compile(r"\bRan (\d{1,8}) tests? in [\d.]+s\b")
@@ -39,7 +41,7 @@ _EMPTY_FAILURE_DETAILS = re.compile(
 _NESTED_EXIT = re.compile(r"(?im)(?:^\s*|CompletedProcess\([^\n]*?,\s*)(?:returncode|exit(?:[_ ]?code)?)\s*[=:]\s*(-?\d{1,8})\b")
 _TRACEBACK = re.compile(r"(?ms)^Traceback \(most recent call last\):\s*\n\s+File .+?"
                         r"^(?:[\w.]+(?:Error|Exception)|SystemExit)(?::|$)")
-_MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "poll_process", "run_browser", "write_file", "edit_file", "append_file", "delete_file"}
+_MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "poll_process", "run_browser", "rerun_browser_check", "write_file", "edit_file", "append_file", "delete_file"}
 _READER = {"open", "read_text", "read_bytes"}
 _SCAN_FILES = 1000
 _SCAN_BYTES = 20 * 1024 * 1024
@@ -553,6 +555,7 @@ class MemberProgress:
         self._passes = {}
         self._review_evidence = {}
         self._inline_failures = {}
+        self._browser_probes = {}
         self._diagnostic_checks = {}
         self._pending_verification = {}
         self._complete_verification = {}
@@ -627,6 +630,28 @@ class MemberProgress:
     def inline_failures(self):
         return {k:v for k,v in self._inline_failures.items() if k in self._failures}
 
+    def browser_replays(self):
+        return {probe["tool_call_id"]:probe for scope, probe in self._browser_probes.items()
+                if scope in self._failures}
+
+    def register_browser_replay(self, registry):
+        if registry.get("run_browser") is None:
+            return
+
+        def replay(ctx, args):
+            call_id = args["tool_call_id"]
+            probe = self.browser_replays().get(call_id)
+            if not probe or ctx.sandbox.root != self.workspace.resolve():
+                return ToolResult.failure("本次成员工作区没有这条仍未通过的浏览器检查。")
+            # Dispatch through the original tool, with the current deadline,
+            # sandbox and permissions. No caller-supplied code, cwd or timeout.
+            result = registry.dispatch("run_browser", probe["arguments"], ctx)
+            return result.model_copy(update={"meta":{**result.meta, "replayed_tool_call_id":call_id}})
+
+        registry.add(Tool("rerun_browser_check", "按本次分工的失败工具调用 ID，在原工作目录重新执行原浏览器断言。",
+            {"type":"object", "properties":{"tool_call_id":{"type":"string"}}, "required":["tool_call_id"],
+             "additionalProperties":False}, replay))
+
     def project_versions(self):
         """Recheck candidate bytes using the same no-follow scan as member scheduling."""
         return self._scan()
@@ -672,6 +697,14 @@ class MemberProgress:
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
         for index, obs in enumerate(record.observations):
             parameters = args.get(obs.tool_call_id, {})
+            replay_of = None
+            if obs.source == "rerun_browser_check":
+                replay_of = obs.meta.get("replayed_tool_call_id")
+                probe = self.browser_replays().get(replay_of)
+                if not probe or probe["task_id"] != state.task_id or type(obs.meta.get("exit_code")) is not int:
+                    continue
+                parameters = probe["arguments"]
+                obs = obs.model_copy(update={"source":"run_browser"})
             if obs.source == "poll_process":
                 if obs.meta.get("process_state") not in {"exited", "timed_out", "cancelled"}:
                     continue
@@ -848,6 +881,10 @@ class MemberProgress:
                         for key, failure in failures.items():
                             self._review_evidence["fail:" + key] = {
                                 "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
+                        if (obs.source == "run_browser" and not replay_of and obs.tool_call_id
+                                and type(obs.meta.get("exit_code")) is int):
+                            self._browser_probes.setdefault(suite_key, {"tool_call_id":obs.tool_call_id,
+                                "task_id":state.task_id, "arguments":dict(parameters)})
                         if obs.source == "run_browser" or (obs.source == "run_python" and command.startswith("assert ")):
                             code = parameters.get("code", "")
                             if obs.tool_call_id and 0 < len(code.encode()) <= 6000:
@@ -871,6 +908,8 @@ class MemberProgress:
                                 "asserted":status != "runner_exit"}
                             if status != "runner_exit":
                                 self._failures.pop(suite_key, None)
+                                if obs.source == "run_browser":
+                                    self._browser_probes.pop(suite_key, None)
                         for case in cases:
                             self._failures.pop(_check_key(versioned, case), None)
                             # Pre-versioned checklists used only the runner and caption.
@@ -878,6 +917,8 @@ class MemberProgress:
                             legacy = _check_key(case_suite, case)
                             if source and self._starting.get(source[0]) == source[1] and legacy in self._restored_keys:
                                 self._failures.pop(legacy, None)
+                        if replay_of and full and status == "passed":
+                            self._review_evidence["pass:" + suite_key]["replayed_tool_call_id"] = replay_of
                         if run:
                             self._retire_revisions(case_suite, run)
                 elif obs.ok and not reading:
@@ -1060,6 +1101,7 @@ class MemberProgress:
             "complete_verification": dict(self._complete_verification),
             "script_exits": dict(self._script_exits),
             "observed_failure": list(dict.fromkeys(self._failures.values()))[-4:],
+            "replayable_browser_call_ids": list(self.browser_replays()),
             "stop_reason": self._stop,
             "prior_check_signals_before_edits": self._prior_passes,
             "executions": {"run_python_calls": self._executions, "run_shell_calls": self._shell_calls,
@@ -1089,6 +1131,9 @@ class MemberProgress:
             return (f"本次分工还需交付 {missing}。与分工起点一致的文件：{unchanged}。"
                     "请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。"
                     "已有文件可作输入，只有实际修改和检查才构成本轮交付证据。已观察记录：" + facts)
+        if self.browser_replays():
+            return ("原浏览器断言曾失败。修复后用 rerun_browser_check 引用 replayable_browser_call_ids 中的原调用 ID。"
+                    "重写脚本检查的是另一个范围。若原断言有误，请说明并交给独立成员复核。已观察记录：" + facts)
         if self._pending_verification and not self._failures:
             if self._pending_verification.keys() & self._script_exits.keys():
                 return ("已取得对应脚本当前版本的正常退出回执。请交接工件，由独立成员复验原始需求。"
