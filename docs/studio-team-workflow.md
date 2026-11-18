@@ -185,7 +185,15 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 同一成员恢复自己的完整草稿后，宿主比较先前与当前可归属的失败检查 ID。实际关闭原失败项可继续由该成员修复。若所有原失败仍未关闭，下一次请求继续修这个草稿就转入冻结候选的独立验收。组长能按角色职责指定评审者；组长再次点名作者时，宿主优先选择已有独立评审记录的已计划成员，再按原计划选择其他可用成员。原分工目标、验收期望、候选摘要和本次改派均写入回执。
 
-针对成员临时编写的内联断言，宿主在能够完整提供探针代码、原失败回执与错误节选时，为每条探针绑定一个必需的独立执行标准。评审者需在冻结文件上实际运行断言，说明原失败与复验结果。原作者的失败仍可查阅。未能完整提供的探针、项目中的测试文件和用户配置的硬性检查继续走原验收规则。实现沿用 LangGraph 的按状态选择下一节点与独立评估的工作流，用未关闭的检查身份作为转交条件。[LangGraph 条件边实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982-L1013) · [条件路由测试](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2948) · [独立评估工作流](https://docs.langchain.com/oss/python/langgraph/workflows-agents#evaluator-optimizer)
+针对成员临时编写的内联断言，宿主在能够完整提供探针代码、原失败回执与错误节选时，为每条探针绑定一个必需的独立执行标准。评审者需在冻结文件上实际运行断言，说明原失败与复验结果。原作者的失败仍可查阅。未能完整提供的探针、未经本成员改写的项目测试文件和用户配置的硬性检查继续走原验收规则。实现沿用 LangGraph 的按状态选择下一节点与独立评估的工作流，用未关闭的检查身份作为转交条件。[LangGraph 条件边实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982-L1013) · [条件路由测试](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2948) · [独立评估工作流](https://docs.langchain.com/oss/python/langgraph/workflows-agents#evaluator-optimizer)
+
+成员本轮通过写入工具实际改过的 Python 检查脚本，若直接执行得到完整的非零退出回执，但只有汇总、没有可归属的逐项结果，也可以成为上述独立复核的对象。宿主保存**失败当时**的完整源码、脚本路径和 SHA-256、原调用 ID、检查进程退出码及完整失败输出；原作者修复一次后仍未关闭的失败，才随冻结候选交给另一成员。每份源码至多 32 KiB、失败输出至多 8 KiB，交接总量至多 96 KiB。未由该成员编辑、输出截断、执行期间文件变化、没有原源码或真实非零退出的检查不进入这条路径。作者修改检查脚本后，即使相同命令实际退出 0 并打印 `PASS 200 / FAIL 0`，也不会自行核销原脚本失败；原检查字节不变、只修正产品后重跑通过，仍可关闭对应失败。独立成员须说明每项原失败，并提供当前冻结工件上的实际断言回执；只读文件、进程退出 0、删除检查或作者的汇总均不能代替它。用户配置的硬性验收继续单独执行。
+
+原检查证据按仍未解决的检查范围保留一份，重复失败不会替换原件；解决后释放。达到 16 个原文名额时保留先前证据，将未收录的范围与原调用明确列入 `undisclosed_failure_probes`。交接总量或内容校验导致无法转交的范围列入 `untransferred_failure_probes`。这些失败继续阻止发布，不会作为已复核项省略。
+
+运行证据 `failed_check_details` 显示原检查调用、步骤、工具外层退出码、检查进程退出码和错误节选。`scope_id` 与 `complete_verification` 的键是检查范围标识，文件摘要使用明确的 `sha256` 字段；不会要求模型猜测这些键或轮询不存在的异步进程。带 `subprocess` 和顶层断言的 `run_python` 是独立内联检查，内层退出 0 不掩盖外层 `AssertionError`。候选已经齐全、同一版本的其他检查重复通过而原失败仍未关闭时，成员收到定向的 `[BLOCKED]` 交接提示；新文件尚未交付或候选真实发生变化时，继续保留工作工具。该提示只改变移交时机，不批准成果，也不自动重放命令。
+
+这一补充参考 pytest 将 `nodeid`、`outcome`、异常 `longrepr` 和捕获输出分别保存的机制，尤其是 `TestReport.from_item_and_call` 对实际异常的判断；其回归确认异常在序列化后仍存在、导入包装错误不会盖住原始异常。Studio 使用既有工具身份和冻结候选，另外保存成员编辑过的脚本原文供第三方裁决；未复制上游代码或引入依赖。[pytest 8.3.5 的报告构造与异常分支](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py#L270-L403) · [异常保留与导入错误回归](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_reports.py#L390-L414) · [Studio 普通群入口的 191/9→200/0→独立裁决回归](../tests/test_private_candidate_review.py) · [步骤证据与停滞回归](../tests/test_crew_progress.py)
 
 ### 负责人结案时的独立验收回执
 

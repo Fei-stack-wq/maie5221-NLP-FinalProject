@@ -783,7 +783,7 @@ class RoomCrew:
                 continue
             probe = available[key]
             data = (probe["code"] + "\n" + probe["error"]).encode()
-            if total + len(data) > 18000:
+            if total + len(data) > 98304:
                 continue
             try:
                 validate_project_data("probe.txt", data, secret=self.settings.api_key, reject_credentials=True)
@@ -791,6 +791,11 @@ class RoomCrew:
                 continue
             probes[key] = probe
             total += len(data)
+        undisclosed = sorted(set(available).intersection(failed_checks).difference(probes))
+        if undisclosed:
+            # No missing source is silently treated as reviewed. These scopes
+            # stay in failed_checks and are restored as mandatory blockers.
+            evidence["untransferred_failure_probes"] = undisclosed
         if reviewable:
             report["reviewable_candidate"] = {"task_id": report["task_id"], "candidate_version": digest(manifest),
                                             "files_total": len(manifest)}
@@ -1125,6 +1130,7 @@ class RoomCrew:
                                     script_exits=dict(list(evidence["script_exits"].items())[-4:]),
                                     superseded_member_checks=evidence.get("superseded_member_checks", []),
                                     diagnostic_checks=evidence["diagnostic_checks"], pending_verification=evidence["pending_verification"],
+                                    failed_check_details=evidence["failed_check_details"],
                                     runs=[{k:v for k,v in run.items() if k != "output_tail"} for run in recent_runs])
                 if self.tracer:
                     self.tracer.event("member_work_checkpoint", root_id=self.run_id, parent_task_id=self.run_id,

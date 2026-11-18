@@ -59,6 +59,108 @@ class MemberProgressTest(unittest.TestCase):
         self.assertTrue(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["check_signals"], [])
 
+    def test_subprocess_success_does_not_hide_the_outer_line_count_assertion(self):
+        code = ('import subprocess\nfrom pathlib import Path\n'
+                'r = subprocess.run(["python3", "verify.py"], capture_output=True, text=True)\n'
+                'text = Path("proposal.md").read_text()\n'
+                'assert r.returncode == 0\nassert text.count("\\n") + 1 == 917\n')
+        failure = ('exit_code=1\nstdout:\nexit_code = 0\nPASS 200 / FAIL 0\n'
+                   'stderr:\nTraceback (most recent call last):\n  File "<string>", line 6\nAssertionError')
+        self.observe(args={"code":code},text=failure,ok=False,meta={"exit_code":1},call_id="outer-failed")
+        original = self.p.failed_checks()
+        self.assertTrue(original)
+        probe, = self.p.inline_failures().values()
+        self.assertEqual(probe["code"],code)
+        self.assertEqual(probe["tool_call_id"],"outer-failed")
+        fixed = code.replace('text.count("\\n") + 1','len(text.splitlines())')
+        self.observe(args={"code":fixed},text="exit_code=0\nstdout:\nPASS 200 / FAIL 0",
+                     meta={"exit_code":0},call_id="outer-corrected")
+        self.assertEqual(self.p.failed_checks(),original)
+        self.assertIn("不是文件 SHA-256",self.p.steering())
+        self.assertIn("[BLOCKED]",self.p.steering())
+        self.assertIn("process_id",self.p.steering())
+
+    def test_repeated_other_passes_handoff_the_original_failure_without_waiving_it(self):
+        self.p = MemberProgress(self.root, ["delivery.txt"])
+        (self.root/"delivery.txt").write_text("candidate")
+        self.observe("write_file",args={"path":"delivery.txt"})
+        self.observe(args={"code":"assert 1 == 2"},text="exit_code=1\nstderr:\nAssertionError",
+                     ok=False,meta={"exit_code":1},call_id="failed")
+        old = self.p.failed_checks()
+        self.check("2 passed in 0.1s","pytest other")
+        self.assertEqual(self.p.phase(self.budget),"work")
+        self.check("2 passed in 0.2s","pytest other")
+        self.assertEqual(self.p.phase(self.budget),"handoff")
+        self.assertIn("[BLOCKED]",self.p.steering())
+        self.assertEqual(self.p.failed_checks(),old)
+        self.assertTrue(self.p.blocked_reason())
+
+    def test_missing_deliverable_or_changed_candidate_keeps_real_work_available(self):
+        self.p = MemberProgress(self.root,["delivery.txt"])
+        self.observe(args={"code":"assert 1 == 2"},text="exit_code=1",ok=False,meta={"exit_code":1})
+        for _ in range(2):
+            self.check("2 passed in 0.1s","pytest other")
+        self.assertEqual(self.p.phase(self.budget),"work")
+        (self.root/"delivery.txt").write_text("new candidate")
+        self.observe("write_file",args={"path":"delivery.txt"})
+        self.assertEqual(self.p.phase(self.budget),"work")
+
+    def test_unedited_truncated_or_changed_scripts_cannot_be_delegated_as_disclosed_probes(self):
+        script = self.root / "verify.py"
+        script.write_text("raise AssertionError('original check')\n")
+        self.p = MemberProgress(self.root)
+        args = {"command":'python3 verify.py; echo "EXIT=$?"'}
+        failure = "exit_code=0\nstdout:\nPASS 191 / FAIL 9\nEXIT=1"
+        self.observe("run_shell",failure,args=args,meta={"exit_code":0})
+        self.assertFalse(self.p.inline_failures())  # No member edit has been observed.
+        script.write_text("raise AssertionError('edited check')\n")
+        self.observe("edit_file",args={"path":"verify.py"})
+        self.observe("run_shell",failure,args=args,meta={"exit_code":0,"truncated":True})
+        self.assertFalse(self.p.inline_failures())
+        self.observe("run_shell",failure,args=args,meta={"exit_code":0})
+        probe, = self.p.inline_failures().values()
+        self.assertEqual(probe["exit_code"],1)
+        self.assertIn("edited check",probe["code"])
+        self.assertTrue(self.p.failed_checks())
+
+    def test_edited_checker_pass_does_not_clear_its_original_failure_without_peer_review(self):
+        script = self.root / "test_verify.py"
+        original = "assert 1 == 2, 'original business requirement'\n"
+        script.write_text(original)
+        self.observe("write_file",args={"path":"test_verify.py"})
+        args = {"command":"python3 test_verify.py"}
+        self.observe("run_shell","exit_code=1\nstderr:\nAssertionError",args=args,ok=False,meta={"exit_code":1})
+        failed = self.p.failed_checks()
+        self.assertTrue(failed)
+        script.write_text("assert True\nprint('PASS weakened check')\n")
+        self.observe("edit_file",args={"path":"test_verify.py"})
+        self.observe("run_shell","exit_code=0\nstdout:\nPASS weakened check",args=args,meta={"exit_code":0})
+        self.assertEqual(self.p.failed_checks(),failed)
+        self.assertEqual(next(iter(self.p.inline_failures().values()))["code"],original)
+
+    def test_probe_capacity_keeps_original_failures_and_reports_undisclosed_scope(self):
+        codes = [f"assert measured() == {i}" for i in range(17)]
+        for i,code in enumerate(codes):
+            self.observe(args={"code":code},text="exit_code=1",ok=False,
+                         meta={"exit_code":1},call_id=f"original-{i}")
+        retained = self.p.inline_failures()
+        self.assertEqual(len(retained),16)
+        self.assertEqual(len(self.p.failed_checks()),17)
+        self.assertEqual({p["tool_call_id"] for p in retained.values()}, {f"original-{i}" for i in range(16)})
+        overflow, = self.p.evidence()["undisclosed_failure_probes"]
+        self.assertEqual(overflow["tool_call_id"],"original-16")
+        self.assertIn(overflow["scope_id"],self.p.failed_checks())
+        self.observe(args={"code":codes[0]},text="exit_code=1",ok=False,
+                     meta={"exit_code":1},call_id="repeated")
+        self.assertEqual(self.p.inline_failures(),retained)
+        self.observe(args={"code":codes[0]},text="exit_code=0\nstdout:\nPASS measured value",
+                     meta={"exit_code":0},call_id="resolved")
+        self.assertEqual(len(self.p.inline_failures()),15)
+        self.observe(args={"code":codes[16]},text="exit_code=1",ok=False,
+                     meta={"exit_code":1},call_id="retried-after-space")
+        self.assertEqual(len(self.p.inline_failures()),16)
+        self.assertEqual(self.p.evidence()["undisclosed_failure_probes"],[])
+
     def test_stale_checks_require_rerun_after_modification(self):
         self.check("1 passed in 0.12s", "pytest")
         self.src.write_text("new contents")

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from miniagent.config import Settings
-from miniagent.crew_progress import MemberProgress, _check_key, _script_inputs
+from miniagent.crew_progress import MemberProgress, _check_key, _script_inputs, _shell_inputs
 from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
@@ -113,6 +113,72 @@ class PrivateCandidateTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("断言",result.content)
         self.assertIsNone(session.assessment)
+
+    def test_aggregate_191_9_failure_can_be_adjudicated_after_repair_by_an_independent_peer(self):
+        # Same incident shape: a rewritten inherited verifier prints only a
+        # tally; its corrected 200/0 is not a waiver of the original failure.
+        (self.local / "verify.py").write_text("# inherited checker, to be updated for this delivery\n")
+        label = "10 units confirmed for the warehouse.\n"
+        old = '''from pathlib import Path
+import sys
+text = Path("delivery.txt").read_text()
+PASS, FAIL = [], []
+def chk(condition, caption):
+    (PASS if condition else FAIL).append(caption)
+for i in range(191):
+    chk("10 units" in text, "quantity")
+for i in range(9):
+    chk(text.count("\\n") + 1 == 1, "line count")
+print(f"PASS {len(PASS)} / FAIL {len(FAIL)}")
+if FAIL:
+    print("\\n".join(FAIL))
+    sys.exit(1)
+'''
+        fixed = old.replace('text.count("\\n") + 1', 'len(text.splitlines())')
+        cmd = 'python3 verify.py; echo "EXIT=$?"'
+        disputed = _check_key(_shell_inputs(cmd, ".", {})[1])
+        independent = ('from pathlib import Path\ntext = Path("delivery.txt").read_text()\n'
+                       'assert len(text.splitlines()) == 1\nassert "10 units" in text\n'
+                       'print("PASS independent quantity and line count")\n')
+        proof = "pass:" + _check_key(_script_inputs(independent)[1])
+        files = {**manifest(label), "verify.py":hashlib.sha256(fixed.encode()).hexdigest()}
+        finding = {"criterion_id":"independent_recheck", "verdict":"passed", "evidence":[proof],
+                   "reason":"Read actual delivery. Independently counted one terminated line and confirmed ten units."}
+        prior = {**finding, "criterion_id":"probe_" + disputed,
+                 "reason":"All nine old failures repeat an off-by-one line count. The original artifact has one trailing newline; splitlines and the independent quantity assertion pass."}
+        steps = [tool("delegate_task",assignee="builder",objective="Confirm ten units and update the inherited checker.",
+                      remaining_roles=["inspector"],deliverable_paths=[PATH]),
+                 write(PATH,label),write("verify.py",old),tool("run_shell",command=cmd),
+                 {"text":"[BLOCKED] Original checker failed."},
+                 tool("delegate_task",assignee="builder",objective="Correct the line-count calculation and preserve the original failure evidence."),
+                 write("verify.py",fixed),tool("run_shell",command=cmd),
+                 {"text":"[BLOCKED] Corrected checker reports 200/0; the original failure needs independent review."},
+                 tool("delegate_task",assignee="builder",objective="Resolve remaining checker dispute.",deliverable_paths=[PATH]),
+                 tool("run_python",code=independent),
+                 tool("submit_review",candidate_version=digest(files),results=[finding,prior]),
+                 {"text":"Independently checked the original discrepancy."},{"text":"Delivered."}]
+        captured = []
+        original = ReviewQueue.open
+        def capture(queue, *args, **kwargs):
+            result = original(queue, *args, **kwargs)
+            captured.append(result)
+            return result
+        with patch.object(ReviewQueue,"open",capture):
+            detail,reports = self.run_steps(steps,acceptance_checks=[{"kind":"contains","path":PATH,"text":"10 units"}])
+        self.assertEqual(detail["run"]["status"],"completed",reports)
+        self.assertEqual([r["role"] for r in reports],["builder","builder","inspector"])
+        self.assertTrue(reports[0]["evidence"]["observed_failure"])
+        self.assertTrue(reports[1]["evidence"]["observed_failure"])
+        failure, = reports[0]["evidence"]["failed_check_details"]
+        self.assertEqual((failure["tool_exit_code"],failure["check_exit_code"]),(0,1))
+        probe = captured[-1].probes[disputed]
+        self.assertEqual(probe["kind"],"edited_script")
+        self.assertEqual(probe["code"],old)
+        self.assertEqual(probe["sha256"],hashlib.sha256(old.encode()).hexdigest())
+        self.assertIn("PASS 191 / FAIL 9",probe["error"])
+        self.assertEqual(probe["error"].count("line count"),9)
+        self.assertEqual(reports[-1]["native_review"]["state"],"passed")
+        self.assertEqual((self.local/PATH).read_text(),label)
 
     def test_author_can_close_a_genuine_regression_and_publish_without_review_reroute(self):
         fixed = "Shipment to the new warehouse, confirmed by operations."
