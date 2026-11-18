@@ -28,9 +28,10 @@
 
 不需要 API key 也能跑完整链路（内置 ScriptedProvider）。
 
-测试包准备、三组四角色的连续任务入口和本轮验证记录见 [测试包核查与交接](docs/testpack-readiness.md)。
+测试包当前完成情况、A/B/C 分工及剩余事项先看 [2026-11-19 交接 checklist](docs/testpack-checklist.md)。
+本修复分支的三组四角色入口和 815 项回归记录见 [测试包核查与交接](docs/testpack-readiness.md)。
 `python -m miniagent.testpack check` 可离线核对草案；`python -m scripts.run_testpack_smoke --output runs/smoke-1`
-可在 Linux/macOS 保存六轮离线协作证据。它们不代表原始 Mid_Test 六题或真实模型已验收。
+可在 Linux/macOS 保存六轮离线协作证据。它们不代表原始 Mid_Test 六题或真实模型已验收；主分支另有原题 4/6 通过的报告，版本与证据边界见上述 checklist。
 
 ---
 
