@@ -159,6 +159,11 @@ function ruleFields(value='') {
   placeholder='[{"kind":"contains","path":"report.md","text":"调查方法"}]'>${e(value)}</textarea>
   <small>JSON 数组支持 contains、sha256、json_equals。留空时可在交付后人工评审。</small></label>`;
 }
+function sourceReviewField(value='', enabled=true) {
+ return `<label class="field-label" ${enabled?'':'hidden'}>需要独立核查来源的文件（选填）
+  <input name="required_source_review_paths" value="${e(value)}" ${enabled?'':'disabled'} placeholder="例如 report.md">
+  <small>群内至少需要三人。由另一位成员打开原始来源核查最终版本，多个路径用逗号分隔。</small></label>`;
+}
 function childFields(value='', group=true) {
  return `<label class="field-label">子任务检查（按${group?'角色 ID':'规划 ID'}）<textarea name="child_checks" rows="2"
   placeholder='{"qa":{"files":["assessment.md"],"checks":[]}}'>${e(value)}</textarea></label>`;
@@ -194,6 +199,11 @@ function syncIntent(form) {
  field.disabled = form.elements.intent.value === 'question';
  field.closest('label').hidden = field.disabled;
  if (form.elements.dispatch) form.elements.dispatch.disabled=field.disabled;
+ const source = form.elements.required_source_review_paths;
+ if (source) {
+  source.disabled = field.disabled || form.elements.dispatch?.value!=='team';
+  source.closest('label').hidden = source.disabled;
+ }
  if (form.elements.acceptance_checks) form.elements.acceptance_checks.disabled=field.disabled;
 }
 
@@ -508,7 +518,7 @@ function conversationComposer(thread,run) {
          return `<option value="${e(key)}" ${draft.base===key?'selected':''}>成员草稿 · ${e(roleLabel(c.role))} · ${e(c.objective)} (${e(c.task_id.slice(-8))})</option>`;
        }).join('')}
        <option value="empty" ${draft.base==='empty'?'selected':''}>新任务，使用空工作区</option></select></label>
-       ${ruleFields(draft.rules||'')}${thread.kind==='group' && (draft.dispatch||last?.mode)==='team'?childFields(draft.children):''}`:''}
+       ${ruleFields(draft.rules||'')}${thread.kind==='group'?sourceReviewField(draft.sourcePaths,(draft.dispatch||last?.mode)==='team'):''}${thread.kind==='group' && (draft.dispatch||last?.mode)==='team'?childFields(draft.children):''}`:''}
      ${limitFields(false,draft.limits || run.limits || {})}</details>
     <div class="reply-footer"><span class="muted-note">${hasProvider ? (intent === 'question' ? '仅查询项目文件与对话记录。' : '基于最近可用的项目版本修改，旧版可随时查看。') : '继续对话需要配置本机 DeepSeek API key。'}</span>
      <button type="submit" class="primary" ${!hasProvider || status ? 'disabled' : ''}>${status ? '正在发送…' : '发送'}${icon('arrow')}</button></div>
@@ -546,6 +556,7 @@ function conversationPanel(detail) {
 function rememberReply(form) {
  const fields = form.elements;
  const draft = {message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
+  sourcePaths:fields.required_source_review_paths?.value ?? chatDrafts.get(form.dataset.thread)?.sourcePaths,
   rules:fields.acceptance_checks?.value,children:fields.child_checks?.value,base:fields.base?.value,dispatch:fields.dispatch?.value,
   limits:Object.fromEntries(runLimitFields.map(k=>[k.name, Number(fields[k.name].value)]))};
  chatDrafts.set(form.dataset.thread,draft);
@@ -566,6 +577,7 @@ async function sendReply(form) {
  }};
  if (draft.intent === 'edit') {
   payload.acceptance_files = parseFiles(draft.files);
+  if (payload.mode==='team' && draft.sourcePaths?.trim()) payload.required_source_review_paths=parseFiles(draft.sourcePaths);
   if (draft.base==='failed') payload.conversation.recover_failed=true;
   if (draft.base?.startsWith('checkpoint:')) {
    payload.conversation.recover_failed=true;
@@ -643,6 +655,7 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
      <option value="enabled" ${state.config?.thinking==='enabled'?'selected':''}>开启</option></select></label>
    ${(chat||mode==='team') ? '<label class="field-label">本轮验收文件（选填）<input name="acceptance_files" placeholder="例如 snake/index.html, snake/game.js"><small>填写工作区相对路径，多个文件用逗号分隔。</small></label>' : ''}
    ${!demo?ruleFields():''}
+   ${mode==='group'?sourceReviewField():''}
    ${mode==='team'||mode==='group'?childFields('',mode==='group'):''}
    ${limitFields(demo)}
   </div>
@@ -820,6 +833,9 @@ async function submit(form) {
  }
  if ((chat||mode==='team') && fields.get('intent')!=='question') {
   payload.acceptance_files=parseFiles(fields.get('acceptance_files'));
+  if (payload.mode==='team' && fields.get('required_source_review_paths')?.trim()) {
+   payload.required_source_review_paths=parseFiles(fields.get('required_source_review_paths'));
+  }
   try {
    if (fields.get('acceptance_checks')?.trim()) payload.acceptance_checks=readRules(fields.get('acceptance_checks'));
    if (payload.mode==='team' && fields.get('child_checks')?.trim()) payload.child_checks=JSON.parse(fields.get('child_checks'));
@@ -870,7 +886,7 @@ document.addEventListener('change',event=>{const form=event.target.closest('form
  if(form?.matches('.role-editor') && event.target.name==='scope'){
   form.querySelector('[data-project-choice]').hidden=event.target.value!=='project';return;
  }
- if(form?.matches('.reply-form')){rememberReply(form);if(event.target.name==='intent'||event.target.name==='dispatch')render();return;}if(event.target.name==='member')updateMemberPicker(form);if(event.target.name==='intent')syncIntent(form);if(event.target.name==='mode')swapMode(event.target.closest('form'),event.target.value);if(event.target.id==='run-filter'){state.filter=event.target.value;patchHTML($('#all-runs'),runList());}if(event.target.id==='log-filter'){state.logFilter=event.target.value;render();}});
+ if(form?.matches('.reply-form')){rememberReply(form);if(event.target.name==='intent'||event.target.name==='dispatch')render();return;}if(event.target.name==='member')updateMemberPicker(form);if(event.target.name==='intent'||event.target.name==='dispatch')syncIntent(form);if(event.target.name==='mode')swapMode(event.target.closest('form'),event.target.value);if(event.target.id==='run-filter'){state.filter=event.target.value;patchHTML($('#all-runs'),runList());}if(event.target.id==='log-filter'){state.logFilter=event.target.value;render();}});
 document.addEventListener('input',event=>{const reply=event.target.closest('.reply-form');if(reply)rememberReply(reply);if(event.target.id==='run-search'){state.search=event.target.value;patchHTML($('#all-runs'),runList());}});
 document.addEventListener('toggle',event=>{if(event.target.matches?.('[data-log]')){const key=event.target.dataset.log;if(event.target.open)state.logOpen.add(key);else state.logOpen.delete(key);}},true);
 document.addEventListener('click',event=>{

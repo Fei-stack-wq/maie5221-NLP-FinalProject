@@ -3,6 +3,29 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const { withFixture } = require('./browser_fixture.cjs');
 
+// Exercise the actual form and JSON request without consuming the scripted
+// provider responses reserved for the full conversation below.
+async function checkSourceReviewRequest(page, url, form, requests) {
+  const field = form.locator('[name="required_source_review_paths"]');
+  await field.fill('findings.md, brief.html');
+  const endpoint = url + 'api/runs';
+  const intercept = async route => {
+    if (route.request().method() === 'POST') {
+      await route.fulfill({ status: 422, json: {error: 'Source review form inspected'} });
+    } else {
+      await route.fallback();
+    }
+  };
+  await page.route(endpoint, intercept);
+  try {
+    await form.getByRole('button', {name:'发送'}).click();
+    await form.getByText('Source review form inspected').waitFor();
+    assert.deepEqual(requests.pop().required_source_review_paths, ['findings.md', 'brief.html']);
+  } finally {
+    await page.unroute(endpoint, intercept);
+  }
+}
+
 async function room(page, url) {
   const requests = [];
   const errors = [];
@@ -29,6 +52,7 @@ async function room(page, url) {
   assert.equal(await form.locator('[name="workspace_path"]').inputValue(), project);
   for (const member of await form.locator('[name="member"]').all()) await member.setChecked(false);
   await form.locator('[name="member"][value="reviewer"]').check();
+  await form.locator('[name="member"][value="worker"]').check();
   await form.locator('[name="member"][value="lead"]').check();
   await form.locator('[name="recipient"]').selectOption('lead');
   assert.equal(await form.locator('[name="dispatch"]').inputValue(), 'team');
@@ -38,6 +62,8 @@ async function room(page, url) {
   await form.locator('[name="max_steps"]').fill('37');
   await form.locator('[name="max_total_tokens"]').fill('1000000');
   await form.locator('[name="objective"]').fill('请协作写一份模拟说明。');
+  await checkSourceReviewRequest(page, url, form, requests);
+  await form.locator('[name="required_source_review_paths"]').fill('');
   await form.getByRole('button', {name:'发送'}).click();
   const human = page.locator('.human-form');
   await human.locator('textarea').fill('两年');
@@ -46,7 +72,7 @@ async function room(page, url) {
   await reply.locator('textarea[name="message"]').fill('接着未完成的文件修订。');
   assert.equal(requests[0].mode, 'team');
   assert.equal(requests[0].workspace_path, project);
-  assert.deepEqual(requests[0].conversation.members.sort(), ['lead','reviewer']);
+  assert.deepEqual(requests[0].conversation.members.sort(), ['lead','reviewer','worker']);
   assert.equal(requests[0].conversation.profiles, undefined);
   const detail=await (await page.request.get(url+'api/runs/'+new URL(page.url()).hash.split('/')[1])).json();
   assert.equal(detail.conversation.profiles.find(p=>p.id==='lead').prompt, '负责协调并委派独立评审。');
@@ -58,7 +84,10 @@ async function room(page, url) {
   await reply.getByRole('button',{name:'不限轮数'}).click();
   await reply.getByRole('button',{name:'不限累计 token'}).click();
   await reply.locator('[name="acceptance_files"]').fill('working.md');
+  await reply.locator('[name="message"]').fill('请继续修订。');
+  await checkSourceReviewRequest(page, url, reply, requests);
   await reply.locator('[name="dispatch"]').selectOption('single');
+  assert.equal(await reply.locator('[name="required_source_review_paths"]').isVisible(), false);
   assert.equal(await reply.locator('[name="base"]').inputValue(), 'failed');
   assert.equal(await reply.locator('[name="max_total_tokens"]').inputValue(), '0');
   const created = page.waitForResponse(r => r.url() === url + 'api/runs' && r.request().method() === 'POST');
@@ -69,6 +98,7 @@ async function room(page, url) {
   await page.waitForURL('**/#run/' + latest + '/chat');
   await page.getByText('已接续并完成修订。').waitFor();
   assert.equal(requests[1].mode, 'single');
+  assert.equal(requests[1].required_source_review_paths, undefined);
   assert.equal(requests[1].limits.max_steps, 0);
   assert.equal(requests[1].limits.max_total_tokens, 0);
   assert.equal(requests[1].conversation.recover_failed, true);

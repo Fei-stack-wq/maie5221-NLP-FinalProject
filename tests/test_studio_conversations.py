@@ -165,6 +165,26 @@ class ConversationTest(unittest.TestCase):
         workspace = self.runs / question["run"]["id"] / "context/project/snake/game.js"
         self.assertIn("speed = 2", workspace.read_text())
 
+    def test_unsupported_snapshot_error_redacts_sensitive_relative_names(self):
+        parent = self.seed()
+        workspace = self.runs / parent / "agents/worker"
+        credential = "sk-" + "z" * 36
+        for name in [credential + ".pdf", "studio-test-sentinel.pdf", "secret-input.pdf", "bad\nname.pdf"]:
+            with self.subTest(name=name[:3]):
+                path = workspace/name
+                path.write_bytes(b"%PDF-1.4")
+                try:
+                    with self.assertRaises(StudioError) as rejected:
+                        self.service.start(msg("Continue work.",reply(parent)))
+                    message = str(rejected.exception)
+                    self.assertEqual(rejected.exception.code,"unsupported_snapshot")
+                    self.assertIn("文件名已隐藏",message)
+                    self.assertNotIn(name,message)
+                    self.assertNotIn(credential,message)
+                    self.assertNotIn(str(workspace),message)
+                finally:
+                    path.unlink()
+
     def test_snapshot_error_does_not_publish_partial_run_or_call_provider(self):
         parent = self.seed()
         workspace = self.runs / parent / "agents/worker"

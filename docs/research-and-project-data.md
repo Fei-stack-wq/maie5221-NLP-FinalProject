@@ -31,3 +31,11 @@ HTML 提取同时返回可见正文和可追踪链接。工具会在来源记录
 这个判断借鉴 FEVER 区分支持、反驳与证据不足的标注方法。新闻组曾从一份公告没有列出课程细节，推断学校从未公布细节。遇到此类主张，核查员应比对有发布职责的目录或政策页，主张的范围应限定在实际查阅的资料内。真实回执能证明打开过来源，来源是否支持稿件中的结论由核查员判断。[FEVER 原论文](https://aclanthology.org/N18-1074/)
 
 公开文本允许引用平台自身完整的任务标识。校方新闻返工时，原检测器曾将任务号后半段误报为密钥，导致事实核查虽已通过却无法交接。字符串脱敏借鉴 Gitleaks 对完整标记边界的区分，本项目仅对通用文本检测排除准确的 Studio 任务号，仍对原始字节检查当前服务密钥。[Gitleaks 标记边界与用例](https://github.com/gitleaks/gitleaks/blob/v8.24.2/cmd/generate/config/utils/generate.go)
+
+### 研究资料的临时文件和交接
+
+研究员可直接用 `http_get` 查阅公开 PDF，`pdf_page` 可定位到具体页面。工具用系统临时文件解析原件，并将出处、采集时间、观察到的字节摘要和正文写入项目中的 `sources/*.json`。手动处理二进制来源时，可在单次 Python 调用中用 `tempfile.TemporaryDirectory()` 保存自行下载的临时副本，再把需要交接的摘录与来源记录留在项目里。
+
+若普通成员提交时，项目内仍有不支持的格式，宿主会在当前草稿中提示可安全显示的相对路径。成员可以移出自行下载的临时副本并再次交接。用户要求交付原件时，应保留原文件并报告格式限制。包含凭据或控制字符的路径会隐藏。正式发布仍会在子进程收尾后校验完整快照。
+
+Pi 的输出文件实现将工作目录内的工件与工具的系统临时文件分开，临时文件独占创建且权限为 0600，其回归覆盖完成与取消两种状态。Studio 沿用现有的 Python 临时文件和来源记录机制。[Pi 临时文件实现](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/utils/output-files.ts#L1-L34) · [Pi 临时工件回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/bash-executor-truncation.test.ts#L6-L45)

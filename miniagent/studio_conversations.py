@@ -137,11 +137,39 @@ class SnapshotError(ValueError):
     """Only a complete, validated set of supported project files may be used."""
 
 
+class UnsupportedProjectFile(SnapshotError):
+    """Regular file that the current project format cannot publish."""
+
+
+def snapshot_location(relative: Path, secret: str) -> str:
+    """Only quote bounded, printable project-relative names without credential material."""
+    value = relative.as_posix()
+    if (relative.is_absolute() or ".." in relative.parts or len(value) > 240 or not value.isprintable() or not re.fullmatch(r"[\w ./()（）-]+", value)
+            or re.search(r"(?i)(?:password|passwd|secret|token|api[_-]?key|private[_-]?key)", value)):
+        return "（文件名已隐藏）"
+    try:
+        validate_project_data("path.txt", value.encode(), secret=secret, reject_credentials=True)
+    except (ValueError, UnicodeError):
+        return "（文件名已隐藏）"
+    return "「" + value + "」"
+
+
 def copy_project(source: Path, recipient: str, target: Path | None, extensions: set[str], *,
                  secret: str = "", manifest: dict | None = None) -> None:
     """Validate every file. Optionally copy to private staging or record its digest."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     total_bytes, entries = 0, 0
+    unsupported = []
+
+    def unsupported_error():
+        # Prefer shorter paths so a deep cache tree cannot hide a top-level
+        # deliverable. Only a bounded list enters a tool reply.
+        paths = sorted(unsupported, key=lambda p: (len(p.parts), p.as_posix()))
+        listed = "、".join(snapshot_location(p, secret) for p in paths[:12])
+        remaining = f"（另有 {len(paths) - 12} 项）" if len(paths) > 12 else ""
+        return UnsupportedProjectFile("项目含尚不支持交接的文件类型" + listed + remaining
+                                      + "。公开资料可用 http_get 保留文本来源；本轮自行产生的原始下载和工具缓存可移至"
+                                      "项目外的系统临时目录。若原件本身是约定交付，请保留并报告格式限制。")
 
     def visit(directory: int, relative: Path, depth: int) -> None:
         nonlocal total_bytes, entries
@@ -153,8 +181,10 @@ def copy_project(source: Path, recipient: str, target: Path | None, extensions: 
             for child in children:
                 if child.name.startswith(".") or (child.name in PROJECT_CACHE_DIRS and child.is_dir(follow_symlinks=False)):
                     continue
+                name = relative / child.name
                 if child.name.lower().endswith(SQLITE_SIDECARS):
-                    raise SnapshotError("数据库仍有日志文件，请关闭数据库并完成 checkpoint 后交接。")
+                    raise SnapshotError("数据库仍有日志文件" + snapshot_location(name, secret)
+                                        + "，请关闭数据库并完成 checkpoint 后交接。")
                 entries += 1
                 if entries > 1000:
                     raise SnapshotError("项目快照超过 1000 个目录项。")
@@ -166,27 +196,34 @@ def copy_project(source: Path, recipient: str, target: Path | None, extensions: 
                     finally:
                         os.close(fd)
                     continue
-                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or not supported_project_file(child.name, extensions)):
-                    raise SnapshotError("项目含尚不支持交接的文件类型或链接，无法完整载入。")
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise SnapshotError("项目含尚不支持交接的链接或特殊文件" + snapshot_location(name, secret)
+                                        + "。请核实项目中的该项，交接需要普通文件。")
+                if not supported_project_file(child.name, extensions):
+                    # A single research download can leave several cache files.
+                    # Collect every blocking name under the existing entry limit
+                    # so one repair can address them together. Never copy them.
+                    unsupported.append(name)
+                    if target is not None or manifest is not None:
+                        raise unsupported_error()
+                    continue
                 fd = os.open(child.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
                 with os.fdopen(fd, "rb") as stream:
                     opened = os.fstat(stream.fileno())
                     if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or not os.path.samestat(opened, info):
-                        raise SnapshotError("读取项目时文件已变化。")
+                        raise SnapshotError("读取项目时文件已变化" + snapshot_location(name, secret) + "。")
                     size_limit = min(8 * 1024 ** 2, 20 * 1024 ** 2 - total_bytes)
                     if opened.st_size > size_limit:
-                        raise SnapshotError("项目快照超过单文件 8 MiB 或总量 20 MiB。")
+                        raise SnapshotError("项目快照超过单文件 8 MiB 或总量 20 MiB，当前文件" + snapshot_location(name, secret) + "。")
                     data = stream.read(size_limit + 1)
                     after = os.fstat(stream.fileno())
                     if (len(data) != opened.st_size or after.st_size != opened.st_size
                             or after.st_mtime_ns != opened.st_mtime_ns):
-                        raise SnapshotError("读取项目时文件已变化。")
+                        raise SnapshotError("读取项目时文件已变化" + snapshot_location(name, secret) + "。")
                 try:
                     validate_project_data(child.name, data, secret=secret, reject_credentials=True)
                 except ValueError as exc:
-                    raise SnapshotError(str(exc)) from None
-                name = relative / child.name
+                    raise SnapshotError(str(exc) + snapshot_location(name, secret)) from None
                 if target is not None:
                     (target / name).write_bytes(data)
                 if manifest is not None:
@@ -199,6 +236,8 @@ def copy_project(source: Path, recipient: str, target: Path | None, extensions: 
         for name in ("agents", recipient):
             descriptors.append(os.open(name, flags, dir_fd=descriptors[-1]))
         visit(descriptors[-1], Path(), 0)
+        if unsupported:
+            raise unsupported_error()
     except OSError as exc:
         raise SnapshotError("读取原项目失败，无权读取的文件或链接无法交接。") from exc
     finally:

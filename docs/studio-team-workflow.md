@@ -188,3 +188,7 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 若负责人依然回复 `[BLOCKED]`，在既有预算内给予一次纯文字核对机会，并在 `reviewed_delivery_blocked` 事件保存依据及处置结果。模型指出的独立验收以外的阻塞仍可成立，二次报告阻塞将原样结束任务。缺文件、显式验收未过、待答业务问题、未出版或已改变的候选都无法触发这种核对。最终交付继续经过 Studio 原有工作区和验收流程。
 
 此机制参考 Pydantic AI 将输出验证错误交还模型、在重试上限后保留失败的处理。本项目自行实现了基于同群发布版本和用户交付文件的资格判定，并使用原有预算和审计轨迹。[Pydantic AI 输出验证与反馈](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/pydantic_ai_slim/pydantic_ai/_output.py#L222) · [Pydantic AI 重试上限测试](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/tests/test_agent.py#L14684)
+
+成稿来源核查复用了现有 `ReviewSession`。每份指定交付的路径及 SHA-256 须出现在当轮独立评审者提交的必需 source 结论中，并与当轮亲自打开的原始来源一起引用。稿件版本变化即重新进入评审。以校规与论文为例，评审人需对照正式规定、建议、反证、研究样本和受限的适用范围。路径及哈希绑定借鉴 in-toto 对跨步骤材料与产物的匹配；本系统使用 Studio 宿主保存的文件读取及来源回执来识别评审角色，没有使用上游的外部签名基础设施。[in-toto 工件匹配实现](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L645) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549)
+
+在网页新建群聊时打开「选项」，或在群内继续对话时打开「本轮选项与预算」。在「需要独立核查来源的文件」中填写最终稿相对路径。选择「由负责人分工」，群内至少需要负责人、作者和另一位核查成员。

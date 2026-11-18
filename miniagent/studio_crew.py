@@ -25,7 +25,7 @@ from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, pol
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
 from .studio_reviews import ReviewQueue, ReviewSession, digest
-from .studio_conversations import SnapshotError, copy_project, member_profiles
+from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
 
@@ -116,7 +116,14 @@ class RoomCrew:
         self.check_delivery = build_checks(self.delivery.get("files", []), self.delivery.get("checks", []))
         self.delivery_issue = ""
         self.pending_check_reviews = {}
-        self.native_reviews = ReviewQueue()
+        self.native_reviews = ReviewQueue(self.delivery.get("required_source_review_paths", []))
+        if self.native_reviews.required_source_paths and thread.get("inherit_files", True):
+            for turn in history:
+                events = self.room_events(turn["run_id"]) if turn.get("events_truncated") else turn.get("events", [])
+                for event in events:
+                    if event.get("kind") == "member_report" and event.get("published"):
+                        handoff = event.get("handoff", {})
+                        self.native_reviews.record_author(handoff.get("role"), handoff.get("changed_files", []))
         self.approved_roles = set()
         self.planned = None
         self.plan_order = []
@@ -174,6 +181,10 @@ class RoomCrew:
                 "开始委派前可核实公开项目中影响选人和分工的必要细节。收到成功交接后根据公开报告安排后续工作。"
                 "工具回执中的调用次数只表示已经执行的次数。查询平台工具配置属于 runtime_capability。"
                 "仅当用户掌握的业务需求、偏好、数据或权限确实缺失时 ask_human，并说明 decision_kind。"
+                + ("\n用户要求独立核查指定成稿。作者的 deliverable_paths 列出最终文件；成稿交接后委派另一成员，"
+                 "用 delegate_task.review 引用作者的最新候选，列出必需的 source 标准。逐条核对重要主张，主动找反证；"
+                 "区分正式规则和建议，注明研究样本与结论适用范围。核对笔记或旧版本不能代替对成稿的评审。"
+                 if self.native_reviews.required_source_paths else "") +
                 "\n用户指定的最终验收：" + _json(self.delivery) +
                 "\n用户指定的成员验收：" + _json(self.child_checks))
 
@@ -443,6 +454,9 @@ class RoomCrew:
         if landmarks:
             facts["public_source_locations"] = landmarks
         return ("你在本地项目副本中完成当前分工。可用工具以本轮接口为准。"
+                "查阅公开网页或 PDF 请先用 http_get（可选 pdf_page），正式文本来源保存在项目的 sources/*.json。"
+                "手动下载供解析的原始 PDF、压缩包及工具缓存须放在项目外的系统临时目录，"
+                "例如在同一次 run_python 调用中使用 tempfile.TemporaryDirectory()。项目中保留交付物和来源记录。"
                 "当前分工来自群负责人。如果分工指定的测试方法与验证要求冲突，向负责人交接冲突和证据；用户只决定业务偏好或外部授权。"
                 "请按实际文件和测试结果交接成果与限制，仍有阻塞时以 [BLOCKED] 说明原因。"
                 "\n当前分工资料：" + _json(facts) + "\n本轮真实用户答复：" + _json(current)
@@ -627,6 +641,15 @@ class RoomCrew:
         if self.pending_check_reviews:
             return ("成员的测试修订或未完成检查仍需另一位成员独立复核。请委派他人按用户需求检查并报告："
                     + "、".join(self.pending_check_reviews))
+        if queue and queue.required_source_paths:
+            missing = queue.missing_source_reviews()
+            if missing:
+                candidates = {p: next((task for task, files in reversed(queue.candidates.items())
+                                      if files.get(p) and files[p] == queue.public_versions.get(p)), None)
+                              for p in missing}
+                return ("指定成稿当前版本缺少独立来源核查（文件及可引用的候选任务）：" + _json(candidates) +
+                        "。有候选时委派非作者，以 delegate_task.review 的必需 source 标准核对成稿及原始来源；"
+                        "没有候选时先让作者交接，deliverable_paths 列出该文件。")
         return None
 
     def _observation(self, ok, text):
@@ -849,9 +872,12 @@ class RoomCrew:
             paths = sorted({_relative_name(path) for path in requested_paths})
         except ValueError:
             return self._observation(False, "deliverable_paths 中有无效的相对路径。")
-        if any(not supported_project_file(p, self.extensions) or any(s.startswith(".") for s in p.split("/"))
-               or any(s in PROJECT_CACHE_DIRS for s in Path(p).parts[:-1]) for p in paths):
-            return self._observation(False, "deliverable_paths 中含无法公开交接的文件类型或隐藏文件。")
+        for path in paths:
+            if (not supported_project_file(path, self.extensions) or any(s.startswith(".") for s in path.split("/"))
+                    or any(s in PROJECT_CACHE_DIRS for s in Path(path).parts[:-1])):
+                return self._observation(False, "deliverable_paths 中的文件无法公开交接"
+                                         + snapshot_location(Path(path), self.settings.api_key)
+                                         + "。如属用户指定原件，请保留并报告交付格式限制。")
         expectations = str(payload.get("acceptance") or "")[:2000]
         user_state = self._clarifications(self.room_events(self.run_id))
         donor = (review.author if review.draft_task else role) if review else payload.get("recover_from", role)
@@ -1161,6 +1187,20 @@ class RoomCrew:
                     return None
             return progress.blocked_reason()
 
+        def preflight_publication():
+            issue = handoff_issue()
+            if issue or private:
+                return issue
+            try:
+                copy_project(assignment, role, None, self.extensions, secret=self.settings.api_key)
+            except UnsupportedProjectFile as exc:
+                return "[验收未通过] 项目快照发布失败：" + str(exc)
+            except SnapshotError:
+                # Publishers perform the full validation again after process
+                # cleanup. A database may still have live transient sidecars.
+                pass
+            return None
+
         initial = allocated.model_copy()
         started = time.monotonic()
         try:
@@ -1168,7 +1208,7 @@ class RoomCrew:
                 result = member.run(objective, execution=execution, budget=allocated,
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,
-                                    on_step=observe, before_answer=handoff_issue,
+                                    on_step=observe, before_answer=preflight_publication,
                                     preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True))
         finally:
             usage = {"steps": allocated.steps_used - initial.steps_used,

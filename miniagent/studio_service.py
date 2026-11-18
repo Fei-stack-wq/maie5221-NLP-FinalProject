@@ -725,7 +725,7 @@ class StudioService(RoomDiscussion, StudioRoles):
             return self._redact(self._summary(path))
 
     def _request(self, payload: Any) -> dict:
-        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path"}:
+        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path", "required_source_review_paths"}:
             raise StudioError("任务参数无效。")
         identity = payload.get("request_id")
         try:
@@ -756,6 +756,22 @@ class StudioService(RoomDiscussion, StudioRoles):
             _relative(name)
         if len(files) != len(set(files)):
             raise StudioError("验收文件不可重复。")
+        source_paths = payload.get("required_source_review_paths", [])
+        if not isinstance(source_paths, list) or len(source_paths) > 20:
+            raise StudioError("来源核查文件须为最多 20 个相对路径。")
+        for name in source_paths:
+            segments = _relative(name)
+            if (len(name) > 256 or not supported_project_file(name, _EXTENSIONS)
+                    or is_database(name) or is_png(name) or any(p in PROJECT_CACHE_DIRS for p in segments[:-1])):
+                raise StudioError("请选择可发布、可作为文本读取的来源核查文件。")
+        if len(set(source_paths)) != len(source_paths):
+            raise StudioError("来源核查文件不可重复。")
+        if source_paths:
+            if mode != "team" or "conversation" not in payload:
+                raise StudioError("来源核查需要群聊中的团队任务。")
+            files = list(dict.fromkeys([*files, *source_paths]))
+            if len(files) > 20:
+                raise StudioError("合并后的交付文件最多 20 个。")
         if mode in {"demo", "team-demo"}:
             files = []
         checks = payload.get("acceptance_checks", [])
@@ -801,6 +817,8 @@ class StudioService(RoomDiscussion, StudioRoles):
             result["limits"] = limits
         if checks:
             result["acceptance_checks"] = checks
+        if source_paths:
+            result["required_source_review_paths"] = source_paths
         if child_checks:
             result["child_checks"] = child_checks
         if "conversation" in payload:
@@ -854,6 +872,8 @@ class StudioService(RoomDiscussion, StudioRoles):
             thread = self._next_turn(run_id, request["conversation"]) if "conversation" in request else None
             if thread and request["mode"] == "team" and thread["kind"] != "group":
                 raise StudioError("私聊内不能启动群组协作。")
+            if request.get("required_source_review_paths") and len(set(thread["members"]) - {thread["recipient"]}) < 2:
+                raise StudioError("来源核查需要负责人以外至少两位成员，分别负责成稿和独立评审。")
             if thread and request.get("child_checks", {}).keys() - (set(thread["members"]) - {thread["recipient"]}):
                 raise StudioError("群内子任务验收须绑定给当前负责人以外的成员。")
             if not self._slots.acquire(blocking=False):
@@ -1259,8 +1279,10 @@ class StudioService(RoomDiscussion, StudioRoles):
                     knowledge = roles.context(recipient, request["objective"])
                     if knowledge:
                         context += "\n" + knowledge
+                delivery = {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])}
+                if request.get("required_source_review_paths"):
+                    delivery["required_source_review_paths"] = request["required_source_review_paths"]
                 if mode != "demo" and checks:
-                    delivery = {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])}
                     context += "\n用户指定的交付检查：" + json.dumps(delivery, ensure_ascii=False)
                 acceptance = accept_files("notes.md") if mode == "demo" else checks
                 workspace = self._workspace(path, thread)
@@ -1270,8 +1292,7 @@ class StudioService(RoomDiscussion, StudioRoles):
                     crew = RoomCrew(run_id, path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
-                                    {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])},
-                                    role_session=roles)
+                                    delivery, role_session=roles)
                     self._load_prior_diagnostics(crew, thread)
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)

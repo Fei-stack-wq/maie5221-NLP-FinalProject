@@ -80,6 +80,20 @@ class Review:
     draft_task: str | None = None
     host_issue: str = ""
     probes: dict = field(default_factory=dict)
+    required_source_paths: set[str] = field(default_factory=set)
+
+    def sourced_files(self, results):
+        """Candidate bytes cited with a freshly retrieved source on a required passing finding."""
+        source_rules = {rule.id for rule in self.criteria if rule.required and rule.method == "source"}
+        files = {}
+        for finding in results:
+            if finding["criterion_id"] not in source_rules or finding["verdict"] != "passed":
+                continue
+            receipts = finding["receipts"]
+            if any(e["kind"] == "source" for e in receipts):
+                files.update({e["path"]: e["sha256"] for e in receipts if e["kind"] == "read"
+                              and e.get("extent", 0) > 0 and self.files.get(e["path"]) == e["sha256"]})
+        return files
 
     @property
     def version(self):
@@ -102,6 +116,8 @@ class Review:
         facts = self.describe()
         facts["files"] = dict(list(self.files.items())[:32])
         facts["files_total"] = len(self.files)
+        if self.required_source_paths:
+            facts["required_source_paths"] = sorted(self.required_source_paths)
         facts["findings"] = [{k:r.get(k) for k in ("criterion_id","verdict","reason","cause","action")}
                              for r in facts["findings"] if r["verdict"] != "passed"]
         return facts
@@ -153,10 +169,28 @@ class Review:
 
 
 class ReviewQueue:
-    def __init__(self):
+    def __init__(self, required_source_paths=()):
         self.items = {}
         self.candidates = {}
         self.public_versions = {}
+        self.required_source_paths = set(required_source_paths)
+        self.source_authors = {}
+
+    def record_author(self, role, changes):
+        for change in changes:
+            path, sha = change["path"], change.get("sha256")
+            if path in self.required_source_paths and sha:
+                self.source_authors[path, sha] = role
+
+    def missing_source_reviews(self):
+        missing = self.required_source_paths.copy()
+        for item in self.items.values():
+            if item.state != "passed" or item.latest.get("candidate_version") != item.version:
+                continue
+            for path, sha in item.sourced_files(item.latest["results"]).items():
+                if self.public_versions.get(path) == sha and self.source_authors.get((path, sha)) != item.reviewer:
+                    missing.discard(path)
+        return sorted(missing)
 
     def next(self, human_state):
         for item in self.items.values():
@@ -170,6 +204,7 @@ class ReviewQueue:
 
     def published(self, report, manifest, changes):
         self.public_versions = manifest
+        self.record_author(report["role"], changes)
         paths = set(report["deliverable_paths"]) | {c["path"] for c in changes}
         self.candidates[report["task_id"]] = {p:manifest.get(p) for p in sorted(paths)}
         for item in self.items.values():
@@ -219,12 +254,19 @@ class ReviewQueue:
                     probes[scope] = probe
         if not files:
             raise ValueError("该交接没有可绑定版本的工件。")
+        required_sources = self.required_source_paths.intersection(p for p, sha in files.items() if sha)
+        if required_sources:
+            if any(self.source_authors.get((p, files[p])) == reviewer for p in required_sources):
+                raise ValueError("请另选评审人。指定文件的当前版本由这名成员写入。")
+            if not any(rule.method == "source" and rule.required for rule in spec.criteria):
+                raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         existing = self.items.get(author["task_id"])
         if existing:
             if existing.criteria != spec.criteria or existing.reviewer != reviewer:
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return existing
-        review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes)
+        review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes,
+                        required_source_paths=required_sources)
         return review
 
 
@@ -368,6 +410,11 @@ class ReviewSession:
             decisions = {r["verdict"] for r in results if r["criterion_id"] in required}
             verdict = "changes_requested" if "changes_requested" in decisions else (
                 "inconclusive" if "inconclusive" in decisions else "passed")
+            if verdict == "passed" and self.item.required_source_paths:
+                missing = self.item.required_source_paths - self.item.sourced_files(results).keys()
+                if missing:
+                    raise ValueError("请在必需的 source 判断中，引用实际读过的成稿和本次打开的原始来源："
+                                     + "、".join(sorted(missing)))
             if verdict == "passed" and self.promotion_issue:
                 if not any(r["criterion_id"] in required and any(e["kind"] in {"read","passed_check"} for e in r["receipts"])
                            for r in results):

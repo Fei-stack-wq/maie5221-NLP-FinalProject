@@ -1,5 +1,6 @@
 """Persistence, real role routing, publication and continuation in a Studio group."""
 import hashlib
+import shutil
 import json
 import time
 import unittest
@@ -12,6 +13,7 @@ from miniagent.studio_conversations import validate_conversation
 from miniagent.studio_preview import html_preview
 from miniagent.studio_service import StudioError, StudioService
 from tests.support import make_temp_dir, cleanup
+from tests.test_research import public_pdf_fixture
 from tests.test_studio_conversations import RecordingProvider, tool
 from tests.test_studio_service import finished, request
 
@@ -383,6 +385,59 @@ class StudioCrewTest(unittest.TestCase):
         [report] = [e for e in detail["room_events"] if e["kind"] == "member_report"]
         self.assertTrue(report["handoff"]["evidence"]["check_signals"])
         self.assertIn("复查", report["handoff"]["evidence"]["stop_reason"])
+
+    @unittest.skipUnless(shutil.which("pdftotext"), "Poppler is optional")
+    def test_researcher_recovers_own_pdf_without_losing_formal_source(self):
+        page = public_pdf_fixture()
+        prepare = ("from pathlib import Path\nPath('downloads').mkdir()\n"
+                   f"Path('downloads/uce_list.pdf').write_bytes(bytes.fromhex('{page.body.hex()}'))\n"
+                   "Path('Library/Caches/tool').mkdir(parents=True)\n"
+                   "Path('Library/Caches/tool/response.bin').write_bytes(b'cache')")
+        recover = ("import tempfile\nfrom pathlib import Path\nfrom shutil import move\n"
+                   "with tempfile.TemporaryDirectory() as folder:\n"
+                   "    path = Path(folder)/'uce_list.pdf'\n"
+                   "    move('downloads/uce_list.pdf', path)\n"
+                   "    move('Library/Caches/tool/response.bin', Path(folder)/'response.bin')\n"
+                   "    assert path.read_bytes().startswith(b'%PDF-')")
+        script = [tool("delegate_task",assignee="writer",objective="Prepare a sourced catalogue report.",
+                       remaining_roles=[],deliverable_paths=["catalogue.md"]),
+                  tool("run_python",code=prepare),tool("http_get",url=page.url,pdf_page=2),
+                  write("catalogue.md","The official PDF lists the Course catalogue on page two."),
+                  {"text":"My sourced report is ready."},tool("run_python",code=recover),
+                  {"text":"The sourced report is ready."},{"text":"Delivered."}]
+        with patch("miniagent.research.fetch",return_value=page):
+            detail,provider = self.execute(script,roster("lead","writer"),objective="Deliver the sourced report.",
+                                          acceptance_files=["catalogue.md"])
+        self.assertEqual(detail["run"]["status"],"completed",detail["diagnostics"])
+        first_member_prompt = str(provider.requests[1][0])
+        self.assertIn("tempfile.TemporaryDirectory",first_member_prompt)
+        self.assertIn("sources/*.json",first_member_prompt)
+        self.assertIn("downloads/uce_list.pdf",str(provider.requests[5][0]))
+        self.assertIn("Library/Caches/tool/response.bin",str(provider.requests[5][0]))
+        pub = self.root/"runs"/detail["run"]["id"]/"agents"/"lead"
+        self.assertTrue((pub/"catalogue.md").is_file())
+        [source] = (pub/"sources").glob("*.json")
+        import json
+        evidence = json.loads(source.read_text())
+        self.assertEqual((evidence["text"],evidence["pdf_page"]),("Course catalogue",2))
+        self.assertEqual(evidence["observed_bytes_sha256"],hashlib.sha256(page.body).hexdigest())
+        self.assertFalse(list(pub.rglob("*.pdf")))
+
+    def test_requested_unsupported_original_stays_in_private_tree(self):
+        script = [tool("delegate_task",assignee="writer",objective="Deliver the original signed PDF.",remaining_roles=[]),
+                  tool("run_python",code="from pathlib import Path\nPath('signed-original.pdf').write_bytes(b'%PDF-1.4')"),
+                  {"text":"The original is ready."},{"text":"[BLOCKED] The required original PDF is unsupported."},
+                  {"text":"[BLOCKED] Original PDF delivery remains open."}]
+        detail,provider = self.execute(script,roster("lead","writer"),objective="Deliver the original signed PDF.")
+        self.assertEqual(detail["run"]["status"],"failed")
+        feedback = str(provider.requests[3][0])
+        self.assertIn("signed-original.pdf",feedback)
+        self.assertIn("保留并报告格式限制",feedback)
+        run = self.root/"runs"/detail["run"]["id"]
+        [original] = run.glob("assignments/*/agents/writer/signed-original.pdf")
+        self.assertEqual(original.read_bytes(),b"%PDF-1.4")
+        self.assertFalse((run/"agents"/"lead"/"signed-original.pdf").exists())
+        self.assertFalse(any(e.get("published") for e in detail["room_events"] if e["kind"]=="member_report"))
 
     def test_blocked_or_rejected_member_publication_prevents_success_after_good_draft(self):
         for last, reason in [([{"text": "[BLOCKED] missing proof"}], "missing proof"),

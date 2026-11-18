@@ -14,6 +14,31 @@ from miniagent.tools import ToolContext, build_default_registry
 from tests.support import cleanup, make_temp_dir
 
 
+def public_pdf_fixture():
+    # A complete PDF with two text pages, an explicit cross-reference
+    # table, and no library dependency for creating the test fixture.
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>",
+               b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"]
+    for content_id in (6, 7):
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
+                       f"/Resources << /Font << /F 5 0 R >> >> /Contents {content_id} 0 R >>".encode())
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    for title in ("Source one", "Course catalogue"):
+        stream = f"BT /F 12 Tf 10 100 Td ({title}) Tj ET".encode()
+        objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
+    body = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, item in enumerate(objects, 1):
+        offsets.append(len(body))
+        body.extend(f"{index} 0 obj\n".encode() + item + b"\nendobj\n")
+    xref = len(body)
+    body.extend(b"xref\n0 8\n0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        body.extend(f"{offset:010} 00000 n \n".encode())
+    body.extend(f"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return Page("https://campus.example/catalogue", "application/octet-stream", bytes(body), False)
+
+
 class ResearchTest(unittest.TestCase):
     def setUp(self):
         self.root = make_temp_dir("research")
@@ -58,28 +83,8 @@ class ResearchTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("pdftotext"), "Poppler is optional")
     def test_public_pdf_is_read_by_page_and_only_text_evidence_is_published(self):
-        # A complete PDF with two text pages, an explicit cross-reference
-        # table, and no library dependency for creating the test fixture.
-        objects = [b"<< /Type /Catalog /Pages 2 0 R >>",
-                   b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>"]
-        for content_id in (6, 7):
-            objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] "
-                           f"/Resources << /Font << /F 5 0 R >> >> /Contents {content_id} 0 R >>".encode())
-        objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
-        for title in ("Source one", "Course catalogue"):
-            stream = f"BT /F 12 Tf 10 100 Td ({title}) Tj ET".encode()
-            objects.append(b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream")
-        body = bytearray(b"%PDF-1.4\n")
-        offsets = [0]
-        for index, item in enumerate(objects, 1):
-            offsets.append(len(body))
-            body.extend(f"{index} 0 obj\n".encode() + item + b"\nendobj\n")
-        xref = len(body)
-        body.extend(b"xref\n0 8\n0000000000 65535 f \n")
-        for offset in offsets[1:]:
-            body.extend(f"{offset:010} 00000 n \n".encode())
-        body.extend(f"trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
-        page = Page("https://campus.example/catalogue", "application/octet-stream", bytes(body), False)
+        page = public_pdf_fixture()
+        body = page.body
         with patch("miniagent.research.fetch", return_value=page):
             result = self.registry.dispatch("http_get", {"url": page.url, "pdf_page": 2}, self.ctx)
             self.assertTrue(result.ok, result.content)
