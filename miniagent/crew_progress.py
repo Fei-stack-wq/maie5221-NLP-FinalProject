@@ -547,6 +547,7 @@ class MemberProgress:
         self._read_hint = ""
         self._inspected = set()
         self._passes = {}
+        self._review_evidence = {}
         self._diagnostic_checks = {}
         self._pending_verification = {}
         self._complete_verification = {}
@@ -611,6 +612,15 @@ class MemberProgress:
                 except OSError:
                     continue
         return files
+
+    def review_evidence(self):
+        """Current actual check outcomes, keyed by scope and linked to their tool invocation."""
+        active = {"pass:" + _check_key(suite) for suite in self._passes} | {"fail:" + key for key in self._failures}
+        return {ref:row for ref,row in self._review_evidence.items() if ref in active}
+
+    def project_versions(self):
+        """Recheck candidate bytes using the same no-follow scan as member scheduling."""
+        return self._scan()
 
     def observe(self, record: StepRecord, state: RAOState) -> None:
         self._steps += 1
@@ -812,6 +822,9 @@ class MemberProgress:
                             failures[suite_key] = label
                         advances |= not failures.keys() <= self._failures.keys()
                         self._failures.update(failures)
+                        for key, failure in failures.items():
+                            self._review_evidence["fail:" + key] = {
+                                "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
                         if run:
                             self._failed_runs[(case_suite, run.digest)] = run
                         self._passes.pop(suite, None)
@@ -823,6 +836,8 @@ class MemberProgress:
                         self._repeat_pass |= self._passes.get(suite) == label
                         if full:
                             self._passes[suite] = label
+                            self._review_evidence["pass:" + suite_key] = {
+                                "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id}
                             if status != "runner_exit":
                                 self._failures.pop(suite_key, None)
                         for case in cases:

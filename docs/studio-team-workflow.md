@@ -142,3 +142,34 @@ Shell 回执记录实际执行的命令、退出码、超时和输出裁剪；Py
 在 booking-04 中，20 秒系统超时产生了第一个旧阻塞。后来的 Python 包装程序在套件退出 0 后打印的 `FAIL lines: none` 产生了第二个。直接重跑套件时，“截断的 JSON”是用例名称，通过宿主的 `truncated` 字段可以区分该名称与输出裁剪。普通测试文本不能替代该字段。测试在独立项目副本上完整运行，实际退出 0，返回 6,083 字节标准输出。宿主记录完整进程的状态和裁剪情况；套件自身报告 132 项通过。
 
 Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与截取输出。pytest 的 TestReport 将用例身份、结果与捕获的标准输出分开，原生退出码还能区分断言失败、用户中断、命令用法错误、缺少测试等情况。本项目复用这两个边界，并用工件摘要和执行范围约束跨成员复验。[Pi Bash 固定版本](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L388-L437) · [Pi 进程已退出而管道超时的回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/suite/regressions/11613-bash-timeout-after-shell-exit.test.ts#L16-L48) · [pytest TestReport](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py) · [pytest 退出码](https://docs.pytest.org/en/stable/reference/exit-codes.html)
+
+### 同群独立成员的结构化验收与返工
+
+负责人把已交付的候选交给群内另一位成员时，可在 `delegate_task` 中提交 `review`。候选可用作者的任务 ID 或该角色最近一次公开交付定位。每条标准包含稳定 ID、描述、是否必需以及取证方式。检查文字内容、合同或版面可选 `inspect`；核对程序行为或可计算结果选 `execute`。宿主绑定原作者任务、完整候选文件的 SHA-256 清单及其版本摘要。普通讨论和仅需交付的委派维持原有流程。
+
+```json
+{
+  "assignee": "qa",
+  "objective": "独立验收这个版本",
+  "review": {
+    "candidate": "dev",
+    "criteria": [
+      {"id":"no-overlap","description":"同一会议室时间重叠时须拒绝第二次预约。","required":true,"method":"execute"},
+      {"id":"start-command","description":"README 明确给出本地启动命令。","required":true,"method":"inspect"}
+    ]
+  }
+}
+```
+
+验收者通过 `submit_review` 提交精确的候选版本和逐项判断。每项须引用当前验收尝试实际产生的读取、检查或诊断回执。宿主在工具提示中列出可引用的 ID。文件证据记录路径、摘要及实际读取位置。执行证据记录真实工具调用及检查范围。通过执行型标准须引用正面执行证据；因程序行为要求返工须引用失败检查。审查过程中改动候选原件会使该结论失效。报告保留基于 M0 `CheckResult` 与 `EvidenceRef` 的结构化判断，以及有待验证的范围。
+
+| 判断 | 宿主的下一步 |
+| --- | --- |
+| 所有必需项均为 `passed` | 记录候选版本的独立验收。用户的硬性验收仍按原配置执行。 |
+| `changes_requested`，原因 `product` | 原作者收到相同目标、稳定标准和操作建议。修复产生新版本后由独立验收者复验。 |
+| `inconclusive` 或 `changes_requested`，原因 `verification` | 验收者改进检查方法并在同一候选上复验。 |
+| `inconclusive`，原因 `business` | 负责人经现有 `ask_human` 向用户询问缺失业务决定；收到群内真实回答后继续。 |
+
+报告位于群事件 `member_report.handoff.native_review`。其中 `target` 跨修订不变，`candidate_version` 绑定本轮文件，`assessment` 记录验收者、尝试、逐项理由、证据和需执行的修复。重复同版、同缺口、同证据会显式停止。原先通过的候选被后续交付改动时，旧结论保留在历史事件，新版本重新进入验收。子候选的独立结论与群目标的最终验收分别展示。
+
+这一工作流借鉴 LangGraph evaluator–optimizer 的结构化反馈和条件路由，以及 A2A 区分任务、工件和等待用户输入的状态模型。实现沿用 Studio 的角色、任务记录、工具回执、预算和现有群运行器。[LangGraph evaluator–optimizer 示例](https://docs.langchain.com/oss/python/langgraph/workflows-agents#evaluator-optimizer) · [条件路由实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982) · [条件执行回归](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2947) · [A2A 任务状态与工件](https://github.com/a2aproject/A2A/blob/5f931b8a25fe66789f987ec4a55fc16ee9fe41ee/specification/a2a.proto#L167-L290) · [本项目普通群入口回归](../tests/test_studio_native_review.py)

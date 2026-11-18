@@ -24,6 +24,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
+from .studio_reviews import ReviewQueue, ReviewSession
 from .studio_conversations import SnapshotError, copy_project, member_profiles
 from .tools import build_default_registry
 
@@ -111,6 +112,7 @@ class RoomCrew:
         self.check_delivery = build_checks(self.delivery.get("files", []), self.delivery.get("checks", []))
         self.delivery_issue = ""
         self.pending_check_reviews = {}
+        self.native_reviews = ReviewQueue()
         self.approved_roles = set()
         self.planned = None
         self.plan_order = []
@@ -155,6 +157,8 @@ class RoomCrew:
         return ("你是群负责人 " + self.lead + "。群成员和职责：" + _json(roster) +
                 "\n依据用户目标和角色职责选人。首次 delegate_task 须用 remaining_roles 列出这次后续需要的角色 ID，"
                 "简单任务可以填 []。完整产品交付如群内有相应分工，应安排实现、独立验收和发布交付。"
+                "独立评估此前已交付的候选时，使用 delegate_task.review 引用原任务或作者角色，填写逐项标准；"
+                "需观察行为用 execute，审阅文件用 inspect。宿主会将返工转回适当成员。"
                 "每次只委派给一人。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
                 "验收只列该成员负责的工作。其他成员的独立验证、交付说明和打包工作请留给其实际负责人，"
                 "不要把整个项目的全部最终验收原样转给执行第一阶段的人。下一人的分工基于实际交接。"
@@ -445,6 +449,14 @@ class RoomCrew:
         plan_finished = self.planned is not None or set(self.profiles) - {self.lead} <= self.approved_roles
         if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
             return closing
+        native = self.native_reviews.next(self._review_answers())
+        if native and native.state == "blocked":
+            return StepPolicy("finalize", "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
+                              _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
+        if native and native.state == "awaiting_user":
+            return StepPolicy("coordinate", "独立验收遇到需要用户决定的业务歧义。请使用 ask_human 询问这一项：" +
+                              _clip(_json(native.latest.get("results", [])), 2500),
+                              frozenset({"ask_human"}), required_tool="ask_human")
         personal = self.role_session.context(self.lead, state.goal) if self.role_session else ""
         instruction = self.instructions() + self._prior_context()
         if personal:
@@ -515,7 +527,7 @@ class RoomCrew:
                 "如亲自核验成功，在最终交接写 [CHECKED 原任务ID] 并说明测试和依据。无法确认时说明缺口。"
                 "等待核验的原任务ID：" + ids)
 
-    def _record_check_reviews(self, role, task_id, summary, evidence, original, changes):
+    def _record_check_reviews(self, role, task_id, summary, evidence, original, changes, native_target=None):
         """A revised self-check can reach a peer. The author cannot approve it."""
         reviewed = []
         changed = {entry["path"] for entry in changes}
@@ -534,7 +546,7 @@ class RoomCrew:
         for item in self._review_requests(role):
             marker = "[CHECKED " + item["task"] + "]"
             scopes = item.get("verification", [])
-            if (marker in summary and evidence.get("check_signals")
+            if ((marker in summary or item["task"] == native_target) and evidence.get("check_signals")
                     and all(c["scope"] in evidence.get("complete_verification", {}) for c in scopes)
                     and all(original.get(path) == digest for path, digest in item.get("candidate", {}).items())
                     and all(not c["path"] or c["path"] not in changed and
@@ -552,7 +564,17 @@ class RoomCrew:
                                                   "verification": [dict(c) for c in verification], "candidate": candidate}
         return reviewed
 
+    def _review_answers(self):
+        replies = [e.get("text", "") for e in self.room_events(self.run_id) if e.get("kind") == "human_answer"]
+        return _json(replies)
+
     def before_answer(self):
+        queue = getattr(self, "native_reviews", None)
+        if queue and queue.items:
+            pending_review = queue.next(self._review_answers())
+            if pending_review:
+                return ("独立验收尚未通过，需要 " + pending_review.owner + " 处理 " + pending_review.state +
+                        "。当前目标与缺口：" + _clip(_json(pending_review.briefing()), 1900))
         if not any(r["published"] for r in self.reports):
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
         pending = (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
@@ -691,6 +713,26 @@ class RoomCrew:
             return self._observation(False, "委派需要具体目标和运行时动作身份。")
         if action in self.handoffs:
             return self.handoffs[action]
+        review = self.native_reviews.next(self._review_answers())
+        if payload.get("review") is not None:
+            if review:
+                ref = payload["review"].get("candidate") if isinstance(payload["review"], dict) else None
+                if ref not in {review.target, review.author}:
+                    return self._observation(False, "请先完成已在进行的独立验收。")
+            try:
+                requested_review = self.native_reviews.open(payload["review"], role, self.reports)
+            except (ValueError, OSError) as exc:
+                return self._observation(False, "无法发起独立验收：" + str(exc))
+            if review and review is not requested_review:
+                return self._observation(False, "请先完成已在进行的独立验收。")
+            review = requested_review
+        if review:
+            if review.state in {"passed", "blocked", "awaiting_user"}:
+                return self._observation(False, "该验收当前状态：" + review.state)
+            role = review.owner
+            objective = (("针对原目标返工，处理独立评估发现的产品缺口。" if review.state == "repair" else
+                          "对同一目标的当前候选执行独立验收，使用 submit_review 提交逐项判断。") +
+                         "\n原目标及标准：" + _clip(_json(review.briefing()), 7000))
         plan = self.planned
         if "remaining_roles" in payload:
             rest = payload["remaining_roles"]
@@ -702,6 +744,8 @@ class RoomCrew:
                 if named not in self.plan_order:
                     self.plan_order.append(named)
         requested_paths = payload.get("deliverable_paths", [])
+        if review and review.state == "repair":
+            requested_paths = [p for p,v in review.files.items() if v is not None]
         if (not isinstance(requested_paths, list) or len(requested_paths) > 32
                 or any(not isinstance(path, str) or len(path) > 256 for path in requested_paths)):
             return self._observation(False, "deliverable_paths 需要最多 32 个项目内的相对文件名。")
@@ -714,10 +758,10 @@ class RoomCrew:
             return self._observation(False, "deliverable_paths 中含无法公开交接的文件类型或隐藏文件。")
         expectations = str(payload.get("acceptance") or "")[:2000]
         user_state = self._clarifications(self.room_events(self.run_id))
-        donor = payload.get("recover_from", role)
+        donor = role if review else payload.get("recover_from", role)
         if not isinstance(donor, str) or donor not in self.profiles or donor == self.lead:
             return self._observation(False, "recover_from 只能选择本群已有受阻交接的成员。")
-        draft = self.private_drafts.get(donor)
+        draft = None if review and review.state == "review" else self.private_drafts.get(donor)
         if draft and draft["version"] != self.project_version:
             draft = None
         transfer = donor != role
@@ -729,7 +773,8 @@ class RoomCrew:
         if draft:
             # Renaming the task cannot drop an unfinished delivery obligation.
             paths = sorted(set(paths) | set(draft["required"]))
-        identity = (role, objective.strip(), expectations.strip(), tuple(paths), user_state, donor)
+        identity = (role, objective.strip(), expectations.strip(), tuple(paths), user_state, donor,
+                    (review.target, review.version, review.state, len(review.visited)) if review else None)
         self.planned = plan
         self.assigned.add(role)
         prior = self.assignment_results.get(identity)
@@ -752,15 +797,17 @@ class RoomCrew:
         self.started_roles.add(role)
         self.untapped_shares.pop(role, None)
         dispatch_started = time.monotonic()
+        if review:
+            self.native_reviews.items[review.target] = review
         try:
-            outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths, draft, routed_from)
+            outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review)
         finally:
             self.nested_seconds += time.monotonic() - dispatch_started
         self.assignment_results[identity] = (self.project_version, outcome, input_revision)
         self.handoffs[action] = outcome
         return outcome
 
-    def _dispatch(self, role, objective, expectations, action, allocated, reserved, paths, draft, routed_from):
+    def _dispatch(self, role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review=None):
         assignments = self.path / "assignments"
         assignments.mkdir(exist_ok=True)
         assignment = Path(tempfile.mkdtemp(dir=assignments, prefix="member-"))
@@ -801,13 +848,17 @@ class RoomCrew:
             registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(role, registry)
+        spec = self.child_checks.get(role, {})
+        required = sorted(set(spec.get("files", [])) | set(paths))
+        progress = MemberProgress(workspace, required_paths=required, public_baseline=original)
+        session = None
+        if review and review.state == "review":
+            session = ReviewSession(review, original, progress, execution.attempt.attempt_id)
+            registry.add(session.tool())
         member = Agent(name=role, provider=self.provider, registry=registry,
                        sandbox=Sandbox(workspace, agent_name=role), settings=self.settings, tracer=self.tracer,
                        task_service=self.service, human_handler=self.human_handler(self.run_id, role, deadline=human_deadline),
                        should_cancel=self.should_cancel)
-        spec = self.child_checks.get(role, {})
-        required = sorted(set(spec.get("files", [])) | set(paths))
-        progress = MemberProgress(workspace, required_paths=required, public_baseline=original)
         repair_context = ""
         if recovered:
             progress.restore_failed_checks(draft["failed_checks"])
@@ -817,6 +868,8 @@ class RoomCrew:
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context)
+        if session:
+            member_context += "\n" + session.context()
 
         if self.role_session:
             personal = self.role_session.context(role, objective)
@@ -832,6 +885,8 @@ class RoomCrew:
 
         def observe(record, state):
             progress.observe(record, state)
+            if session:
+                session.observe(record)
             for obs in record.observations:
                 if obs.ok and obs.source in {"read_file", "read_lines", "search_files", "find_files", "list_dir"}:
                     snippet = _clip(obs.content, 720)
@@ -899,6 +954,9 @@ class RoomCrew:
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
+            if phase == "handoff" and session and not session.assessment and session.receipts:
+                return StepPolicy("work", "依据已取得的回执提交逐项评审；证据不足时写 inconclusive。" +
+                                  _json(list(session.receipts)), frozenset({"submit_review"}), required_tool="submit_review")
             if phase == "handoff":
                 # A qualitative review can quote the sources already inspected
                 # locally when its allocation still fits that request.
@@ -911,6 +969,8 @@ class RoomCrew:
             # textual assignment. On subsequent work reserve the handoff when
             # capping the next provider reply, before its usage is charged.
             steering = progress.steering()
+            if session and not session.assessment:
+                steering += "\n提交逐项结论时可引用的宿主回执：" + _json(list(session.receipts))
             if work_receipt and state.step_index >= 2:
                 # The normal RAO projection keeps recent complete tool
                 # batches, including full actionable reads. This small host
@@ -922,6 +982,14 @@ class RoomCrew:
                 return closing if state.step_index else work
             return StepPolicy("work", steering, work_tools, token_reserve=reserve, seconds_reserve=handoff_seconds)
 
+        def handoff_issue():
+            if session and not session.assessment:
+                return "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
+            if session and session.assessment["verdict"] != "passed" and not progress.pending_paths():
+                # Finding an observable product failure is a valid outcome of a review.
+                return None
+            return progress.blocked_reason()
+
         initial = allocated.model_copy()
         started = time.monotonic()
         try:
@@ -929,7 +997,7 @@ class RoomCrew:
                 result = member.run(objective, execution=execution, budget=allocated,
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,
-                                    on_step=observe, before_answer=progress.blocked_reason,
+                                    on_step=observe, before_answer=handoff_issue,
                                     preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True))
         finally:
             usage = {"steps": allocated.steps_used - initial.steps_used,
@@ -941,11 +1009,15 @@ class RoomCrew:
         text = result.answer or result.error or status
         issue = (result.error or status) if status not in {"completed", "unverified"} else ""
         if not issue:
-            issue = progress.blocked_reason() or ("任务已取消" if self.should_cancel() else "")
+            issue = handoff_issue() or ("任务已取消" if self.should_cancel() else "")
         if spec and not result.succeeded:
             issue = issue or "用户指定的成员验收未通过。"
         changes = []
         artifacts = []
+        assessment = session.assessment if session else None
+        if assessment and not session.unchanged():
+            issue = "验收提交后候选文件已变化，原结论失效。"
+            assessment = None
         if not issue:
             try:
                 changes, artifacts = self._publish(assignment, role, original)
@@ -967,13 +1039,34 @@ class RoomCrew:
                 self.delivery_issue = "" if ok else reason
         else:
             self.approved_roles.discard(role)
+        if published:
+            public_versions = dict(original)
+            for change in changes:
+                if change["change"] == "deleted":
+                    public_versions.pop(change["path"], None)
+                else:
+                    public_versions[change["path"]] = change["sha256"]
         evidence = progress.evidence()
-        reviewed = self._record_check_reviews(role, record.task_id, text, evidence, original, changes) if published else []
+        if review:
+            if session and assessment and (published or assessment["verdict"] != "passed"):
+                review.apply(assessment, self._review_answers())
+            elif not session and published:
+                review.repaired(public_versions, [c["path"] for c in changes])
+            elif not session:
+                review.repair_blocked(progress.project_versions(), progress.failed_checks(), progress.pending_paths())
+            else:
+                review.state = "blocked"
+        native_target = review.target if review and review.state == "passed" and published else None
+        reviewed = self._record_check_reviews(role, record.task_id, text, evidence, original, changes, native_target) if published else []
         report = {"role": role, "task_id": record.task_id, "objective": objective,
                   "acceptance_expectation": expectations, "status": status, "published": published,
                   "summary": _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
                   "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
+        if published:
+            self.native_reviews.published(report, public_versions, changes)
+        if review:
+            report["native_review"] = {**review.describe(), "assessment":assessment}
         if not published:
             artifacts = self.diagnostics.capture(assignment, role, required, original, record.task_id)
             if artifacts:

@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from .config import Limits
 from .providers import DeepSeekProvider, Provider
 from .sandbox import Sandbox, SandboxError
+from .studio_reviews import REVIEW_REQUEST_SCHEMA
 from .schemas import LLMResponse, RequestAttempts, ToolResult, ToolSpec, Usage, UsageSource
 from .tools import ToolContext, ToolRegistry
 
@@ -427,6 +428,7 @@ DELEGATE_TOOL = ToolSpec(
                                 "description": "群组计划中本次委派之后仍需参与的角色 ID，空数组表示本角色是最后一位。"},
             "deliverable_paths": {"type": "array", "items": {"type": "string"},
                                   "description": "本次委派由该成员负责交付的具体文件相对路径。仅阅读的输入文件不计入。"},
+            "review": REVIEW_REQUEST_SCHEMA,
             "recover_from": {"type": "string", "description": "接手已有受阻草稿时，填写该成员的角色 ID。"},
         },
         "required": ["objective"],

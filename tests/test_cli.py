@@ -35,6 +35,12 @@ class CliTest(unittest.TestCase):
         self.assertTrue((run_dirs[0] / "trace.jsonl").exists())
         self.assertTrue(any((run_dirs[0] / "agents").rglob("notes.md")))
 
+    def test_explicit_positive_and_unlimited_turn_caps(self) -> None:
+        for cap, expected in [(1, 1), (0, 0)]:
+            with self.subTest(cap=cap):
+                code, output = self._run(["demo", "--runs-dir", str(self.base / str(cap)), "--max-steps", str(cap)])
+                self.assertEqual(code, expected, output)
+
     def test_eval_with_mock_writes_report(self) -> None:
         code, output = self._run(
             [

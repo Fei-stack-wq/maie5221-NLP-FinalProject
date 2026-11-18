@@ -106,6 +106,15 @@ class StudioHarnessTest(unittest.TestCase):
         self.assertEqual(config["max_steps"], limits["max_steps"])
         self.assertEqual(config["max_task_seconds"], limits["max_seconds"])
         self.assertEqual(config["max_total_tokens"], limits["max_total_tokens"])
+        # Old releases recorded the effective host default only in the trace.
+        path = self.service.runs_dir / run["id"] / "studio.json"
+        old_meta = json.loads(path.read_text())
+        old_meta.pop("effective_limits", None)
+        old_meta["request"]["limits"].pop("max_steps")
+        path.write_text(json.dumps(old_meta))
+        historic = self.service.detail(run["id"])
+        self.assertEqual(historic["run"]["limits"]["max_steps"], 2)
+        self.assertEqual(historic["diagnostics"]["configuration"]["max_steps"], 2)
         # A second task uses the host default and reaches independent acceptance.
         _, default_detail = self.demo()
         default_config = next(event["configuration"] for event in default_detail["events"]
