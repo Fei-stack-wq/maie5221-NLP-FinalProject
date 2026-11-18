@@ -1,11 +1,13 @@
 """Acceptance of the final manuscript is independent of earlier research notes."""
 import hashlib
+import json
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from miniagent.config import Settings
 from miniagent.research import Page
-from miniagent.studio_reviews import ReviewQueue, digest
+from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
 from miniagent.studio_service import StudioError, StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, tool
@@ -37,8 +39,8 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps, *, members=("lead", "writer", "checker"), **kwargs):
-        provider = RecordingProvider(steps)
+    def execute(self, steps, *, members=("lead", "writer", "checker"), provider_type=RecordingProvider, **kwargs):
+        provider = provider_type(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider), \
              patch("miniagent.research.fetch", return_value=Page(URL, "text/plain", ARTICLE.encode(), False)):
             job = self.service.start(request("team", conversation=roster(*members),
@@ -72,6 +74,101 @@ class RequiredSourceReviewTest(unittest.TestCase):
         receipts = review["assessment"]["results"][0]["receipts"]
         self.assertEqual([(r["path"], r["sha256"]) for r in receipts if r["kind"] == "read"], [(FINAL, files[FINAL])])
         self.assertEqual([r["url"] for r in receipts if r["kind"] == "source"], [URL])
+
+    def closing_review(self):
+        review = {"candidate": "writer", "criteria": [RULE]}
+        return [tool("delegate_task", assignee="writer", objective="Write final article.", deliverable_paths=[FINAL],
+                     remaining_roles=["checker"]), write(FINAL, ARTICLE), {"text": "Article delivered."},
+                tool("delegate_task", assignee="checker", objective="Verify final article.", review=review),
+                tool("http_get", url=URL),
+                # Seeing its contents via shell is not a signed read of the original.
+                tool("run_shell", command="cat final.md"),
+                *[tool("list_review_evidence", offset=i) for i in range(7)]]
+
+    def test_stalled_reviewer_can_acquire_specific_missing_read_and_submit_short_ids(self):
+        version = digest({FINAL: hashed(ARTICLE)})
+        def claim(refs):
+            return tool("submit_review", candidate_version=version, results=[{"criterion_id":"claim",
+                "verdict":"passed", "reason":"Compared the destination in the article to the dispatch.", "evidence":refs}])
+
+        class ShortReferences(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0):
+                if self.cursor < len(self.script) and self.script[self.cursor].get("use_observed_refs"):
+                    for message in reversed(messages):
+                        text = message.get("content") or ""
+                        pos = text.find('{"recent_evidence"') if isinstance(text, str) else -1
+                        if pos != -1:
+                            catalog = json.JSONDecoder().raw_decode(text[pos:])[0]["recent_evidence"]
+                            read, = [ref for ref, path in catalog["read"] if path == FINAL]
+                            source, = [ref for ref, url in catalog["source"] if url == URL]
+                            self.script[self.cursor] = claim([read, source])
+                            break
+                return super().chat(messages, tools, temperature)
+
+        start = self.closing_review()
+        steps = start + [claim(["source:" + URL]), tool("read_lines", path=FINAL), {"use_observed_refs":True},
+                         {"text":"The article checks out."}, {"text":"Delivered."}]
+        detail, provider = self.execute(steps, provider_type=ShortReferences)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(set(provider.requests[len(start)][1]), {"read_lines", "submit_review"})
+        self.assertIn("list_review_evidence", provider.requests[len(start) + 1][1])
+        self.assertEqual(provider.requests[len(start) + 2][1], ["submit_review"])
+        correction = str(provider.requests[len(start) + 1][0])
+        self.assertIn("本次亲自打开的来源", correction)
+        self.assertIn('"claim":[{"tool":"read_lines","paths":["final.md"]}]', correction)
+        report = [e["handoff"]["native_review"] for e in detail["room_events"]
+                  if e["kind"] == "member_report" and "native_review" in e["handoff"]][-1]
+        finding, = report["assessment"]["results"]
+        self.assertTrue(all(ref.startswith("E") for ref in finding["evidence"]))
+        read, source = finding["receipts"]
+        self.assertEqual([read["ref"], source["ref"]], finding["evidence"])
+        self.assertEqual((read["path"], read["sha256"], source["url"]), (FINAL, hashed(ARTICLE), URL))
+        self.assertTrue(source["observed_bytes_sha256"])
+
+    def test_no_progress_at_review_close_eventually_yields_unverified(self):
+        steps = self.closing_review() + [tool("read_lines", path=f"absent-{i}.md") for i in range(3)]
+        steps += [{"text":"[BLOCKED] Could not verify the original file."},
+                  {"text":"[BLOCKED] Source criterion is still outstanding."}]
+        detail, provider = self.execute(steps)
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        stops = [m for m, names in provider.requests if not names and "同一缺口反复未获进展" in str(m)]
+        self.assertTrue(stops)
+        self.assertFalse(any(e.get("handoff", {}).get("native_review", {}).get("state") == "passed"
+                             for e in detail["room_events"]))
+
+    def test_same_url_with_distinct_content_requires_exact_short_ref_and_errors_identify_each_rule(self):
+        file_hash = hashed(ARTICLE)
+        manifest = {FINAL:file_hash}
+        rules = [Rule.model_validate(RULE), Rule(id="runtime", description="Execute check", method="execute")]
+        item = Review("target", "writer", "checker", "Review.", rules, manifest.copy(), required_source_paths={FINAL})
+        progress = Mock()
+        progress.project_versions.return_value = manifest
+        progress.review_evidence.return_value = {}
+        progress.evidence.return_value = {"diagnostic_checks":[]}
+        session = ReviewSession(item, manifest.copy(), progress, "attempt")
+        def observe(tool, call, **meta):
+            session.observe(SimpleNamespace(observations=[SimpleNamespace(ok=True, source=tool, tool_call_id=call, meta=meta)]))
+        observe("read_lines", "read", path=FINAL, sha256=file_hash, start_line=1, returned_lines=1)
+        for body in ("first signed dispatch", "updated dispatch"):
+            sha = hashed(body)
+            path = f"sources/{sha}.json"
+            manifest[path] = sha
+            observe("http_get", body, path=path, url=URL, bytes=len(body), observed_bytes_sha256=sha)
+        read, first, second = session.catalog()["evidence"]
+        self.assertNotEqual(first["ref"], second["ref"])
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        submitted = {"candidate_version":item.version, "results":[
+            {"criterion_id":"claim", "verdict":"passed", "reason":"Compared the dispatch.", "evidence":[read["ref"], "source:" + URL]},
+            {"criterion_id":"runtime", "verdict":"passed", "reason":"Executed.", "evidence":[read["ref"]]}]}
+        rejected = session.submit(None, submitted)
+        self.assertEqual([e["criterion_id"] for e in rejected.meta["issues"]], ["claim", "runtime"])
+        self.assertIsNone(session.assessment)
+        submitted["results"][0]["evidence"][1] = second["ref"]
+        submitted["results"][1].update(verdict="inconclusive", cause="verification", action="Run the actual check.")
+        self.assertTrue(session.submit(None, submitted).ok)
+        received = session.assessment["results"][0]["receipts"][1]
+        self.assertEqual((received["tool_call_id"], received["url"], received["sha256"]),
+                         ("updated dispatch", URL, hashed("updated dispatch")))
 
     def test_working_notes_alone_cannot_complete_final_delivery(self):
         steps = [tool("delegate_task", assignee="writer", objective="Write research notes.", deliverable_paths=[NOTES],

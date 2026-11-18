@@ -200,3 +200,11 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 复查时，原版本已通过且引用材料哈希仍匹配的结论可连同原评审回执保留。未决的来源核查要通过，仍须在复查期间直接读取成稿并取得独立来源。重复遇到 403、改写说明或改变读取范围均不能让同一版本无限复查。只有必需的未决标准真正减少，才继续下一轮；原件变化则重新检查新版本。
 
 设计参考 LangGraph 按检查点和任务保存已完成写入，以及 Pydantic AI 把具体验证错误交回调用方的方式。Studio 另行核对候选与证据哈希，并以未决标准的实际减少限制复查次数。[LangGraph 的中间写入](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py#L458-L499) · [Pydantic AI 验证反馈](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/pydantic_ai_slim/pydantic_ai/_output.py#L222) · [Pydantic AI 重试边界测试](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/tests/test_agent.py#L14684)
+
+### 评审收尾期间的取证
+
+评审人可调用 `list_review_evidence` 分页查阅本次尝试的宿主回执。每条短 ID 指向实际观察及其类别，来源附原始 URL 和记录摘要，文件附路径、版本和读取范围。同一 URL 返回不同内容时，每次取得的版本有独立 ID。逐项提交会一起返回存在问题的标准 ID、证据要求和缺失的工具操作。报告保留本次引用的证据、任务尝试与原工具调用 ID。
+
+例如，评审人已执行网页测试并从发行方取得公告，但只用 shell 查看成稿时，收尾仍允许用 `read_lines` 读取指定成稿。拿到文件回执后，以它和对应的来源回执提交事实判断。若满足剩余取证条件的集合持续缩小，可在本次分配的时间和预算内继续。相同缺口连续三个收尾工具回合仍未缩小时，系统收回工具并要求明确交接未验证项。独立验收与最终发布仍分别检查绑定版本和用户标准。
+
+这一实现借鉴 Pydantic AI 按字段返回验证错误、对同一次工具纠错限制重试的处理。Studio 自行实现按标准整理多个错误、真实工件回执与尚缺取证操作的关联。[Pydantic AI 的错误回执](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/pydantic_ai_slim/pydantic_ai/messages.py#L2938-L2958) · [工具级重试测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L1765-L1803) · [Studio 普通入口回归](../tests/test_studio_required_source_review.py)

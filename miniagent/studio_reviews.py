@@ -301,6 +301,8 @@ class ReviewSession:
         self.receipts = {}
         self.assessment = None
         self.source_files = {}
+        self.closing_needs = None
+        self.closing_attempts = 0
 
     def unchanged(self):
         manifest = self.progress.project_versions()
@@ -315,6 +317,8 @@ class ReviewSession:
                 and all(manifest.get(p) == v for p, v in self.original.items()))
 
     def observe(self, record):
+        if self.closing_needs is not None and record.observations:
+            self.closing_attempts += 1
         retrieved = [obs for obs in record.observations if obs.ok and obs.source in {"search_sources", "http_get"}]
         if retrieved:
             versions = self.progress.project_versions()
@@ -354,8 +358,11 @@ class ReviewSession:
                 note = self.receipts[ref]
                 if self.progress.project_versions().get(note["path"]) != note["sha256"]:
                     del self.receipts[ref]
-            elif ref.startswith(("pass:", "fail:")) and ref not in current:
-                del self.receipts[ref]
+            elif self.receipts[ref]["kind"] in {"passed_check", "failed_check"}:
+                old = self.receipts[ref]
+                active = current.get(old["legacy_ref"])
+                if not active or active["tool_call_id"] != old["tool_call_id"]:
+                    del self.receipts[ref]
         for ref, event in current.items():
             self._add(ref, {k:v for k,v in event.items() if k != "tool_call_id"}, event["tool_call_id"])
         for d in evidence["diagnostic_checks"]:
@@ -363,8 +370,95 @@ class ReviewSession:
             self._add("observation:" + digest(row)[:12], row, None)
 
     def _add(self, ref, row, tool_call_id):
-        self.receipts[ref] = {**row, "attempt_id":self.attempt_id, "tool_call_id":tool_call_id,
-                              "fingerprint":digest(row), "receipt_id":digest([self.attempt_id, tool_call_id, row])}
+        fingerprint = digest(row)
+        receipt_id = digest([self.attempt_id, tool_call_id, row])
+        # The same observation reused on a later turn keeps its original identity.
+        short = "E" + receipt_id[:16]
+        if short in self.receipts and self.receipts[short]["receipt_id"] != receipt_id:
+            short = "E" + receipt_id
+        self.receipts[short] = {**row, "ref":short, "legacy_ref":ref, "attempt_id":self.attempt_id,
+                                "tool_call_id":tool_call_id, "fingerprint":fingerprint,
+                                "receipt_id":receipt_id}
+
+    def _resolve(self, ref):
+        if ref in self.receipts:
+            return self.receipts[ref]
+        # Older clients used literal URLs and paths. A URL that returned two
+        # different records must now be disambiguated by its exact receipt.
+        matches = [r for r in self.receipts.values() if r["legacy_ref"] == ref]
+        if matches and (len({r["fingerprint"] for r in matches}) == 1 or matches[-1]["kind"] == "read"):
+            return matches[-1]
+        return None
+
+    def catalog(self, offset=0, limit=12):
+        rows = list(self.receipts.values())
+        evidence = [{k:r[k] for k in ("ref", "kind", "path", "url", "label", "check", "sha256",
+                                      "position", "extent") if k in r} for r in rows[offset:offset + limit]]
+        return {"candidate_version":self.item.version, "offset":offset, "total":len(rows),
+                "evidence":evidence, "needs":self.evidence_needs()}
+
+    def evidence_needs(self):
+        retained = self.retained_findings()
+        kinds = {r["kind"] for r in self.receipts.values()}
+        reads = {r["path"] for r in self.receipts.values() if r["kind"] == "read" and r.get("extent", 0) > 0}
+        required_paths = self.item.required_source_paths - self.item.sourced_files(retained.values()).keys()
+        needs = {}
+        for rule in self.item.criteria:
+            if rule.id in retained:
+                continue
+            missing = []
+            if rule.method == "source":
+                if paths := sorted(required_paths - reads):
+                    missing.append({"tool":"read_lines", "paths":paths})
+                elif not reads:
+                    missing.append({"tool":"read_lines"})
+                if "source" not in kinds:
+                    missing.append({"tool":"http_get"})
+            elif rule.method == "execute" and not kinds & {"passed_check", "failed_check"}:
+                missing.append({"tool":"run_shell"})
+            elif rule.method == "inspect" and not kinds & {"read", "passed_check", "review_note"}:
+                missing.append({"tool":"read_lines"})
+            if missing:
+                needs[rule.id] = missing
+        return needs
+
+    def guidance(self):
+        # Avoid repeatedly projecting every URL or duplicating the raw records.
+        # The paginated tool returns the original, unabridged source mapped to each ref.
+        by_kind = {}
+        for receipt in self.receipts.values():
+            label = receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt.get("check") or ""
+            by_kind.setdefault(receipt["kind"], []).append([receipt["ref"], label[:110]])
+        return json.dumps({"recent_evidence":{k:v[-6:] for k,v in by_kind.items()},
+                           "needs":self.evidence_needs(), "catalog":"list_review_evidence"},
+                          ensure_ascii=False, separators=(",", ":"))
+
+    def closing_options(self):
+        needs = self.evidence_needs()
+        gaps = {(cid, step["tool"], path) for cid, steps in needs.items()
+                for step in steps for path in step.get("paths", [""])}
+        if self.closing_needs is None or gaps < self.closing_needs:
+            self.closing_needs, self.closing_attempts = gaps, 0
+        # At handoff only a change in missing, host-observed prerequisites
+        # reopens correction attempts. Rephrasing a verdict cannot buy time.
+        if self.closing_attempts >= 3:
+            return frozenset()
+        tools = {"submit_review"}
+        if self.closing_attempts or len(self.receipts) > 6:
+            tools.add("list_review_evidence")
+        for steps in needs.values():
+            tools.update(step["tool"] for step in steps)
+        return frozenset(tools)
+
+    def catalog_tool(self):
+        def list_evidence(ctx, args):
+            offset = args.get("offset", 0)
+            if type(offset) is not int or offset < 0:
+                return ToolResult.failure("offset 须为非负整数。")
+            return ToolResult.success(json.dumps(self.catalog(offset), ensure_ascii=False))
+        return Tool("list_review_evidence", "分页列出本次独立评审实际观察到的短回执及其原始路径、URL、SHA 和缺失的取证步骤。",
+                    {"type":"object","properties":{"offset":{"type":"integer","minimum":0}},
+                     "additionalProperties":False}, list_evidence)
 
     def retained_findings(self):
         if not self.item.verification_gaps():
@@ -380,7 +474,7 @@ class ReviewSession:
         retained = list(self.retained_findings())
         return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
                  + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
-                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，引用 file:候选路径 和 source:最终URL，并说明证据支持的范围。检索不到只能记录查证范围或证据不足。"
+                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
                 "用 submit_review 提交结构化结果；每项引用宿主回执 ID。变更请求写明责任分类与可执行修改。"
                 "业务标准本身不明确时选择 inconclusive/business。材料：" +
                 json.dumps(self.item.briefing(), ensure_ascii=False) +
@@ -393,6 +487,44 @@ class ReviewSession:
 
     def tool(self):
         return Tool("submit_review", "对本次群内候选版本逐项提交独立验收结论与宿主证据。", SUBMIT_SCHEMA, self.submit)
+
+    def _rejection(self, issues):
+        content = json.dumps(issues, ensure_ascii=False)
+        return ToolResult.failure(content + "\n当前回执和可执行的取证步骤：" + self.guidance(), issues=issues)
+
+    def _finding(self, rule, result):
+        receipts = [self._resolve(ref) for ref in result.evidence]
+        unknown = [ref for ref, row in zip(result.evidence, receipts) if row is None]
+        if unknown:
+            raise ValueError("引用了未观察到或不唯一的证据：" + "、".join(r[:160] for r in unknown)
+                             + "。从 list_review_evidence 选择相符的短 ID。")
+        kinds = {e["kind"] for e in receipts}
+        if rule.method == "source" and (result.verdict == "passed" or result.cause == "product"):
+            if not {"read", "source"} <= kinds:
+                raise ValueError("核实事实需要引用所读候选及本次亲自打开的来源。资料不足时标记 inconclusive。")
+            if any(self.progress.project_versions().get(e["path"]) != e["sha256"] for e in receipts if e["kind"] == "source"):
+                raise ValueError("获取的来源记录已变化，请重新核实。")
+        if result.verdict == "passed":
+            if (rule.id.removeprefix("probe_") in self.item.probes and
+                    not any(r["kind"] == "passed_check" and r.get("asserted") for r in receipts)):
+                raise ValueError("原临时探针的独立复核需要实际断言结果，进程正常退出只能证明运行完成。")
+            if result.cause or result.action:
+                raise ValueError("通过项不应分派修复。")
+            if rule.method == "execute" and "passed_check" not in kinds or not kinds & {"read","passed_check","review_note"}:
+                raise ValueError("通过项需要符合标准方法的正面证据。")
+        else:
+            if not result.cause or not (result.action or "").strip():
+                raise ValueError("需要提供归因及可操作的修改、复验或业务问题。")
+            if result.cause == "business" and result.verdict != "inconclusive":
+                raise ValueError("业务歧义使用 inconclusive，不能判定候选交付错误。")
+            if result.cause == "product" and rule.method == "inspect" and not kinds & {"read", "failed_check"}:
+                raise ValueError("文件内容缺陷需要候选文件读取或失败检查的证据。")
+            if result.cause == "product" and rule.method == "execute" and "failed_check" not in kinds:
+                raise ValueError("可执行标准的产品缺陷需要失败检查回执。")
+        check = CheckResult(criterion_id=rule.id,
+            verdict={"passed":"passed","changes_requested":"failed","inconclusive":"unverified"}[result.verdict],
+            reason=result.reason, evidence_refs=[EvidenceRef(kind="receipt", id=e["receipt_id"]) for e in receipts])
+        return {**result.model_dump(), "check_result":check.model_dump(), "receipts":receipts}
 
     def submit(self, ctx, args):
         try:
@@ -407,38 +539,15 @@ class ReviewSession:
             if len(set(submitted)) != len(submitted) or set(submitted) | retained.keys() != rules.keys():
                 raise ValueError("每个标准都须正好有一个结论。")
             results = [finding for cid, finding in retained.items() if cid not in submitted]
+            issues = []
             for result in request.results:
                 rule = rules[result.criterion_id]
-                receipts = [self.receipts.get(ref) for ref in result.evidence]
-                if not all(receipts):
-                    raise ValueError("引用了未观察到的证据。当前可用：" + ", ".join(self.receipts))
-                kinds = {e["kind"] for e in receipts}
-                if rule.method == "source" and (result.verdict == "passed" or result.cause == "product"):
-                    if not {"read", "source"} <= kinds:
-                        raise ValueError("核实事实需要引用所读候选及本次亲自打开的来源。资料不足时标记 inconclusive。")
-                    if any(self.progress.project_versions().get(e["path"]) != e["sha256"] for e in receipts if e["kind"] == "source"):
-                        raise ValueError("获取的来源记录已变化，请重新核实。")
-                if result.verdict == "passed":
-                    if (rule.id.removeprefix("probe_") in self.item.probes and
-                            not any(r["kind"] == "passed_check" and r.get("asserted") for r in receipts)):
-                        raise ValueError("原临时探针的独立复核需要实际断言结果，进程正常退出只能证明运行完成。")
-                    if result.cause or result.action:
-                        raise ValueError("通过项不应分派修复。")
-                    if rule.method == "execute" and "passed_check" not in kinds or not kinds & {"read","passed_check","review_note"}:
-                        raise ValueError("通过项需要符合标准方法的正面证据。")
-                else:
-                    if not result.cause or not (result.action or "").strip():
-                        raise ValueError("需要提供归因及可操作的修改、复验或业务问题。")
-                    if result.cause == "business" and result.verdict != "inconclusive":
-                        raise ValueError("业务歧义使用 inconclusive，不能判定候选交付错误。")
-                    if result.cause == "product" and rule.method == "inspect" and not kinds & {"read", "failed_check"}:
-                        raise ValueError("文件内容缺陷需要候选文件读取或失败检查的证据。")
-                    if result.cause == "product" and rule.method == "execute" and "failed_check" not in kinds:
-                        raise ValueError("可执行标准的产品缺陷需要失败检查回执。")
-                check = CheckResult(criterion_id=rule.id,
-                    verdict={"passed":"passed","changes_requested":"failed","inconclusive":"unverified"}[result.verdict],
-                    reason=result.reason, evidence_refs=[EvidenceRef(kind="receipt", id=e["receipt_id"]) for e in receipts])
-                results.append({**result.model_dump(), "check_result":check.model_dump(), "receipts":receipts})
+                try:
+                    results.append(self._finding(rule, result))
+                except ValueError as exc:
+                    issues.append({"criterion_id":rule.id, "method":rule.method, "message":str(exc)})
+            if issues:
+                return self._rejection(issues)
             by_id = {r["criterion_id"]: r for r in results}
             results = [by_id[rule.id] for rule in self.item.criteria]
             required = {r.id for r in self.item.criteria if r.required}
@@ -448,8 +557,10 @@ class ReviewSession:
             if verdict == "passed" and self.item.required_source_paths:
                 missing = self.item.required_source_paths - self.item.sourced_files(results).keys()
                 if missing:
-                    raise ValueError("请在必需的 source 判断中，引用实际读过的成稿和本次打开的原始来源："
-                                     + "、".join(sorted(missing)))
+                    return self._rejection([{"criterion_id":r.id, "method":r.method,
+                        "message":"请在必需的 source 判断中，引用实际读过的成稿和本次打开的原始来源；"
+                                  "用 read_lines 读取并引用成稿：" + "、".join(sorted(missing))}
+                        for r in self.item.criteria if r.required and r.method == "source"])
             if verdict == "passed" and self.promotion_issue:
                 if not any(r["criterion_id"] in required and any(e["kind"] in {"read","passed_check"} for e in r["receipts"])
                            for r in results):

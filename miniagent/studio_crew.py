@@ -1054,6 +1054,7 @@ class RoomCrew:
                                     snapshot_matches=snapshot_matches if private else None,
                                     promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())
             registry.add(session.tool())
+            registry.add(session.catalog_tool())
         member = Agent(name=role, provider=self.provider, registry=registry,
                        sandbox=Sandbox(workspace, agent_name=role), settings=self.settings, tracer=self.tracer,
                        task_service=self.service, human_handler=self.human_handler(self.run_id, role, deadline=human_deadline),
@@ -1159,9 +1160,16 @@ class RoomCrew:
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
-            if phase == "handoff" and session and not session.assessment and session.receipts:
-                return StepPolicy("work", "依据已取得的回执提交逐项评审；证据不足时写 inconclusive。" +
-                                  _json(list(session.receipts)), frozenset({"submit_review"}), required_tool="submit_review")
+            if phase == "handoff" and session and not session.assessment:
+                allowed = session.closing_options() & work_tools
+                if not allowed or spendable.exhausted:
+                    return StepPolicy("handoff", "取证预算已用完或同一缺口反复未获进展。以 [BLOCKED] 交接具体标准和缺少的回执。"
+                                      + session.guidance(), frozenset(), compact=True)
+                return StepPolicy("work", "按 needs 的工具和路径补齐实际回执，再用短 ID 提交逐项评审。"
+                                  "证据不足可提交 inconclusive；无法取得回执则以 [BLOCKED] 交接。"
+                                  + session.guidance(), allowed,
+                                  required_tool="submit_review" if allowed == {"submit_review"} else None,
+                                  token_reserve=reserve, seconds_reserve=handoff_seconds)
             if phase == "handoff":
                 # A qualitative review can quote the sources already inspected
                 # locally when its allocation still fits that request.
@@ -1175,7 +1183,7 @@ class RoomCrew:
             # capping the next provider reply, before its usage is charged.
             steering = progress.steering()
             if session and not session.assessment:
-                steering += "\n提交逐项结论时可引用的宿主回执：" + _json(list(session.receipts))
+                steering += "\n提交逐项结论时可引用的宿主回执：" + session.guidance()
             if work_receipt and state.step_index >= 2:
                 # The normal RAO projection keeps recent complete tool
                 # batches, including full actionable reads. This small host
