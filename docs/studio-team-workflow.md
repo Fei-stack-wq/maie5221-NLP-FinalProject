@@ -238,3 +238,13 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 绑定后，群事件 `published_review_bound` 记录原运行、作者任务、文件摘要、本轮评审者和标准。评审者独立取证并提交本轮结论。原件上的未决标准会带入复核；同一版本已有明确产品缺陷时，应由作者修订再发布。缺失原始来源或本轮硬性验收不通过时，复核不能授权交付。实际作者只有在需要修订产品时才需再次交接。
 
 路径和版本匹配参考 in-toto 逐项核对上一步产物和下一步材料的做法。Studio 使用本机群发布回执、不可变交接归档与即时工作区摘要来确认来源。[in-toto 的材料匹配](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L727-L765) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549) · [Studio 跨轮复核回归](../tests/test_studio_inherited_review.py)
+
+### DeepSeek 额度不足时的诊断与接续
+
+DeepSeek 官方将 HTTP 402 定义为账户额度不足。Studio 将其显示为“DeepSeek 账户额度不足”，并保留原任务、尝试、HTTP 状态码、真实请求次数及不可重试标记，不保存响应正文、凭据或服务地址。既有历史轨迹即使只记录 `provider_error.code=http_error`，也可通过同一尝试的 provider 配置识别；没有服务身份的普通 402 不推断为 DeepSeek 额度不足。新配置只记录 `official_api` 布尔值，第三方兼容端点不会被按官方 402 处理。[官方错误码说明](https://api-docs.deepseek.com/quick_start/error_codes/)
+
+首次确认官方 402 后，同一轮共享的 provider 实例停止发出后续模型请求，并通过原有 ProviderError 收尾路径保存成员状态和草稿。首次错误保留真实 `request_attempts`，之后本地拒绝为 0；不会把本地拒绝算作新的 HTTP 请求。已经在途的并发请求不被强行撤回，也不把其他 `retryable=False` 错误一概锁住。新一轮新建实例，仍可正常尝试；接续需要可用额度，Studio 不执行余额或支付操作。
+
+API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验的成员检查点，`recoverable_drafts` 列出其任务 ID 和角色，GUI 提示可在项目文件选项中选择。未找到检查点时不声称草稿一定可恢复；旧轮详情不借用后续轮的草稿。后续同一任务获得有效响应时，先前 402 保留为 `resolved=true` 的历史警告，不覆盖新的执行或验收结果。其他任务的成功、晚到的旧尝试响应均不能据此声称恢复。额度受阻与成稿是否满足业务目标是不同结论。
+
+实现参考维护中的 DeepSeek Harness 将 402 映射到 QUOTA、默认不重试此类非瞬态错误及其“仅一次请求、无重试计时器”回归。Studio 额外按一轮共用实例保存终止原因，以避免成员失败后负责人再次请求同一服务；未复制上游代码。[官方适配器分类](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-deepseek/src/transport.ts#L34-L54) · [重试异常分支](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-retry/src/index.ts#L191-L221) · [单次请求回归](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-retry/tests/retry.spec.ts#L454-L465) · [Studio 新鲜/历史诊断及正常群入口回归](../tests/test_studio_diagnostics.py)

@@ -510,13 +510,17 @@ class StudioService(RoomDiscussion, StudioRoles):
                 "artifacts": artifacts, "artifacts_truncated": len(artifacts) >= MAX_ARTIFACTS,
                 "acceptance": acceptance, "summary": summarize(events), "summary_incomplete": log_truncated,
                 "report": report.decode("utf-8", errors="replace"), "report_truncated": report_truncated}
+        data["conversation"] = self._conversation(path)
+        conversation = data["conversation"] or {}
+        recoverable = (conversation.get("recovery_candidates", [])
+                       if conversation.get("head_run_id") == run_id else [])
         data["diagnostics"] = diagnose(tasks, events, acceptance,
-                                       active=run_id in self._active, incomplete=log_truncated)
+                                       active=run_id in self._active, incomplete=log_truncated,
+                                       recovery_candidates=recoverable)
         data["room_events"] = self.room_events(run_id)
         data["pending_questions"] = [{key: row[key] for key in ("request_id", "role", "text")}
                                      for (rid, _), row in self._questions.items()
                                      if rid == run_id and row["answer"] is None]
-        data["conversation"] = self._conversation(path)
         return self._redact(data)
 
     def _conversation(self, path: Path, *, before: int | None = None, with_answers: bool = True) -> dict | None:

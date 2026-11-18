@@ -696,7 +696,8 @@ function acceptance(detail){const reports=detail.acceptance||[];const passed=rep
 function diagnosis(detail){
  const d=detail.diagnostics;if(!d)return '';
  const issue=d.issues?.find(item=>item.severity==='error')||d.issues?.[0];
- const active=runActive(detail.run);
+ const providerBlocked=issue?.code==='provider_balance_exhausted'&&!issue.resolved;
+ const active=runActive(detail.run)&&!providerBlocked;
  const cancelling=runStatus(detail.run)==='cancel_requested';
  if(!issue&&!active)return '';
  const task=(detail.tasks||[]).find(t=>t.task_id===issue?.task_id);

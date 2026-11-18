@@ -5,7 +5,8 @@ from typing import Any
 
 
 def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
-             *, active: bool = False, incomplete: bool = False) -> dict[str, Any]:
+             *, active: bool = False, incomplete: bool = False,
+             recovery_candidates: list[dict] | None = None) -> dict[str, Any]:
     def scope(event):
         return (event.get("task_id") or event.get("root_id"),
                 event.get("attempt_id") or event.get("root_attempt_id"),
@@ -49,6 +50,52 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
                    if event.get("kind") == "studio_configuration"
                    and isinstance(event.get("configuration"), dict)), {})
     issues = []
+    for index, event in enumerate(events):
+        if event.get("kind") != "provider_error" or event.get("http_status") != 402:
+            continue
+        identity = scope(event)
+        # New adapters classify official 402s without retaining response bodies.
+        # Historical traces still identify the provider on the matching start.
+        provider_config = next((prior.get("provider_config", {})
+            for prior in reversed(events[:index]) if scope(prior) == identity
+            and isinstance(prior.get("provider_config"), dict)), {})
+        provider = event.get("provider") or provider_config.get("provider")
+        if event.get("code") != "insufficient_balance" and (provider != "deepseek"
+                or provider_config.get("official_api") is False):
+            continue
+        later = [row for row in events[index + 1:] if scope(row)[0] == identity[0]]
+        # A late response from an older attempt or another task cannot resolve
+        # this failure. A new attempt needs its own subsequent start and response.
+        restarted, resolved = set(), False
+        prior_scopes = {scope(row) for row in events[:index] if scope(row)[0] == identity[0]}
+        current_attempt = next((row.get("current_attempt_id") for row in tasks
+                                if row.get("task_id") == identity[0]), None)
+        ambiguous = any(identity[part] is None and scope(row)[part] is not None
+                        for row in later for part in (1, 2))
+        for row in later:
+            if (row.get("kind") in {"step_start", "plan_start"} and scope(row) not in prior_scopes
+                    and (not current_attempt or scope(row)[1] == current_attempt)):
+                restarted.add(scope(row))
+            if (identity[0] and not ambiguous and row.get("kind") in {"step", "plan_usage"}
+                    and row.get("finish_reason") in {"stop", "tool_calls"} and not row.get("error_class")
+                    and (scope(row) == identity or all(scope(row)) and scope(row) in restarted)):
+                resolved = True
+                break
+        drafts = [{"task_id": row["task_id"], "role": row.get("role", "")}
+                  for row in recovery_candidates or [] if isinstance(row.get("task_id"), str)]
+        suggestion = ("后续模型调用已成功。可查看该任务的最新执行及验收结果。" if resolved else
+                      "重试需要可用的 DeepSeek 账户额度。可先查看已保存的产物和日志。")
+        if not resolved and drafts:
+            suggestion += f" 当前有 {len(drafts)} 份可接续成员草稿，可在项目对话的项目文件选项中选择，恢复后继续验收。"
+        issues.append({"code": "provider_balance_exhausted", "severity": "warning" if resolved else "error",
+                       "resolved": resolved, "task_id": identity[0], "attempt_id": identity[1], "run_id": identity[2],
+                       "title": "此前 DeepSeek 额度不足，后续请求已成功" if resolved else "DeepSeek 账户额度不足",
+                       "message": "该任务曾收到 HTTP 402，后续模型调用已成功。" if resolved else
+                                  "DeepSeek 返回 HTTP 402（额度不足），本轮模型调用受阻。",
+                       "suggestion": suggestion, "http_status": 402, "retryable": event.get("retryable"),
+                       "step": event.get("step"), "request_attempts": event.get("request_attempts"),
+                       "latency_ms": event.get("latency_ms"), "recoverable_drafts": drafts,
+                       "retry_requires_available_balance": not resolved})
     for index, event in enumerate(events):
         if event.get("kind") not in {"step", "plan_usage"} or event.get("finish_reason") != "length":
             continue
@@ -156,7 +203,11 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
             if issue.get("task_id") and issue["task_id"] not in roots and issue["severity"] == "error":
                 issue["severity"] = "warning"
                 issue["suggestion"] = "子任务的原始问题保留在记录中，项目最终交付已通过独立验收。"
-    has_error = bool((failed & roots if delivered else failed) or any(item["severity"] == "error" and item["code"] in {"studio_error", "output_truncated"}
+                if issue["code"] == "provider_balance_exhausted":
+                    issue["superseded_by_delivery"] = True
+                    issue["title"] = "此前 DeepSeek 额度不足，项目后续已交付"
+                    issue["message"] = "该子任务曾收到 HTTP 402。项目后来已通过验收，账户当前额度需另行核实。"
+    has_error = bool((failed & roots if delivered else failed) or any(item["severity"] == "error" and item["code"] in {"studio_error", "output_truncated", "provider_balance_exhausted"}
                                  for item in issues))
     root_finished = any(identity in ends for identity in roots)
     execution = ("running" if active else "cancelled" if roots & cancelled else "failed" if has_error else "blocked" if blocked and not delivered

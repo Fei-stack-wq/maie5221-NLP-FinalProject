@@ -12,6 +12,7 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import (DEFAULT_MODEL, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_REQUEST_TIMEOUT_SECONDS,
                      DEFAULT_REQUEST_DEADLINE_SECONDS, validate_provider_options)
@@ -39,6 +40,7 @@ def provider_configuration(provider: Provider) -> dict[str, Any]:
     if isinstance(provider, DeepSeekProvider):
         result.update(
             model=provider.model, thinking=provider.thinking,
+            official_api=urlsplit(provider.base_url).hostname == "api.deepseek.com",
             max_output_tokens=provider.max_output_tokens,
             request_timeout_seconds=provider.timeout,
             request_deadline_seconds=provider.deadline_seconds,
@@ -116,6 +118,17 @@ class DeepSeekProvider(Provider):
         self.model, self.thinking = model, thinking
         self.reasoning_effort, self.max_output_tokens = reasoning_effort, max_output_tokens
         self.timeout, self.deadline_seconds, self.max_retries = timeout, deadline_seconds, max_retries
+        # Studio creates a provider per run and shares it across its members.
+        # Keep only safe state, not the original exception or its traceback.
+        self._insufficient_balance = False
+
+    @staticmethod
+    def _balance_error(attempts: int) -> ProviderError:
+        return ProviderError(
+            "DeepSeek 账户额度不足（HTTP 402）。重试需要可用额度，可在满足条件后重新发起任务；"
+            "本轮不会继续发送模型请求，已保存的工作仍然保留。",
+            code="insufficient_balance", status_code=402, attempts=attempts, retryable=False,
+        )
 
     def _build_payload(self, messages: list[dict[str, Any]],
                        tools: list[ToolSpec] | None, temperature: float) -> dict[str, Any]:
@@ -189,6 +202,8 @@ class DeepSeekProvider(Provider):
     def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
              temperature: float = 0.0, *, max_output_tokens: int | None = None,
              deadline_seconds: float | None = None, required_tool: str | None = None) -> LLMResponse:
+        if self._insufficient_balance:
+            raise self._balance_error(0)
         payload = self._build_payload(messages, tools, temperature)
         if required_tool is not None:
             if self.thinking != "disabled" or required_tool not in {tool.name for tool in tools or []}:
@@ -199,8 +214,14 @@ class DeepSeekProvider(Provider):
                 raise ProviderError("Invalid per-request output allocation", code="invalid_config")
             payload["max_tokens"] = max_output_tokens
         started = time.perf_counter()
-        result = (self._post_with_retry(payload) if deadline_seconds is None else
-                  self._post_with_retry(payload, deadline_seconds=deadline_seconds))
+        try:
+            result = (self._post_with_retry(payload) if deadline_seconds is None else
+                      self._post_with_retry(payload, deadline_seconds=deadline_seconds))
+        except ProviderError as exc:
+            if exc.status_code == 402 and urlsplit(self.base_url).hostname == "api.deepseek.com":
+                self._insufficient_balance = True
+                raise self._balance_error(exc.attempts) from None
+            raise
         try:
             response = self._parse(result.data, (time.perf_counter() - started) * 1000)
             if self.thinking == "enabled" and tools and response.reasoning_content is None:

@@ -3,15 +3,21 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
+import shutil
+import subprocess
 import time
 import unittest
 import uuid
 from unittest.mock import patch
 
 from miniagent.config import Settings
+from miniagent.provider_http import HTTPResult, ProviderError
 from miniagent.studio_diagnostics import diagnose
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
+from tests.test_studio_service import finished, request
+from tests.test_studio_crew import roster
 
 
 def task(identity="root", status="unverified", parent=None):
@@ -28,6 +34,162 @@ def event(kind, identity="root", **fields):
 
 
 class StudioDiagnosticsTest(unittest.TestCase):
+    def test_historical_402_receipts_explain_balance_and_verified_recoverable_drafts(self):
+        rows = [task(status="failed"), task("risk", "failed", "root")]
+        events = []
+        for identity, attempt in [("risk", "risk-attempt"), ("root", "lead-attempt")]:
+            common = {"attempt_id":attempt,"run_id":attempt + "-run"}
+            events.extend([
+                event("step_start",identity,step=25,provider_config={"provider":"deepseek"},**common),
+                event("provider_error",identity,step=25,code="http_error",http_status=402,
+                      retryable=False,request_attempts=1,**common),
+                event("task_end",identity,status="error",error="Provider returned an HTTP error",**common)])
+        before = copy.deepcopy((rows,events))
+        result = diagnose(rows,events,[],recovery_candidates=[{"task_id":"risk","role":"risk","objective":"private objective"}])
+        self.assertEqual(result["execution_status"],"failed")
+        self.assertEqual(len(result["issues"]),2)
+        for issue in result["issues"]:
+            self.assertEqual(issue["code"],"provider_balance_exhausted")
+            self.assertEqual(issue["title"],"DeepSeek 账户额度不足")
+            self.assertIn("本轮模型调用受阻",issue["message"])
+            self.assertFalse(issue["resolved"])
+            self.assertFalse(issue["retryable"])
+            self.assertTrue(issue["retry_requires_available_balance"])
+            self.assertEqual(issue["recoverable_drafts"],[{"task_id":"risk","role":"risk"}])
+            self.assertIn("1 份可接续成员草稿",issue["suggestion"])
+        self.assertEqual((rows,events),before)
+
+    def test_new_balance_code_does_not_require_legacy_start_metadata(self):
+        result = diagnose([task(status="running")],[event("provider_error",code="insufficient_balance",
+            http_status=402,retryable=False,request_attempts=0)],[],active=True)
+        self.assertEqual(result["execution_status"],"running")
+        self.assertEqual(result["issues"][0]["title"],"DeepSeek 账户额度不足")
+        self.assertEqual(result["issues"][0]["request_attempts"],0)
+        self.assertEqual(result["issues"][0]["recoverable_drafts"],[])
+        self.assertNotIn("份可接续",result["issues"][0]["suggestion"])
+
+    def test_later_successful_attempt_retains_402_only_as_history(self):
+        events = [event("provider_error",code="insufficient_balance",http_status=402,
+                        attempt_id="old",run_id="old-run"),
+                  event("task_end",status="error",attempt_id="old",run_id="old-run"),
+                  event("step_start",step=1,attempt_id="new",run_id="new-run"),
+                  event("step",step=1,finish_reason="stop",attempt_id="new",run_id="new-run"),
+                  event("task_end",status="completed",attempt_id="new",run_id="new-run")]
+        result = diagnose([task(status="completed")],events,[report("passed",{})])
+        self.assertEqual(result["execution_status"],"finished")
+        issue, = result["issues"]
+        self.assertTrue(issue["resolved"])
+        self.assertEqual(issue["severity"],"warning")
+        self.assertFalse(issue["retry_requires_available_balance"])
+        self.assertIn("后续请求已成功",issue["title"])
+        # Recovery does not erase a subsequent independent execution failure.
+        events.append(event("task_end",status="error",error="tool failed",attempt_id="new",run_id="new-run"))
+        result = diagnose([task(status="failed")],events,[])
+        self.assertEqual(result["execution_status"],"failed")
+        self.assertEqual(result["issues"][-1]["code"],"execution_failed")
+
+    def test_other_tasks_and_late_old_attempt_responses_do_not_resolve_balance_failure(self):
+        for response in [event("step","other",finish_reason="stop",attempt_id="a",run_id="r"),
+                         event("step",finish_reason="stop",attempt_id="older",run_id="older-run")]:
+            with self.subTest(response=response):
+                result = diagnose([task(status="failed")],[
+                    event("provider_error",code="insufficient_balance",http_status=402,attempt_id="a",run_id="r"),
+                    response,event("task_end",status="error",attempt_id="a",run_id="r")],[])
+                self.assertFalse(result["issues"][0]["resolved"])
+                self.assertEqual(result["execution_status"],"failed")
+        result = diagnose([{**task(status="failed"),"current_attempt_id":"new"}],[
+            event("step_start",attempt_id="old",run_id="old-run"),
+            event("task_end",status="error",attempt_id="old",run_id="old-run"),
+            event("provider_error",code="insufficient_balance",http_status=402,attempt_id="new",run_id="new-run"),
+            event("step_start",attempt_id="old",run_id="old-run"),
+            event("step",finish_reason="stop",attempt_id="old",run_id="old-run"),
+            event("task_end",status="error",attempt_id="new",run_id="new-run")],[])
+        self.assertFalse(result["issues"][0]["resolved"])
+
+    def test_project_delivery_does_not_claim_child_balance_recovered(self):
+        result=diagnose([task(status="completed"),task("child","failed","root")],[
+            event("provider_error","child",code="insufficient_balance",http_status=402),
+            event("task_end","child",status="error"),event("task_end",status="completed")],[report("passed",{})])
+        self.assertEqual(result["execution_status"],"finished")
+        issue,=result["issues"]
+        self.assertEqual(issue["severity"],"warning")
+        self.assertTrue(issue["superseded_by_delivery"])
+        self.assertFalse(issue["resolved"])
+        self.assertTrue(issue["retry_requires_available_balance"])
+
+    def test_unrelated_http_errors_do_not_claim_deepseek_balance(self):
+        for status, provider in [(401,"deepseek"),(429,"deepseek"),(402,"other")]:
+            with self.subTest(status=status,provider=provider):
+                result=diagnose([task(status="failed")],[
+                    event("provider_error",provider=provider,code="http_error",http_status=status),
+                    event("task_end",status="error",error="Provider returned an HTTP error")],[])
+                self.assertEqual(result["issues"][0]["code"],"execution_failed")
+        result = diagnose([task(status="failed")],[
+            event("step_start",provider_config={"provider":"deepseek","official_api":False}),
+            event("provider_error",code="http_error",http_status=402),
+            event("task_end",status="error",error="HTTP error")],[])
+        self.assertEqual(result["issues"][0]["code"],"execution_failed")
+
+    def test_fresh_team_balance_failure_preserves_draft_and_stops_lead_http_request(self):
+        root = make_temp_dir("studio-balance")
+        secret = "private-balance-key"
+        service = StudioService(root / "runs",Settings(api_key=secret))
+        def response(call_id, name, arguments):
+            return HTTPResult({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{
+                "id":call_id,"type":"function","function":{"name":name,"arguments":json.dumps(arguments)}}]},
+                "finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5}},1)
+        transport = [response("delegate","delegate_task",{"assignee":"risk","objective":"Write a recoverable draft.",
+                     "deliverable_paths":["draft.md"],"remaining_roles":[]}),
+                     response("write","write_file",{"path":"draft.md","content":"# Work in progress\nEvidence retained."}),
+                     ProviderError("Provider returned an HTTP error",code="http_error",status_code=402,attempts=1)]
+        try:
+            with patch("miniagent.providers.post_json",side_effect=transport) as post:
+                run = service.start(request("team",conversation=roster("lead","risk"),
+                    objective="Write a report with review.",acceptance_files=["draft.md"],limits={"max_steps":15}))
+                detail = finished(service,run["id"])
+            self.assertEqual(post.call_count,3)
+            self.assertEqual(detail["run"]["status"],"failed")
+            errors = [e for e in detail["events"] if e["kind"]=="provider_error"]
+            self.assertEqual([e["request_attempts"] for e in errors],[1,0])
+            self.assertTrue(all(e["code"]=="insufficient_balance" and not e["retryable"] for e in errors))
+            candidates = detail["conversation"]["recovery_candidates"]
+            self.assertEqual([c["role"] for c in candidates],["risk"])
+            issue = detail["diagnostics"]["issues"][0]
+            self.assertEqual(issue["recoverable_drafts"][0]["task_id"],candidates[0]["task_id"])
+            self.assertIn("可接续成员草稿",issue["suggestion"])
+            self.assertNotIn(secret,json.dumps(detail))
+            # Merely reading an old turn must not offer a later turn's drafts.
+            conversation = {**detail["conversation"],"head_run_id":"a-later-run"}
+            with patch.object(service,"_conversation",return_value=conversation):
+                older = service.detail(run["id"])
+            self.assertTrue(all(not i.get("recoverable_drafts") for i in older["diagnostics"]["issues"]))
+        finally:
+            service.close()
+            cleanup(root)
+
+    @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the existing GUI renderer")
+    def test_gui_shows_balance_cause_during_shutdown_and_resolved_history_afterwards(self):
+        source = (Path(__file__).parents[1]/"miniagent/web/app.js").read_text()
+        renderer = source[source.index("function diagnosis(detail){"):source.index("function roomMessages(")]
+        current = diagnose([task(status="running")],[event("provider_error",code="insufficient_balance",
+            http_status=402,retryable=False,request_attempts=1)],[],active=True)
+        historical = diagnose([task(status="completed")],[event("provider_error",code="insufficient_balance",http_status=402),
+            event("step",finish_reason="stop"),event("task_end",status="completed")],[report("passed",{})])
+        fixtures=[{"run":{"status":status},"diagnostics":value,"tasks":[]}
+                  for status,value in [("running",current),("completed",historical)]]
+        javascript = ("const runActive=r=>r.status==='running',runStatus=r=>r.status,endedWithoutChecks=()=>false;\n"
+                      "const e=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');\n"
+                      "const icon=()=>'',duration=()=>'';\n" + renderer +
+                      "console.log(JSON.stringify(" + json.dumps(fixtures,ensure_ascii=False) + ".map(diagnosis)));\n")
+        result=subprocess.run([shutil.which("node")],input=javascript,text=True,capture_output=True,check=True)
+        live,old=json.loads(result.stdout)
+        self.assertIn("DeepSeek 账户额度不足",live)
+        self.assertIn("HTTP 402",live)
+        self.assertIn("重试需要可用",live)
+        self.assertNotIn("正在执行 Agent",live)
+        self.assertIn("后续请求已成功",old)
+        self.assertNotIn("重试需要可用",old)
+
     def test_accepted_root_after_repair_retains_child_issue(self):
         result = diagnose([task(status="completed"), task("draft", "failed", parent="root")],
                           [event("task_end", "draft", status="failed", error="missing deliverable"),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 import unittest
 from pathlib import Path
 from copy import deepcopy
@@ -129,6 +130,80 @@ def envelope(*, calls=None, finish="stop", reasoning=None, content="ok"):
 def tool_call(raw='{"path":"a.md"}', identity="call-1"):
     return {"id": identity, "type": "function",
             "function": {"name": "read_file", "arguments": raw}}
+
+
+class DeepSeekBalanceTest(unittest.TestCase):
+    messages = [{"role": "user", "content": "continue the task"}]
+
+    def test_official_balance_error_stops_later_requests_only_on_this_instance(self):
+        secret = "private-key-and-response-body"
+        provider = DeepSeekProvider(secret)
+        original = ProviderError(secret, code="http_error", status_code=402, attempts=1)
+        with patch("miniagent.providers.post_json", side_effect=original) as post:
+            failures = []
+            for _ in range(3):
+                with self.assertRaises(ProviderError) as caught:
+                    provider.chat(self.messages)
+                failures.append(caught.exception)
+            self.assertEqual(post.call_count, 1)
+        self.assertEqual([exc.attempts for exc in failures], [1, 0, 0])
+        for error in failures:
+            self.assertEqual(error.code, "insufficient_balance")
+            self.assertEqual(error.status_code, 402)
+            self.assertFalse(error.retryable)
+            self.assertIn("额度不足", str(error))
+            self.assertIn("重新发起任务", str(error))
+            rendered = "".join(traceback.format_exception(error))
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn("https://", rendered)
+        self.assertIsNot(failures[0], failures[1])
+        self.assertTrue(failures[0].__suppress_context__)
+        # A subsequent run constructs a new provider; replenishing the account
+        # must not require restarting Studio or clearing global state.
+        later = DeepSeekProvider(secret)
+        with patch("miniagent.providers.post_json", return_value=HTTPResult(envelope(), 1)) as post:
+            self.assertEqual(later.chat(self.messages).text, "ok")
+            self.assertEqual(post.call_count, 1)
+
+    def test_only_the_exact_official_hostname_gets_balance_classification(self):
+        for base_url in ("https://api.deepseek.com/v1", "https://API.DEEPSEEK.COM"):
+            with self.subTest(base_url=base_url):
+                provider = DeepSeekProvider("test-key", base_url=base_url)
+                with patch("miniagent.providers.post_json", side_effect=ProviderError(
+                        status_code=402, attempts=2)) as post:
+                    with self.assertRaises(ProviderError) as caught:
+                        provider.chat(self.messages)
+                    self.assertEqual(caught.exception.code, "insufficient_balance")
+                    self.assertEqual(caught.exception.attempts, 2)
+                    with self.assertRaises(ProviderError) as again:
+                        provider.chat(self.messages)
+                    self.assertEqual(again.exception.attempts, 0)
+                    self.assertEqual(post.call_count, 1)
+        for base_url in ("https://proxy.example/v1", "https://api.deepseek.com.example",
+                         "https://example.org/api.deepseek.com"):
+            with self.subTest(base_url=base_url):
+                provider = DeepSeekProvider("test-key", base_url=base_url)
+                original = ProviderError("upstream payment required", code="http_error", status_code=402, attempts=1)
+                with patch("miniagent.providers.post_json", side_effect=[original, HTTPResult(envelope(), 1)]) as post:
+                    with self.assertRaises(ProviderError) as caught:
+                        provider.chat(self.messages)
+                    self.assertIs(caught.exception, original)
+                    self.assertEqual(provider.chat(self.messages).text, "ok")
+                    self.assertEqual(post.call_count, 2)
+
+    def test_rate_limit_and_context_overflow_do_not_latch(self):
+        for code, status, retryable in (("http_error", 429, True),
+                                        ("context_length_exceeded", 400, False),
+                                        ("http_error", 401, False)):
+            with self.subTest(code=code, status=status):
+                provider = DeepSeekProvider("test-key")
+                original = ProviderError(code=code, status_code=status, attempts=1, retryable=retryable)
+                with patch("miniagent.providers.post_json", side_effect=[original, HTTPResult(envelope(), 1)]) as post:
+                    with self.assertRaises(ProviderError) as caught:
+                        provider.chat(self.messages)
+                    self.assertIs(caught.exception, original)
+                    self.assertEqual(provider.chat(self.messages).text, "ok")
+                    self.assertEqual(post.call_count, 2)
 
 
 class DeepSeekProtocolTest(unittest.TestCase):
