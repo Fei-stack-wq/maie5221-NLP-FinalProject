@@ -334,6 +334,37 @@ class StudioCrewTest(unittest.TestCase):
         self.assertEqual(reports[1]["handoff"]["changed_files"], [])
         self.assertIn("work.txt", reports[1]["handoff"]["evidence"]["inspected"])
 
+    def test_member_and_lead_each_correct_unexecuted_tool_text_within_six_room_steps(self):
+        pseudo = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="run_shell">touch ghost.txt'
+        script = [tool("delegate_task", assignee="dev", objective="Write result", remaining_roles=[]),
+                  write("receipt.md", "Deliverable verified independently."),
+                  {"text": pseudo}, {"text": "Wrote receipt.md."},
+                  {"text": pseudo}, {"text": "Delivered receipt.md."}]
+        detail, provider = self.execute(script, roster("lead", "dev"), objective="Write a receipt",
+                                        acceptance_files=["receipt.md"], limits={"max_steps": 6})
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(len(provider.requests), 6)
+        self.assertEqual([names for _, names in provider.requests[2:]], [[], [], [], []])
+        self.assertTrue(all("工具协议纠正" in str(provider.requests[i][0]) for i in (3, 5)))
+        self.assertFalse(list(self.root.rglob("ghost.txt")))
+        fixes = [e for e in detail["events"] if e["kind"] == "tool_protocol_correction"]
+        self.assertEqual([(e["phase"], e["retry"]) for e in fixes], [("handoff", True), ("finalize", True)])
+
+    def test_two_step_member_lease_keeps_its_work_turn_and_cannot_overrun_room(self):
+        pseudo = "<｜tool▁calls▁begin｜> name=run_shell"
+        script = [tool("delegate_task", assignee="dev", objective="Write result", remaining_roles=[]),
+                  write("receipt.md", "A real but unaccepted draft."),
+                  {"text": pseudo}, {"text": "[BLOCKED] No published receipt."}]
+        detail, provider = self.execute(script, roster("lead", "dev"), objective="Write a receipt",
+                                        acceptance_files=["receipt.md"], limits={"max_steps": 4})
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertEqual(len(provider.requests), 4)
+        self.assertIn("write_file", provider.requests[1][1])
+        self.assertEqual(provider.requests[2][1], [])
+        reports = [e for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertFalse(reports[0]["published"])
+        self.assertEqual(reports[0]["status"], "limit_exceeded")
+
     def test_repeated_green_suite_transitions_to_member_handoff_and_lead_final(self):
         code = ("import subprocess, sys\n"
                 "p = subprocess.run([sys.executable, '-m', 'unittest', 'test_delivery'], capture_output=True, text=True)\n"

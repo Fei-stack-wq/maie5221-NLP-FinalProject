@@ -90,6 +90,22 @@ class StepPolicyTest(unittest.TestCase):
                     self.assertNotEqual(getattr(result.acceptance_report,"verdict",None),"passed")
                     self.assertIn("纠正后仍",result.error)
 
+    def test_work_and_final_protocols_have_separate_single_corrections(self):
+        pseudo = "<｜tool▁calls▁begin｜> run_shell"
+        agent, provider = self.agent([{"text": pseudo},
+                                      {"tool_calls": [{"name": "write_file", "arguments": {
+                                          "path": "deliver.md", "content": "real artifact"}}]},
+                                      {"text": pseudo}, {"text": "delivered"}])
+        def policy(state, budget):
+            if state.step_index < 2:
+                return StepPolicy("work", allowed_tools=frozenset({"write_file"}))
+            return StepPolicy("handoff", allowed_tools=frozenset(), compact=True)
+        result = agent.run("write and report", step_policy=policy, budget=Budget(steps_left=4),
+                           acceptance=accept_files("deliver.md", min_bytes=1))
+        self.assertEqual(result.status, "completed", result.error)
+        self.assertEqual([names for _, names in provider.requests], [["write_file"], ["write_file"], [], []])
+        self.assertEqual(result.tool_calls, 1)
+
     def test_literal_fenced_protocol_example_is_a_valid_text_response(self):
         example = "协议文档的示例：\n~~~~text\n<｜｜DSML｜｜ calls>\n~~~\n<｜tool▁calls▁begin｜>\n~~~~"
         agent, provider = self.agent([{"text":example}])

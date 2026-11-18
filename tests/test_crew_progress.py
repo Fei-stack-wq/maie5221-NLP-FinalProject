@@ -308,6 +308,60 @@ class MemberProgressTest(unittest.TestCase):
         self.check("PASS  total = 8  8", "python acceptance_test.py")
         self.assertFalse(self.p.blocked_reason())
 
+    def test_real_shell_runner_case_survives_output_filters_and_draft_transfer(self):
+        strip = r"sed -e 's/\x1b\[[0-9;]*m//g'"
+        first = ("python3 selftest.py 2>&1 | " + strip + " | tail -45; echo '---'; "
+                 "python3 selftest.py >/tmp/st.log 2>&1; echo \"EXIT=$?\"; "
+                 + strip + " /tmp/st.log | grep -E 'FAIL|结果'")
+        final = ("python3 selftest.py >/tmp/final.log 2>&1; RC=$?; "
+                 + strip + " /tmp/final.log | grep -E 'FAIL|重复取消|取消不存在|结果'; echo \"EXIT=$RC\"")
+        self.observe("run_shell", "exit_code=0\nstdout:\nFAIL 重复取消被拒(400)  -> HTTP 500 / 旧错误"
+                     "\nFAIL 取消不存在的预约(404)  -> HTTP 500\nEXIT=1", args={"command":first}, meta={"exit_code":0})
+        failed = self.p.failed_checks()
+        self.assertEqual(len(failed), 2)
+        self.p = MemberProgress(self.root)
+        self.p.restore_failed_checks(failed)
+        self.observe("run_shell", "exit_code=0\nstdout:\n  PASS 重复取消被拒(400)  -> HTTP 400 / 新诊断\nEXIT=0",
+                     args={"command":final}, meta={"exit_code":0})
+        self.assertEqual(list(self.p.failed_checks().values()), ["工具输出 FAIL · 取消不存在的预约(404)  -> HTTP 500"])
+        self.observe("run_shell", "exit_code=0\nstdout:\n  \x1b[32mPASS\x1b[0m 取消不存在的预约(404)  -> HTTP 404",
+                     args={"command":"python3 selftest.py"}, meta={"exit_code":0})
+        self.assertFalse(self.p.failed_checks())
+
+    def test_shell_custom_case_identity_resists_false_resolution(self):
+        case = "cancel missing (404)"; command = "python3 check.py --profile local"
+        self.observe("run_shell", "exit_code=0\nstdout:\nFAIL " + case + "  -> HTTP 500",
+                     args={"command":command, "cwd":"frontend"}, meta={"exit_code":0})
+        initial = self.p.failed_checks()
+        for invocation, cwd, caption, exit_footer in (
+                (command, "backend", case, ""),
+                (command.replace("local","remote"), "frontend", case, ""),
+                (command.replace("check.py","different.py"), "frontend", case, ""),
+                ("grep -E PASS /tmp/old.log", "frontend", case, ""),
+                (command + " >/tmp/new.log; grep -E PASS /tmp/old.log", "frontend", case, ""),
+                (command + "; echo 'PASS cancel missing (404)'", "frontend", case, ""),
+                (command + " | sed -e 's/FAIL/PASS/g'", "frontend", case, ""),
+                (command + "; python3 other.py", "frontend", case, ""),
+                (command + " | tail -5", "frontend", "cancel missing (403)", ""),
+                (command + " | tail -5; echo \"EXIT=$?\"", "frontend", case, "\nEXIT=1")):
+            with self.subTest(invocation=invocation, cwd=cwd):
+                self.observe("run_shell", "exit_code=0\nstdout:\nPASS " + caption + "  -> HTTP 404" + exit_footer,
+                             args={"command":invocation,"cwd":cwd},meta={"exit_code":0})
+                self.assertTrue(initial.keys() <= self.p.failed_checks().keys())
+        self.observe("run_shell","exit_code=0\nstdout:\nPASS " + case + "  -> HTTP 404",
+                     args={"command":command+" | tail -5","cwd":"frontend"},meta={"exit_code":0})
+        self.assertTrue(initial.keys().isdisjoint(self.p.failed_checks()))
+
+    def test_case_keys_preserve_full_captions_independently_of_display_limit(self):
+        prefix = "x" * 180
+        command = {"command":"python3 checks.py"}
+        self.observe("run_shell", "exit_code=0\nstdout:\nFAIL " + prefix + "A  -> mismatch\nFAIL "
+                     + prefix + "B  -> mismatch", args=command, meta={"exit_code":0})
+        self.assertEqual(len(self.p.failed_checks()), 2)
+        self.observe("run_shell", "exit_code=0\nstdout:\nPASS " + prefix + "A  -> expected",
+                     args=command, meta={"exit_code":0})
+        self.assertEqual(len(self.p.failed_checks()), 1)
+
     def test_transferred_standard_suite_failure_requires_its_actual_rerun(self):
         self.check("1 failed in 0.1s", "pytest group_a")
         previous = self.p.failed_checks()

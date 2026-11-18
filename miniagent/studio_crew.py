@@ -226,7 +226,7 @@ class RoomCrew:
         # smaller allowance for looking into genuinely new information.
         available = budget.available_tokens(self.close_tokens)
         seconds = max(.1, budget.seconds_left - self.close_seconds)
-        steps = max(1, budget.steps_left - 1)
+        steps = max(1, budget.steps_left - 2)
         if self.inspection_revision != self.project_version:
             self.inspection_revision = self.project_version
             self.revision_reads = _ReadAllowance(None if available is None else max(1024, math.ceil(.03*available)),
@@ -452,7 +452,7 @@ class RoomCrew:
         if inspect_public and not budget.has_tokens(self.close_tokens + decision_input + 1):
             allowed = controls
             decision_input = input_cost(controls)
-        if (budget.steps_left <= 1 or budget.seconds_left <= self.close_seconds
+        if (budget.steps_left <= (2 if self.assigned else 1) or budget.seconds_left <= self.close_seconds
                 or not budget.has_tokens(self.close_tokens + decision_input + 1)):
             return closing
         dispatch_limit = decision_input + 8192
@@ -475,14 +475,16 @@ class RoomCrew:
                            content=text, error_class=None if ok else ErrorClass.A_TOOL_ERROR)
 
     def _allocation(self, role, planned, *, record_shares=True):
-        # Hold one complete final request plus one compact decision for each
-        # other potential assignee. Unused child allowance stays with the room.
+        # Hold the final report and the remaining dispatches. If each elected
+        # member can still work, report, and correct a malformed report, leave
+        # the lead a correction too. Unused turns stay with the room.
         peers = planned if planned is not None else set(self.profiles) - {self.lead}
         count = len((peers | set(self.child_checks) | {role}) - (self.approved_roles - {role}))
         b = self.budget
         available_seconds = min(b.seconds_left, self.deadline - time.monotonic())
         next_dispatch = min(14000, self.close_tokens + 2000)
-        reserved = Budget(steps_left=count, actions_left=count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
+        lead_retry = int(b.steps_left >= 4 * count + 1)
+        reserved = Budget(steps_left=count + lead_retry, actions_left=count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
                           seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count-1))
         child = Budget(steps_left=(b.steps_left-reserved.steps_left)//count,
                        actions_left=(b.actions_left-reserved.actions_left)//count,
@@ -760,7 +762,11 @@ class RoomCrew:
         def member_policy(state, budget, *, preflight=False):
             bare = StepPolicy("handoff", allowed_tools=frozenset(), compact=True)
             reserve = 0 if budget.tokens_left is None else estimate_tokens(policy_messages(state, bare)) + handoff_limit + 1344
-            spendable = budget.model_copy(update={"tokens_left": budget.available_tokens(reserve),
+            # MemberProgress already holds one turn for the first handoff.
+            # Keep one more for a protocol correction without spending more
+            # than the allocation or taking another member's share.
+            spendable = budget.model_copy(update={"steps_left": budget.steps_left - 1,
+                                                  "tokens_left": budget.available_tokens(reserve),
                                                   "seconds_left": budget.seconds_left - handoff_seconds})
             if preflight:
                 progress.require_handoff("工作调用的受保护输入超过可用 token；使用保留的最终交接额度")

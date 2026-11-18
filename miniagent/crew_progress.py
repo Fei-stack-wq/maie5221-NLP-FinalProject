@@ -25,8 +25,8 @@ _UNIT_OK = re.compile(r"^OK(?: \([^\n]*\))?\s*$", re.M)
 _PYTEST = re.compile(r"(?m)^\s*=*\s*(?:\d+ (?:skipped|warnings?), )*(\d{1,8}) passed\b[^\n]*$")
 _FAILURE = re.compile(r"(?m)^\s*(?:=+\s*)?(?:FAILED\s*\(|(?:\d+ (?:passed|skipped|warnings?), )*"
                       r"[1-9]\d* (?:failed|errors?)\b|FAILED \S+::)")
-_CASE = re.compile(r"(?im)^\s*(PASS|FAIL)\s*[:|–-]?\s+([^\n]{1,160})")
-_NESTED_EXIT = re.compile(r"(?im)(?:^\s*|CompletedProcess\([^\n]*?,\s*)(?:returncode|exit[_ ]?code)\s*[=:]\s*(-?\d{1,8})\b")
+_CASE = re.compile(r"(?im)^\s*(PASS|FAIL)\s*[:|–-]?\s+([^\n]+)")
+_NESTED_EXIT = re.compile(r"(?im)(?:^\s*|CompletedProcess\([^\n]*?,\s*)(?:returncode|exit(?:[_ ]?code)?)\s*[=:]\s*(-?\d{1,8})\b")
 _TRACEBACK = re.compile(r"(?ms)^Traceback \(most recent call last\):\s*\n\s+File .+?"
                         r"^(?:[\w.]+(?:Error|Exception)|SystemExit)(?::|$)")
 _MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "run_browser", "write_file", "edit_file", "append_file", "delete_file"}
@@ -129,6 +129,83 @@ def _shell_inputs(command: str, cwd: str, files: dict) -> tuple[set, str, bool]:
     return reads if inspection else set(), (f"(cwd={base}) " if base != Path(".") else "") + scope, inspection
 
 
+def _shell_case_suite(command: str, cwd: str) -> str | None:
+    """Attribute custom PASS/FAIL lines only to a single identifiable runner.
+
+    Allow ordinary stdout formatting and viewing a log produced by that runner
+    in this invocation. Any other producer, unrelated file, expansion, or mixed
+    test suite falls back to the exact original invocation.
+    """
+    if any(c in command.strip() for c in ("\n", "`", "$(", "<<")):
+        return None
+    lex = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None
+    suite = None
+    logs = set()
+    piped = False
+    words = []
+    for token in [*tokens, ";"]:
+        if token not in ("|", ";"):
+            words.append(token)
+            continue
+        if not words:
+            return None
+        # The sole writer of named test-result lines must be the same runner.
+        name, *args = words
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|node", Path(name).name) and args and not piped:
+            redirect = next((j for j, arg in enumerate(args) if arg in (">", ">&")), len(args))
+            argv = args[:redirect]
+            tail = args[redirect:]
+            # shlex tokenizes '2>&1' into ['2', '>&', '1'].
+            if tail[:2] == [">&", "1"] and argv[-1:] == ["2"]:
+                argv.pop()
+                tail = tail[2:]
+            if tail[:1] == [">"] and len(tail) >= 2 and re.fullmatch(r"[\w./-]+", tail[1]):
+                logs.add(tail[1])
+                tail = tail[2:]
+            if tail not in ([], ["2", ">&", "1"]):
+                return None
+            if (not argv or not argv[0].endswith((".py", ".js", ".mjs", ".cjs"))
+                    or any(not re.fullmatch(r"[\w./:=+@-]+", arg) for arg in [name, *argv])):
+                return None
+            identity = shlex.join([name, *argv])
+            if suite is not None and suite != identity:
+                return None
+            suite = identity
+        elif name in ("sed", "grep", "head", "tail") and suite:
+            if not piped and (not args or args.pop() not in logs):
+                return None
+            if name == "sed":
+                if args[:1] == ["-e"]:
+                    args.pop(0)
+                if args != [r"s/\x1b\[[0-9;]*m//g"] and not (
+                        len(args) == 2 and args[0] == "-n" and re.fullmatch(r"\d+(?:,\d+)?p", args[1])):
+                    return None
+            elif name == "grep":
+                if args and re.fullmatch(r"-[EFiv]+", args[0]):
+                    args.pop(0)
+                if len(args) != 1 or args[0].startswith("-"):
+                    return None
+            elif not (len(args) == 1 and re.fullmatch(r"-\d+", args[0]) or
+                      len(args) == 2 and args[0] == "-n" and args[1].isdigit()):
+                return None
+        elif not piped and name == "echo" and len(args) == 1 and re.fullmatch(
+                r"-+|(?:EXIT|EXIT_CODE|returncode)=\$(?:\?|RC|rc)", args[0], re.I):
+            pass
+        elif not piped and name in ("RC=$?", "rc=$?") and not args:
+            pass
+        else:
+            return None
+        words = []
+        piped = token == "|"
+    return f"shell case {Path(cwd or '.')} {suite}" if suite else None
+
+
 class _Check(NamedTuple):
     suite: str
     status: str
@@ -182,6 +259,7 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
     if reading and not (is_test or inline_assertions):
         return None
     output = obs.content.partition("\n")[2] if obs.content.startswith("exit_code=") else obs.content
+    output = re.sub(r"\x1b\[[0-9;]*m", "", output)
     # Common wrapper: print(result.returncode, result.stderr.splitlines()[-2:]).
     # Parse a literal list of lines; do not interpret arbitrary Python output.
     for line in output.splitlines()[-4:]:
@@ -196,8 +274,8 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
     unit = _UNIT.search(output)
     passed = _PYTEST.search(output)
     cases = _CASE.findall(output)
-    failed_cases = [name.strip()[:72] for status, name in cases if status.upper() == "FAIL"]
-    passed_cases = [name.strip()[:72] for status, name in cases if status.upper() == "PASS"]
+    failed_cases = [name.strip() for status, name in cases if status.upper() == "FAIL"]
+    passed_cases = [name.strip() for status, name in cases if status.upper() == "PASS"]
     failure = _FAILURE.search(output)
     nested = [int(s) for s in _NESTED_EXIT.findall(output)]
     # Some callers print numeric exit codes without a label. Only interpret
@@ -222,7 +300,7 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
     bad_exit = not obs.ok or obs.meta.get("exit_code", 0) != 0 or any(n != 0 for n in nested)
     nested_exception = (is_test or inline_assertions) and _TRACEBACK.search(output) and not unit
     if failed_cases:
-        return _Check(suite, "failed", "工具输出 FAIL · " + failed_cases[0], tuple(failed_cases))
+        return _Check(suite, "failed", "工具输出 FAIL · " + failed_cases[0][:72], tuple(failed_cases))
     if failure or nested_exception or (check_context and bad_exit):
         return _Check(suite, "failed", f"{framework} 执行失败")
     if obs.truncated or not obs.ok or "截断" in output[-80:]:
@@ -232,7 +310,7 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
     if passed and int(passed[1]):
         return _Check(suite, "passed", f"pytest · {passed[1]} passed", tuple(passed_cases))
     if passed_cases:
-        return _Check(suite, "passed", f"工具输出 {len(passed_cases)} 项 PASS · " + " / ".join(passed_cases[:2]), tuple(passed_cases))
+        return _Check(suite, "passed", f"工具输出 {len(passed_cases)} 项 PASS · " + " / ".join(name[:72] for name in passed_cases[:2]), tuple(passed_cases))
     if inline_assertions and obs.meta.get("exit_code") == 0:
         # A silent script with top-level assertions may have exited early.
         # It can clear its own failed invocation, not certify a suite pass.
@@ -411,9 +489,13 @@ class MemberProgress:
                     signal = _check(obs, command, reading, exit_position)
                 if signal:
                     suite, status, label, cases = signal
+                    case_suite = suite
+                    if cases and obs.source == "run_shell":
+                        case_suite = _shell_case_suite(str(parameters.get("command", "")),
+                                                     str(parameters.get("cwd") or ".")) or suite
                     suite_key = _check_key(suite)
                     if status == "failed":
-                        failures = ({_check_key(suite, case): "工具输出 FAIL · " + case for case in cases}
+                        failures = ({_check_key(case_suite, case): "工具输出 FAIL · " + case[:72] for case in cases}
                                     if cases else {suite_key: label})
                         advances |= not failures.keys() <= self._failures.keys()
                         self._failures.update(failures)
@@ -427,7 +509,7 @@ class MemberProgress:
                         self._passes[suite] = label
                         self._failures.pop(suite_key, None)
                         for case in cases:
-                            self._failures.pop(_check_key(suite, case), None)
+                            self._failures.pop(_check_key(case_suite, case), None)
                 elif obs.ok and not reading:
                     # Different observed results from real data/API queries
                     # are useful investigation. Repeated clocks and elapsed

@@ -258,7 +258,9 @@ class Agent:
             return True
 
         preflight_handoff_used = False
-        tool_protocol_correction_used = False
+        # A malformed work action and a malformed final handoff have distinct
+        # protocols. Each may be corrected once, within the original budget.
+        corrected_protocols: set[str] = set()
 
         def budget_reason() -> str:
             if budget.seconds_left <= 0:
@@ -459,14 +461,16 @@ class Agent:
                     status, error = "limit_exceeded", budget_reason()
                     break
                 if record.unstructured_tool_call:
-                    can_retry = not tool_protocol_correction_used and budget.steps_left > 0 and budget.has_tokens(1)
+                    protocol = "text" if text_only else "tools"
+                    already_corrected = protocol in corrected_protocols
+                    can_retry = not already_corrected and budget.steps_left > 0 and budget.has_tokens(1)
                     if self.tracer:
                         self.tracer.event("tool_protocol_correction", **identity, step=record.step,
-                                          retry=can_retry, phase=policy.phase)
+                                          retry=can_retry, phase=policy.phase, protocol=protocol)
                     if not can_retry:
-                        status = "error" if tool_protocol_correction_used else "limit_exceeded"
+                        status = "error" if already_corrected else "limit_exceeded"
                         error = ("纠正后仍在正文中输出工具调用；未执行该调用，无法确认交接。"
-                                 if tool_protocol_correction_used else "模型在正文中输出工具调用，剩余额度不足以纠正。")
+                                 if already_corrected else "模型在正文中输出工具调用，剩余额度不足以纠正。")
                         break
                     # Keep the malformed response for auditing and exclude the
                     # entire unexecuted batch (including any skipped tool replies).
@@ -476,7 +480,7 @@ class Agent:
                         "请通过 API 的结构化 tool_calls 发出实际调用。若本轮仅能用文字交接，"
                         "请基于已有证据报告结果或以 [BLOCKED] 说明剩余工作。请勿在正文中书写调用标记。"
                     )
-                    tool_protocol_correction_used = True
+                    corrected_protocols.add(protocol)
                     continue
                 if record.recoverable_output_length:
                     if output_recoveries < self.settings.max_output_recovery_attempts and not budget.exhausted:
