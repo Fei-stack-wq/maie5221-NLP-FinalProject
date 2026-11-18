@@ -103,6 +103,13 @@ class Review:
     def owner(self):
         return self.author if self.state == "repair" else self.reviewer
 
+    def verification_gaps(self):
+        if self.state != "review" or self.latest.get("candidate_version") != self.version:
+            return []
+        required = {rule.id for rule in self.criteria if rule.required}
+        gaps = [g for g in self.latest["results"] if g["criterion_id"] in required and g["verdict"] != "passed"]
+        return gaps if all(g.get("cause") == "verification" for g in gaps) else []
+
     def describe(self):
         return {"target":self.target, "author":self.author, "reviewer":self.reviewer,
                 "state":self.state, "candidate_version":self.version, "files":dict(self.files),
@@ -114,15 +121,21 @@ class Review:
         # Prompts need actionable gaps and an immutable version. The complete
         # manifest and evidence records remain in the persisted room handoff.
         facts = self.describe()
+        pending = [r for r in facts.pop("findings") if r["verdict"] != "passed"]
+        # Tool results and coordinator close corrections are clipped. Keep the
+        # identities and actions ahead of long objectives, manifests and rubrics.
+        brief = {"target": self.target, "reviewer": self.reviewer, "candidate_version": self.version,
+                 "pending_criteria": [r["criterion_id"] for r in pending],
+                 "findings": [{k: r.get(k) for k in ("criterion_id", "verdict", "cause", "action", "reason")}
+                              for r in pending]}
         facts["files"] = dict(list(self.files.items())[:32])
         facts["files_total"] = len(self.files)
         if self.required_source_paths:
             facts["required_source_paths"] = sorted(self.required_source_paths)
-        facts["findings"] = [{k:r.get(k) for k in ("criterion_id","verdict","reason","cause","action")}
-                             for r in facts["findings"] if r["verdict"] != "passed"]
-        return facts
+        return {**brief, **facts}
 
     def apply(self, assessment, human_state):
+        previous = {g["criterion_id"] for g in self.verification_gaps()}
         self.latest = assessment
         required = {r.id for r in self.criteria if r.required}
         gaps = [r for r in assessment["results"] if r["criterion_id"] in required and r["verdict"] != "passed"]
@@ -147,7 +160,11 @@ class Review:
             self.state = "awaiting_user"
             self.answer_at = human_state
         else:
-            self.state = "review"
+            remaining = {g["criterion_id"] for g in gaps}
+            # One opportunity to obtain an independent source for this gap.
+            # New tool IDs, different read ranges or another 403 must not buy
+            # more attempts against identical bytes and unresolved criteria.
+            self.state = "blocked" if previous and not remaining < previous else "review"
 
     def repair_blocked(self, snapshot, failed, missing):
         # Public-candidate repairs that could not publish can retry with fresh evidence.
@@ -221,7 +238,8 @@ class ReviewQueue:
             raise ValueError("标准 ID 需要唯一，且至少一项为必需。")
         if active := next((r for r in self.items.values() if r.draft_task and
                            spec.candidate in {r.target,r.author,r.draft_task}), None):
-            if active.reviewer != reviewer or active.criteria[:len(active.criteria)-len(active.probes)] != spec.criteria:
+            original_rules = active.criteria[:len(active.criteria) - len(active.probes)]
+            if (active.reviewer != reviewer or original_rules != spec.criteria) and not active.verification_gaps():
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return active
         author = next((r for r in reversed(reports) if spec.candidate in {r["task_id"], r["role"]}
@@ -254,17 +272,17 @@ class ReviewQueue:
                     probes[scope] = probe
         if not files:
             raise ValueError("该交接没有可绑定版本的工件。")
-        required_sources = self.required_source_paths.intersection(p for p, sha in files.items() if sha)
-        if required_sources:
-            if any(self.source_authors.get((p, files[p])) == reviewer for p in required_sources):
-                raise ValueError("请另选评审人。指定文件的当前版本由这名成员写入。")
-            if not any(rule.method == "source" and rule.required for rule in spec.criteria):
-                raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         existing = self.items.get(author["task_id"])
+        required_sources = self.required_source_paths.intersection(p for p, sha in files.items() if sha)
+        bound_reviewer = existing.reviewer if existing else reviewer
+        if any(self.source_authors.get((p, files[p])) == bound_reviewer for p in required_sources):
+            raise ValueError("请另选评审人。指定文件的当前版本由这名成员写入。")
         if existing:
-            if existing.criteria != spec.criteria or existing.reviewer != reviewer:
+            if (existing.reviewer != reviewer or existing.criteria != spec.criteria) and not existing.verification_gaps():
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return existing
+        if required_sources and not any(rule.method == "source" and rule.required for rule in spec.criteria):
+            raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes,
                         required_source_paths=required_sources)
         return review
@@ -348,8 +366,21 @@ class ReviewSession:
         self.receipts[ref] = {**row, "attempt_id":self.attempt_id, "tool_call_id":tool_call_id,
                               "fingerprint":digest(row), "receipt_id":digest([self.attempt_id, tool_call_id, row])}
 
+    def retained_findings(self):
+        if not self.item.verification_gaps():
+            return {}
+        manifest = self.progress.project_versions()
+        # Use only authenticated findings on the identical candidate. A
+        # source report or review note that disappeared requires a fresh check.
+        return {g["criterion_id"]: g for g in self.item.latest["results"]
+                if g["verdict"] == "passed" and all(manifest.get(e["path"]) == e["sha256"]
+                    for e in g["receipts"] if e["kind"] in {"read", "source", "review_note"})}
+
     def context(self):
-        return ("本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，引用 file:候选路径 和 source:最终URL，并说明证据支持的范围。检索不到只能记录查证范围或证据不足。"
+        retained = list(self.retained_findings())
+        return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
+                 + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
+                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，引用 file:候选路径 和 source:最终URL，并说明证据支持的范围。检索不到只能记录查证范围或证据不足。"
                 "用 submit_review 提交结构化结果；每项引用宿主回执 ID。变更请求写明责任分类与可执行修改。"
                 "业务标准本身不明确时选择 inconclusive/business。材料：" +
                 json.dumps(self.item.briefing(), ensure_ascii=False) +
@@ -371,9 +402,11 @@ class ReviewSession:
             if request.candidate_version != self.item.version or not self.unchanged():
                 raise ValueError("候选版本已改变，验收者须针对绑定的原件检查。")
             rules = {r.id:r for r in self.item.criteria}
-            if sorted(rules) != sorted(r.criterion_id for r in request.results):
+            retained = self.retained_findings()
+            submitted = [r.criterion_id for r in request.results]
+            if len(set(submitted)) != len(submitted) or set(submitted) | retained.keys() != rules.keys():
                 raise ValueError("每个标准都须正好有一个结论。")
-            results = []
+            results = [finding for cid, finding in retained.items() if cid not in submitted]
             for result in request.results:
                 rule = rules[result.criterion_id]
                 receipts = [self.receipts.get(ref) for ref in result.evidence]
@@ -406,6 +439,8 @@ class ReviewSession:
                     verdict={"passed":"passed","changes_requested":"failed","inconclusive":"unverified"}[result.verdict],
                     reason=result.reason, evidence_refs=[EvidenceRef(kind="receipt", id=e["receipt_id"]) for e in receipts])
                 results.append({**result.model_dump(), "check_result":check.model_dump(), "receipts":receipts})
+            by_id = {r["criterion_id"]: r for r in results}
+            results = [by_id[rule.id] for rule in self.item.criteria]
             required = {r.id for r in self.item.criteria if r.required}
             decisions = {r["verdict"] for r in results if r["criterion_id"] in required}
             verdict = "changes_requested" if "changes_requested" in decisions else (

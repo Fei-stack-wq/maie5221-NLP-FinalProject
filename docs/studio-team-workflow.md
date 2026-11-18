@@ -192,3 +192,11 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 成稿来源核查复用了现有 `ReviewSession`。每份指定交付的路径及 SHA-256 须出现在当轮独立评审者提交的必需 source 结论中，并与当轮亲自打开的原始来源一起引用。稿件版本变化即重新进入评审。以校规与论文为例，评审人需对照正式规定、建议、反证、研究样本和受限的适用范围。路径及哈希绑定借鉴 in-toto 对跨步骤材料与产物的匹配；本系统使用 Studio 宿主保存的文件读取及来源回执来识别评审角色，没有使用上游的外部签名基础设施。[in-toto 工件匹配实现](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L645) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549)
 
 在网页新建群聊时打开「选项」，或在群内继续对话时打开「本轮选项与预算」。在「需要独立核查来源的文件」中填写最终稿相对路径。选择「由负责人分工」，群内至少需要负责人、作者和另一位核查成员。
+
+### 同一版本的未决核查
+
+独立验收者提交证据不足时，负责人可用 `delegate_task` 把核查交回原验收者。应在目标里说明准备检查的新来源或方法。再次引用同一候选时，宿主沿用已绑定的验收者、文件版本和完整标准，并在公开的 `review_resumed` 事件中记录实际标准和待核查项。交接提示先展示缺口及建议行动，较长的原任务放在后面。
+
+复查时，原版本已通过且引用材料哈希仍匹配的结论可连同原评审回执保留。未决的来源核查要通过，仍须在复查期间直接读取成稿并取得独立来源。重复遇到 403、改写说明或改变读取范围均不能让同一版本无限复查。只有必需的未决标准真正减少，才继续下一轮；原件变化则重新检查新版本。
+
+设计参考 LangGraph 按检查点和任务保存已完成写入，以及 Pydantic AI 把具体验证错误交回调用方的方式。Studio 另行核对候选与证据哈希，并以未决标准的实际减少限制复查次数。[LangGraph 的中间写入](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py#L458-L499) · [Pydantic AI 验证反馈](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/pydantic_ai_slim/pydantic_ai/_output.py#L222) · [Pydantic AI 重试边界测试](https://github.com/pydantic/pydantic-ai/blob/ef740deb08789941192f093436dd1a1c31ba4532/tests/test_agent.py#L14684)

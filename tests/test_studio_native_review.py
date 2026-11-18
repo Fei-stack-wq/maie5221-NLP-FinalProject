@@ -1,11 +1,11 @@
 import hashlib
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from miniagent.config import Settings
 from miniagent.research import Page
-from miniagent.studio_reviews import Review, ReviewQueue, Rule, digest
+from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, tool
@@ -33,10 +33,10 @@ class NativeReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps):
+    def execute(self, steps, *others):
         provider = RecordingProvider(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
-            run = self.service.start(request("team",conversation=roster("lead","builder","inspector"),
+            run = self.service.start(request("team",conversation=roster("lead","builder","inspector",*others),
                  objective="Build and independently verify the shipment label.",acceptance_files=[PATH],
                  limits={"max_steps":90}))
             detail = finished(self.service, run["id"])
@@ -162,6 +162,103 @@ class NativeReviewTest(unittest.TestCase):
         self.assertEqual(reports[-1]["native_review"]["state"],"blocked")
         self.assertNotEqual(detail["run"]["status"],"completed")
         self.assertNotIn("human_question",[e["kind"] for e in detail["room_events"]])
+
+    def verification_retry(self, retry_steps):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        url = "https://issuer.example/dispatch.pdf"
+        rules = [RULE, {"id": "issuer_notice", "method": "source", "description": "Check the issuer's dispatch notice."}]
+        checked = {"criterion_id": "content", "verdict": "passed", "reason": "Read the label.", "evidence": ["file:" + PATH]}
+        gap = {"criterion_id": "issuer_notice", "verdict": "inconclusive", "cause": "verification",
+               "action": "Locate a readable issuer copy.", "reason": "The PDF returns HTTP 403.", "evidence": ["file:" + PATH]}
+        steps = self.start_review()
+        steps[3] = tool("delegate_task", assignee="inspector", objective="Review both criteria.", remaining_roles=[],
+                        review={"candidate": "builder", "criteria": rules})
+        steps += [tool("http_get", url=url), tool("submit_review", candidate_version=version(label), results=[checked, gap]),
+                  {"text": "The PDF returned HTTP 403."},
+                  tool("delegate_task", assignee="backup", objective="Try the issuer's accessible alternate notice.",
+                       deliverable_paths=["backup-review.txt"], review={"candidate": "builder", "criteria": [{**RULE, "description": "Reading the label suffices."}]}),
+                  tool("read_file", path=PATH)]
+        return steps + retry_steps(label, gap), rules
+
+    def test_resume_bound_rule_with_alternate_source_and_retain_verified_receipts(self):
+        alternate = "https://issuer.example/dispatch.html"
+        def finish(label, gap):
+            positive = {"criterion_id": gap["criterion_id"], "verdict": "passed", "evidence": ["file:" + PATH],
+                        "reason": "Issuer HTML confirms the named warehouse."}
+            return [tool("submit_review", candidate_version=version(label), results=[positive]),
+                    tool("http_get", url=alternate),
+                    tool("submit_review", candidate_version=version(label),
+                         results=[{**positive, "evidence": ["file:" + PATH, "source:" + alternate]}]),
+                    {"text": "Verified the remaining source."}, {"text": "Delivered."}]
+        steps, rules = self.verification_retry(finish)
+        with patch("miniagent.research.fetch", side_effect=[OSError("HTTP 403"), Page(alternate,"text/plain",b"Official destination.",False)]):
+            detail, provider = self.execute(steps, "backup")
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        reports = [e["handoff"]["native_review"] for e in detail["room_events"]
+                   if e["kind"] == "member_report" and "native_review" in e["handoff"]]
+        self.assertEqual([r["state"] for r in reports], ["review", "passed"])
+        first, second = reports
+        self.assertEqual(first["candidate_version"], second["candidate_version"])
+        self.assertEqual(first["reviewer"], second["reviewer"])
+        self.assertEqual(first["criteria"], second["criteria"])
+        self.assertEqual(first["findings"][0], second["findings"][0])  # preserves the previous evaluator and attempt
+        self.assertEqual(second["findings"][1]["receipts"][1]["url"], alternate)
+        resume, = [e for e in detail["room_events"] if e["kind"] == "review_resumed"]
+        self.assertEqual((resume["requested"], resume["recipient"]), ("backup", "inspector"))
+        self.assertEqual(resume["pending_criteria"], ["issuer_notice"])
+        self.assertEqual([r["id"] for r in resume["bound_criteria"]], [r["id"] for r in rules])
+        self.assertTrue(any("本次亲自打开的来源" in str(req[0]) for req in provider.requests))
+        self.assertTrue(any("accessible alternate" in str(req[0]) and "Locate a readable issuer copy" in str(req[0])
+                            for req in provider.requests))
+
+    def test_unresolved_403_cannot_purchase_further_verification_by_changing_read_ranges(self):
+        def finish(label, gap):
+            return [tool("http_get", url="https://issuer.example/dispatch.pdf"), tool("read_file", path=PATH, offset=9, limit=23),
+                    tool("submit_review", candidate_version=version(label), results=[gap]),
+                    {"text": "Independent source remains inaccessible."}, {"text": "[BLOCKED] Notice inaccessible."}]
+        steps, _ = self.verification_retry(finish)
+        with patch("miniagent.research.fetch", side_effect=OSError("HTTP 403")):
+            detail, _ = self.execute(steps, "backup")
+        self.assertEqual(detail["run"]["status"], "failed")
+        reviews = [e["handoff"]["native_review"] for e in detail["room_events"]
+                   if e["kind"] == "member_report" and "native_review" in e["handoff"]]
+        self.assertEqual([r["state"] for r in reviews], ["review", "blocked"])
+        self.assertNotEqual(reviews[0]["findings"][1]["receipts"][0]["fingerprint"],
+                            reviews[1]["findings"][1]["receipts"][0]["fingerprint"])
+        self.assertTrue(all(r["findings"][1]["verdict"] == "inconclusive" for r in reviews))
+        self.assertNotIn("human_question", [e["kind"] for e in detail["room_events"]])
+
+    def test_method_retry_preserves_only_the_same_version_and_intact_source_evidence(self):
+        item = Review("target", "writer", "inspector", "Verify the shipping notice.", [
+            Rule.model_validate(RULE), Rule(id="other", description="Check the issuer.", method="source")
+        ], {PATH: "v1"})
+        retained = {"criterion_id": "content", "verdict": "passed", "receipts": [
+            {"kind": "read", "path": PATH, "sha256": "v1"}, {"kind": "source", "path": "source.json", "sha256": "s1"}]}
+        other = {"criterion_id": "other", "verdict": "inconclusive", "cause": "verification", "receipts": []}
+        item.latest = {"candidate_version": item.version, "results": [retained, other]}
+        manifest = {PATH: "v1", "source.json": "s1"}
+        progress = Mock()
+        progress.project_versions.return_value = manifest
+        session = ReviewSession(item, manifest.copy(), progress, "retry")
+        self.assertEqual(session.retained_findings(), {"content": retained})
+        del manifest["source.json"]
+        self.assertEqual(session.retained_findings(), {})
+        manifest["source.json"] = "s1"
+        item.files[PATH] = manifest[PATH] = "v2"
+        self.assertEqual(session.retained_findings(), {})
+
+    def test_method_retry_can_continue_only_when_required_gap_set_shrinks(self):
+        rules = [Rule(id=name, description="Verify independently.", method="inspect") for name in ["a", "b"]]
+        item = Review("target", "writer", "inspector", "Review.", rules, {PATH: "v1"})
+        def finding(rule, okay, evidence):
+            return {"criterion_id": rule, "verdict": "passed" if okay else "inconclusive",
+                    "cause": None if okay else "verification", "receipts": [{"fingerprint": evidence}]}
+        def apply(a_ok, tag):
+            item.apply({"candidate_version": item.version, "results": [finding("a", a_ok, tag), finding("b", False, tag)]}, "[]")
+            return item.state
+        self.assertEqual(apply(False, "first"), "review")
+        self.assertEqual(apply(True, "second"), "review")
+        self.assertEqual(apply(True, "different-paging"), "blocked")
 
     def test_execution_criterion_needs_a_real_test_and_hard_user_checks_remain_binding(self):
         old = "Shipment destination: old warehouse. Verified dispatch record."

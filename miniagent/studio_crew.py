@@ -631,7 +631,8 @@ class RoomCrew:
             pending_review = queue.next(self._review_answers())
             if pending_review:
                 return ("独立验收尚未通过，需要 " + pending_review.owner + " 处理 " + pending_review.state +
-                        "。当前目标与缺口：" + _clip(_json(pending_review.briefing()), 1900))
+                        ("。用 delegate_task 委派原验收者，省略 review 以沿用原标准；有新的可复核来源时告诉验收者。"
+                         if pending_review.verification_gaps() else "。") + "当前目标与缺口：" + _clip(_json(pending_review.briefing()), 1900))
         if not any(r["published"] for r in self.reports):
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
         pending = (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
@@ -845,12 +846,20 @@ class RoomCrew:
             if review and review is not requested_review:
                 return self._observation(False, "请先完成已在进行的独立验收。")
             review = requested_review
+        retry_gaps = review.verification_gaps() if review else []
+        original_recipient = role
+        if retry_gaps and role != review.owner:
+            # The other member's new report is a separate assignment. Finish
+            # the bound review before adding work for a different reviewer.
+            routed_from = role
+            payload = {**payload, "deliverable_paths": [], "acceptance": ""}
         if review:
             if review.state in {"passed", "blocked", "awaiting_user"}:
                 return self._observation(False, "该验收当前状态：" + review.state)
             role = review.owner
             objective = (("针对原目标返工，处理独立评估发现的产品缺口。" if review.state == "repair" else
                           "对同一目标的当前候选执行独立验收，使用 submit_review 提交逐项判断。") +
+                         ("\n本次复核线索（仅供核对，验收标准沿用原件）：" + _clip(objective, 1600) if retry_gaps else "") +
                          "\n原目标及标准：" + _clip(_json(review.briefing()), 7000))
         plan = self.planned
         if "remaining_roles" in payload:
@@ -927,6 +936,11 @@ class RoomCrew:
         dispatch_started = time.monotonic()
         if review:
             self.native_reviews.items[review.target] = review
+        if retry_gaps:
+            self.record_event(self.run_id, "studio", "review_resumed", "原标准继续生效，已将未决项交给原验收者。",
+                              task_id=self.run_id, requested=original_recipient, recipient=role, candidate_task=review.target,
+                              candidate_version=review.version, pending_criteria=[g["criterion_id"] for g in retry_gaps],
+                              bound_criteria=[r.model_dump() for r in review.criteria])
         try:
             outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review)
         finally:
