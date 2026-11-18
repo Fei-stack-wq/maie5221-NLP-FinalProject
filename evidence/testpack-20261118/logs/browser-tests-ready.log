@@ -1,0 +1,10 @@
+test_missing_browser_points_to_install_and_other_launch_errors_surface (tests.test_browser_tool.BrowserLauncherTest.test_missing_browser_points_to_install_and_other_launch_errors_surface) ... ok
+test_failing_assertion_keeps_native_error_and_runs_script_once (tests.test_browser_tool.BrowserToolTest.test_failing_assertion_keeps_native_error_and_runs_script_once) ... ok
+test_real_form_on_local_http_in_member_copy (tests.test_browser_tool.BrowserToolTest.test_real_form_on_local_http_in_member_copy) ... ok
+test_registry_and_args (tests.test_browser_tool.BrowserToolTest.test_registry_and_args) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 7.125s
+
+OK

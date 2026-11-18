@@ -141,6 +141,7 @@ class Settings:
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
     api_key: str = field(default="", repr=False)
+    git_test_remote: str = ""
     temperature: float = 0.0
     """默认 0：agent 场景要的是可复现，不是创意。进 agent 的每一步都该能重放。"""
 
@@ -161,6 +162,11 @@ class Settings:
     def __post_init__(self) -> None:
         if type(self.api_key) is not str:
             raise ValueError("api_key must be a string")
+        if not isinstance(self.git_test_remote, str):
+            raise ValueError("git_test_remote must be a string")
+        if self.git_test_remote:
+            from .git_delivery import validate_remote
+            validate_remote(self.git_test_remote)
         _integer("context_window_tokens", self.context_window_tokens, 1024, 1_000_000)
         _integer("max_output_recovery_attempts", self.max_output_recovery_attempts, 0, 3)
         validate_provider_options(
@@ -179,6 +185,7 @@ class Settings:
             model=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
             base_url=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL),
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+            git_test_remote=os.environ.get("MA_GIT_TEST_REMOTE", ""),
             temperature=_env_number("MA_TEMPERATURE", "0"),
             thinking=os.environ.get("DEEPSEEK_THINKING", "disabled"),
             reasoning_effort=os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),

@@ -1,0 +1,38 @@
+test_six_runs_three_teams_continuation_and_complete_exports (tests.test_testpack.TestpackIntegrationTest.test_six_runs_three_teams_continuation_and_complete_exports) ... ok
+test_task_one_failure_preserves_evidence_and_blocks_task_two (tests.test_testpack.TestpackIntegrationTest.test_task_one_failure_preserves_evidence_and_blocks_task_two) ... ok
+test_dashboard_requires_exact_known_fixture_statistics (tests.test_testpack.TestpackSchemaTest.test_dashboard_requires_exact_known_fixture_statistics) ... ok
+test_invalid_paths_and_role_roster_are_rejected (tests.test_testpack.TestpackSchemaTest.test_invalid_paths_and_role_roster_are_rejected) ... ok
+test_missing_file_and_unchanged_prior_output_fail (tests.test_testpack.TestpackSchemaTest.test_missing_file_and_unchanged_prior_output_fail) ... ok
+test_pack_explicitly_declares_missing_originals_and_four_roles (tests.test_testpack.TestpackSchemaTest.test_pack_explicitly_declares_missing_originals_and_four_roles) ... ok
+test_portfolio_checks_each_ratio_total_and_nonfinite_values (tests.test_testpack.TestpackSchemaTest.test_portfolio_checks_each_ratio_total_and_nonfinite_values) ... ok
+test_sources_require_delivered_body_and_dates (tests.test_testpack.TestpackSchemaTest.test_sources_require_delivered_body_and_dates) ... ok
+test_absent_rule_data_or_wrong_value_does_not_pass (tests.test_studio_discussion.DiscussionHTTPTest.test_absent_rule_data_or_wrong_value_does_not_pass) ... ok
+test_cancel_wakes_a_waiting_worker_and_rejects_late_reply (tests.test_studio_discussion.DiscussionHTTPTest.test_cancel_wakes_a_waiting_worker_and_rejects_late_reply) ... ok
+test_human_reply_stays_in_same_attempt_and_is_exportable (tests.test_studio_discussion.DiscussionHTTPTest.test_human_reply_stays_in_same_attempt_and_is_exportable) ... ok
+test_saved_profiles_available_for_new_rooms (tests.test_studio_discussion.DiscussionHTTPTest.test_saved_profiles_available_for_new_rooms) ... ok
+test_abort_tool_maps_to_aborted (tests.test_rao.AgentTerminationTest.test_abort_tool_maps_to_aborted) ... ok
+test_acceptance_failure_then_success (tests.test_rao.AgentTerminationTest.test_acceptance_failure_then_success) ... ok
+test_acceptance_failure_twice_is_failed_acceptance (tests.test_rao.AgentTerminationTest.test_acceptance_failure_twice_is_failed_acceptance) ... ok
+test_trace_records_acceptance_event (tests.test_rao.AgentTerminationTest.test_trace_records_acceptance_event) ... ok
+test_fork_splits_remaining (tests.test_rao.BudgetTest.test_fork_splits_remaining) ... ok
+test_seconds_reason_takes_priority (tests.test_rao.BudgetTest.test_seconds_reason_takes_priority) ... ok
+test_spend_and_exhaust (tests.test_rao.BudgetTest.test_spend_and_exhaust) ... ok
+test_accept_files (tests.test_rao.ContractTest.test_accept_files) ... ok
+test_acceptance_exception_fails_safe (tests.test_rao.ContractTest.test_acceptance_exception_fails_safe) ... ok
+test_acceptance_none_is_not_verified (tests.test_rao.ContractTest.test_acceptance_none_is_not_verified) ... ok
+test_classify_failure_table (tests.test_rao.ContractTest.test_classify_failure_table) ... ok
+test_act_observation_carries_artifacts (tests.test_rao.RaoStepTest.test_act_observation_carries_artifacts) ... ok
+test_ask_human_with_handler_returns_reply (tests.test_rao.RaoStepTest.test_ask_human_with_handler_returns_reply) ... ok
+test_ask_human_without_handler_stops (tests.test_rao.RaoStepTest.test_ask_human_without_handler_stops) ... ok
+test_delegate_with_handler_returns_observation (tests.test_rao.RaoStepTest.test_delegate_with_handler_returns_observation) ... ok
+test_delegate_without_orchestrator_is_unsupported (tests.test_rao.RaoStepTest.test_delegate_without_orchestrator_is_unsupported) ... ok
+test_empty_decision_is_invalid (tests.test_rao.RaoStepTest.test_empty_decision_is_invalid) ... ok
+test_loop_terminates_after_five_repeats (tests.test_rao.RaoStepTest.test_loop_terminates_after_five_repeats) ... ok
+test_loop_warning_after_three_repeats (tests.test_rao.RaoStepTest.test_loop_warning_after_three_repeats) ... ok
+test_observe_classifies_sandbox_denial (tests.test_rao.RaoStepTest.test_observe_classifies_sandbox_denial) ... ok
+test_parse_response_maps_closed_set (tests.test_rao.RaoStepTest.test_parse_response_maps_closed_set) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 2.530s
+
+OK

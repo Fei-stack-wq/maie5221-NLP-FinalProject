@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "base_commit": "fff680e022ac75487189aba3a527c6b7f4688ff0",
+  "branch": "fix/testpack-readiness",
+  "baseline_tests": {
+    "run": 793,
+    "passed": 793,
+    "skipped": 0
+  },
+  "final_tests": {
+    "run": 815,
+    "passed": 815,
+    "skipped": 0,
+    "seconds": 35.306
+  },
+  "added_tests": 22,
+  "real_browser_tests": {
+    "run": 5,
+    "passed": 5
+  },
+  "repeated_browser_timeout_cleanup": {
+    "run": 6,
+    "passed": 6
+  },
+  "smoke": {
+    "execution_kind": "scripted_fixture",
+    "scenarios": 3,
+    "turns": 6,
+    "machine_passed": true,
+    "formal_acceptance": false,
+    "role_task_executions": 24,
+    "tool_receipts": 60,
+    "tokens": 114357,
+    "token_usage_source": "estimated",
+    "wall_clock_ms": 2412.0,
+    "human_wait_seconds": 0.392732,
+    "human_requests": 12,
+    "human_response_source": "scripted_fixture",
+    "real_model_verified": false
+  },
+  "runtime": {
+    "python": "3.11.11",
+    "platform": "Linux",
+    "packages": {
+      "pydantic": "2.11.7",
+      "psutil": "7.0.0",
+      "Pillow": "11.3.0",
+      "playwright": "1.65.2"
+    },
+    "source_sha256": "71e313fd8a58491f4b1cdcd7a99b15bfd33d0eab244a49915773be6a1866b2a1",
+    "source_files": {
+      "__init__.py": "b4d9de14e73dd05b04b465d426f135fda5f8946537725f578aa060eeef4ee2f0",
+      "__main__.py": "b5ed05a23de1f01bc093b397cc434be4455aba029ff06dcc1186de633ef592ea",
+      "acceptance.py": "6836e7d78ba2ec1148c440fd2094331abf11650bd75a8d11d93b0e9e4adac623",
+      "acceptance_evidence.py": "17460175969048d2e751ae51ed18d21c9a8d6461489ef69718d507fd9343e1e0",
+      "agent.py": "bb814af8a855ab04b48d510b0d7ce6e53e1c1357fbe3d981696aa0089746f217",
+      "browser_tool.py": "84ad724f63911a4115a56f30d09fb415e0aa35190b4dbf453b24bbaa0c91a98b",
+      "bus.py": "f8bd9989de117bef3c601897bc41466e3fa19baaa488eaf63f4a34221217105c",
+      "cli.py": "550cad323f05c8efedf3716dbf54e2324ed3eed23e59729e440b40de76f26767",
+      "config.py": "627a2f7385674679ebe270c9d6918d39ea6afceecafe710312fa3c17b83a19ac",
+      "context_window.py": "0118b07df8e9d1eeb52a182dc27cd083c05423c1f6bea42f8745e38dae89b518",
+      "contracts/__init__.py": "58cd63f0a89283f9a61836fce758f9e794f0be6e1a3f732fccc69d81a7d33f3b",
+      "contracts/acceptance.py": "d7716b56ecb9846415b98924e5440d21c965ecbbcea9e0acc1cbfa296727c0b8",
+      "contracts/artifacts.py": "9a816c0947a946e899e6c3f30b719782f50ea2bfa04e91e40cd7fcc4d2d08517",
+      "contracts/base.py": "40cdafbf86627cf305bccae5efedac5e13a03d45b28573ae3bf817bca76047f2",
+      "contracts/budget.py": "b3f19459c917d56f5dcc11cb22d07d5a4c92fecf53c2b9f0055d3591fa03cb63",
+      "contracts/human.py": "bea6d66053a9018983e825e55e1273581b01cdaad94c738c0bf30de609fbd088",
+      "contracts/snapshot.py": "a32c5494e798d569eb4c3c27d67cf198a98d09eeb2b2ff233e4c70c474325eff",
+      "contracts/tasks.py": "996d8e21b66513377aea63bcb5c793708228cf337cdecf9ae258f7393716670a",
+      "contracts/transitions.py": "22d30bd7041111d0db1c49a2096409c1ecdfb146d055f2b16259c57bcd24df0b",
+      "crew_progress.py": "20c9f0e9c689b0e2b5dc5ef29e665e8a317fcceddda9a920d7517237aa1819ab",
+      "file_tools.py": "d3f82eeefd389152f204534195a51266978a397bc5c4717e29f0bfc4780e9d88",
+      "git_delivery.py": "ec19ae3f5b6322c24c0eb88eef8f483fdc31dd8f40d7e76f37f472443abe5cdd",
+      "human.py": "1cbfaec7c332d4ce5954557cdcb35810e43dc4080968948152baaf63e8fd1267",
+      "member_processes.py": "69b1d596be8d539c36e772c6c697f30c12a9897feea43a803cd142e0efc65fb8",
+      "metrics.py": "8b57569c49ea6cf9494fa5c3db6cd71e6ffe48de16ed9a2c42766d8895e0461b",
+      "orchestrator.py": "df7f8d13da9eda4dc3e4c251f95613355400aa19f215724b8fdee55c1929498d",
+      "playwright_runner.py": "396db162b1ef7c90337df2afea6eb2725758ff8d5737af38d25349cc38a42899",
+      "project_data.py": "cb6eda38b7e4cc91e6f0959ff257817c336b0a5c58b80d11ebd007569e1e75a6",
+      "project_navigation.py": "4e3dce4616e632e274214a5f44ddb53678b1ed0de2d39d40e626b89dacceac6a",
+      "provider_http.py": "307d9fd6e785c367109c5979b989393e91e78c3746dcb701bcf407fe25406651",
+      "provider_smoke.py": "fac5392eb4da87f211a769e8987a850c013695fa89cd7d4c4e3b440f612b124c",
+      "providers.py": "01689bc838c26192347b75ae24692ff79cf4e5ec716219e1e261e7cbbad337fc",
+      "rao.py": "094365594806c05cdb0cf821f2c851030415d6d0e8c4c4b688e04c5cf1ee3828",
+      "research.py": "d7a5131763495de02427f953c4426c0e76d273a0e36b18ebb3adb7d46dc7106b",
+      "role_memory.py": "6e8b9fa8912b884564dac49e173ee2df08992541f46ac1001884be7ac06b19d6",
+      "runtime_identity.py": "2391def9f06b4f1e8d38b736c7f317620f0b5d42246346711a22b516a337cc79",
+      "sandbox.py": "67ceb01e8c8b62b32b2454ffb43b20a1f04029b3cd2c60f4e8acdeb241defa05",
+      "schemas.py": "42faa1329aa3a1ea51c9fb21e020f1db77f68a319ba1047521a41594f58b7f24",
+      "shell_tool.py": "d63c9c9b27e7cff86aa6860a1ddf0065aea2433756522d80a3e4b56bd6e147aa",
+      "studio_acceptance.py": "30819757f410d5a6cc49ecc41aa3d256cd9cfacdd01334139067b2ada2a16cf7",
+      "studio_config.py": "1b316617aef21c21a012baa5b7da334a044ada4f30c9426553405492a860289f",
+      "studio_conversations.py": "ec14fe3b30d79bc1388c155ed2e80e2fbb6c901d62af7430a48228d4cccd7cbf",
+      "studio_crew.py": "c9ae4c496c7932ec69958e5110e9f94e45bb83e30827163a451e9120ecce0649",
+      "studio_diagnostics.py": "f0c68cba693f2f9f70211a7e5e9c13b370a7b65bb1562fc39249219d6364567b",
+      "studio_discussion.py": "8ccaa05827eb0781315cce38673a2e49dff1d06d278b7fda5034f270a53d2ca3",
+      "studio_preview.py": "7b91aa6652fc53b2d0404ae69d0ecd9e4fb2545a3da94efb6f40b5d3113df00a",
+      "studio_server.py": "411e37c70698e31c5d3a746f719d06d6408702ed6a4cd4e80e7939fccc7d8df6",
+      "studio_service.py": "1fe9ad578a8d76a8566687f5f03cb1880a469e45997969b13d6d37b37bf93109",
+      "studio_workspace.py": "f1eb699e8bab0497afad2e37260f779e139a70e481f574348fe476e9d7619d2b",
+      "task_service.py": "cb3d57d623862a2afc52ecf92b366a7a9fbe4d218a14b041e41aee0107afce84",
+      "task_store.py": "779636cfb5a940dcc431ccad5f21c6a70d380eb951df5314bd24c2290fa3b170",
+      "testpack.py": "c667ab98a7a6c656d0362a17e62c737b9bbdb6661af1bb7e544d78faa0717691",
+      "tools.py": "ed663116f4ab06bb4f6fddfccc031c98ae305acdc0e1d54889be38665bccbf41"
+    }
+  },
+  "remaining": [
+    "Mid_Test.zip originals and role prompts",
+    "course model and valid credentials",
+    "dedicated GitHub test repository",
+    "live runs and independent human quality review"
+  ]
+}

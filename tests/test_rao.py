@@ -165,14 +165,15 @@ class RaoStepTest(unittest.TestCase):
         assert record is not None
         self.assertEqual(record.terminate_reason, ErrorClass.T_LOOP)
 
-    def test_ask_human_without_handler_is_denied(self) -> None:
+    def test_ask_human_without_handler_stops(self) -> None:
         unit = _unit(
             self.root,
             [{"tool_calls": [{"name": "ask_human", "arguments": {"question": "选 A 还是 B？"}}]}],
         )
         record = unit.step(_state(), Budget())
         self.assertEqual(record.decision_kind, "ask_human")
-        self.assertEqual(record.observations[0].error_class, ErrorClass.A_HUMAN_DENIED)
+        self.assertEqual(record.observations[0].error_class, ErrorClass.T_HUMAN_UNAVAILABLE)
+        self.assertEqual(record.terminate_reason, ErrorClass.T_HUMAN_UNAVAILABLE)
 
     def test_ask_human_with_handler_returns_reply(self) -> None:
         unit = _unit(

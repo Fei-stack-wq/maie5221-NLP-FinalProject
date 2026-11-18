@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -178,15 +179,30 @@ def _delete_file(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     path = ctx.sandbox.resolve(args["path"], must_exist=True)
     if not path.is_file():
         return ToolResult.failure(f"不是文件：{args['path']}")
+    def fingerprint(target):
+        value = hashlib.sha256()
+        with target.open("rb") as stream:
+            for block in iter(lambda: stream.read(65536), b""):
+                value.update(block)
+        return value.hexdigest()
+    before = path.stat()
+    digest = fingerprint(path)
 
     # 人机闸门：删除是不可逆的关键操作，必须经过人类批准（课程要求 2.1c）。
-    if ctx.approve is None or not ctx.approve(f"agent 请求删除文件：{args['path']}"):
+    if ctx.approve is None or not ctx.approve(f"agent 请求删除文件：{args['path']}\nsha256={digest}\nbytes={before.st_size}"):
         return ToolResult.failure(
             "已取消：删除文件需要人类批准（HITL 拦截）。\n"
-            "请改用 write_file 覆盖，或请人类在界面中确认。"
+            "请保留文件并等待明确批准。"
         )
 
-    path.unlink()
+    current = ctx.sandbox.resolve(args["path"], must_exist=True)
+    after = current.stat()
+    if (current != path or not os.path.samestat(before, after)
+            or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)):
+        return ToolResult.failure("审批期间文件已改变；未删除，需要重新核对该文件。")
+    if fingerprint(current) != digest:
+        return ToolResult.failure("审批期间文件内容已改变；未删除。")
+    current.unlink()
     return ToolResult.success(f"已删除 {args['path']}")
 
 
@@ -238,7 +254,7 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 # ---------------------------------------------------------------------------
 # 默认工具集
 # ---------------------------------------------------------------------------
-def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
+def build_default_registry(*, read_only: bool = False, git_test_remote: str = "", secret: str = "") -> ToolRegistry:
     registry = ToolRegistry()
 
     registry.add(
@@ -290,6 +306,13 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                        "required": ["path"]}, read_lines))
     if read_only:
         return registry
+    if git_test_remote:
+        from .git_delivery import publish, validate_remote
+        remote = validate_remote(git_test_remote)
+        registry.add(Tool("git_publish", "准备选定文本文件的不可变快照，在明确批准后发布到宿主指定的独立 Git 测试仓库新分支。每次需人工确认具体提交与文件哈希。",
+                          {"type": "object", "properties": {"branch": {"type": "string"},
+                           "files": {"type": "array", "items": {"type": "string"}}}, "required": ["branch", "files"]},
+                          lambda ctx, args: publish(ctx, args, remote, secret=secret)))
 
     registry.add(
         Tool(

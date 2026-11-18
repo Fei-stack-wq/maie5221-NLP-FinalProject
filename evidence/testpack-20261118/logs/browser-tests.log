@@ -1,0 +1,105 @@
+test_missing_browser_points_to_install_and_other_launch_errors_surface (tests.test_browser_tool.BrowserLauncherTest.test_missing_browser_points_to_install_and_other_launch_errors_surface) ... ok
+test_failing_assertion_keeps_native_error_and_runs_script_once (tests.test_browser_tool.BrowserToolTest.test_failing_assertion_keeps_native_error_and_runs_script_once) ... FAIL
+test_real_form_on_local_http_in_member_copy (tests.test_browser_tool.BrowserToolTest.test_real_form_on_local_http_in_member_copy) ... FAIL
+test_registry_and_args (tests.test_browser_tool.BrowserToolTest.test_registry_and_args) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... FAIL
+
+======================================================================
+FAIL: test_failing_assertion_keeps_native_error_and_runs_script_once (tests.test_browser_tool.BrowserToolTest.test_failing_assertion_keeps_native_error_and_runs_script_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/tests/test_browser_tool.py", line 122, in test_failing_assertion_keeps_native_error_and_runs_script_once
+    self.assertIn("AssertionError", result.content)
+AssertionError: 'AssertionError' not found in 'exit_code=1\nstderr:\nTraceback (most recent call last):\n  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 71, in <module>\n    main()\n  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 52, in main\n    browser = _launch(playwright.chromium, Error)\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 25, in _launch\n    return chromium.launch(headless=True, **selection)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/sync_api/_generated.py", line 4113, in launch\n    self._sync(\n  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/_sync_base.py", line 124, in _sync\n    return task.result()\n           ^^^^^^^^^^^^^\n  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 387, in finish\n    raise e from None\n  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 352, in finish\n    result = await zone.run_async(lambda: awaitable)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/utils/zones.py", line 58, in run_async\n    return \n…[已截断]…\n-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,AvoidCorsURLLoaderRestartOnRedirect,TcpPortRandomizationWin,OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,PreconnectToSearch,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface,SkipListAccountsWithoutGaiaCookies --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --enable-unsafe-swiftshader --edge-skip-compat-layer-relaunch --disable-stack-profiler --disable-infobars --disable-sync --do-not-de-elevate --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/miniagent-browser-56g8r_ob/playwright_chromiumdev_profile-6Ayxe2 --remote-debugging-pipe --no-startup-window\n  - <launched> pid=362385\n  - [pid=362385][err] /tmp/nlp_testpack_20261118_z121/chromium/chrome-linux64/chrome: error while loading shared libraries: libavahi-common.so.3: cannot open shared object file: No such file or directory\n  - [pid=362385] <gracefully close start>\n  - [pid=362385] <kill>\n  - [pid=362385] <will force kill>\n  - [pid=362385] exception while trying to kill process: Error: kill ESRCH\n  - [pid=362385] <process did exit: exitCode=127, signal=null>\n  - [pid=362385] starting temporary directories cleanup\n  - [pid=362385] finished temporary directories cleanup\n  - [pid=362385] <gracefully close end>\n\n'
+
+======================================================================
+FAIL: test_real_form_on_local_http_in_member_copy (tests.test_browser_tool.BrowserToolTest.test_real_form_on_local_http_in_member_copy)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/tests/test_browser_tool.py", line 100, in test_real_form_on_local_http_in_member_copy
+    self.assertTrue(result.ok, result.content)
+AssertionError: False is not true : exit_code=1
+stderr:
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 71, in <module>
+    main()
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 52, in main
+    browser = _launch(playwright.chromium, Error)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 25, in _launch
+    return chromium.launch(headless=True, **selection)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/sync_api/_generated.py", line 4113, in launch
+    self._sync(
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/_sync_base.py", line 124, in _sync
+    return task.result()
+           ^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 387, in finish
+    raise e from None
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 352, in finish
+    result = await zone.run_async(lambda: awaitable)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/utils/zones.py", line 58, in run_async
+    return 
+…[已截断]…
+-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,AvoidCorsURLLoaderRestartOnRedirect,TcpPortRandomizationWin,OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,PreconnectToSearch,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface,SkipListAccountsWithoutGaiaCookies --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --enable-unsafe-swiftshader --edge-skip-compat-layer-relaunch --disable-stack-profiler --disable-infobars --disable-sync --do-not-de-elevate --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/miniagent-browser-6o4rdfaf/playwright_chromiumdev_profile-IOA9hi --remote-debugging-pipe --no-startup-window
+  - <launched> pid=362400
+  - [pid=362400][err] /tmp/nlp_testpack_20261118_z121/chromium/chrome-linux64/chrome: error while loading shared libraries: libavahi-common.so.3: cannot open shared object file: No such file or directory
+  - [pid=362400] <gracefully close start>
+  - [pid=362400] <kill>
+  - [pid=362400] <will force kill>
+  - [pid=362400] exception while trying to kill process: Error: kill ESRCH
+  - [pid=362400] <process did exit: exitCode=127, signal=null>
+  - [pid=362400] starting temporary directories cleanup
+  - [pid=362400] finished temporary directories cleanup
+  - [pid=362400] <gracefully close end>
+
+
+
+======================================================================
+FAIL: test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/tests/test_browser_tool.py", line 136, in test_session_cleaned_on_native_timeout
+    self.assertTrue(result.meta.get("timed_out"), result.content)
+AssertionError: False is not true : exit_code=1
+stderr:
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 71, in <module>
+    main()
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 52, in main
+    browser = _launch(playwright.chromium, Error)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/repo/miniagent/playwright_runner.py", line 25, in _launch
+    return chromium.launch(headless=True, **selection)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/sync_api/_generated.py", line 4113, in launch
+    self._sync(
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/_sync_base.py", line 124, in _sync
+    return task.result()
+           ^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 387, in finish
+    raise e from None
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/channel_owner.py", line 352, in finish
+    result = await zone.run_async(lambda: awaitable)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/venv/lib/python3.11/site-packages/playwright/_impl/utils/zones.py", line 58, in run_async
+    return 
+…[已截断]…
+nd-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-back-forward-cache --disable-breakpad --disable-component-extensions-with-background-pages --disable-component-update --no-default-browser-check --disable-default-apps --disable-dev-shm-usage --disable-edgeupdater --disable-extensions --disable-features=AvoidUnnecessaryBeforeUnloadCheckSync,DestroyProfileOnBrowserClose,HttpsUpgrades,HttpsFirstBalancedModeAutoEnable,LensOverlay,MediaRouter,PaintHolding,ThirdPartyStoragePartitioning,AvoidCorsURLLoaderRestartOnRedirect,TcpPortRandomizationWin,OptimizationHints,NetworkTimeServiceQuerying,AimEnabled,PreconnectToSearch,msForceBrowserSignIn,msEdgeUpdateLaunchServicesPreferredVersion --enable-features=CDPScreenshotNewSurface,SkipListAccountsWithoutGaiaCookies --allow-pre-commit-input --disable-hang-monitor --disable-ipc-flooding-protection --disable-popup-blocking --disable-prompt-on-repost --disable-renderer-backgrounding --disable-updater-scheduler --force-color-profile=srgb --metrics-recording-only --no-first-run --password-store=basic --use-mock-keychain --no-service-autorun --disable-search-engine-choice-screen --unsafely-disable-devtools-self-xss-warnings --enable-unsafe-swiftshader --edge-skip-compat-layer-relaunch --disable-stack-profiler --disable-infobars --disable-sync --do-not-de-elevate --headless --hide-scrollbars --mute-audio --blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4 --no-sandbox --user-data-dir=/tmp/miniagent-browser-op0lhbp5/playwright_chromiumdev_profile-NOsvF6 --remote-debugging-pipe --no-startup-window
+  - <launched> pid=362418
+  - [pid=362418][err] /tmp/nlp_testpack_20261118_z121/chromium/chrome-linux64/chrome: error while loading shared libraries: libavahi-common.so.3: cannot open shared object file: No such file or directory
+  - [pid=362418] <gracefully close start>
+  - [pid=362418] <kill>
+  - [pid=362418] <will force kill>
+  - [pid=362418] <process did exit: exitCode=127, signal=null>
+  - [pid=362418] starting temporary directories cleanup
+  - [pid=362418] finished temporary directories cleanup
+  - [pid=362418] <gracefully close end>
+
+
+
+----------------------------------------------------------------------
+Ran 5 tests in 1.420s
+
+FAILED (failures=3)

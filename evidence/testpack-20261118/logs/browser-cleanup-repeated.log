@@ -1,0 +1,11 @@
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+test_session_cleaned_on_native_timeout (tests.test_browser_tool.BrowserToolTest.test_session_cleaned_on_native_timeout) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 30.237s
+
+OK

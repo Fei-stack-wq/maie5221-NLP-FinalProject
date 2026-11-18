@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import threading
 import tempfile
+import time
 import traceback
 import uuid
 import zipfile
@@ -49,7 +50,7 @@ from .studio_diagnostics import diagnose
 from .studio_acceptance import build_checks
 from .studio_crew import RoomCrew
 from .studio_conversations import (ROLE_LABELS, SnapshotError, copy_project, project_context,
-                                   thread_info, validate_conversation)
+                                   thread_info, validate_conversation, member_profiles)
 
 MAX_PREVIEW_BYTES = 262144
 MAX_LOG_BYTES = 4 * 1024 * 1024
@@ -496,7 +497,9 @@ class StudioService(RoomDiscussion):
         data["diagnostics"] = diagnose(tasks, events, acceptance,
                                        active=run_id in self._active, incomplete=log_truncated)
         data["room_events"] = self.room_events(run_id)
-        data["pending_questions"] = [{key: row[key] for key in ("request_id", "role", "text")}
+        data["human_timing"] = self.human_timing(data["room_events"])
+        data["pending_questions"] = [{**{key: row[key] for key in ("request_id", "role", "text", "request_kind", "action_digest")},
+                                      "remaining_seconds": max(0, row["deadline"] - time.monotonic())}
                                      for (rid, _), row in self._questions.items()
                                      if rid == run_id and row["answer"] is None]
         data["conversation"] = self._conversation(path)
@@ -590,7 +593,9 @@ class StudioService(RoomDiscussion):
             if last["status"] != "failed" or last["intent"] != "edit":
                 raise StudioError("只有最近一轮修改失败后，才能接续该轮文件。", "invalid_recovery")
             base = parent
-        return {**message, "id": room["id"], "kind": room["kind"], "members": room["members"],
+        parent_thread = self._meta(self._directory(parent)).get("thread", {})
+        return {"memory_enabled": parent_thread.get("memory_enabled", False),
+                **message, "id": room["id"], "kind": room["kind"], "members": room["members"],
                 "profiles": room["profiles"], "ordinal": len(room["turns"]) + 1, "base_run_id": base}
 
     def _artifact_data(self, run_id, name, limit):
@@ -833,6 +838,8 @@ class StudioService(RoomDiscussion):
                 meta = {"schema_version": 1, "request_id": request["request_id"], "fingerprint": fingerprint,
                         "request": request, "title": request["objective"], "mode": request["mode"],
                         "state": "queued", "created_at": _now()}
+                from .runtime_identity import runtime_identity
+                meta["runtime_identity"] = runtime_identity()
                 assignee = "orchestrator" if request["mode"] in {"team", "team-demo"} else "worker"
                 local = request.get("workspace_path")
                 if thread and thread["parent_run_id"] and thread.get("inherit_files", True):
@@ -1068,6 +1075,10 @@ class StudioService(RoomDiscussion):
                 try:
                     self._update_meta(run_id, finished_at=_now(), **outcome)
                 finally:
+                    if any(rid == run_id for rid, _ in self._questions):
+                        self._cancellations[run_id].set()
+                        self._answers.notify_all()
+                        self._answers.wait_for(lambda: not any(rid == run_id for rid, _ in self._questions), timeout=1)
                     self._active.discard(run_id)
                     self._cancellations.pop(run_id, None)
                     self._slots.release()
@@ -1133,21 +1144,37 @@ class StudioService(RoomDiscussion):
                 acceptance = accept_files("notes.md") if mode == "demo" else checks
                 workspace = self._workspace(path, thread)
                 sandbox = Sandbox(workspace, agent_name=recipient)
+                from .role_memory import RoleMemory
+                initial_memory = None
+                if thread.get("memory_enabled") and thread.get("parent_run_id") and thread.get("inherit_files", True):
+                    raw, truncated = _read_file(self._directory(thread["parent_run_id"]), "role-memory.json", 512 * 1024, missing=True)
+                    if truncated:
+                        raise StudioError("角色经验快照超过大小限制。")
+                    initial_memory = json.loads(raw) if raw else None
+                    if initial_memory and not initial_memory.get("enabled"):
+                        initial_memory = None
+                memory = RoleMemory(path / "role-memory.json", thread["id"], member_profiles(thread),
+                                    enabled=thread.get("memory_enabled", False), initial=initial_memory, redact=self._redact)
+                context += memory.context(recipient)
                 crew = None
                 if mode == "team":
                     crew = RoomCrew(run_id, path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
-                                    {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])})
+                                    {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])},
+                                    approve_handler=self._approval_handler, memory=memory)
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
-                agent = Agent(name=recipient, provider=provider, registry=build_default_registry(read_only=question),
+                agent = Agent(name=recipient, provider=provider, registry=build_default_registry(
+                              read_only=question, git_test_remote=settings.git_test_remote, secret=settings.api_key),
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
                               human_handler=(self._human_handler(run_id, recipient, deadline=crew.deadline - crew.close_seconds)
                                              if crew else self._human_handler(run_id, recipient)
                                              if "conversation" in request else None),
                               delegate_handler=crew.delegate if crew else None,
                               human_request_gate=crew.human_request_gate if crew else None, should_cancel=should_cancel)
+                agent.unit.approve = self._approval_handler(run_id, recipient,
+                                                           deadline=crew.deadline - crew.close_seconds if crew else None)
                 if question:
                     agent.unit.enable_control_tools = False
                 result = agent.run(request["objective"], task_id=run_id, acceptance=acceptance,
@@ -1156,6 +1183,9 @@ class StudioService(RoomDiscussion):
                                    before_answer=crew.before_answer if crew else None,
                                    step_policy=crew.coordinator_policy if crew else None,
                                    on_step=crew.observe_coordinator if crew else None)
+                memory.remember(recipient, run_id=run_id, task_id=run_id, objective=request["objective"],
+                                summary=result.answer or "", evidence={}, files=request.get("acceptance_files", []),
+                                published=service.store.get(run_id).status == "completed")
                 if result.answer:
                     # Write the public final answer only. Keep reasoning, raw
                     # tool buffers, and credentials out of the transcript.

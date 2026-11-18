@@ -1,0 +1,239 @@
+{
+  "execution_kind": "scripted_fixture",
+  "scenarios": [
+    {
+      "id": "news",
+      "lead": "chief",
+      "memory_enabled": true,
+      "profiles": [
+        {
+          "id": "chief",
+          "name": "主编",
+          "prompt": "明确受众、校区和近期时间范围，组织记者、核查者、编辑协作。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "reporter",
+          "name": "记者",
+          "prompt": "检索并阅读全文，记录来源 URL、发布日期和抓取日期。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "checker",
+          "name": "事实核查员",
+          "prompt": "核对关键断言与相反证据，不把搜索摘要当正文证据。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "editor",
+          "name": "编辑",
+          "prompt": "按渠道改写稿件，保留准确引用和限制。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "news-1.json",
+              "pointer": "/sum"
+            }
+          ],
+          "id": "campus-news",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: news turn 1. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "news-1.json",
+            "news-1.md"
+          ],
+          "title": "校园 AI 新闻",
+          "validator": null
+        },
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "news-2.json",
+              "pointer": "/sum"
+            }
+          ],
+          "id": "detector-factcheck",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: news turn 2. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "news-2.json",
+            "news-2.md"
+          ],
+          "title": "AI 写作检测器事实核查",
+          "validator": null
+        }
+      ]
+    },
+    {
+      "id": "fund",
+      "lead": "manager",
+      "memory_enabled": true,
+      "profiles": [
+        {
+          "id": "manager",
+          "name": "基金经理",
+          "prompt": "先澄清模拟资金、币种、期限和风险偏好，组织研究、风控和展示。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "analyst",
+          "name": "研究员",
+          "prompt": "核对资料日期和一手证据，说明估值和情景假设。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "risk",
+          "name": "风控员",
+          "prompt": "核验金额、比例、情景风险和资料时效，不给出无依据的收益承诺。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "presenter",
+          "name": "展示者",
+          "prompt": "制作可独立打开的 HTML 幻灯片并验证翻页。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "fund-1.json",
+              "pointer": "/sum"
+            }
+          ],
+          "id": "portfolio",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: fund turn 1. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "fund-1.json",
+            "fund-1.md"
+          ],
+          "title": "模拟投资方案",
+          "validator": null
+        },
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "fund-2.json",
+              "pointer": "/sum"
+            }
+          ],
+          "id": "semiconductor-slides",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: fund turn 2. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "fund-2.json",
+            "fund-2.md"
+          ],
+          "title": "半导体 HTML 幻灯片",
+          "validator": null
+        }
+      ]
+    },
+    {
+      "id": "software",
+      "lead": "lead",
+      "memory_enabled": true,
+      "profiles": [
+        {
+          "id": "lead",
+          "name": "技术负责人",
+          "prompt": "讨论需求并组织开发、测试、发布三名成员。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "dev",
+          "name": "开发者",
+          "prompt": "实现会议室预约与看板。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "qa",
+          "name": "测试者",
+          "prompt": "用固定记录验证冲突、取消、统计边界；保留真实执行输出。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "release",
+          "name": "发布者",
+          "prompt": "复核文件与启动说明，验收浏览器交互。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "software-1.json",
+              "pointer": "/sum"
+            }
+          ],
+          "id": "booking",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: software turn 1. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "software-1.json",
+            "software-1.md"
+          ],
+          "title": "会议室预约系统",
+          "validator": null
+        },
+        {
+          "checks": [
+            {
+              "expected": 55,
+              "kind": "json_equals",
+              "path": "software-2.json",
+              "pointer": "/sum"
+            }
+          ],
+          "expected_metrics": {
+            "active_count": 2,
+            "cancelled_count": 1,
+            "hours": 3.0,
+            "peak_concurrency": 2
+          },
+          "id": "dashboard",
+          "limits": {
+            "max_seconds": 600,
+            "max_steps": 100,
+            "max_total_tokens": 200000
+          },
+          "objective": "OFFLINE FIXTURE: software turn 2. Ask the fixture responder, compute and independently verify a file, then publish a receipt. All four roles participate.",
+          "outputs": [
+            "software-2.json",
+            "software-2.md"
+          ],
+          "title": "预约使用看板",
+          "validator": null
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "source_kind": "derived_document_summary",
+  "source_note": "依据《测试包准备情况与分工_2026-11-18.docx》的六题摘要制定的预验收草案。Mid_Test.zip 原题和原始角色提示未取得；以下提示为新编验收协议，不代表老师原题。 本次另将题目替换为离线协作夹具，仅验收协作链路；不能作为原题质量或真实模型实测。"
+}

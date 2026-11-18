@@ -50,6 +50,7 @@ class StudioCrewTest(unittest.TestCase):
         from miniagent.studio_crew import RoomCrew
         crew = object.__new__(RoomCrew)
         crew.lead, crew.profiles = "manager", {"manager": {}, "builder": {}}
+        crew.settings = Settings()
         question = "请确认本轮成员是否具备运行 Python 的能力？"
         message = crew.human_request_gate({"question": question, "decision_kind": "missing_user_data"})
         self.assertIn("run_python", message)
@@ -587,11 +588,11 @@ class StudioCrewTest(unittest.TestCase):
         service_handler = self.service._human_handler
         observed = []
 
-        def immediate_member_timeout(run_id, role, *, deadline=None):
-            if role == "dev":
+        def immediate_member_timeout(run_id, role, *, deadline=None, request_kind="question"):
+            if role == "dev" and request_kind == "question":
                 observed.append(deadline)
                 return service_handler(run_id, role, deadline=time.monotonic() - 1)
-            return service_handler(run_id, role, deadline=deadline)
+            return service_handler(run_id, role, deadline=deadline, request_kind=request_kind)
 
         with patch.object(self.service, "_human_handler", side_effect=immediate_member_timeout):
             script = [tool("delegate_task", assignee="dev", objective="Resolve the issue", remaining_roles=[]),

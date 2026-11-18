@@ -1,0 +1,43 @@
+test_six_runs_three_teams_continuation_and_complete_exports (tests.test_testpack.TestpackIntegrationTest.test_six_runs_three_teams_continuation_and_complete_exports) ... ok
+test_task_one_failure_preserves_evidence_and_blocks_task_two (tests.test_testpack.TestpackIntegrationTest.test_task_one_failure_preserves_evidence_and_blocks_task_two) ... ok
+test_dashboard_requires_exact_known_fixture_statistics (tests.test_testpack.TestpackSchemaTest.test_dashboard_requires_exact_known_fixture_statistics) ... ok
+test_invalid_paths_and_role_roster_are_rejected (tests.test_testpack.TestpackSchemaTest.test_invalid_paths_and_role_roster_are_rejected) ... ok
+test_missing_file_and_unchanged_prior_output_fail (tests.test_testpack.TestpackSchemaTest.test_missing_file_and_unchanged_prior_output_fail) ... ok
+test_pack_explicitly_declares_missing_originals_and_four_roles (tests.test_testpack.TestpackSchemaTest.test_pack_explicitly_declares_missing_originals_and_four_roles) ... ok
+test_portfolio_checks_each_ratio_total_and_nonfinite_values (tests.test_testpack.TestpackSchemaTest.test_portfolio_checks_each_ratio_total_and_nonfinite_values) ... ok
+test_sources_require_delivered_body_and_dates (tests.test_testpack.TestpackSchemaTest.test_sources_require_delivered_body_and_dates) ... ok
+test_allow_and_deny_are_explicit_audited_and_control_real_delete (tests.test_human_readiness.ApprovalHTTPTest.test_allow_and_deny_are_explicit_audited_and_control_real_delete) ... FAIL
+test_cancelled_approval_does_not_delete_or_accept_late_answer (tests.test_human_readiness.ApprovalHTTPTest.test_cancelled_approval_does_not_delete_or_accept_late_answer) ... ok
+test_auto_approve_is_not_a_substitute_for_question_answer (tests.test_human_readiness.TerminalReadinessTest.test_auto_approve_is_not_a_substitute_for_question_answer) ... ok
+test_blocked_human_and_tool_receive_remaining_deadline (tests.test_human_readiness.TerminalReadinessTest.test_blocked_human_and_tool_receive_remaining_deadline) ... ok
+test_missing_or_empty_reply_stops_the_batch_before_write (tests.test_human_readiness.TerminalReadinessTest.test_missing_or_empty_reply_stops_the_batch_before_write) ... ok
+test_disabled_or_new_room_resets_and_failed_work_is_not_learned (tests.test_role_memory.RoleMemoryTest.test_disabled_or_new_room_resets_and_failed_work_is_not_learned) ... ok
+test_four_roles_select_only_own_experience_and_restore_same_snapshot (tests.test_role_memory.RoleMemoryTest.test_four_roles_select_only_own_experience_and_restore_same_snapshot) ... ok
+test_memory_is_bounded_and_does_not_expose_configured_secret (tests.test_role_memory.RoleMemoryTest.test_memory_is_bounded_and_does_not_expose_configured_secret) ... ok
+test_concurrent_process_handles_admit_only_one_successor (tests.test_studio_conversations.ConversationTest.test_concurrent_process_handles_admit_only_one_successor) ... ok
+test_failed_edit_retains_last_published_project_for_next_turn (tests.test_studio_conversations.ConversationTest.test_failed_edit_retains_last_published_project_for_next_turn) ... ok
+test_fresh_question_and_first_edit_need_no_source_files (tests.test_studio_conversations.ConversationTest.test_fresh_question_and_first_edit_need_no_source_files) ... ok
+test_group_turns_pin_responder_and_publish_edits_separately_from_questions (tests.test_studio_conversations.ConversationTest.test_group_turns_pin_responder_and_publish_edits_separately_from_questions) ... ok
+test_invalid_conversation_configs_and_foreign_threads_rejected (tests.test_studio_conversations.ConversationTest.test_invalid_conversation_configs_and_foreign_threads_rejected) ... ok
+test_legacy_terminal_single_can_continue_without_a_saved_transcript (tests.test_studio_conversations.ConversationTest.test_legacy_terminal_single_can_continue_without_a_saved_transcript) ... ok
+test_model_context_retains_goal_and_latest_turn_after_many_long_replies (tests.test_studio_conversations.ConversationTest.test_model_context_retains_goal_and_latest_turn_after_many_long_replies) ... ok
+test_public_answer_persisted_separately_and_key_redacted (tests.test_studio_conversations.ConversationTest.test_public_answer_persisted_separately_and_key_redacted) ... ok
+test_same_role_in_two_rooms_cannot_see_unrelated_transcript_or_files (tests.test_studio_conversations.ConversationTest.test_same_role_in_two_rooms_cannot_see_unrelated_transcript_or_files) ... ok
+test_snapshot_error_does_not_publish_partial_run_or_call_provider (tests.test_studio_conversations.ConversationTest.test_snapshot_error_does_not_publish_partial_run_or_call_provider) ... ok
+test_stale_and_nonmember_requests_fail_before_model_and_do_not_create_run (tests.test_studio_conversations.ConversationTest.test_stale_and_nonmember_requests_fail_before_model_and_do_not_create_run) ... ok
+
+======================================================================
+FAIL: test_allow_and_deny_are_explicit_audited_and_control_real_delete (tests.test_human_readiness.ApprovalHTTPTest.test_allow_and_deny_are_explicit_audited_and_control_real_delete)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/nlp_testpack_20261118_z121/repo/tests/test_human_readiness.py", line 78, in test_allow_and_deny_are_explicit_audited_and_control_real_delete
+    done = self.detail_at(identity, {"completed"})
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/nlp_testpack_20261118_z121/repo/tests/test_studio_discussion.py", line 39, in detail_at
+    self.fail("did not reach expected state")
+AssertionError: did not reach expected state
+
+----------------------------------------------------------------------
+Ran 27 tests in 8.698s
+
+FAILED (failures=1)

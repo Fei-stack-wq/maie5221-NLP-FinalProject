@@ -260,7 +260,10 @@ class StepPolicyTest(unittest.TestCase):
         answers = iter([None, "08:00", "17:00", "yes this time", "no this time", "changed to 09:00"])
         observed = []
         agent.unit.human_handler = lambda q: observed.append(q) or next(answers)
-        agent.run("first")
+        stopped = agent.run("first unanswered attempt")
+        self.assertEqual(stopped.status, "aborted")
+        self.assertEqual(observed, ["opening time"])
+        agent.run("retry with available human")
         agent.run("new attempt")
         self.assertEqual(observed, ["opening time","opening time","closing time","approve operating this machine?",
                                     "approve operating this machine?","opening time"])

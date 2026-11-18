@@ -84,6 +84,22 @@ def _stop_timed_out_process(process):
             child.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    # SIGKILL delivery is asynchronous. Waiting for the launcher alone can
+    # return while a browser descendant is still running its exit path.
+    # Observe those exact process identities, with a bounded cleanup grace.
+    cleanup_deadline = time.monotonic() + 1.0
+    pending = children
+    while pending and time.monotonic() < cleanup_deadline:
+        running = []
+        for child in pending:
+            try:
+                if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    running.append(child)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        pending = running
+        if pending:
+            time.sleep(0.01)
 
 
 def _drain(process, stdout, stderr, deadline):

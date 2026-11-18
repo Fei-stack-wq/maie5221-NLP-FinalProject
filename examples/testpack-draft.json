@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "source_kind": "derived_document_summary",
+  "source_note": "依据《测试包准备情况与分工_2026-11-18.docx》的六题摘要制定的预验收草案。Mid_Test.zip 原题和原始角色提示未取得；以下提示为新编验收协议，不代表老师原题。",
+  "scenarios": [
+    {
+      "id": "news",
+      "lead": "chief",
+      "profiles": [
+        {
+          "id": "chief",
+          "name": "主编",
+          "prompt": "明确受众、校区和近期时间范围，组织记者、核查者、编辑协作。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "reporter",
+          "name": "记者",
+          "prompt": "检索并阅读全文，记录来源 URL、发布日期和抓取日期。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "checker",
+          "name": "事实核查员",
+          "prompt": "核对关键断言与相反证据，不把搜索摘要当正文证据。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "editor",
+          "name": "编辑",
+          "prompt": "按渠道改写稿件，保留准确引用和限制。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "campus-news",
+          "title": "校园 AI 新闻",
+          "objective": "先询问用户学校、受众及近期的具体时间范围，再检索学校或研究机构的一手消息。交付 campus_news.md 和 social_posts.md（至少两个渠道版本）。保存 sources.json 数组，每条含 url、published_at、retrieved_at（带时区 ISO 日期）、text_path；text_path 对应实际获取的正文文件。事实核查员逐条核对关键断言，编辑确认标题和引用。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "campus_news.md",
+            "social_posts.md",
+            "sources.json"
+          ],
+          "validator": "sources",
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          }
+        },
+        {
+          "id": "detector-factcheck",
+          "title": "AI 写作检测器事实核查",
+          "objective": "延续上一题团队历史。核查 AI 写作检测器准确性与适用范围，阅读全文、实验条件及相反证据，讨论假阳性与非英语母语写作者等局限。交付 fact_check.md、counterevidence.md、claim_checks.json，并更新 sources.json 与正文文件；每项结论可追溯到来源。不要把单一检测分数当作作弊证明。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "fact_check.md",
+            "counterevidence.md",
+            "claim_checks.json",
+            "sources.json"
+          ],
+          "validator": "sources",
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          }
+        }
+      ],
+      "memory_enabled": true
+    },
+    {
+      "id": "fund",
+      "lead": "manager",
+      "profiles": [
+        {
+          "id": "manager",
+          "name": "基金经理",
+          "prompt": "先澄清模拟资金、币种、期限和风险偏好，组织研究、风控和展示。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "analyst",
+          "name": "研究员",
+          "prompt": "核对资料日期和一手证据，说明估值和情景假设。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "risk",
+          "name": "风控员",
+          "prompt": "核验金额、比例、情景风险和资料时效，不给出无依据的收益承诺。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "presenter",
+          "name": "展示者",
+          "prompt": "制作可独立打开的 HTML 幻灯片并验证翻页。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "portfolio",
+          "title": "模拟投资方案",
+          "objective": "先就模拟金额、币种、期限、风险和限制询问用户，不进行真实交易。交付 brief.md、risks.md、portfolio.json。JSON 采用 {\"total\": 数值, \"currency\": \"币种\", \"assets\": [{\"name\": \"名称\", \"weight\": 百分数, \"amount\": 金额}]}。风控员独立核对总比例为 100、总金额及每项乘积，资料注明日期，解释风险和不确定性。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "brief.md",
+            "risks.md",
+            "portfolio.json"
+          ],
+          "validator": "portfolio",
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          }
+        },
+        {
+          "id": "semiconductor-slides",
+          "title": "半导体 HTML 幻灯片",
+          "objective": "延续基金团队及已确认的用户条件，研究半导体产业并交付自包含 semiconductors.html（至少五页）及 sources.json、正文文件。展示者实际在浏览器打开，验证前进、后退和首尾页边界，保存浏览器测试回执与截图。不要声称实时价格或保证收益；注明资料日期。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "semiconductors.html",
+            "sources.json"
+          ],
+          "validator": "slides",
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          }
+        }
+      ],
+      "memory_enabled": true
+    },
+    {
+      "id": "software",
+      "lead": "lead",
+      "profiles": [
+        {
+          "id": "lead",
+          "name": "技术负责人",
+          "prompt": "讨论需求并组织开发、测试、发布三名成员。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "dev",
+          "name": "开发者",
+          "prompt": "实现会议室预约与看板。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "qa",
+          "name": "测试者",
+          "prompt": "用固定记录验证冲突、取消、统计边界；保留真实执行输出。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        },
+        {
+          "id": "release",
+          "name": "发布者",
+          "prompt": "复核文件与启动说明，验收浏览器交互。 仅把观察到的工具和来源结果作为证据，遇到未知信息向用户澄清。"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "booking",
+          "title": "会议室预约系统",
+          "objective": "先询问用户会议室、时区和预约规则，再交付可运行的预约系统 app.py 与 README.md，包含新增、冲突拒绝、取消后重新预约和日期输入校验。测试者生成 bookings.json 保存检查记录，发布者实际启动服务并检查交互。先确认参数，不把示例当用户决定。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "app.py",
+            "README.md",
+            "bookings.json"
+          ],
+          "validator": null,
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          }
+        },
+        {
+          "id": "dashboard",
+          "title": "预约使用看板",
+          "objective": "继续上一题的团队与代码，交付 dashboard.html 和 metrics.json。用独立测试记录核对统计：2026-11-01 A 10:00–12:00 有效、B 11:00–12:00 有效、A 09:00–10:00 已取消；2026-11-02 A 12:00–13:00 有效。筛选 2026-11-01 当天，应为 active_count=2、cancelled_count=1、hours=3.0、peak_concurrency=2。还要验证空范围、跨日边界，并保留上题原始快照。\n请负责人让其他三名成员实际参与，声明各自任务与交付，最后根据独立检查汇总。所有输出只在本次项目工作区。",
+          "outputs": [
+            "dashboard.html",
+            "metrics.json"
+          ],
+          "validator": "dashboard",
+          "checks": [],
+          "limits": {
+            "max_steps": 100,
+            "max_seconds": 600,
+            "max_total_tokens": 200000
+          },
+          "expected_metrics": {
+            "active_count": 2,
+            "cancelled_count": 1,
+            "hours": 3.0,
+            "peak_concurrency": 2
+          }
+        }
+      ],
+      "memory_enabled": true
+    }
+  ]
+}

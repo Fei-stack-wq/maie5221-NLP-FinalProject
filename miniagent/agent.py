@@ -642,6 +642,8 @@ class Agent:
             return "模型响应协议不完整或异常终止（T_PROTOCOL）", "error"
         if reason == ErrorClass.T_ABORT:
             return "任务被主动中止", "aborted"
+        if reason == ErrorClass.T_HUMAN_UNAVAILABLE:
+            return "所需人工答复不可用，已停止并保留记录", "aborted"
         if reason == ErrorClass.T_CANCEL:
             return "用户请求停止", "aborted"
         if reason == ErrorClass.T_LOOP:
@@ -651,6 +653,14 @@ class Agent:
     def _trace_step(self, identity: dict, record: StepRecord, request_output_limit: int) -> None:
         if not self.tracer:
             return
+        def clean(value):
+            if isinstance(value, str):
+                return value.replace(self.settings.api_key, "[REDACTED]") if self.settings.api_key else value
+            if isinstance(value, dict):
+                return {k: clean(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            return value
         self.tracer.event(
             "step",
             **identity,
@@ -686,6 +696,12 @@ class Agent:
                 ok=obs.ok,
                 error_class=obs.error_class,
                 artifacts=obs.artifacts,
-                preview=obs.content[:200],
+                preview=clean(obs.content[:200]),
+                content=clean(obs.content),
+                requested_tool=obs.meta.get("requested_tool"),
+                requested_arguments=clean(obs.meta.get("requested_arguments")),
+                receipt_complete=True,
+                observation_truncated=obs.truncated,
+                observation_bytes=obs.bytes,
                 **command_metrics,
             )

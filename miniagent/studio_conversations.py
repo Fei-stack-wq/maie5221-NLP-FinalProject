@@ -33,16 +33,17 @@ def validate_conversation(value: object) -> dict:
     if "parent_run_id" in value:
         required = {"parent_run_id", "intent", "recipient"}
         parent = value["parent_run_id"]
-        if (not required <= value.keys() <= required | {"inherit_files", "recover_failed"}
+        if (not required <= value.keys() <= required | {"inherit_files", "recover_failed", "memory_enabled"}
                 or type(parent) is not str or not parent or len(parent) > 128
-                or any(type(value[k]) is not bool for k in ("inherit_files", "recover_failed") if k in value)):
+                or any(type(value[k]) is not bool for k in ("inherit_files", "recover_failed", "memory_enabled") if k in value)):
             raise ValueError("后续消息必须指向上一轮，成员与职责由原会话继承。")
         if (value.get("recover_failed") and (not value.get("inherit_files", True) or intent != "edit")
                 or intent == "question" and not value.get("inherit_files", True)):
             raise ValueError("只可在修改项目时选择新文件或继续失败版本。")
         return dict(value)
     required = {"kind", "members", "recipient", "intent"}
-    if not required <= value.keys() <= required | {"profiles"}:
+    if (not required <= value.keys() <= required | {"profiles", "memory_enabled"}
+            or "memory_enabled" in value and type(value["memory_enabled"]) is not bool):
         raise ValueError("新会话需要类型、成员、回复角色和消息用途。")
     kind, members = value["kind"], value["members"]
     if (kind not in ("dm", "group") or type(members) is not list or len(members) > 16
@@ -68,6 +69,8 @@ def validate_conversation(value: object) -> dict:
     result = {"kind": kind, "members": list(members), "recipient": recipient, "intent": intent}
     if profiles:
         result["profiles"] = list(profiles_by_id.values())
+    if "memory_enabled" in value:
+        result["memory_enabled"] = value["memory_enabled"]
     return result
 
 

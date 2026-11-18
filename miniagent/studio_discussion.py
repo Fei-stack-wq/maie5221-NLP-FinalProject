@@ -33,7 +33,7 @@ class RoomDiscussion:
                 os.fsync(stream.fileno())
         return row
 
-    def _human_handler(self, run_id, role, *, deadline=None):
+    def _human_handler(self, run_id, role, *, deadline=None, request_kind="question"):
         def ask(question):
             if not question.strip():
                 return None
@@ -47,22 +47,38 @@ class RoomDiscussion:
                 expires = min(room_deadline, deadline) if deadline is not None else room_deadline
                 identity = uuid.uuid4().hex
                 key = (run_id, identity)
-                if self._closed or self._cancellations[run_id].is_set():
+                cancellation = self._cancellations.get(run_id)
+                if self._closed or cancellation is None or cancellation.is_set():
                     return None
-                self._record_room_event(run_id, role, "human_question", question, request_id=identity)
-                self._questions[key] = {"request_id": identity, "role": role, "text": self._redact(question), "answer": None, "deadline": expires}
+                started = time.monotonic()
+                action_digest = hashlib.sha256(question.encode()).hexdigest() if request_kind == "approval" else None
+                self._record_room_event(run_id, role, "human_question", question, request_id=identity,
+                                        request_kind=request_kind, action_digest=action_digest)
+                self._questions[key] = {"request_id": identity, "role": role, "text": self._redact(question),
+                                       "answer": None, "deadline": expires, "started": started,
+                                       "request_kind": request_kind, "action_digest": action_digest}
                 try:
                     while self._questions[key]["answer"] is None:
-                        if self._closed or self._cancellations[run_id].is_set() or time.monotonic() >= expires:
+                        if self._closed or cancellation.is_set() or time.monotonic() >= expires:
                             if time.monotonic() >= room_deadline:
-                                self._cancellations[run_id].set()
-                            self._record_room_event(run_id, role, "question_closed", "等待结束，本次没有收到答复。", request_id=identity)
+                                cancellation.set()
+                            self._record_room_event(run_id, role, "question_closed", "等待结束，本次没有收到答复。",
+                                                    request_id=identity, request_kind=request_kind,
+                                                    wait_seconds=round(time.monotonic() - started, 6))
                             return None
                         self._answers.wait(timeout=max(0.01, expires - time.monotonic()))
                     return self._questions[key]["answer"]
                 finally:
                     del self._questions[key]
+                    self._answers.notify_all()
         return ask
+
+    def _approval_handler(self, run_id, role, *, deadline=None):
+        ask = self._human_handler(run_id, role, deadline=deadline, request_kind="approval")
+        def approve(action):
+            answer = ask(action + "\n请明确回答批准或拒绝。")
+            return isinstance(answer, str) and answer.strip().lower() in {"y", "yes", "allow", "批准", "同意"}
+        return approve
 
     def reply_human(self, run_id, request_id, answer):
         from .studio_service import StudioError
@@ -79,11 +95,29 @@ class RoomDiscussion:
             if (pending is None or self._closed or self._cancellations[run_id].is_set()
                     or time.monotonic() >= pending["deadline"]):
                 raise StudioError("本次执行没有在等待这条答复。", "not_waiting", 409)
+            decision = None
+            if pending.get("request_kind") == "approval":
+                allowed = {"y", "yes", "allow", "批准", "同意"}
+                denied = {"n", "no", "deny", "拒绝", "不同意"}
+                if answer.lower() not in allowed | denied:
+                    raise StudioError("审批需要明确回答批准或拒绝。")
+                decision = "allow" if answer.lower() in allowed else "deny"
             row = self._record_room_event(run_id, "user", "human_answer", answer, request_id=request_id,
-                                          recipient=pending["role"])
+                                          recipient=pending["role"], request_kind=pending.get("request_kind", "question"),
+                                          decision=decision, action_digest=pending.get("action_digest"),
+                                          wait_seconds=round(time.monotonic() - pending["started"], 6))
             pending["answer"] = answer
             self._answers.notify_all()
             return row
+
+    @staticmethod
+    def human_timing(events):
+        questions = {e["request_id"] for e in events if e["kind"] == "human_question"}
+        completed = {e["request_id"]: e for e in events if e["kind"] in {"human_answer", "question_closed"}}
+        measured = [e["wait_seconds"] for e in completed.values() if "wait_seconds" in e]
+        return {"request_count": len(questions), "resolved_count": len(questions & completed.keys()),
+                "waiting_seconds": round(sum(measured), 6),
+                "measurement_complete": all(i in completed and "wait_seconds" in completed[i] for i in questions)}
 
     def review_delivery(self, run_id, verdict, note):
         from .studio_service import StudioError, _TERMINAL
@@ -140,6 +174,31 @@ class RoomDiscussion:
                     tasks, checks = self._records(root)
                     prefix = f"turn-{i:03d}"
                     request = self._meta(root).get("request", {})
+                    audit_files = []
+                    # Preserve complete bounded tool receipts, not only the UI's
+                    # last MAX_EVENTS slice. Export never includes model reasoning.
+                    audit = {"request": request, "thread": self._meta(root).get("thread"),
+                             "timing": self.human_timing(public["events"]),
+                             "wall_clock": {k: self._summary(root).get(k) for k in ("created_at", "finished_at", "duration_ms")},
+                             "runtime": self._meta(root).get("runtime_identity"),
+                             "runtime_identity_available": "runtime_identity" in self._meta(root)}
+                    items = [("execution.json", encode(audit))]
+                    for filename in ("trace.jsonl", "board.json", "plan.json", "bus.jsonl", "role-memory.json"):
+                        raw, truncated = _read_file(root, filename, cap - size - transcript_size, missing=True)
+                        if truncated:
+                            raise StudioError("运行记录超过导出上限。", "room_too_large", 413)
+                        if raw:
+                            # Redact configured credentials recursively through
+                            # the existing service policy, retaining every event.
+                            parsed = ([json.loads(line) for line in raw.splitlines() if line]
+                                      if filename.endswith("jsonl") else json.loads(raw))
+                            content = (("\n".join(json.dumps(self._redact(row), ensure_ascii=False) for row in parsed) + "\n").encode()
+                                       if filename.endswith("jsonl") else encode(parsed))
+                            items.append((filename, content))
+                    for filename, content in items:
+                        location = f"{prefix}/audit/{filename}"
+                        add(packet, location, content)
+                        audit_files.append({"path": location, "sha256": hashlib.sha256(content).hexdigest()})
                     add(packet, f"{prefix}/assessment.json", encode({"tasks": tasks, "checks": checks,
                         "acceptance_files": request.get("acceptance_files", []),
                         "criteria": request.get("acceptance_checks", []), "child_checks": request.get("child_checks", {})}))
@@ -154,7 +213,8 @@ class RoomDiscussion:
                                 name = f"{prefix}/artifacts/{file.filename}"
                                 add(packet, name, content)
                                 files.append({"path": name, "sha256": hashlib.sha256(content).hexdigest()})
-                    manifest.append({"run_id": identity, "turn": i, "status": turn["status"], "files": files})
+                    manifest.append({"run_id": identity, "turn": i, "status": turn["status"], "files": files,
+                                     "audit_files": audit_files, "human_timing": self.human_timing(public["events"])})
                 add(packet, "conversation.json", encode({**room, "turns": transcript}))
                 add(packet, "manifest.json", encode(manifest))
             return stream.getvalue()

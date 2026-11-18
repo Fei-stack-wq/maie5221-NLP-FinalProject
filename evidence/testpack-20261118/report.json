@@ -1,0 +1,257 @@
+{
+  "schema_version": 1,
+  "pack_sha256": "a1411117457f29d5f6cb390301c00b035c41b9e65d67aa63611c4ff49790b6b3",
+  "input_pack_sha256": "b054f25e02a96322a6dc35b025ee15bd8a7e9906331c932a8066643e277cb222",
+  "execution_kind": "scripted_fixture",
+  "source_kind": "derived_document_summary",
+  "source_note": "依据《测试包准备情况与分工_2026-11-18.docx》的六题摘要制定的预验收草案。Mid_Test.zip 原题和原始角色提示未取得；以下提示为新编验收协议，不代表老师原题。 本次另将题目替换为离线协作夹具，仅验收协作链路；不能作为原题质量或真实模型实测。",
+  "started_at": "2026-11-18T12:43:23.177015+00:00",
+  "formal_acceptance": false,
+  "scenarios": [
+    {
+      "id": "news",
+      "tasks": [
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:news-1.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:news-1.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204323-d9becc7bf15b",
+          "task_id": "campus-news",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.052668,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "news-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "news-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        },
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:news-2.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:news-2.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204323-7750efdecf38",
+          "task_id": "detector-factcheck",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.091742,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "news-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "news-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a",
+            "news-2.json": "ac704374e065c11e2f528a7b4bc100d12ca4a5f4751103a509ed5eb8e92ef6a1",
+            "news-2.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        }
+      ]
+    },
+    {
+      "id": "fund",
+      "tasks": [
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:fund-1.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:fund-1.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204324-e248d37bf8ef",
+          "task_id": "portfolio",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.07921,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "fund-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "fund-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        },
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:fund-2.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:fund-2.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204324-e05137605a02",
+          "task_id": "semiconductor-slides",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.048588,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "fund-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "fund-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a",
+            "fund-2.json": "86b62baac24b7c8075e7a060edef75620845f9df66e16042ace480326c1976dd",
+            "fund-2.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        }
+      ]
+    },
+    {
+      "id": "software",
+      "tasks": [
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:software-1.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:software-1.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204325-19d8fd842ce6",
+          "task_id": "booking",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.060506,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "software-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "software-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        },
+        {
+          "passed": true,
+          "checks": [
+            {
+              "check": "output:software-2.json",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "output:software-2.md",
+              "passed": true,
+              "detail": "nonempty delivered file"
+            },
+            {
+              "check": "four-role-participation",
+              "passed": true,
+              "detail": []
+            }
+          ],
+          "quality_verified": false,
+          "browser_verified": false,
+          "machine_passed": true,
+          "run_id": "studio-20261118-204325-5fc5c39add00",
+          "task_id": "dashboard",
+          "runtime_status": "completed",
+          "human_timing": {
+            "request_count": 2,
+            "resolved_count": 2,
+            "waiting_seconds": 0.060018,
+            "measurement_complete": true
+          },
+          "artifacts": {
+            "software-1.json": "5ff689a4613147cd571faa399263233d4be6a5f6426cc79224b2b64f2d6b3cdf",
+            "software-1.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a",
+            "software-2.json": "030a9db98c7ed9beadaafd4565f3fafcbfee3c4e5119f863fcad7b812390f49f",
+            "software-2.md": "fa1e67b9ba8e18ebca7377a4469189b9fa337c895dce21adc47ca1602002fb7a"
+          },
+          "review_status": "pending_independent_quality_and_functional_review"
+        }
+      ]
+    }
+  ],
+  "machine_passed": true,
+  "finished_at": "2026-11-18T12:43:26.076529+00:00"
+}

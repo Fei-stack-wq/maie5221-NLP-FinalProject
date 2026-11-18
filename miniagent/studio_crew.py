@@ -70,7 +70,7 @@ def _manifest(staged):
 class RoomCrew:
     def __init__(self, run_id, path, thread, history, provider, settings, tracer,
                  service, should_cancel, human_handler, record_event, room_events, extensions, child_checks,
-                 delivery=None):
+                 delivery=None, *, approve_handler=None, memory=None):
         self.run_id = run_id
         self.path = path
         self.thread = thread
@@ -83,6 +83,8 @@ class RoomCrew:
         self.service = service
         self.should_cancel = should_cancel
         self.human_handler = human_handler
+        self.approve_handler = approve_handler
+        self.memory = memory
         self.record_event = record_event
         self.room_events = room_events
         self.extensions = extensions
@@ -124,7 +126,7 @@ class RoomCrew:
 
     @cached_property
     def capabilities(self):
-        ordinary_tools = "、".join(s.name for s in build_default_registry().specs())
+        ordinary_tools = "、".join(s.name for s in build_default_registry(git_test_remote=self.settings.git_test_remote).specs())
         return ("成员工作阶段始终使用实际注册的工具：" + ordinary_tools +
                              "。可以读取现有文件、定位和修改实现、运行 Python 3 并测试。"
                              "缺少报告会产生进度提醒。最终文字交接和负责人最终汇总不调用工具。")
@@ -380,7 +382,8 @@ class RoomCrew:
         return ("你在本地项目副本中完成当前分工。可用工具以本轮接口为准。"
                 "请按实际文件和测试结果交接成果与限制，仍有阻塞时以 [BLOCKED] 说明原因。"
                 "\n当前分工资料：" + _json(facts) + "\n本轮真实用户答复：" + _json(current)
-                + self._prior_context(include_model_answers=False) + ("\n" + repair if repair else ""))
+                + self._prior_context(include_model_answers=False) + (self.memory.context(role) if self.memory else "")
+                + ("\n" + repair if repair else ""))
 
     def coordinator_policy(self, state, budget):
         closing = StepPolicy("finalize", "请根据成员公开交接汇总交付，说明证据、使用方法和局限。"
@@ -673,10 +676,13 @@ class RoomCrew:
                                        context={"role": role, "workspace": str(workspace), "public_room": self.thread["id"]})
         handoff_seconds = min(30, allocated.seconds_left * .1)
         human_deadline = time.monotonic() + allocated.seconds_left - handoff_seconds
-        member = Agent(name=role, provider=self.provider, registry=build_default_registry(),
+        member = Agent(name=role, provider=self.provider, registry=build_default_registry(
+                       git_test_remote=self.settings.git_test_remote, secret=self.settings.api_key),
                        sandbox=Sandbox(workspace, agent_name=role), settings=self.settings, tracer=self.tracer,
                        task_service=self.service, human_handler=self.human_handler(self.run_id, role, deadline=human_deadline),
                        should_cancel=self.should_cancel)
+        if self.approve_handler:
+            member.unit.approve = self.approve_handler(self.run_id, role, deadline=human_deadline)
         spec = self.child_checks.get(role, {})
         required = sorted(set(spec.get("files", [])) | set(paths))
         progress = MemberProgress(workspace, required_paths=required, public_baseline=original)
@@ -828,6 +834,9 @@ class RoomCrew:
             self._remember_draft(role, assignment, required, report, progress.failed_checks(),
                                  {"runs": recent_runs, "reads": recent_reads}, original)
         self.reports.append(report)
+        if self.memory:
+            self.memory.remember(role, run_id=self.run_id, task_id=record.task_id, objective=objective,
+                                 summary=text, evidence=report["evidence"], files=changes, published=published)
         disposition = "published" if published else "blocked"
         self.record_event(self.run_id, role, "member_report", text + ("\n" + issue if issue and issue != text else ""),
                           task_id=record.task_id, status=status, published=published,

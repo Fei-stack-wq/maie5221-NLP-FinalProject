@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 from .agent import Agent
 from .config import Settings
+from .human import TerminalHuman
 from .metrics import Tracer, load_events, render_report, summarize
 from .providers import DeepSeekProvider, Provider, ProviderError, ScriptedProvider
 from .acceptance import AcceptanceInput, accept_files
@@ -286,6 +287,7 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
         return 2
 
     with Tracer(run_dir) as tracer:
+        human = TerminalHuman(auto_approve=args.yes, emit=tracer.event)
         orchestrator = Orchestrator(
             provider=provider,
             settings=settings,
@@ -294,12 +296,7 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
             root_acceptance=root_acceptance,
             acceptances=acceptances,
             enable_delegation=args.delegate,
-            approve=(lambda _prompt: True) if args.yes else None,
-            human_handler=(
-                (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-                if args.yes
-                else None
-            ),
+            approve=human.approve, human_handler=human.ask,
         )
         result = orchestrator.run(
             args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel, goal_id=goal_id
@@ -384,6 +381,7 @@ def _execute(
     results = []
     task_service = TaskService(TaskStore(run_dir / "tasks.sqlite3"))
     with Tracer(run_dir) as tracer:
+        human = TerminalHuman(auto_approve=auto_approve, emit=tracer.event)
         for index, item in enumerate(tasks, start=1):
             case_id = item.get("task_id") or f"task-{index}"
             task_service.create(
@@ -408,11 +406,7 @@ def _execute(
                     name=agent_name, provider=provider,
                     registry=build_default_registry(), sandbox=sandbox,
                     settings=settings, tracer=tracer, task_service=task_service,
-                    approve=(lambda _prompt: True) if auto_approve else None,
-                    human_handler=(
-                        (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-                        if auto_approve else None
-                    ),
+                    approve=human.approve, human_handler=human.ask,
                 )
                 result = agent.run(item["task"], task_id=task_id, acceptance=selected)
             except Exception as exc:

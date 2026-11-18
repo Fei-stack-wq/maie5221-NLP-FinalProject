@@ -29,13 +29,14 @@ import math
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from .config import Limits
+from .human import bounded_call
 from .providers import DeepSeekProvider, Provider
 from .sandbox import Sandbox, SandboxError
 from .schemas import LLMResponse, RequestAttempts, ToolResult, ToolSpec, Usage, UsageSource
@@ -93,6 +94,7 @@ class ErrorClass:
     T_LOOP = "T_LOOP"                              # 检测到重复动作
     T_BUDGET = "T_BUDGET"                          # 预算耗尽
     T_ABORT = "T_ABORT"                            # 主动中止
+    T_HUMAN_UNAVAILABLE = "T_HUMAN_UNAVAILABLE"    # 所需人工答复不可用
     T_CANCEL = "T_CANCEL"                          # 用户请求停止；不执行后续动作
     T_STORE = "T_STORE"                            # 持久动作身份登记失败；不得执行工具
     T_PROTOCOL = "T_PROTOCOL"                      # 响应协议异常/截断；已收到的用量仍记录
@@ -756,17 +758,25 @@ class RAOUnit:
                     ts=time.time(),
                 )
             elif action.tool in CONTROL_TOOLS and self.enable_control_tools:
-                kind, obs, terminate = self._run_control(action, state, step_id)
+                kind, obs, terminate = self._run_control(action, state, step_id, human_seconds=budget.seconds_left)
                 if obs.source == "human" and obs.ok:
                     state.scratch.setdefault("human_replies", []).append((obs.meta["question"], obs.content))
                 elif not obs.ok:
                     state.scratch["delivery_feedback"] = f"[{action.tool} 未完成] {obs.content[:1000]}"
             else:
+                approval_deadline = time.perf_counter() + budget.seconds_left
+                def approve_with_budget(prompt):
+                    try:
+                        return bool(self.approve and bounded_call(
+                            self.approve, prompt, max(0, approval_deadline - time.perf_counter()), task_id=state.task_id))
+                    except (TimeoutError, EOFError, OSError):
+                        return False
                 result = self.registry.dispatch(
                     action.tool,
                     action.arguments,
                     ToolContext(
-                        sandbox=self.sandbox, limits=self.limits, approve=self.approve
+                        sandbox=self.sandbox, limits=replace(self.limits, tool_timeout_seconds=min(
+                            self.limits.tool_timeout_seconds, budget.seconds_left)), approve=approve_with_budget
                     ),
                 )
                 obs = self._observe(result, action, step_id)
@@ -808,7 +818,8 @@ class RAOUnit:
                         }
                     )
 
-            obs = obs.model_copy(update={"action_id": action.action_id, "tool_call_id": call_id})
+            obs = obs.model_copy(update={"action_id": action.action_id, "tool_call_id": call_id,
+                "meta": {**obs.meta, "requested_tool": action.tool, "requested_arguments": action.arguments}})
             observations.append(obs)
             state.history.append(obs.to_message(call_id))
 
@@ -852,10 +863,10 @@ class RAOUnit:
 
     # ------------------------------------------------------------- 控制工具
     def _run_control(
-        self, action: Action, state: RAOState, step_id: str
+        self, action: Action, state: RAOState, step_id: str, *, human_seconds=None
     ) -> tuple[str, Observation, str | None]:
         if action.tool == "ask_human":
-            return self._ask_human(action, state, step_id)
+            return self._ask_human(action, state, step_id, seconds=human_seconds)
         if action.tool == "delegate_task":
             return self._delegate(action, step_id)
         if action.tool == "abort_task":
@@ -877,7 +888,7 @@ class RAOUnit:
         ), None
 
     def _ask_human(
-        self, action: Action, state: RAOState, step_id: str
+        self, action: Action, state: RAOState, step_id: str, *, seconds=None
     ) -> tuple[str, Observation, str | None]:
         question = str(action.arguments.get("question") or "")
         if self.human_request_gate and (reason := self.human_request_gate(action.arguments)):
@@ -904,29 +915,26 @@ class RAOUnit:
                 step_id=step_id,
                 source="human",
                 ok=False,
-                error_class=ErrorClass.A_HUMAN_DENIED,
-                content=(
-                    "当前没有人类可应答（无人值守模式）。请基于已有信息自行判断并继续，"
-                    "不要再调用 ask_human。"
-                ),
+                error_class=ErrorClass.T_HUMAN_UNAVAILABLE,
+                content="所需人工答复不可用，本次执行停止并保留记录。",
                 ts=time.time(),
             )
-            return "ask_human", obs, None
+            return "ask_human", obs, ErrorClass.T_HUMAN_UNAVAILABLE
         try:
-            reply = self.human_handler(question)
+            reply = bounded_call(self.human_handler, question, seconds, task_id=state.task_id)
         except Exception as exc:  # 人类通道故障不应带走任务
             reply = None
             question = f"{question}（人类通道异常：{type(exc).__name__}）"
-        if reply is None:
+        if not isinstance(reply, str) or not reply.strip():
             obs = Observation(
                 step_id=step_id,
                 source="human",
                 ok=False,
-                error_class=ErrorClass.A_HUMAN_DENIED,
-                content="人类没有回答（或拒绝了该请求）。请换一种方案，不要重复询问。",
+                error_class=ErrorClass.T_HUMAN_UNAVAILABLE,
+                content="没有收到有效人工答复，本次执行停止并保留记录。",
                 ts=time.time(),
             )
-            return "ask_human", obs, None
+            return "ask_human", obs, ErrorClass.T_HUMAN_UNAVAILABLE
         if confirmed is not None:
             confirmed[question] = action.action_id or action.id
         obs = Observation(
