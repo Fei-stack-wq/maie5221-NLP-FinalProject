@@ -39,12 +39,12 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps, *, members=("lead", "writer", "checker"), provider_type=RecordingProvider, **kwargs):
+    def execute(self, steps, *, members=("lead", "writer", "checker"), provider_type=RecordingProvider, final_path=FINAL, **kwargs):
         provider = provider_type(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider), \
              patch("miniagent.research.fetch", return_value=Page(URL, "text/plain", ARTICLE.encode(), False)):
             job = self.service.start(request("team", conversation=roster(*members),
-                objective="Publish the sourced dispatch article.", required_source_review_paths=[FINAL],
+                objective="Publish the sourced dispatch article.", required_source_review_paths=[final_path],
                 limits={"max_steps": 90}, **kwargs))
             return finished(self.service, job["id"]), provider
 
@@ -204,6 +204,61 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.assertEqual([a["candidate_version"] for a in signed],
                          [digest({FINAL: hashed(ARTICLE)}), digest({FINAL: hashed(new)})])
         self.assertIn("候选版本已改变", str(provider.requests))
+
+    def test_original_browser_replay_on_revision_requires_new_independent_source_review(self):
+        path = "dispatch.html"
+        initial = "<!doctype html><h1>Dispatch to Main St.</h1>"
+        revised = initial.replace("Main St.", "Main Street")
+        initial_version, new_version = {path: hashed(initial)}, {path: hashed(revised)}
+        open_page = "from pathlib import Path\npage.goto(Path('dispatch.html').resolve().as_uri())\n"
+        original_probe = open_page + "assert 'Main Street' in page.locator('h1').inner_text()"
+        different_probe = open_page + "assert page.locator('h1').count() == 1"
+        first_probe = tool("run_browser", code=original_probe)
+        steps = [tool("delegate_task", assignee="writer", objective="Publish the dispatch destination.",
+                      deliverable_paths=[path], remaining_roles=["checker", "release"]),
+                 write(path, initial), {"text": "Dispatch published."},
+                 tool("delegate_task", assignee="checker", objective="Check the destination.",
+                      review={"candidate": "writer", "criteria": [RULE]}),
+                 tool("read_file", path=path), tool("http_get", url=URL), submit(initial_version, path),
+                 {"text": "Verified the initial destination."},
+                 tool("delegate_task", assignee="release", objective="Use the full street name and verify the rendered page.",
+                      deliverable_paths=[path]), first_probe]
+        # The scripted provider assigns real tool call IDs from its turn counter.
+        original_call_id = f"call_{len(steps)}_0"
+        steps += [tool("edit_file", path=path, old_text="Main St.", new_text="Main Street"),
+                  tool("run_browser", code=different_probe),
+                  tool("rerun_browser_check", tool_call_id=original_call_id),
+                  {"text": "Full spelling verified with the original browser test."},
+                  tool("delegate_task", assignee="checker", objective="Check the published revision."),
+                  tool("read_file", path=path), tool("http_get", url=URL),
+                  submit(initial_version, path), submit(new_version, path),
+                  {"text": "The revised page matches the source."}, {"text": "Delivered the reviewed revision."}]
+        detail, _ = self.execute(steps, members=("lead", "writer", "checker", "release"), final_path=path)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        trace_path = self.root/"runs"/detail["run"]["id"]/"trace.jsonl"
+        trace = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertTrue(all(r["published"] for r in reports))
+        release = next(r for r in reports if r["role"] == "release")
+        evidence = [e for e in trace if e.get("task_id") == release["task_id"]]
+        probes = [e for e in evidence if e["kind"] == "tool_result" and e["tool"] in {"run_browser", "rerun_browser_check"}]
+        self.assertEqual([(e["tool"], e["exit_code"]) for e in probes],
+                         [("run_browser", 1), ("run_browser", 0), ("rerun_browser_check", 0)])
+        self.assertEqual(probes[-1]["replayed_tool_call_id"], probes[0]["tool_call_id"])
+        checkpoints = {e["step"]: e["checkpoint"] for e in evidence if e["kind"] == "member_work_checkpoint"}
+        self.assertTrue(checkpoints[probes[1]["step"]]["failed"])
+        self.assertEqual(checkpoints[probes[-1]["step"]]["failed"], [])
+        reviews = [r["native_review"]["assessment"] for r in reports if r["role"] == "checker"]
+        self.assertEqual([x["candidate_version"] for x in reviews], [digest(initial_version), digest(new_version)])
+        second_checker = next(r["task_id"] for r in reversed(reports) if r["role"] == "checker")
+        decisions = [e for e in trace if e["kind"] == "tool_result" and e["tool"] == "submit_review"
+                     and e["task_id"] == second_checker]
+        self.assertEqual([e["ok"] for e in decisions], [False, True])
+        self.assertIn("候选版本已改变", decisions[0]["preview"])
+        original_receipts, revised_receipts = [x["results"][0]["receipts"] for x in reviews]
+        self.assertEqual([r["sha256"] for r in revised_receipts if r["kind"] == "read"], [hashed(revised)])
+        self.assertNotEqual(next(r["receipt_id"] for r in original_receipts if r["kind"] == "source"),
+                            next(r["receipt_id"] for r in revised_receipts if r["kind"] == "source"))
 
     def test_new_version_invalidates_receipt_and_no_op_handoff_cannot_hide_authorship(self):
         old, new = hashed(ARTICLE), hashed(ARTICLE + " Updated.")
