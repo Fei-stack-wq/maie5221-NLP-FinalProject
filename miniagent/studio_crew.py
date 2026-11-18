@@ -80,6 +80,7 @@ class RoomCrew:
                  service, should_cancel, human_handler, record_event, room_events, extensions, child_checks,
                  delivery=None, *, role_session=None):
         self.role_session = role_session
+        self.inherited_review = None
         self.run_id = run_id
         self.path = path
         self.thread = thread
@@ -123,7 +124,8 @@ class RoomCrew:
                 for event in events:
                     if event.get("kind") == "member_report" and event.get("published"):
                         handoff = event.get("handoff", {})
-                        self.native_reviews.record_author(handoff.get("role"), handoff.get("changed_files", []))
+                        author = (handoff.get("promoted_candidate") or {}).get("author", handoff.get("role"))
+                        self.native_reviews.record_author(author, handoff.get("changed_files", []))
         self.approved_roles = set()
         self.planned = None
         self.plan_order = []
@@ -169,6 +171,8 @@ class RoomCrew:
                 "\n" + self.capabilities + " 这份清单来自执行成员的工具注册表。成员可检索并读取公开来源时，请委派调查；来源能否访问以实际回执为准。" +
                 "\n依据用户目标和角色职责选人。首次 delegate_task 须用 remaining_roles 列出这次后续需要的角色 ID，"
                 "简单任务可以填 []。完整产品交付如群内有相应分工，应安排实现、独立验收和发布交付。"
+                "复核继承的成稿时可以直接用 delegate_task.review.candidate 填成稿路径、原作者任务 ID 或唯一作者角色，"
+                "由另一成员独立检查现版。无需先让作者改写原件或重复交接。"
                 "独立评估已交付的候选或带 reviewable_candidate 的完整私有草稿时，使用 delegate_task.review 引用原任务或作者角色，填写逐项标准；"
                 "需观察行为用 execute，审阅文件用 inspect，核查事实用 source。要求独立调查时，评审者可打开其他原始资料；检索未命中只说明已查范围。宿主会将返工转回适当成员。"
                 "每次只委派给一人。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
@@ -181,7 +185,7 @@ class RoomCrew:
                 "开始委派前可核实公开项目中影响选人和分工的必要细节。收到成功交接后根据公开报告安排后续工作。"
                 "工具回执中的调用次数只表示已经执行的次数。查询平台工具配置属于 runtime_capability。"
                 "仅当用户掌握的业务需求、偏好、数据或权限确实缺失时 ask_human，并说明 decision_kind。"
-                + ("\n用户要求独立核查指定成稿。作者的 deliverable_paths 列出最终文件；成稿交接后委派另一成员，"
+                + ("\n用户要求独立核查指定成稿。继承的成稿可直接引用路径。若为本轮新增或修订，作者用 deliverable_paths 列出最终文件。委派另一成员，"
                  "用 delegate_task.review 引用作者的最新候选，列出必需的 source 标准。逐条核对重要主张，主动找反证；"
                  "区分正式规则和建议，注明研究样本与结论适用范围。核对笔记或旧版本不能代替对成稿的评审。"
                  if self.native_reviews.required_source_paths else "") +
@@ -650,7 +654,7 @@ class RoomCrew:
                               for p in missing}
                 return ("指定成稿当前版本缺少独立来源核查（文件及可引用的候选任务）：" + _json(candidates) +
                         "。有候选时委派非作者，以 delegate_task.review 的必需 source 标准核对成稿及原始来源；"
-                        "没有候选时先让作者交接，deliverable_paths 列出该文件。")
+                        "没有本轮候选时，先以成稿路径引用同群可验证的原发布；本轮新增或修订的成稿由作者交接。")
         return None
 
     def _observation(self, ok, text):
@@ -840,7 +844,7 @@ class RoomCrew:
         if payload.get("review") is not None:
             try:
                 requested_review = self.native_reviews.open(payload["review"], role, self.reports,
-                    drafts=self.private_drafts, project_version=self.project_version)
+                    drafts=self.private_drafts, project_version=self.project_version, inherited=self.inherited_review)
             except (ValueError, OSError) as exc:
                 return self._observation(False, "无法发起独立验收：" + str(exc))
             if review and review is not requested_review:
@@ -935,6 +939,10 @@ class RoomCrew:
         self.untapped_shares.pop(role, None)
         dispatch_started = time.monotonic()
         if review:
+            if review.publication and review.target not in self.native_reviews.items:
+                self.record_event(self.run_id, "studio", "published_review_bound", "已绑定同群先前发布的原件，开始本轮独立复核。",
+                                  task_id=self.run_id, reviewer=role, publication=review.publication,
+                                  candidate_version=review.version, criteria=[r.model_dump() for r in review.criteria])
             self.native_reviews.items[review.target] = review
         if retry_gaps:
             self.record_event(self.run_id, "studio", "review_resumed", "原标准继续生效，已将未决项交给原验收者。",

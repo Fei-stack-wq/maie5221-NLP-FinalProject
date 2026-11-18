@@ -1037,6 +1037,100 @@ class StudioService(RoomDiscussion, StudioRoles):
             return candidates[0]
         return None
 
+    def _inherited_review_publication(self, crew, local, reference):
+        """Resolve a published original from this conversation's actual file ancestry."""
+        thread = crew.thread
+        if not thread.get("inherit_files", True) or thread.get("recovery_source"):
+            return None
+        # A local workspace receives member projections even if the whole turn
+        # later fails. Internal workspaces are checked out from base_run_id.
+        parent_key = "parent_run_id" if local else "base_run_id"
+        parent = thread.get(parent_key)
+        ancestors = {turn["run_id"] for turn in crew.history}
+        manifest = {}
+        copy_project(crew.path, crew.lead, None, _EXTENSIONS, secret=self.settings.api_key, manifest=manifest)
+        wanted = set(crew.delivery.get("files", [])) | crew.native_reviews.required_source_paths
+        wanted.update(check["path"] for check in crew.delivery.get("checks", []))
+        # Once this turn publishes a path, its current writer and candidate
+        # govern review, including changes that restore older bytes.
+        seen = {change["path"] for report in crew.reports if report.get("published")
+                for change in report.get("changed_files", [])}
+        choices, prior_findings = {}, {}
+        task_scope = set()
+        while parent and parent in ancestors:
+            ancestors.remove(parent)
+            meta = self._meta(self._directory(parent))
+            past = thread_info(parent, meta)
+            if not past or past["id"] != thread["id"] or past["kind"] != "group" or meta.get("workspace_path") != local:
+                break
+            for e in reversed(self.room_events(parent)):
+                if e.get("kind") != "member_report" or e.get("role") not in crew.profiles:
+                    continue
+                h = e.get("handoff", {})
+                old = h.get("native_review") or {}
+                assessment = old.get("assessment") or {}
+                if (assessment and not old.get("private_candidate_task")
+                        and old.get("candidate_version") == assessment.get("candidate_version")):
+                    target = old.get("target"), old["candidate_version"]
+                    if target not in prior_findings:
+                        if assessment.get("verdict") != "passed":
+                            failed = {r["criterion_id"]:r for r in assessment["results"] if r["verdict"] != "passed"}
+                            pending = [r for r in old["criteria"] if r["id"] in failed and r["required"]]
+                            product = any(failed[r["id"]].get("cause") == "product" for r in pending)
+                            prior_findings[target] = (old["files"], pending, product)
+                        elif e.get("published") and old.get("state") == "passed":
+                            prior_findings[target] = (old["files"], [], False)
+                if not (e.get("published") and h.get("published") and e.get("task_id")
+                        and e["task_id"] == h.get("task_id")):
+                    continue
+                promoted = h.get("promoted_candidate") or {}
+                author = promoted.get("author", e["role"])
+                task = promoted.get("source_task", h["task_id"])
+                projection = e.get("workspace_delivery") or {}
+                changes = {c["path"]:c.get("sha256") for c in h.get("changed_files", [])}
+                if reference == task:
+                    task_scope.update(h.get("deliverable_paths") or (p for p, sha in changes.items() if sha))
+                for artifact in e.get("artifacts", []):
+                    rel = artifact.get("project_path")
+                    sha = artifact.get("sha256")
+                    if not rel or rel in seen:
+                        continue
+                    seen.add(rel)
+                    if (not sha or manifest.get(rel) != sha or changes.get(rel, sha) != sha or author not in crew.profiles
+                            or reference not in (rel, task, author) or reference == author and wanted and rel not in wanted
+                            or local and (projection.get("status") != "published" or rel not in projection.get("files", []))):
+                        continue
+                    link = artifact.get("path", "")
+                    if not re.fullmatch(r"handoffs/[a-f0-9]{32}/" + re.escape(rel), link):
+                        continue
+                    try:
+                        data, truncated = self._artifact_data(parent, link, 8 * 1024**2)
+                    except StudioError:
+                        continue
+                    if truncated or hashlib.sha256(data).hexdigest() != sha:
+                        continue
+                    match = choices.setdefault(task, {"task_id":task, "role":author, "run_id":parent,
+                        "objective":h.get("objective", "Review published files."), "files":{}, "unresolved":[]})
+                    match["files"][rel] = sha
+                seen.update(changes)
+            if not past.get("inherit_files", True) or past.get("recovery_source"):
+                break
+            parent = past.get(parent_key)
+        if len(choices) > 1:
+            raise ValueError("该作者有多个已发布候选，请用成稿路径或任务 ID 指定：" +
+                             json.dumps({task:sorted(c["files"]) for task,c in choices.items()}, ensure_ascii=False))
+        candidate = next(iter(choices.values()), None)
+        if candidate:
+            if task_scope - candidate["files"].keys():
+                raise ValueError("原任务的完整交付范围已改变或缺少发布凭证。请指定仍匹配的单份成稿。")
+            for files, findings, product in prior_findings.values():
+                if not candidate["files"].items() & files.items():
+                    continue
+                if product:
+                    raise ValueError("指定版本已有独立验收确认的产品缺陷。请安排作者修订并发布新版本。")
+                candidate["unresolved"].extend(r for r in findings if r not in candidate["unresolved"])
+        return candidate
+
     def _load_prior_diagnostics(self, crew, thread):
         parent = thread.get("parent_run_id")
         if not parent or not thread.get("inherit_files", True):
@@ -1293,6 +1387,12 @@ class StudioService(RoomDiscussion, StudioRoles):
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
                                     delivery, role_session=roles)
+                    def inherited_review(reference):
+                        try:
+                            return self._inherited_review_publication(crew, metadata.get("workspace_path"), reference)
+                        except StudioError as exc:
+                            raise ValueError("无法核对本群发布记录：" + str(exc)) from None
+                    crew.inherited_review = inherited_review
                     self._load_prior_diagnostics(crew, thread)
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)

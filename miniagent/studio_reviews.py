@@ -49,7 +49,7 @@ class Submission(BaseModel):
 
 
 # Explicit wire schemas are also consumed by OpenAI-compatible providers.
-REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候选作者任务 ID（或当前角色 ID；完整的私有检查点也可验收）引用候选。",
+REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候选作者任务 ID（或当前角色 ID；可用同群已发布的成稿路径、原任务 ID 或唯一的原作者引用继承的原件）引用候选。",
     "properties": {"candidate": {"type": "string"}, "criteria": {"type": "array", "items": {
         "type": "object", "properties": {"id":{"type":"string"}, "description":{"type":"string"},
             "method":{"type":"string","enum":["inspect","execute","source"]}, "required":{"type":"boolean"}},
@@ -81,6 +81,7 @@ class Review:
     host_issue: str = ""
     probes: dict = field(default_factory=dict)
     required_source_paths: set[str] = field(default_factory=set)
+    publication: dict = field(default_factory=dict)
 
     def sourced_files(self, results):
         """Candidate bytes cited with a freshly retrieved source on a required passing finding."""
@@ -115,7 +116,7 @@ class Review:
                 "state":self.state, "candidate_version":self.version, "files":dict(self.files),
                 "objective":self.objective, "criteria":[c.model_dump() for c in self.criteria],
                 "findings":self.latest.get("results", []), "private_candidate_task":self.draft_task,
-                "host_issue":self.host_issue}
+                "host_issue":self.host_issue, **({"publication":self.publication} if self.publication else {})}
 
     def briefing(self):
         # Prompts need actionable gaps and an immutable version. The complete
@@ -231,7 +232,7 @@ class ReviewQueue:
                 # independently sign off their own new version.
                 item.state = "blocked" if item.reviewer == report["role"] else "review"
 
-    def open(self, raw, reviewer, reports, *, drafts=None, project_version=None):
+    def open(self, raw, reviewer, reports, *, drafts=None, project_version=None, inherited=None):
         spec = ReviewRequest.model_validate(raw)
         ids = [rule.id for rule in spec.criteria]
         if len(set(ids)) != len(ids) or not any(r.required for r in spec.criteria):
@@ -244,12 +245,31 @@ class ReviewQueue:
             return active
         author = next((r for r in reversed(reports) if spec.candidate in {r["task_id"], r["role"]}
                        and not r.get("promoted_candidate")), None)
-        if not author or author["role"] == reviewer:
+        publication = None
+        if author is None and inherited:
+            publication = inherited(spec.candidate)
+            if publication:
+                author = publication
+        if not author:
+            raise ValueError("请选择本群其他成员产生的候选。找不到与当前文件匹配的同群发布回执，请核对成稿路径或原任务 ID。")
+        if author["role"] == reviewer:
             raise ValueError("请选择本群其他成员产生的候选。")
         draft_task = None
         objective = author["objective"]
         probes = {}
-        if author["task_id"] in self.candidates:
+        if publication:
+            files = publication["files"]
+            # A new turn must recheck unresolved public criteria on these exact bytes.
+            for old in publication["unresolved"]:
+                required_rule = Rule.model_validate(old)
+                if required_rule.id in ids and required_rule not in spec.criteria:
+                    raise ValueError("原件已有未通过的标准，请保留其原定义：" + required_rule.id)
+                if required_rule.id not in ids:
+                    if len(spec.criteria) >= 24:
+                        raise ValueError("请减少新增标准，并保留原件未通过的必需项。")
+                    ids.append(required_rule.id)
+                    spec.criteria.append(required_rule)
+        elif author["task_id"] in self.candidates:
             files = self.candidates[author["task_id"]]
             if any(self.public_versions.get(p) != sha for p,sha in files.items()):
                 raise ValueError("该候选已有更新，请选择最新交付。")
@@ -278,6 +298,8 @@ class ReviewQueue:
         if any(self.source_authors.get((p, files[p])) == bound_reviewer for p in required_sources):
             raise ValueError("请另选评审人。指定文件的当前版本由这名成员写入。")
         if existing:
+            if publication and existing.files != files:
+                raise ValueError("这次复核已绑定其他文件范围，请沿用原目标。")
             if (existing.reviewer != reviewer or existing.criteria != spec.criteria) and not existing.verification_gaps():
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return existing
@@ -285,6 +307,8 @@ class ReviewQueue:
             raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes,
                         required_source_paths=required_sources)
+        if publication:
+            review.publication = {k:publication[k] for k in ("run_id", "task_id", "role", "files")}
         return review
 
 

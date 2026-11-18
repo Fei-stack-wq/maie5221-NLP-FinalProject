@@ -214,3 +214,11 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 例如，评审人已执行网页测试并从发行方取得公告，但只用 shell 查看成稿时，收尾仍允许用 `read_lines` 读取指定成稿。拿到文件回执后，以它和对应的来源回执提交事实判断。若满足剩余取证条件的集合持续缩小，可在本次分配的时间和预算内继续。相同缺口连续三个收尾工具回合仍未缩小时，系统收回工具并要求明确交接未验证项。独立验收与最终发布仍分别检查绑定版本和用户标准。
 
 这一实现借鉴 Pydantic AI 按字段返回验证错误、对同一次工具纠错限制重试的处理。Studio 自行实现按标准整理多个错误、真实工件回执与尚缺取证操作的关联。[Pydantic AI 的错误回执](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/pydantic_ai_slim/pydantic_ai/messages.py#L2938-L2958) · [工具级重试测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L1765-L1803) · [Studio 普通入口回归](../tests/test_studio_required_source_review.py)
+
+### 在后续群聊中直接复核原件
+
+同群继续工作时，负责人可直接在 `delegate_task.review.candidate` 中填写成稿路径、原作者任务 ID 或可唯一确定的作者角色。例如，研究员可以检查上一轮营销成员发布的 `proposal.md`。宿主核对发布事件、原作者、本轮成稿 SHA-256 和归档快照中的实际字节。选择本地工作区时还须有该文件成功投影到同一目录的回执，因此上轮整体失败前已经公开交付的成员工件也可核对。内部工作区沿实际继承的基础版本查找。开启新项目会截断文件来源链。
+
+绑定后，群事件 `published_review_bound` 记录原运行、作者任务、文件摘要、本轮评审者和标准。评审者独立取证并提交本轮结论。原件上的未决标准会带入复核；同一版本已有明确产品缺陷时，应由作者修订再发布。缺失原始来源或本轮硬性验收不通过时，复核不能授权交付。实际作者只有在需要修订产品时才需再次交接。
+
+路径和版本匹配参考 in-toto 逐项核对上一步产物和下一步材料的做法。Studio 使用本机群发布回执、不可变交接归档与即时工作区摘要来确认来源。[in-toto 的材料匹配](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L727-L765) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549) · [Studio 跨轮复核回归](../tests/test_studio_inherited_review.py)
