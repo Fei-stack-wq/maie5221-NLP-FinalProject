@@ -593,6 +593,13 @@ sys.exit(bool(failures))
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["superseded_member_checks"], [])
 
+    def test_unrelated_passing_case_sharing_a_word_prefix_cannot_retire_a_failure(self):
+        self.run_custom(self._custom_script)
+        fixed = self._custom_script.replace("180", "150")
+        self.run_custom(fixed, output="PASS busy 150 records  | 150\nPASS all intervals\n")
+        self.assertTrue(self.p.blocked_reason())
+        self.assertFalse(self.p.evidence()["superseded_member_checks"])
+
     def test_recovered_fixed_checks_remain_bound_to_original_script_bytes(self):
         original = self._custom_script
         self.run_custom(original)

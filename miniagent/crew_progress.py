@@ -26,6 +26,7 @@ _UNIT_OK = re.compile(r"^OK(?: \([^\n]*\))?\s*$", re.M)
 _PYTEST = re.compile(r"(?m)^\s*=*\s*(?:\d+ (?:skipped|warnings?), )*(\d{1,8}) passed\b[^\n]*$")
 _FAILURE = re.compile(r"(?m)^\s*(?:=+\s*)?(?:FAILED\s*\(|(?:\d+ (?:passed|skipped|warnings?), )*"
                       r"[1-9]\d* (?:failed|errors?)\b|FAILED \S+::)")
+_CASE_DETAIL = re.compile(r"\s{2,}|\s+->\s+")
 _CASE = re.compile(r"(?im)^\s*(PASS|FAIL)\s*[:|–-]?\s+([^\n]+)")
 # Custom test scripts may append a balanced tally, then key-value diagnostics.
 # Unlike a result event, an empty failure inventory has no test identity.
@@ -356,8 +357,11 @@ def _script_run(layouts, current, command, cwd, obs, status):
         return None
     for result, name in report.rows:
         name = name.strip()
+        # Match a passing row's literal source caption independently of its
+        # changing diagnostics. A shared word prefix is not a case identity.
         matches = [i for i, cap in enumerate(layout.captions)
-                   if name == cap or result.upper() == "FAIL" and name.startswith(cap + " ")]
+                   if name == cap or name.startswith(cap + " ") and
+                   (result == "FAIL" or _CASE_DETAIL.match(name, len(cap)))]
         if len(matches) == 1:
             key = matches[0]
         elif result.upper() == "PASS" and not matches:
@@ -413,7 +417,7 @@ def _browser_check(obs: Observation, code: str, cwd: str) -> _Check | None:
 def _check_key(suite: str, case: str = "") -> str:
     # Custom runners often print a stable case caption, then two spaces
     # and the actual result. Keep the expected assertion in the caption.
-    caption = re.split(r"\s{2,}|\s+->\s+", case.strip(), maxsplit=1)[0]
+    caption = _CASE_DETAIL.split(case.strip(), maxsplit=1)[0]
     return hashlib.sha256((suite + "\0" + caption).encode()).hexdigest()
 
 

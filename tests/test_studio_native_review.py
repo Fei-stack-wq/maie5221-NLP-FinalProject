@@ -105,6 +105,46 @@ class NativeReviewTest(unittest.TestCase):
                          ["request_clarification", "preserve_block"])
         self.assertEqual(len([1 for messages, _ in provider.requests if "宿主结案核对" in str(messages)]), 1)
 
+    def test_revised_reviewer_probe_with_diagnostics_hands_off_to_an_independent_peer(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        probe = """from pathlib import Path
+import sys
+errors = []
+def record(name, condition, observed):
+    print(("PASS  " if condition else "FAIL  ") + name + "  | " + str(observed))
+    if not condition:
+        errors.append(name)
+label = Path("delivery.txt").read_text()
+length = len(label) + 10
+record("shipment label length", length == EXPECTED, length)
+record("warehouse present", "old warehouse" in label, "found warehouse")
+sys.exit(bool(errors))
+""".replace("EXPECTED", str(len(label)))
+        fixed = probe.replace("len(label) + 10", "len(label)")
+        command = "python3 label_probe.py"
+        checked = "pass:" + hashlib.sha256((command + "\0").encode()).hexdigest()
+        second = {"candidate":"inspector", "criteria":[{"id":"probe", "description":"Independently verify the corrected length calculation.", "method":"execute"}]}
+        steps = self.start_review() + [write("label_probe.py", probe), tool("run_shell", command=command),
+            tool("edit_file", path="label_probe.py", old_text="len(label) + 10", new_text="len(label)"),
+            tool("run_shell", command=command), submit(label, "passed"), {"text":"Reviewed the original label and fixed my test."},
+            tool("delegate_task", assignee="builder", objective="Independently verify the corrected calculation.", review=second),
+            tool("read_file", path="label_probe.py"), tool("run_shell", command=command),
+            tool("submit_review", candidate_version=digest({"label_probe.py":hashlib.sha256(fixed.encode()).hexdigest()}),
+                 results=[{"criterion_id":"probe", "verdict":"passed","reason":"Checked the expected length against the label and reran both assertions.",
+                           "evidence":[checked]}]),
+            {"text":"Verified the corrected probe independently."}, {"text":"Shipment handed over."}]
+        detail, _ = self.execute(steps)
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(detail["run"]["status"], "completed", [(r["role"], r["remaining_issue"]) for r in reports])
+        first, peer = reports[-2:]
+        self.assertTrue(first["published"])
+        self.assertEqual(first["native_review"]["state"], "passed")
+        retired, = first["evidence"]["superseded_member_checks"]
+        self.assertIn("pending_independent_acceptance", retired["disposition"])
+        self.assertEqual((retired["prior_exit_code"], retired["current_exit_code"]), (1, 0))
+        self.assertIn("shipment label length", retired["prior_failure"])
+        self.assertEqual(peer["independently_reviewed_tasks"], [first["task_id"]])
+
     def test_reject_fix_independent_recheck_on_new_bytes(self):
         script = self.start_review()+[
             submit("Shipment destination: old warehouse. Verified dispatch record.","changes_requested",cause="product",action="Print the confirmed new warehouse."),
