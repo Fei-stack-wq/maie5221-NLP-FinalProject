@@ -4,10 +4,11 @@
 单 agent 运行时、任务编排（串行 / 分层并发 / 事件驱动）、消息总线与指标观测。
 
 面向 MAIE5221 NLP 期末项目。只用 DeepSeek / HKGAI 主干，产出只用 Markdown / 纯文本，
-UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
+提供轻量本地网页工作室与 CLI。课程要求界面简单实用，允许基础网页文本界面；
+前端围绕真实任务操作与观测，复用同一套 AI 工程与编排后端。
 
 ```
-版本 0.4.0 · Python 3.10+ · 仅依赖 pydantic · 417 个测试（离线可跑）
+版本 0.4.0 · Python 3.10+ · pydantic 与 psutil · 本地网页与离线演示
 ```
 
 ---
@@ -16,11 +17,13 @@ UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
 
 | 能力                                        | 命令                        | 产出                                           |
 | ------------------------------------------- | --------------------------- | ---------------------------------------------- |
+| 本地网页工作室 | `studio` | 发起任务、任务树、状态、日志、产物与验收报告 |
 | 单 agent 干活（读写文件 / 跑代码 / 抓网页） | `demo`、`run`、`eval` | 产物文件 + 完成率/耗时报告                     |
 | 目标拆成子任务图并调度                      | `orchestrate`             | `plan.json` + 子任务完成率 + 总体目标状态    |
 | 三种调度：串行 / 分层并发 / 事件驱动        | `--scheduler`             | 可对比的墙钟数据                               |
 | agent 之间互相委派                          | `--delegate`              | `bus.jsonl` 里的 `delegate_request/result` |
 | 群聊与私信                                  | `bus.jsonl` 频道          | 每个 agent 的 `report` 消息                  |
+| 持久任务、执行身份与状态查询 | `tasks runs/<run_id>` | `tasks.sqlite3` + 事务事件，重启可查 |
 | 一切操作可追溯                              | `trace.jsonl`             | 每步的决策、耗时、token、错误类                |
 
 不需要 API key 也能跑完整链路（内置 ScriptedProvider）。
@@ -29,11 +32,27 @@ UI 只有 CLI —— 把精力全部放在「AI 工程与编排后端」。
 
 ## 快速开始
 
+macOS 可直接双击仓库根目录的 [Start Studio.command](<Start Studio.command>)，启动本地服务并打开默认浏览器；首次使用若没有 `.venv`，启动器会显示环境安装步骤，不会自动安装或启动模型任务。
+
+也可以从终端启动本地网页工作室（在仓库根目录，使用已有虚拟环境）：
+
+```sh
+.venv/bin/python -m miniagent studio --port 8765 --runs-dir runs
+```
+
+浏览器打开 <http://127.0.0.1:8765>。先选择离线单任务或协作演示，即可看到真实工具执行、任务树、产物和验收结果。真实模型模式读取服务端环境变量；`studio` 还支持从本地 `.env` 加载字面量配置，已有环境变量优先，密钥不发送到浏览器。CLI 的其他命令继续只读进程环境。
+
+工作室支持刷新与重新打开历史运行；自动续跑、角色/skill 管理及人工审批会话属于后续阶段。完整启动、API、视觉参考与边界见 [本地 GUI 说明](docs/local-studio-gui.md)。
+
+原有命令行入口继续保留：
+
 ```powershell
-pip install -r requirements.txt          # 只有 pydantic
+pip install -r requirements.txt
 
 # 1) 单 agent 闭环：列目录 → 写文件 → 回读 → 执行代码 → 最终答复
 python -m miniagent demo
+# 重启后仍可查询本次任务、Attempt 和 Run
+python -m miniagent tasks runs/<run_id>
 
 # 2) 批量指标：任务完成率 / 平均耗时 / P95 / token
 python -m miniagent eval --tasks examples/verified_mock_tasks.jsonl --mock examples/mock_task.json
@@ -55,16 +74,19 @@ python -m miniagent run "调研 ReAct 并写一份 notes.md"
 python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-parallel 2
 ```
 
-默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 4096 token；请求重试与 deadline 可配置。`.env` 不自动加载，变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
+默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 300000 token；请求重试与 deadline 可配置。任务默认最多 100 轮、累计 1000000 tokens、3600 秒；网页选项可按任务设置预算，运行时可请求停止，结束后可下载保留相对目录的产物 ZIP。输出截断最多恢复两次，上下文按完整工具批次裁剪，大文件支持分页读取、局部编辑及追加；详见 [Harness 基础能力](docs/harness-foundations.md)。除 `studio` 的本地配置加载入口外，`.env` 不自动加载；变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
 
 > `--mock` 只能配 `--scheduler serial`：`ScriptedProvider` 带游标、不是线程安全的，
 > 并发/事件驱动请用真实模型（或用 `agent_factory` 注入独立 provider）。
 
 没有配置独立验收时，答复和产物仍保留，但结果为 `unverified`，不会计入成功。原 `examples/tasks.jsonl` 和无验收的委派演示属于这种情况。文件检查器当前需要 POSIX no-follow 能力，Windows 上会明确报错；接口、配置与平台边界见 [M0-02 说明](docs/m0-02-acceptance-and-metrics.md)。
 
+编码成员可用 `run_python` 执行 Python，或在 macOS、Linux 上用 `run_shell` 启动非交互式 `/bin/sh`。两个工具共用工具时限和项目环境，PATH 优先使用 Studio 的 Python 解释器，子进程仅继承选定的系统变量。在 macOS、Linux 上，两者共用输出限额和进程组清理，均记录退出码、耗时和标准输出、标准错误的首尾片段。Shell 还可指定项目内的相对工作目录。Windows 的 Python 工具沿用宿主原生子进程。成员需要跨步使用本地测试服务时，请把服务输出重定向到项目日志。命令以 Studio 进程的系统用户权限运行，工作目录用于定位项目文件。
+
 每次运行在 `runs/<run_id>/` 下留下：
 
 ```
+tasks.sqlite3 任务、Attempt/Run、验收与事务事件
 trace.jsonl   每步事件（决策/工具/验收/终态）
 plan.json     子任务图（降级时标记 degraded）
 board.json    黑板快照（每步摘要、产物、错误类）
@@ -91,8 +113,9 @@ workspaces/<attempt>/agents/task-<subtask>/   编排子任务工作区
 ## 架构速览
 
 ```
-CLI
- └─ Orchestrator          计划校验 → 路由 → 调度（S1/S2/S3）→ 黑板/总线
+浏览器 → 本地 HTTP → StudioService（后台执行、运行查询）
+                       ├─ Agent（单任务）
+CLI / StudioService ───┴─ Orchestrator          计划校验 → 路由 → 调度（S1/S2/S3）→ 黑板/总线
      └─ Agent             循环 + 预算 + 验收 + 终态映射
          └─ RAOUnit       一步 = Reason → Act → Observe
              ├─ Tools     文件 / 代码 / 网络 / 控制工具
@@ -102,6 +125,8 @@ CLI
 
 | 层   | 一句话职责                    | 文件                                         |
 | ---- | ----------------------------- | -------------------------------------------- |
+| 入口 | 本地 HTTP 与网页；启动后轮询运行状态 | `studio_server.py` `studio_service.py` `web/` |
+| 控制 | 持久任务生命周期与事务状态 | `task_service.py` `task_store.py` |
 | L0   | 一步的决策、执行、观察归一化  | `rao.py`                                   |
 | L1   | 驱动 RAO 到终止，管预算与验收 | `agent.py`                                 |
 | L2   | 计划 → 子任务 DAG → 调度    | `orchestrator.py`                          |
@@ -148,6 +173,8 @@ CLI
 | [docs/m0-01-computer-maintenance-example.md](docs/m0-01-computer-maintenance-example.md) | M0-01 完整电脑维护数据示例：任务、验收、预算、工件、审批与恢复（虚构数据） |
 | [docs/m0-02-acceptance-and-metrics.md](docs/m0-02-acceptance-and-metrics.md) | M0-02 运行期独立验收、root 检查、trace v2、逻辑任务指标与 CLI 验收规则 |
 | [docs/m0-03-provider-protocol.md](docs/m0-03-provider-protocol.md) | DeepSeek thinking/工具协议、请求重试与 deadline、用量来源、L1/L2 探针证据 |
+| [docs/local-studio-gui.md](docs/local-studio-gui.md) | 本地网页工作室：操作、服务接口、状态边界、设计参考和验收 |
+| [docs/m0-04-task-store.md](docs/m0-04-task-store.md) | SQLite TaskStore、持久身份、幂等委派、CAS/事务事件、重启查询与恢复边界 |
 
 ---
 
@@ -169,6 +196,8 @@ CLI
 
 | 命令                     | 作用                   | 主要参数                                                                             |
 | ------------------------ | ---------------------- | ------------------------------------------------------------------------------------ |
+| `studio` | 本地网页任务工作室 | `--port` `--runs-dir` `--env-file` `--no-env` `--open` |
+| `tasks <run_dir>` | 查询持久任务及执行历史 | `--task-id` |
 | `demo`                 | 离线单 agent 闭环      | `--runs-dir`                                                                       |
 | `run "<任务>"`         | 单任务（默认真实模型） | `--mock` `--agent` `--yes`                                                     |
 | `eval`                 | 批量任务集 → 指标     | `--tasks` `--mock`                                                               |
@@ -185,13 +214,13 @@ CLI
 python -m unittest discover -s tests -t . -v
 ```
 
-417 个用例，全部离线（不需要 key、不联网）。最初 96 项覆盖：RAO 单步断言、沙箱越狱、工具参数校验、
+M0-04 基线有 504 个离线用例；本地网页交付另补服务与 HTTP 测试，验证方法见 [GUI 文档](docs/local-studio-gui.md#7-验证与复现)。无需 API key 或外部模型服务，HTTP 用例仅使用本机回环地址。最初 96 项覆盖：RAO 单步断言、沙箱越狱、工具参数校验、
 护栏（超步数/超时）、验收打回、计划校验与降级、S1/S2/S3 调度差异、失败局部传播、
 委派与深度上限、总线订阅/广播、指标口径、CLI 端到端。
 
-M0-01 的 108 项测试覆盖核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。M0-02 再新增 92 项运行期验收和统计测试；原有“无验收也算成功”的预期已迁移为未验证。M0-03 新增 121 项测试，补充请求协议、thinking 历史、批次回写、重试、超时、用量来源与无副作用探针测试；离线与线上证据分别保存；2026-11-17 另完成两种模式的真实 API 往返，见 [线上记录](docs/m0-03-provider-protocol.md#61-2026-11-17-线上实测记录)。
+M0-01 的 108 项测试覆盖核心契约的严格类型、必填字段、状态转换、引用与任务图、验收证据、预算、工件授权、审批链和 checkpoint，并直接校验完整电脑维护数据示例。M0-02 再新增 92 项运行期验收和统计测试；原有“无验收也算成功”的预期已迁移为未验证。M0-03 新增 121 项测试，补充请求协议、thinking 历史、批次回写、重试、超时、用量来源与无副作用探针测试；离线与线上证据分别保存；2026-11-17 另完成两种模式的真实 API 往返，见 [线上记录](docs/m0-03-provider-protocol.md#61-2026-11-17-线上实测记录)。M0-04 再新增 87 项事务、持久身份、并发、崩溃回滚和运行期集成测试。
 
-新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它提供不可变数据快照、校验和纯状态转换；M0-02 已接入运行期 AcceptanceSpec/Report，其余持久化、预算账本和执行恢复仍待后续模块。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
+新数据层通过 [miniagent/contracts/](miniagent/contracts/__init__.py) 显式导入；它提供不可变数据快照、校验和纯状态转换；M0-02 已接入运行期 AcceptanceSpec/Report；M0-04 已接入 Task/Attempt/Run、验收历史和事务事件的 SQLite 持久化，预算账本和安全执行恢复仍待后续模块。使用方法和后续存储/执行职责见 [核心契约第 11 节](docs/m0-01-data-contracts.md#11-独立数据层实现与使用边界)。只运行契约测试：
 
 ```sh
 python -m unittest discover -s tests -p 'test_contract*.py' -t . -v
@@ -216,7 +245,7 @@ python -m unittest discover -s tests -p 'test_contract*.py' -t . -v
 | 2.2b 沙箱隔离      | ✅ L1 软隔离（分级与残余风险见架构文档）                   |
 | 2.3 行动空间       | ✅ 文件 / 代码 / 网络；⏳ git 提交推送                     |
 | 2.4 只用 md/txt    | ✅ 依赖里没有 docx/pdf 库                                  |
-| 2.5 极简 UI        | ✅ 纯 CLI                                                  |
+| 2.5 极简 UI        | ✅ 轻量本地网页 + CLI                                                  |
 | 2.6 DeepSeek/HKGAI | ✅ Provider 抽象；HKGAI 预留                               |
 | 评估指标           | ✅ 完成率 / 耗时 / token / 失败分类自动产出                |
 
@@ -232,6 +261,8 @@ python -m unittest discover -s tests -p 'test_contract*.py' -t . -v
 - 无优先级 / 抢占 / 限流感知。
 
 ## 路线图
+
+以下 P0–P5 保留原仓库编号；当前工作室开发顺序以 [M0–M4 计划](docs/agent-studio-development-plan.md) 为准。M0-UI-01 接入本地任务控制台，角色与 skill 管理随后在 M1 接入，会话与 HITL 在 M2 接入。
 
 | 阶段   | 内容                           | 状态                  |
 | ------ | ------------------------------ | --------------------- |

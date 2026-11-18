@@ -164,6 +164,7 @@ class RunResult(BaseModel):
 
     task_id: str
     attempt_id: str = ""
+    run_id: str = ""
     agent: str
     status: Status = "error"
     answer: str = ""

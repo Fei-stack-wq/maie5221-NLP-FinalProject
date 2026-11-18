@@ -143,7 +143,7 @@ class DeepSeekProtocolTest(unittest.TestCase):
         payload = self.provider._build_payload(self.messages, self.tools, 0.0)
         self.assertEqual(payload["temperature"], 0.0)
         self.assertEqual(payload["thinking"], {"type": "disabled"})
-        self.assertEqual(payload["max_tokens"], 4096)
+        self.assertEqual(payload["max_tokens"], 300_000)
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["tool_choice"], "auto")
         payload["messages"][0]["content"] = "mutated"

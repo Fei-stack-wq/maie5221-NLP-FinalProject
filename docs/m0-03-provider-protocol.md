@@ -28,9 +28,9 @@
 | `DEEPSEEK_MODEL` | `model: str` | `deepseek-flash`；另支持 `deepseek-v4-pro` |
 | `DEEPSEEK_THINKING` | `thinking: Literal['enabled','disabled']` | `disabled`；每次请求显式传 `thinking.type` |
 | `DEEPSEEK_REASONING_EFFORT` | `reasoning_effort: Literal['low','high','max']` | `high`；仅 thinking 开启时发送 |
-| `DEEPSEEK_MAX_TOKENS` | `max_output_tokens: int` | 4096；1..393216 |
-| `DEEPSEEK_TIMEOUT` | `request_timeout_seconds: float` | 60；有限正数，单次网络等待上限 |
-| `DEEPSEEK_DEADLINE` | `request_deadline_seconds: float` | 120；有限正数，一次 post_json 传输包含重试的 deadline |
+| `DEEPSEEK_MAX_TOKENS` | `max_output_tokens: int` | 300000；1..393216 |
+| `DEEPSEEK_TIMEOUT` | `request_timeout_seconds: float` | 120；有限正数，单次网络等待上限 |
+| `DEEPSEEK_DEADLINE` | `request_deadline_seconds: float` | 3600；有限正数，一次 post_json 传输包含重试的 deadline |
 | `DEEPSEEK_MAX_RETRIES` | `max_retries: int` | 2；0..10，表示初次请求以外的次数 |
 | `MA_TEMPERATURE` | `temperature: float` | 0；0..2；非 thinking 请求显式发送零，thinking 请求省略 |
 
@@ -151,3 +151,16 @@ M0-03 的本阶段出口已满足；M0-04 持久任务身份、M0-05 隔离、M0
 - [Rate Limit](https://api-docs.deepseek.com/quick_start/rate_limit/)：排队与非流式 keepalive 行为。
 
 官方文档可能更新；本项目的重试次数、退避上限、超时、响应大小和探针轮数均为本地工程策略。
+
+
+## 2026-11-17 输出预算调整
+
+按用户要求，将项目默认单次输出上限及本机配置提高至 **300000 token**。官方 `deepseek-flash` 的上下文窗口为 1M，Chat Completions 的 `max_tokens` 范围为 1..393216；上下文窗口、单次输出上限、任务多轮累计预算是不同参数。500000 不能作为该接口的 `max_tokens`。上限不代表模型必须输出这么长，正常 `stop` / `tool_calls` 仍可提前结束。
+
+为避免下一级限制立即中止长任务，`Limits.max_total_tokens` 从 200000 改为 1000000（现有子任务 0.8 分配后为 800000），`Limits.max_seconds` 从 120 改为 3600；provider 的 socket 等待从 60 改为 120 秒，总请求 deadline 从 120 改为 3600 秒。步数 12、每轮工具数 4、工具超时 20 秒保持原值。这些是项目运行策略，并非官方 SLA；现有任务预算仍是轮次间检查和事后累计，不是严格的费用预留账本。
+
+新默认值统一用于 Settings、直接构造 Provider 和环境变量缺省值；`.env.example` 同步更新。已验证本机 `.env` 的三个非密钥数值项已更新，密钥内容保持原样。历史事故日志、旧配置快照与 M0-03 线上验证记录中的 4096 保留为当时的证据。
+
+完整离线回归 **566 项通过**（39.722 秒，ResourceWarning 作为错误），包括模拟 300000 输出 token 的工具调用后继续第二轮并通过独立验收；该用例不会真实生成或消费 30 万 token。未重新发起付费任务。
+
+官方依据：[Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing/)、[Chat Completions max_tokens](https://api-docs.deepseek.com/api/create-chat-completion/)、[连接保活说明](https://api-docs.deepseek.com/quick_start/rate_limit/)。

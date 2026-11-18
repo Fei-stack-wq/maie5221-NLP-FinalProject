@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import uuid
 from datetime import datetime
@@ -30,6 +31,8 @@ from .orchestrator import Orchestrator
 from .sandbox import Sandbox
 from .schemas import RunResult
 from .tools import build_default_registry
+from .task_store import TaskStore, StoreError
+from .task_service import TaskService
 
 # 离线演示剧本：完整走一遍「列目录 -> 写文件 -> 读文件 -> 执行代码 -> 最终答复」。
 # 它同时是一份"模型该长什么样"的说明书，写 prompt 时可以对照。
@@ -69,6 +72,16 @@ DEMO_SCRIPT: list[dict[str, Any]] = [
 
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except (StoreError, sqlite3.Error, OSError) as exc:
+        # Store/operational failure is an explicit command failure. Do not
+        # overwrite active records or turn an unavailable database into success.
+        print(f"存储或文件操作失败（{type(exc).__name__}）；未自动重试或覆盖任务状态。", file=sys.stderr)
+        return 2
+
+
+def _main(argv: list[str] | None = None) -> int:
     _enable_utf8()
     try:
         settings = Settings.from_env()
@@ -128,10 +141,24 @@ def main(argv: list[str] | None = None) -> int:
     smoke.add_argument("--thinking", choices=["enabled", "disabled"], default=settings.thinking)
     smoke.add_argument("--output", default="build/provider-smoke.json", help="仅保存脱敏元数据")
 
+    tasks_view = sub.add_parser("tasks", help="从持久 TaskStore 查询任务状态和执行身份")
+    tasks_view.add_argument("run_dir")
+    tasks_view.add_argument("--task-id", help="查看指定任务及其 attempt/run 历史")
+
     report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
     report.add_argument("run_dir")
 
+    studio = sub.add_parser("studio", help="启动本地网页工作室：任务、日志、产物和验收")
+    studio.add_argument("--port", type=int, default=8765)
+    studio.add_argument("--runs-dir", default=str(settings.runs_dir))
+    studio.add_argument("--env-file", type=Path, help="只读取字面量配置；默认尝试当前目录 .env")
+    studio.add_argument("--no-env", action="store_true", help="只使用进程环境变量")
+    studio.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
+
     args = parser.parse_args(argv)
+
+    if args.command == "studio":
+        return _cmd_studio(args, settings)
 
     if args.command == "provider-smoke":
         return _cmd_provider_smoke(args, settings)
@@ -143,10 +170,36 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_eval(args, settings)
     if args.command == "orchestrate":
         return _cmd_orchestrate(args, settings)
+    if args.command == "tasks":
+        return _cmd_tasks(args)
     if args.command == "report":
         return _cmd_report(args)
     parser.print_help()
     return 1
+
+
+def _cmd_studio(args: argparse.Namespace, settings: Settings) -> int:
+    from .studio_config import load_studio_settings
+    from .studio_service import StudioService
+    from .studio_server import serve
+
+    if not 1 <= args.port <= 65535:
+        print("配置错误：port 必须为 1..65535。", file=sys.stderr)
+        return 2
+    if args.no_env and args.env_file:
+        print("配置错误：--no-env 与 --env-file 不能同时使用。", file=sys.stderr)
+        return 2
+    try:
+        selected = settings if args.no_env else load_studio_settings(settings, args.env_file)
+    except ValueError as exc:
+        print(f"配置错误：{exc}", file=sys.stderr)
+        return 2
+    service = StudioService(Path(args.runs_dir), selected)
+    try:
+        serve(service, port=args.port, open_browser=args.open)
+    finally:
+        service.close()
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -232,28 +285,25 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
         _record_batch_setup_error([{"task_id": goal_id, "task": args.goal}], run_dir, exc)
         return 2
 
-    tracer = Tracer(run_dir)
-    orchestrator = Orchestrator(
-        provider=provider,
-        settings=settings,
-        run_dir=run_dir,
-        tracer=tracer,
-        root_acceptance=root_acceptance,
-        acceptances=acceptances,
-        enable_delegation=args.delegate,
-        approve=(lambda _prompt: True) if args.yes else None,
-        human_handler=(
-            (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-            if args.yes
-            else None
-        ),
-    )
-    try:
+    with Tracer(run_dir) as tracer:
+        orchestrator = Orchestrator(
+            provider=provider,
+            settings=settings,
+            run_dir=run_dir,
+            tracer=tracer,
+            root_acceptance=root_acceptance,
+            acceptances=acceptances,
+            enable_delegation=args.delegate,
+            approve=(lambda _prompt: True) if args.yes else None,
+            human_handler=(
+                (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
+                if args.yes
+                else None
+            ),
+        )
         result = orchestrator.run(
             args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel, goal_id=goal_id
         )
-    finally:
-        tracer.close()
 
     print(f"\n目标：{result.goal}")
     print(
@@ -278,6 +328,32 @@ def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
     print("\n" + render_report(run_dir))
     print(f"运行目录：{run_dir.resolve()}")
     return 0 if result.succeeded else 1
+
+
+def _cmd_tasks(args: argparse.Namespace) -> int:
+    path = Path(args.run_dir) / "tasks.sqlite3"
+    if not path.is_file():
+        print("该运行目录没有 tasks.sqlite3；历史 trace 不会自动迁移为持久任务。", file=sys.stderr)
+        return 2
+    try:
+        store = TaskStore(path)
+        if args.task_id:
+            task = store.get(args.task_id)
+            attempts = store.attempts(task.task_id)
+            data = {"task": task.model_dump(mode="json"),
+                    "attempts": [value.model_dump(mode="json") for value in attempts],
+                    "runs": [run.model_dump(mode="json") for attempt in attempts
+                             for run in store.runs(attempt.attempt_id)]}
+        else:
+            data = [{"task_id": task.task_id, "root_id": task.root_id,
+                     "parent_id": task.parent_id, "status": task.status,
+                     "revision": task.revision, "attempt_id": task.current_attempt_id,
+                     "reason": task.reason} for task in store.tasks()]
+    except (StoreError, ValueError) as exc:
+        print(f"任务查询失败：{exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -306,9 +382,14 @@ def _execute(
     却被算成 completed —— 指标虚高，是最危险的一类 bug。
     """
     results = []
+    task_service = TaskService(TaskStore(run_dir / "tasks.sqlite3"))
     with Tracer(run_dir) as tracer:
         for index, item in enumerate(tasks, start=1):
             case_id = item.get("task_id") or f"task-{index}"
+            task_service.create(
+                task_id=case_id, creation_key=f"root:{case_id}", objective=item["task"],
+                owner=agent_name, assignee=agent_name,
+            )
             tracer.event(
                 "case_registered", schema_version=2, root_id=case_id,
                 task_id=case_id, level="goal", task=item["task"],
@@ -326,7 +407,7 @@ def _execute(
                 agent = Agent(
                     name=agent_name, provider=provider,
                     registry=build_default_registry(), sandbox=sandbox,
-                    settings=settings, tracer=tracer,
+                    settings=settings, tracer=tracer, task_service=task_service,
                     approve=(lambda _prompt: True) if auto_approve else None,
                     human_handler=(
                         (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
@@ -335,6 +416,12 @@ def _execute(
                 )
                 result = agent.run(item["task"], task_id=task_id, acceptance=selected)
             except Exception as exc:
+                # Only cancel work that never acquired an execution claim. A
+                # store conflict during execution must remain visible for audit.
+                saved = task_service.store.get(task_id)
+                if saved.status in {"created", "ready"}:
+                    task_service.cancel(task_id, expected_revision=saved.revision,
+                                        reason="setup_failed")
                 result = RunResult(
                     task_id=task_id, attempt_id=f"setup-{uuid.uuid4().hex}",
                     agent=agent_name, status="error",
@@ -488,9 +575,13 @@ def _load_orchestration_acceptance(filename: str | None) -> tuple[AcceptanceInpu
 
 
 def _record_batch_setup_error(tasks: list[dict[str, Any]], run_dir: Path, exc: Exception) -> None:
+    task_service = TaskService(TaskStore(run_dir / "tasks.sqlite3"))
     with Tracer(run_dir) as tracer:
         for item in tasks:
             task_id = item["task_id"]
+            task = task_service.create(task_id=task_id, creation_key=f"root:{task_id}",
+                                       objective=item["task"], owner="setup", assignee="setup")
+            task_service.cancel(task_id, expected_revision=task.revision, reason="setup_failed")
             tracer.event("case_registered", schema_version=2, root_id=task_id, task_id=task_id, level="goal", task=item["task"])
             tracer.event(
                 "task_end", schema_version=2, level="goal", root_id=task_id,

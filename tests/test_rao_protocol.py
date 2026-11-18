@@ -140,7 +140,7 @@ class RaoProtocolTest(unittest.TestCase):
         self.assertEqual(provider.requests[2][4]["tool_call_id"], "read-2")
         self.assertEqual(state.history[-1], final.to_assistant_message())
         self.assertNotIn("private reasoning", json.dumps([record.model_dump() for record in records]))
-        self.assertEqual(budget.tokens_left, 200_000 - 12)
+        self.assertEqual(budget.tokens_left, Limits().max_total_tokens - 12)
 
     def test_bad_envelope_rejects_entire_batch_before_first_write(self) -> None:
         bad_calls = [write_call("", "bad.txt"), write_call("  ", "bad.txt"),
@@ -157,7 +157,7 @@ class RaoProtocolTest(unittest.TestCase):
                 self.assertEqual(record.terminate_reason, ErrorClass.T_PROTOCOL)
                 self.assertEqual(record.prompt_tokens, 7)
                 self.assertEqual(record.tool_calls, 0)
-                self.assertEqual(budget.tokens_left, 200_000 - 7)
+                self.assertEqual(budget.tokens_left, Limits().max_total_tokens - 7)
                 self.assertFalse((self.workspace / "first.txt").exists())
                 self.assertEqual(len(state.history), 1)
 

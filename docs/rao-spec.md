@@ -1,5 +1,7 @@
 # RAO 契约规范（Reason · Act · Observe）
 
+> M0-04 增加执行前的持久 action_id 登记和 T_STORE 终止；tool_call_id 仍用于模型协议，动作身份不等同授权或执行回执，见 [TaskStore 说明](m0-04-task-store.md)。
+
 > M0-03 补充 T_PROTOCOL、原始消息/推理字段回传和完整工具批次回写，接口边界见 [协议说明](m0-03-provider-protocol.md)。
 
 > 本文是 `miniagent/rao.py` 的**定义文档**：字段、闭集、错误分类、终止谓词、验收规则。

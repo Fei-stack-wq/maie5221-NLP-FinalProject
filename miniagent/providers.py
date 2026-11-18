@@ -13,7 +13,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_MODEL, validate_provider_options
+from .config import (DEFAULT_MODEL, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                     DEFAULT_REQUEST_DEADLINE_SECONDS, validate_provider_options)
 from .provider_http import HTTPResult, ProviderError, post_json
 from .schemas import LLMResponse, ToolCall, ToolSpec, Usage
 
@@ -26,6 +27,24 @@ class Provider(ABC):
     def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
              temperature: float = 0.0) -> LLMResponse:
         """Return one response; never execute tools in this method."""
+
+
+def provider_configuration(provider: Provider) -> dict[str, Any]:
+    """Public execution knobs only; never serialize a provider's attributes.
+
+    A trace needs the effective output ceiling to explain truncation. Credentials,
+    endpoint URLs, prompts and private reasoning are deliberately excluded.
+    """
+    result = {"provider": provider.name, "transport": provider.transport}
+    if isinstance(provider, DeepSeekProvider):
+        result.update(
+            model=provider.model, thinking=provider.thinking,
+            max_output_tokens=provider.max_output_tokens,
+            request_timeout_seconds=provider.timeout,
+            request_deadline_seconds=provider.deadline_seconds,
+            max_retries=provider.max_retries,
+        )
+    return result
 
 
 def _require(condition: bool, message: str) -> None:
@@ -72,9 +91,10 @@ class DeepSeekProvider(Provider):
 
     def __init__(
         self, api_key: str, base_url: str = "https://api.deepseek.com",
-        model: str = DEFAULT_MODEL, timeout: float = 60.0, max_retries: int = 2,
+        model: str = DEFAULT_MODEL, timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS, max_retries: int = 2,
         *, thinking: str = "disabled", reasoning_effort: str = "high",
-        max_output_tokens: int = 4096, deadline_seconds: float = 120.0,
+        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        deadline_seconds: float = DEFAULT_REQUEST_DEADLINE_SECONDS,
     ) -> None:
         if type(api_key) is not str or not api_key.strip():
             raise ProviderError(
@@ -167,10 +187,20 @@ class DeepSeekProvider(Provider):
             raise ValueError("tool batch has unanswered calls")
 
     def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
-             temperature: float = 0.0) -> LLMResponse:
+             temperature: float = 0.0, *, max_output_tokens: int | None = None,
+             deadline_seconds: float | None = None, required_tool: str | None = None) -> LLMResponse:
         payload = self._build_payload(messages, tools, temperature)
+        if required_tool is not None:
+            if self.thinking != "disabled" or required_tool not in {tool.name for tool in tools or []}:
+                raise ProviderError("Named tool choice requires a declared tool and thinking disabled", code="invalid_config")
+            payload["tool_choice"] = {"type": "function", "function": {"name": required_tool}}
+        if max_output_tokens is not None:
+            if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= self.max_output_tokens:
+                raise ProviderError("Invalid per-request output allocation", code="invalid_config")
+            payload["max_tokens"] = max_output_tokens
         started = time.perf_counter()
-        result = self._post_with_retry(payload)
+        result = (self._post_with_retry(payload) if deadline_seconds is None else
+                  self._post_with_retry(payload, deadline_seconds=deadline_seconds))
         try:
             response = self._parse(result.data, (time.perf_counter() - started) * 1000)
             if self.thinking == "enabled" and tools and response.reasoning_content is None:
@@ -180,10 +210,11 @@ class DeepSeekProvider(Provider):
             raise
         return response.model_copy(update={"request_attempts": result.attempts})
 
-    def _post_with_retry(self, payload: dict[str, Any]) -> HTTPResult:
+    def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None) -> HTTPResult:
         return post_json(
             f"{self.base_url}/chat/completions", payload, api_key=self.api_key,
-            timeout=self.timeout, deadline_seconds=self.deadline_seconds,
+            timeout=self.timeout, deadline_seconds=(self.deadline_seconds if deadline_seconds is None else
+                                                   min(self.deadline_seconds, deadline_seconds)),
             max_retries=self.max_retries,
         )
 

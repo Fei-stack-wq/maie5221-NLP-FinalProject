@@ -1,6 +1,6 @@
 # M0-01 核心数据契约（v1）
 
-> 2026-11-15；原代码基线 `3e195e2067058d9034831912ef8204f6126fa3cd`。核心模型、字段校验、纯状态转换和完整快照校验已在独立的 `miniagent/contracts/` 包实现，使用边界见第 11 节。持久化、事务、真实授权和执行恢复仍是后续阶段；M0-01 阶段不接入执行流程；后续验收接入见 [M0-02](m0-02-acceptance-and-metrics.md)。代码、测试与本文作为 M0-01 的同一交付维护。
+> 2026-11-15；原代码基线 `3e195e2067058d9034831912ef8204f6126fa3cd`。核心模型、字段校验、纯状态转换和完整快照校验已在独立的 `miniagent/contracts/` 包实现，使用边界见第 11 节。M0-01 本身不提供持久事务、真实授权或执行恢复，也不接入执行流程；后续验收接入见 [M0-02](m0-02-acceptance-and-metrics.md)，任务持久化和事务接入见 [M0-04](m0-04-task-store.md)。代码、测试与本文作为 M0-01 的同一交付维护。
 > 上层计划：[个人 Agent 工作室开发计划](agent-studio-development-plan.md)。完整数据：[电脑维护任务示例](m0-01-computer-maintenance-example.md)。当前实现：[RAO](rao-spec.md)、[编排](scheduler.md)。
 
 ## 1. 范围与本次定细的决定
@@ -306,7 +306,7 @@ PendingDelegation 为 `{child_task_id:Id, tool_call_id:Id?, delivery_key:Id, del
 
 统一错误至少区分 invalid_reference、invalid_transition、revision_conflict、permission_denied、budget_exhausted、approval_required、expired、external_state_unknown。错误不能被误写为某个成功状态。
 
-现有 `RunResult` 继续作为运行结果的兼容输出；未来接入时不再兼任持久 Task/Attempt 历史，老数据缺验收证据时不能迁移成 verified。M0-01 提供独立契约与校验，TaskStore/预算账本/工件存储分别在 M0-04/06/07 实现；同步人工通道在 M0-08，持久等待恢复在 M2 实现。完整示例展示目标语义，不表示这些服务已经存在。
+现有 `RunResult` 继续作为运行结果的兼容输出；未来接入时不再兼任持久 Task/Attempt 历史，老数据缺验收证据时不能迁移成 verified。M0-01 提供独立契约与校验，TaskStore 的 M0-04 基础事务已实现（具体范围见 [说明](m0-04-task-store.md)），预算账本/工件存储分别在 M0-06/07 实现；同步人工通道在 M0-08，持久等待恢复在 M2 实现。完整示例展示目标语义，不表示这些服务已经存在。
 
 ## 10. 设计验收与待实施验证
 
@@ -368,7 +368,7 @@ wire_record = ready.model_dump(mode="json")
 - `catalog` 是完整快照的辅助目录。适配器须提供带类型的主体、项目/环境、版本化约束/策略/验收器、资源、上下文、授权及回执记录；具体所需字段由引用用途校验。它不是通用运行时数据库 schema。资源须能通过自身或所属项目确定 environment_id，不能把 staging 证据标成目标环境。
 - `ContractSnapshot.validate_artifact_access(...)` 针对所提供快照和时间检查 grant；不会读取最新策略或访问文件。撤销 grant 不应抹除历史执行记录，下一次读取须用最新快照重新判断。历史报告的固定资源版本也不会被当前资源版本替换。
 - 预算允许记录真实超额消耗，不能为了满足 limit 丢掉实际 usage；unknown 保留占用。快照可拒绝预算耗尽后的 ready/retry，但并发预留、防重复扣费、实时 deadline 与活跃时间计费需要 BudgetLedger。
-- `expected_revision` 只是本次纯函数中的一致性条件，不是数据库原子 CAS。Task/Attempt/Run、Reply/Request、Action/Lease 等联合更新，以及幂等键去重、事件投递和外部状态核对，仍需后续存储事务与服务实现。纯数据层不保证外部动作恰好执行一次。
+- `expected_revision` 只是本次纯函数中的一致性条件，不是数据库原子 CAS。M0-04 已在 TaskStore 中实现 Task/Attempt/Run 的联合事务、CAS、创建键去重及 outbox。Reply/Request、Action/Lease 联合更新、自动事件投递与外部状态核对仍需后续服务实现。纯数据层不保证外部动作恰好执行一次。
 
 ### 11.3 M0-01 交付时执行的验证
 

@@ -35,6 +35,23 @@ class ProviderRuntimeTest(unittest.TestCase):
                      settings=Settings(), tracer=tracer)
 
     @patch("miniagent.providers.post_json")
+    def test_recovery_tool_choice_respects_live_mode_and_disclosed_tools(self, post):
+        from miniagent.rao import StepPolicy
+        from miniagent.agent import COORDINATOR_PROMPT
+        for mode in ("disabled", "enabled"):
+            with self.subTest(mode=mode):
+                post.return_value = HTTPResult(envelope(content="test summary"), 1)
+                runner = self.agent(DeepSeekProvider("test-key", thinking=mode), None)
+                policy = StepPolicy("coordinate", allowed_tools=frozenset({"delegate_task"}), required_tool="delegate_task")
+                runner.run("prepare routing", system_prompt=COORDINATOR_PROMPT, step_policy=lambda *_: policy)
+                payload = post.call_args.args[1]
+                self.assertEqual(payload["tool_choice"], {"type": "function", "function": {"name":"delegate_task"}}
+                                 if mode == "disabled" else "auto")
+                self.assertEqual(payload["messages"][0]["content"], COORDINATOR_PROMPT)
+        with self.assertRaises(ValueError):
+            StepPolicy("handoff", allowed_tools=frozenset(), required_tool="write_file")
+
+    @patch("miniagent.providers.post_json")
     def test_two_tool_rounds_thinking_receipts_and_trace_privacy(self, post):
         calls = [
             {"id": "write-1", "type": "function", "function": {
@@ -70,6 +87,35 @@ class ProviderRuntimeTest(unittest.TestCase):
         self.assertEqual(steps[-1]["finish_reason"], "stop")
 
     @patch("miniagent.providers.post_json")
+    def test_large_tool_response_can_continue_to_acceptance_with_default_child_budget(self, post):
+        # Reported usage models a large output without generating or paying for it.
+        # The old 160k child budget stopped immediately after the first tool call.
+        from miniagent.rao import Budget
+        call = {"id": "large-write", "type": "function", "function": {
+            "name": "write_file", "arguments": '{"path":"proof.md","content":"verified output"}'}}
+        written = envelope(calls=[call], finish="tool_calls")
+        written["usage"] = {"prompt_tokens": 100, "completion_tokens": 300000,
+                            "total_tokens": 300100}
+        final = envelope(content="done")
+        final["usage"] = {"prompt_tokens": 300200, "completion_tokens": 20,
+                          "total_tokens": 300220}
+        post.side_effect = [HTTPResult(written, attempts=1), HTTPResult(final, attempts=1)]
+        with Tracer(self.root / "trace") as tracer:
+            result = self.agent(DeepSeekProvider("test-key"), tracer).run(
+                "write and verify", acceptance=accept_files("proof.md", min_bytes=1),
+                budget=Budget.from_limits(Settings().limits, factor=0.8))
+        self.assertEqual(result.status, "completed", result.error)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(result.usage.total, 600320)
+        allocations = [call.args[1]["max_tokens"] for call in post.call_args_list]
+        self.assertEqual(allocations[0], 300000)
+        starts = [event for event in load_events(self.root / "trace") if event["kind"] == "step_start"]
+        self.assertEqual(allocations[1], starts[1]["tokens_remaining"] - starts[1]["estimated_input_tokens"])
+        self.assertLess(0, allocations[1])
+        self.assertLess(allocations[1], 300000)
+        self.assertEqual(starts[1]["provider_config"]["max_output_tokens"], 300000)
+
+    @patch("miniagent.providers.post_json")
     def test_truncated_response_never_executes_or_passes_acceptance(self, post):
         call = {"id": "c1", "type": "function", "function": {"name": "write_file",
                 "arguments": '{"path":"bad.md","content":"must not write"}'}}
@@ -78,9 +124,70 @@ class ProviderRuntimeTest(unittest.TestCase):
             result = self.agent(DeepSeekProvider("test-key"), tracer).run("truncated")
         self.assertEqual(result.status, "error")
         self.assertEqual(result.tool_calls, 0)
-        self.assertEqual(result.usage.total, 15)
+        self.assertEqual(result.usage.total, 45)
+        self.assertEqual(post.call_count, 3)
         self.assertFalse((self.root / "agent" / "bad.md").exists())
         self.assertNotIn("acceptance", [e["kind"] for e in load_events(self.root / "trace")])
+        self.assertIn("max_output_tokens=300000", result.error)
+        self.assertIn("finish_reason=length", result.error)
+        self.assertIn("本轮工具未执行", result.error)
+        step = next(e for e in load_events(self.root / "trace") if e["kind"] == "step")
+        self.assertEqual(step["max_output_tokens"], 300_000)
+
+    @patch("miniagent.providers.post_json")
+    def test_in_flight_step_is_observable_before_http_returns_without_private_data(self, post):
+        def complete(*_args, **_kwargs):
+            events = load_events(self.root / "trace")
+            start = events[-1]
+            self.assertEqual(start["kind"], "step_start")
+            self.assertEqual(start["step"], 1)
+            self.assertEqual(start["provider_config"]["max_output_tokens"], 1234)
+            self.assertGreater(start["seconds_remaining"], 0)
+            self.assertFalse(any(e["kind"] == "step" for e in events))
+            return HTTPResult(envelope(content="done", reasoning="private-reasoning"), attempts=1)
+
+        post.side_effect = complete
+        with Tracer(self.root / "trace") as tracer:
+            self.agent(DeepSeekProvider("private-key", max_output_tokens=1234), tracer).run("work")
+        events = load_events(self.root / "trace")
+        trace = (self.root / "trace" / "trace.jsonl").read_text()
+        for private in ("private-key", "private-reasoning", "https://api.deepseek.com"):
+            self.assertNotIn(private, trace)
+        self.assertTrue(all(e["iso"].endswith("Z") for e in events))
+
+    @patch("miniagent.providers.post_json")
+    def test_truncated_worker_error_is_not_masked_by_missing_root_acceptance(self, post):
+        plan = {"subtasks": [
+            {"id": "s1", "objective": "write design", "assignee": "worker", "deps": []},
+            {"id": "s2", "objective": "write game", "assignee": "worker", "deps": ["s1"]},
+        ]}
+        call = {"id": "write", "type": "function", "function": {
+            "name": "write_file", "arguments": '{"path":"design.md","content":"partial"}'}}
+        for scheduler in ("serial", "parallel", "evented"):
+            with self.subTest(scheduler=scheduler):
+                post.side_effect = [
+                    HTTPResult(envelope(content=json.dumps(plan)), attempts=1),
+                    *[HTTPResult(envelope(calls=[call], finish="length"), attempts=1) for _ in range(3)],
+                ]
+                directory = self.root / scheduler
+                orchestrator = Orchestrator(
+                    provider=DeepSeekProvider("private-key"), settings=Settings(), run_dir=directory,
+                )
+                result = orchestrator.run("make a web game", scheduler=scheduler)
+                self.assertEqual(result.status, "error")
+                self.assertEqual(result.acceptance_report.verdict, "unverified")
+                self.assertEqual([t.status for t in result.subtasks], ["error", "blocked"])
+                self.assertIn("s1", result.error)
+                self.assertIn("finish_reason=length", result.error)
+                self.assertEqual(orchestrator.task_service.store.get(result.task_id).status, "failed")
+                self.assertFalse(list(directory.rglob("design.md")))
+                events = load_events(directory)
+                self.assertEqual(events[-1]["execution_error"], result.error)
+                start = next(e for e in events if e["kind"] == "plan_start")
+                end = next(e for e in events if e["kind"] == "plan_usage")
+                self.assertEqual(start["call_id"], end["call_id"])
+                self.assertEqual(end["max_output_tokens"], 300_000)
+                self.assertGreaterEqual(end["latency_ms"], 0)
 
     @patch("miniagent.providers.post_json")
     def test_failed_http_attempts_have_trace_and_unknown_usage(self, post):
@@ -93,6 +200,9 @@ class ProviderRuntimeTest(unittest.TestCase):
         error = next(e for e in events if e["kind"] == "provider_error")
         self.assertEqual(error["request_attempts"], 3)
         self.assertEqual(error["http_status"], 503)
+        self.assertGreaterEqual(error["latency_ms"], 0)
+        self.assertEqual(error["step"], 1)
+        self.assertFalse(error["retryable"])
         summary = summarize(events)
         self.assertEqual(summary["goal_completed"], 0)
 

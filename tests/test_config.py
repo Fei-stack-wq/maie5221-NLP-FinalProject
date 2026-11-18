@@ -6,7 +6,7 @@ import traceback
 import unittest
 from unittest.mock import patch
 
-from miniagent.config import Settings, validate_provider_options
+from miniagent.config import Limits, Settings, configured_limits, validate_provider_options
 
 
 class SettingsTest(unittest.TestCase):
@@ -18,9 +18,12 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.api_key, "")
         self.assertEqual(settings.thinking, "disabled")
         self.assertEqual(settings.reasoning_effort, "high")
-        self.assertEqual(settings.max_output_tokens, 4096)
-        self.assertEqual(settings.request_timeout_seconds, 60)
-        self.assertEqual(settings.request_deadline_seconds, 120)
+        self.assertEqual(settings.max_output_tokens, 300_000)
+        self.assertEqual(settings.request_timeout_seconds, 120)
+        self.assertEqual(settings.request_deadline_seconds, 3600)
+        self.assertEqual(settings.limits.max_total_tokens, 1_000_000)
+        self.assertEqual(settings.limits.max_seconds, 3600)
+        self.assertEqual(settings.limits.max_steps, 100)
         self.assertEqual(settings.max_retries, 2)
         self.assertEqual(settings.temperature, 0)
 
@@ -119,11 +122,11 @@ class SettingsTest(unittest.TestCase):
                         Settings(**{field: value})
 
     def test_integer_ranges_include_boundaries(self) -> None:
-        for value in (1, 393216):
+        for value in (1, 300000, 393216):
             self.assertEqual(Settings(max_output_tokens=value).max_output_tokens, value)
         for value in (0, 10):
             self.assertEqual(Settings(max_retries=value).max_retries, value)
-        for field, values in {"max_output_tokens": (0, -1, 393217), "max_retries": (-1, 11)}.items():
+        for field, values in {"max_output_tokens": (0, -1, 393217, 500000), "max_retries": (-1, 11)}.items():
             for value in values:
                 with self.subTest(field=field, value=value):
                     with self.assertRaisesRegex(ValueError, field):
@@ -181,7 +184,37 @@ class SettingsTest(unittest.TestCase):
     def test_limits_are_not_shared_between_settings(self) -> None:
         first, second = Settings(), Settings()
         first.limits.max_steps = 99
-        self.assertEqual(second.limits.max_steps, 12)
+        self.assertEqual(second.limits.max_steps, 100)
+
+    def test_task_budget_environment_and_recovery_options(self):
+        with patch.dict(os.environ, {"MA_MAX_STEPS": "250", "MA_MAX_TOTAL_TOKENS": "5000000",
+                                   "MA_MAX_SECONDS": "7200.5", "MA_CONTEXT_WINDOW_TOKENS": "900000",
+                                   "MA_OUTPUT_RECOVERY_ATTEMPTS": "1"}, clear=True):
+            value = Settings.from_env()
+        self.assertEqual((value.limits.max_steps, value.limits.max_total_tokens, value.limits.max_seconds),
+                         (250, 5_000_000, 7200.5))
+        self.assertEqual(value.context_window_tokens, 900000)
+        self.assertEqual(value.max_output_recovery_attempts, 1)
+
+    def test_invalid_budget_configuration_never_silently_disables_a_limit(self):
+        for key, values in {"max_steps": [0, 1001, True, "12", 1.5],
+                            "max_total_tokens": [0, 100000001, True, "100"],
+                            "max_seconds": [0, 86401, float("nan"), float("inf"), True]}.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    configured_limits(Limits(), {key: value})
+        with self.assertRaises(ValueError):
+            configured_limits(Limits(), {"unknown": 3})
+        base = Limits(tool_timeout_seconds=7)
+        changed = configured_limits(base, {"max_steps": 300})
+        self.assertEqual((base.max_steps, changed.max_steps, changed.tool_timeout_seconds), (100, 300, 7))
+
+    def test_context_and_recovery_ranges_are_strict(self):
+        for key, values in {"context_window_tokens": [1023, 1000001, True, "1024"],
+                            "max_output_recovery_attempts": [-1, 4, True, 1.0]}.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    Settings(**{key: value})
 
 
 if __name__ == "__main__":

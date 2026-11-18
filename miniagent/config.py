@@ -1,9 +1,4 @@
-"""配置与护栏。
-
-为什么单独一个文件：这些数字是"设计决策"，不是零散常量。
-在报告里你会需要解释"为什么 max_steps=12" —— 因为单任务平均 6 步、
-P95 是 11 步，超出的基本是死循环。
-"""
+"""Explicit workload policy, separate from model capacity and actual usage."""
 
 from __future__ import annotations
 
@@ -16,6 +11,10 @@ from urllib.parse import urlsplit
 
 # M0-03 的官方 DeepSeek 模型配置；新增模型需同步协议验证与文档。
 DEFAULT_MODEL = "deepseek-flash"
+# Workload policy, distinct from the provider context window and API maximum.
+DEFAULT_MAX_OUTPUT_TOKENS = 300_000
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+DEFAULT_REQUEST_DEADLINE_SECONDS = 3600.0
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 SUPPORTED_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
 
@@ -47,9 +46,9 @@ def validate_provider_options(
     base_url: str = DEFAULT_BASE_URL,
     thinking: Literal["enabled", "disabled"] = "disabled",
     reasoning_effort: Literal["low", "high", "max"] = "high",
-    max_output_tokens: int = 4096,
-    request_timeout_seconds: float = 60.0,
-    request_deadline_seconds: float = 120.0,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    request_deadline_seconds: float = DEFAULT_REQUEST_DEADLINE_SECONDS,
     max_retries: int = 2,
     temperature: float = 0.0,
 ) -> None:
@@ -107,13 +106,13 @@ def _env_number(name: str, default: str) -> float:
 class Limits:
     """护栏。任何一个缺失，agent 都会在某天烧掉你的余额或永远卡住。"""
 
-    max_steps: int = 12
+    max_steps: int = 100
     """最多几轮 LLM 调用。超过就判定 limit_exceeded，而不是无限循环。"""
 
-    max_seconds: float = 120.0
+    max_seconds: float = 3600.0
     """单个任务的总墙钟时间上限。"""
 
-    max_total_tokens: int = 200_000
+    max_total_tokens: int = 1_000_000
     """单个任务的 token 预算（prompt+completion 累计）。"""
 
     max_tool_calls_per_step: int = 4
@@ -121,6 +120,20 @@ class Limits:
 
     tool_timeout_seconds: float = 20.0
     """单个工具（尤其是 run_python）的超时。"""
+
+
+def configured_limits(base: Limits, changes: dict) -> Limits:
+    """Validate user-configurable budgets without changing legacy test budgets."""
+    from dataclasses import replace
+    if set(changes) - {"max_steps", "max_seconds", "max_total_tokens"}:
+        raise ValueError("unknown task budget")
+    if "max_steps" in changes:
+        _integer("max_steps", changes["max_steps"], 1, 1000)
+    if "max_total_tokens" in changes:
+        _integer("max_total_tokens", changes["max_total_tokens"], 1, 100_000_000)
+    if "max_seconds" in changes:
+        _number("max_seconds", changes["max_seconds"], 1, 86400)
+    return replace(base, **changes)
 
 
 @dataclass
@@ -137,15 +150,19 @@ class Settings:
 
     thinking: Literal["enabled", "disabled"] = "disabled"
     reasoning_effort: Literal["low", "high", "max"] = "high"
-    max_output_tokens: int = 4096
-    request_timeout_seconds: float = 60.0
-    request_deadline_seconds: float = 120.0
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    request_deadline_seconds: float = DEFAULT_REQUEST_DEADLINE_SECONDS
     max_retries: int = 2
     """初次请求之外的额外重试次数；0 表示不重试。"""
+    context_window_tokens: int = 1_000_000
+    max_output_recovery_attempts: int = 2
 
     def __post_init__(self) -> None:
         if type(self.api_key) is not str:
             raise ValueError("api_key must be a string")
+        _integer("context_window_tokens", self.context_window_tokens, 1024, 1_000_000)
+        _integer("max_output_recovery_attempts", self.max_output_recovery_attempts, 0, 3)
         validate_provider_options(
             model=self.model, base_url=self.base_url,
             thinking=self.thinking, reasoning_effort=self.reasoning_effort,
@@ -165,8 +182,15 @@ class Settings:
             temperature=_env_number("MA_TEMPERATURE", "0"),
             thinking=os.environ.get("DEEPSEEK_THINKING", "disabled"),
             reasoning_effort=os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),
-            max_output_tokens=_env_integer("DEEPSEEK_MAX_TOKENS", "4096"),
-            request_timeout_seconds=_env_number("DEEPSEEK_TIMEOUT", "60"),
-            request_deadline_seconds=_env_number("DEEPSEEK_DEADLINE", "120"),
+            max_output_tokens=_env_integer("DEEPSEEK_MAX_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS)),
+            request_timeout_seconds=_env_number("DEEPSEEK_TIMEOUT", str(DEFAULT_REQUEST_TIMEOUT_SECONDS)),
+            request_deadline_seconds=_env_number("DEEPSEEK_DEADLINE", str(DEFAULT_REQUEST_DEADLINE_SECONDS)),
             max_retries=_env_integer("DEEPSEEK_MAX_RETRIES", "2"),
+            context_window_tokens=_env_integer("MA_CONTEXT_WINDOW_TOKENS", "1000000"),
+            max_output_recovery_attempts=_env_integer("MA_OUTPUT_RECOVERY_ATTEMPTS", "2"),
+            limits=configured_limits(Limits(), {
+                "max_steps": _env_integer("MA_MAX_STEPS", "100"),
+                "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", "1000000"),
+                "max_seconds": _env_number("MA_MAX_SECONDS", "3600"),
+            }),
         )

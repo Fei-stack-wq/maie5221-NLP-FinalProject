@@ -1,5 +1,9 @@
 # 系统架构设计
 
+> 2026-11-17：新增 [本地网页工作室](local-studio-gui.md)。浏览器经 loopback HTTP 与 StudioService 调用现有运行链路，使用后台执行和轮询；CLI 保留。角色/skill 管理、完整会话和安全恢复仍待后续阶段。
+
+> M0-04 已将任务、Attempt/Run、验收记录和 outbox 接入 SQLite，Board 继续作为投影；当前持久化与恢复边界见 [TaskStore 说明](m0-04-task-store.md)。
+
 > 2026-11-16 更新：本文保留原架构基线，验收与指标已按 [M0-02](m0-02-acceptance-and-metrics.md) 更新；其余未接入的持久化、隔离与预算能力仍以分阶段计划为准。
 
 > 一个可运行的**多智能体协作系统**：以 RAO 为原子单元，在其上叠加运行时、编排器、消息总线与观测层。
@@ -8,20 +12,22 @@
 
 | 项 | 内容 |
 |---|---|
-| 版本 | v2.0（重写） |
-| 日期 | 2026-11-03 |
+| 版本 | v2.0 架构基线，叠加 M0-01 至 M0-04 与 M0-UI-01 |
+| 日期 | 基线 2026-11-03；最近更新 2026-11-17 |
 | 状态 | L0 RAO ✅ · L1 运行时 ✅ · L2 编排 ✅ · L3 组织 ✅部分 · L4 观测 ✅ · 记忆 P4 设计中 |
-| 代码基线 | `miniagent/` 13 个模块 ≈ 3,400 行；`tests/` 96 个用例 |
+| 代码基线 | 初始 13 个模块、96 个测试为历史基线；M0-04 时 504 个测试，最新 GUI 验证见对应交付文档 |
 | 对应课程要求 | 2.1 通信与协作 · 2.2 记忆演化与隔离 · 2.3 行动空间 · 2.4 纯文本 · 2.5 极简 UI · 2.6 标准化 LLM 主干 · 评估指标 |
 
 ---
 
 ## 1. 摘要
 
-系统分成四层，每层只解决一类问题：
+执行核心按 L0–L4 分层，入口和持久控制层复用这些职责：
 
 | 层 | 一句话职责 | 代码 |
 |---|---|---|
+| 用户入口 | 本地网页、HTTP 适配、后台任务管理与查询 | `web/`、`studio_server.py`、`studio_service.py`、`cli.py` |
+| 持久控制 | Task/Attempt/Run、验收历史、状态事务与 outbox | `task_service.py`、`task_store.py` |
 | **L0 RAO** | 一步 = Reason（决策）→ Act（执行）→ Observe（归一化观察） | `rao.py` |
 | **L1 运行时** | 驱动 RAO 直到终止：预算、验收、终态映射、trace | `agent.py` |
 | **L2 编排** | 把目标拆成子任务 DAG，按依赖调度 | `orchestrator.py` |
@@ -47,12 +53,12 @@
 | G2 | 多智能体自主分解与委派 | 同一目标可产出不同子任务图；agent 可 `delegate_task` 派子任务 |
 | G3 | 指标自动、可追溯 | 一个命令出表，每个数字可追到 trace 行 |
 | G4 | 隔离可演示 | agent A 读不到 agent B 的工作区 |
-| G5 | 无密钥可开发 | ScriptedProvider 全链路可跑（96 个测试不花一分钱） |
+| G5 | 无密钥可开发 | ScriptedProvider 全链路可跑，网页包含离线演示 |
 
 ### 2.2 非目标（明确不做）
 
 - ❌ PDF / DOCX / PPT 的解析与生成（课程 2.4 明令）
-- ❌ 复杂前端（课程 2.5：网页不加分）
+- ❌ 与任务无关的复杂前端；课程 2.5 允许基础网页界面，本地 GUI 以任务操作与观测为范围
 - ❌ 微服务 / 分布式调度（单进程线程池足够，见 §9）
 - ❌ 模型训练 / 微调
 
@@ -72,7 +78,14 @@
 
 ```mermaid
 flowchart TB
-    CLI[CLI: demo / run / eval / orchestrate / report] --> ORC
+    WEB[本地网页] --> HTTP[loopback HTTP]
+    HTTP --> STUDIO[StudioService<br/>后台执行 · 查询适配]
+    STUDIO --> ORC
+    STUDIO --> AG
+    STUDIO -.读取状态.-> STORE[(TaskStore / SQLite)]
+    CLI[CLI: demo / run / eval / orchestrate / tasks / report] --> ORC
+    CLI --> AG
+    SERVICE[TaskService<br/>生命周期操作] --> STORE
     subgraph L2[L2 编排层]
         ORC[Orchestrator<br/>Planner · Router · Scheduler · Board]
     end
@@ -87,6 +100,8 @@ flowchart TB
     end
     ORC <--> BUS
     ORC --> AG --> R
+    ORC --> SERVICE
+    AG --> SERVICE
     X1[记忆 P4] -.注入/写回.-> R
     X2[沙箱] -.约束路径.-> A
     X3[Provider] -.供能.-> R
@@ -98,6 +113,8 @@ flowchart TB
 
 | 层 | 组件 | 文件 | 状态 |
 |---|---|---|---|
+| 入口 | 本地网页任务控制台 | `web/`、`studio_server.py`、`studio_service.py` | M0-UI-01 |
+| 控制 | 持久任务与事务状态 | `task_service.py`、`task_store.py` | M0-04 |
 | L0 | RAO 原子（决策闭集 / 观察归一 / 预算 / 循环检测 / 验收） | `rao.py` | ✅ |
 | L1 | Agent 运行时（循环 / 预算 / 验收打回 / 终态映射 / trace） | `agent.py` | ✅ |
 | L2 | 编排器（计划校验 / 降级 / 路由 / S1·S2·S3 调度 / 黑板） | `orchestrator.py` | ✅ |
@@ -220,7 +237,7 @@ sequenceDiagram
 
 ```
 agent 调 delegate_task(objective, assignee?, acceptance?)
-  → Orchestrator 创建子任务 {parent}.d{depth+1}
+  → Orchestrator 按平台 action_id 幂等登记独立 child task_id
   → 同步执行（继承预算、独立沙箱）
   → 结果作为一条 Observation 返回给父 agent
 ```
@@ -230,7 +247,7 @@ agent 调 delegate_task(objective, assignee?, acceptance?)
 ### 7.3 黑板
 
 `Board` 记录每个子任务每一步的摘要、产物索引与错误类，落 `board.json`。
-分工原则：**总线记"谁说了什么"，黑板记"现在是什么状态"**。
+分工原则：总线记录交流事件，黑板提供状态摘要投影；**任务生命周期的持久真源是 TaskStore**。浏览器同样读取持久任务记录，不以黑板或动画推断任务成功。
 
 ---
 
@@ -351,9 +368,11 @@ class MessageBus:   # bus.py
 
 ## 13. 部署与运行
 
-- 形态：单机 CLI，`python -m miniagent ...`；无服务端、无数据库（JSONL/JSON 足够）。
+- 形态：单机 CLI 或 `python -m miniagent studio` 启动的本地网页；macOS 可双击 `Start Studio.command` 自动定位仓库并打开浏览器。HTTP 服务只监听 `127.0.0.1`，不提供远程共享或多人账户。
+- 执行：StudioService 有界后台线程运行 Agent/Orchestrator；网页轮询查询。刷新或重新打开页面不提交新任务；重启读取记录，不自动续跑。
+- 持久化：每次运行的 `tasks.sqlite3` 保存 Task/Attempt/Run 和验收；JSONL/JSON 保留日志与投影用途。GUI 运行元数据描述作业管理状态，不覆盖任务状态。当前服务未持有的未结束执行显示“待核实”，未知耗时不推算；大日志仅保留有界尾部时，页面将汇总标为部分记录。
 - 目录：`runs/<run_id>/{trace.jsonl, plan.json, board.json, bus.jsonl, report.md, agents/<agent>-<task>/}`。
-- 配置：环境变量（`DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` / `MA_TEMPERATURE`）。
+- 配置：环境变量（`DEEPSEEK_API_KEY` / `DEEPSEEK_MODEL` / `MA_TEMPERATURE`）；studio 的可选本地 `.env` 读取仅解析字面量，不执行 shell，已有环境变量优先。API key 留在服务端。
 - CI（建议）：GitHub Actions 跑 `python -m unittest discover`，用 ScriptedProvider，零成本。
 
 ---
@@ -369,7 +388,7 @@ class MessageBus:   # bus.py
 | 2.2b 隔离 | `sandbox.py` | agent A 读 agent B 目录被拒的日志 |
 | 2.3 行动空间 | `tools.py`（搜索/文件/代码/git 待补） | 各工具一次调用记录 |
 | 2.4 只用 md/txt | system prompt + 无 PDF 依赖 | 依赖清单只有 pydantic |
-| 2.5 极简 UI | `cli.py` | 一个终端窗口完成全流程 |
+| 2.5 极简 UI | `cli.py` + 本地网页 | 启动工作室，从浏览器发起任务并检查任务树、日志、产物与验收 |
 | 2.6 DeepSeek/HKGAI | `providers.py` | 请求日志里的 base_url 与模型名 |
 | 评估指标 | `metrics.py` | 一键出完成率 / 耗时 / P95 / 失败分类 |
 
@@ -412,6 +431,11 @@ miniagent/
 ├─ agent.py          # L1：循环 / 预算 / 验收 / 终态 / trace
 ├─ orchestrator.py   # L2/L3：Planner / Router / Scheduler / Board / 委派
 ├─ bus.py            # L3：消息总线
+├─ task_store.py     # SQLite 持久记录与事务
+├─ task_service.py   # 任务生命周期命令
+├─ studio_service.py # 本地工作室执行与查询适配
+├─ studio_server.py  # 本机 HTTP 与静态资源
+├─ web/              # 无构建步骤的 HTML/CSS/JS
 ├─ memory.py         # P4：三层记忆与演化（待建）
 ├─ tools.py          # 工具注册表与默认工具集
 ├─ sandbox.py        # 路径隔离
@@ -419,10 +443,10 @@ miniagent/
 ├─ metrics.py        # trace → 指标 → report
 ├─ schemas.py        # 数据契约（全体 review）
 ├─ config.py         # 预算与护栏
-└─ cli.py            # demo / run / eval / orchestrate / report
+└─ cli.py            # studio / demo / run / eval / orchestrate / tasks / report
 docs/                # 本文档 + RAO 规范 + 调度器设计 + 要求分析
 examples/            # 任务集与 mock 剧本
-tests/               # 96 个用例
+tests/               # 离线契约、运行期、HTTP 与 GUI 服务测试
 runs/                # 每次运行的产物（gitignore）
 ```
 

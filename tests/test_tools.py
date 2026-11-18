@@ -43,7 +43,8 @@ class ToolTest(unittest.TestCase):
 
         read = self.registry.dispatch("read_file", {"path": "a.md"}, self.ctx)
         self.assertTrue(read.ok)
-        self.assertEqual(read.content, "你好")
+        self.assertEqual(read.content[:read.meta["returned_chars"]], "你好")
+        self.assertIn(read.meta["sha256"], read.content)
 
     def test_missing_required_argument_is_a_result_not_an_exception(self) -> None:
         result = self.registry.dispatch("write_file", {"path": "a.md"}, self.ctx)
@@ -103,10 +104,10 @@ class ToolTest(unittest.TestCase):
         self.assertIn("禁止访问内网", result.content)
 
     # ------------------------------------------------------------ 清单
-    def test_registry_exposes_six_tools(self) -> None:
+    def test_registry_exposes_workspace_and_research_tools(self) -> None:
         self.assertEqual(
             self.registry.names(),
-            ["delete_file", "http_get", "list_dir", "read_file", "run_python", "write_file"],
+            ["append_file", "delete_file", "edit_file", "find_files", "http_get", "list_dir", "read_file", "read_lines", "run_browser", "run_python", "run_shell", "search_files", "search_sources", "write_file"],
         )
         for spec in self.registry.specs():
             self.assertEqual(spec.to_api()["type"], "function")

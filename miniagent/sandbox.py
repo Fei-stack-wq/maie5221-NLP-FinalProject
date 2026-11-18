@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Callable
 
 
 class SandboxError(RuntimeError):
@@ -31,6 +32,8 @@ class SandboxError(RuntimeError):
 class Sandbox:
     def __init__(self, root: Path | str, agent_name: str = "agent") -> None:
         self.agent_name = agent_name
+        self.process_env: dict[str, str] = {}
+        self.track_shell_group: Callable[[int], None] | None = None
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 

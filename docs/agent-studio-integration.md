@@ -85,7 +85,7 @@ MessageBus 有订阅过滤和广播，但默认运行路径主要发布状态与
 
 ### 4.5 目录隔离尚不是课程所需的可靠执行边界
 
-`Sandbox` 对内置文件工具做路径检查，但 `_run_python()` 运行宿主 Python，仅设置 cwd 和 `-I`（`tools.py:218`）。任意 Python 代码没有经过相同的文件与审批检查；当前防护不能阻止它读取其他目录或绕过 delete_file 的审批。仓库文档已承认软隔离。
+`Sandbox` 对内置文件工具做路径检查。当前编码工具 `run_python` 和 POSIX `run_shell` 在项目目录中以宿主用户权限启动子进程，使用受限的继承环境。Python 额外设置 `-I`。工具层的相对路径与删除审批规则只约束内置文件操作。操作系统级执行隔离仍属于 M0-05。
 
 建议：保留路径检查作为一层防护，增加真正限制文件/进程/网络访问的执行后端。在此之前演示仅使用可控 fixture 和 mock，不连接真实电脑的广泛权限。真实主机诊断需要明确的受控连接器；容器中的命令不能自动代表宿主电脑状态。
 
@@ -105,7 +105,7 @@ MessageBus 有订阅过滤和广播，但默认运行路径主要发布状态与
 
 ### 4.8 真实模型和工具完整度需独立验证
 
-- 现有默认工具只有 list_dir/read_file/write_file/delete_file/run_python/http_get；http_get 是抓取已知 URL，尚无独立搜索工具，也没有专门的 Git commit/push 工具。
+- 此处的初版工具清单是仓库早期基线。当前编码角色可运行 Python 和 POSIX shell、编辑与搜索项目文件，也可使用 `search_sources` 和 `http_get` 查阅外部资料。工具与角色开关以 `build_default_registry()` 为准。
 - HKGAI 是预留方向，当前没有单独实现或测试过其适配。
 - `_parse()` 与 `LLMResponse.to_assistant_message()` 没有保留 `reasoning_content`（`providers.py:142`、`schemas.py:92`），请求也没有明确禁用 thinking。
 - 2026-11-15 查阅的 [DeepSeek 官方 Thinking Mode 文档](https://api-docs.deepseek.com/guides/thinking_mode/) 要求在启用思考且携带 tools 时回传该字段，并说明思考模式默认开启。因此存在多轮工具调用协议兼容风险；这是代码与官方契约对照，**本次未在线复现**。

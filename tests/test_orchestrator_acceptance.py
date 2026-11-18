@@ -114,6 +114,16 @@ class OrchestratorAcceptanceTest(unittest.TestCase):
         self.assertIsNone(result.acceptance_spec)
         self.assertFalse(result.succeeded)
 
+    def test_failed_child_is_not_hidden_by_missing_root_checker(self) -> None:
+        result = self._orchestrator(
+            root_acceptance=None, default_acceptance=_child_checker(expected="missing content"),
+        ).run("goal")
+        self.assertEqual(result.subtasks[0].status, "failed")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.acceptance_report.verdict, "unverified")
+        self.assertIn("s1", result.error)
+        self.assertNotIn("no-acceptance", result.error)
+
     def test_root_checker_exception_is_error(self) -> None:
         def broken_checker(workspace):
             (workspace / _root_file()).read_text()
@@ -140,22 +150,22 @@ class OrchestratorAcceptanceTest(unittest.TestCase):
                 self.assertEqual(result.subtasks[1].attempt_id, "")
                 self.assertIsNone(result.subtasks[1].acceptance_report)
 
-    def test_same_goal_retry_gets_new_workspace_without_old_file_success(self) -> None:
+    def test_independent_goals_get_new_workspaces_without_old_file_success(self) -> None:
         orchestrator = self._orchestrator()
-        first = orchestrator.run("goal", goal_id="reused-root")
-        second = orchestrator.run("goal", task_id="reused-root")
+        first = orchestrator.run("goal", goal_id="first-root")
+        second = orchestrator.run("goal", task_id="second-root")
         self.assertTrue(first.succeeded)
-        self.assertEqual(first.root_id, second.root_id)
+        self.assertNotEqual(first.root_id, second.root_id)
         self.assertNotEqual(first.attempt_id, second.attempt_id)
         self.assertNotEqual(first.workspace, second.workspace)
-        self.assertEqual(first.subtasks[0].task_id, second.subtasks[0].task_id)
+        self.assertNotEqual(first.subtasks[0].task_id, second.subtasks[0].task_id)
         self.assertNotEqual(first.subtasks[0].attempt_id, second.subtasks[0].attempt_id)
         self.assertFalse((Path(second.workspace) / _root_file()).exists())
         self.assertEqual(second.status, "failed_acceptance")
         self.assertEqual(second.acceptance_report.verdict, "failed")
         ends = [e for e in load_events(self.run_dir) if e["kind"] == "orchestration_end"]
         self.assertEqual(len(ends), 2)
-        self.assertEqual({e["root_id"] for e in ends}, {"reused-root"})
+        self.assertEqual({e["root_id"] for e in ends}, {"first-root", "second-root"})
 
     def test_missing_goal_id_generates_distinct_logical_goals(self) -> None:
         orchestrator = self._orchestrator()

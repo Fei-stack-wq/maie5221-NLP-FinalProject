@@ -41,6 +41,8 @@ from .rao import (
     evaluate_acceptance,
 )
 from .schemas import LLMResponse, RunResult, ToolCall, ToolResult, ToolSpec, Usage
+from .task_store import StoreError, TaskStore
+from .task_service import ExecutionHandle, TaskService
 
 __version__ = "0.4.0"
 
@@ -75,5 +77,10 @@ __all__ = [
     # 总线（v0.4）
     "Message",
     "MessageBus",
+    # M0-04 durable task lifecycle
+    "TaskStore",
+    "StoreError",
+    "TaskService",
+    "ExecutionHandle",
     "__version__",
 ]

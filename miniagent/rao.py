@@ -26,17 +26,44 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from .config import Limits
-from .providers import Provider
-from .sandbox import Sandbox
+from .providers import DeepSeekProvider, Provider
+from .sandbox import Sandbox, SandboxError
 from .schemas import LLMResponse, RequestAttempts, ToolResult, ToolSpec, Usage, UsageSource
 from .tools import ToolContext, ToolRegistry
+
+
+_TEXT_TOOL_TAG = re.compile(
+    r"^\s*<(?:[｜|]{1,2}DSML[｜|]{1,2}\s*(?:(?:function[_▁ ])?calls?|invoke)\b"
+    r"|[｜|]tool[▁_ ]calls?[▁_ ]begin[｜|]>)", re.IGNORECASE)
+_CODE_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _unstructured_tool_call(text: str) -> bool:
+    """Identify provider invocation markers in prose, leaving Markdown examples intact."""
+    fence = ""
+    for line in text.splitlines():
+        marker = _CODE_FENCE.match(line)
+        if marker:
+            token, rest = marker.groups()
+            if not fence:
+                fence = token
+                continue
+            if token[0] == fence[0] and len(token) >= len(fence) and not rest.strip():
+                fence = ""
+                continue
+        if not fence and _TEXT_TOOL_TAG.match(line):
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # 错误分类：报告里的失败模式就是按这些常量统计的
@@ -66,6 +93,8 @@ class ErrorClass:
     T_LOOP = "T_LOOP"                              # 检测到重复动作
     T_BUDGET = "T_BUDGET"                          # 预算耗尽
     T_ABORT = "T_ABORT"                            # 主动中止
+    T_CANCEL = "T_CANCEL"                          # 用户请求停止；不执行后续动作
+    T_STORE = "T_STORE"                            # 持久动作身份登记失败；不得执行工具
     T_PROTOCOL = "T_PROTOCOL"                      # 响应协议异常/截断；已收到的用量仍记录
 
 
@@ -115,6 +144,7 @@ class Action(BaseModel):
     """决策里的一个具体动作。"""
 
     id: str = ""
+    action_id: str = ""
     type: Literal["function"] = "function"
     tool: str
     arguments: dict[str, Any] = Field(default_factory=dict)
@@ -138,12 +168,15 @@ class Decision(BaseModel):
     delegate: dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
     protocol_error: str | None = None
+    unstructured_tool_call: bool = False
 
 
 class Observation(BaseModel):
     """Act 结果的归一化对象。所有下游（重试、指标、记忆）都只认这个形状。"""
 
     step_id: str
+    action_id: str | None = None
+    tool_call_id: str | None = None
     source: str
     ok: bool
     content: str
@@ -164,10 +197,10 @@ class Observation(BaseModel):
 class Budget(BaseModel):
     """四维预算。单调递减，父任务可向子任务切分。"""
 
-    steps_left: int = 12
-    seconds_left: float = 120.0
-    tokens_left: int = 200_000
-    actions_left: int = 48
+    steps_left: int = Field(default_factory=lambda: Limits().max_steps)
+    seconds_left: float = Field(default_factory=lambda: Limits().max_seconds)
+    tokens_left: int = Field(default_factory=lambda: Limits().max_total_tokens)
+    actions_left: int = Field(default_factory=lambda: Limits().max_steps * Limits().max_tool_calls_per_step)
 
     @classmethod
     def from_limits(cls, limits: Limits, *, factor: float = 1.0) -> "Budget":
@@ -245,6 +278,57 @@ class RAOState(BaseModel):
     scratch: dict[str, Any] = Field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StepPolicy:
+    """Host-selected request mode. An empty allowlist requires a text response."""
+
+    phase: str
+    instruction: str = ""
+    allowed_tools: frozenset[str] | None = None
+    compact: bool = False
+    token_reserve: int = 0
+    seconds_reserve: float = 0
+    allowed_write_paths: frozenset[str] | None = None
+    required_tool: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.required_tool is not None and self.required_tool not in (self.allowed_tools or ()):
+            raise ValueError("required_tool must be in the allowed tool set")
+        if self.token_reserve < 0:
+            raise ValueError("token_reserve must be non-negative")
+        if not math.isfinite(self.seconds_reserve) or self.seconds_reserve < 0:
+            raise ValueError("seconds_reserve must be finite and non-negative")
+
+
+def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]:
+    """Project request-only steering without growing replay history.
+
+    In compact mode only the current objective and authenticated human replies
+    survive from the conversation. The caller supplies its current receipts
+    and dispatch state in instruction. Past tool outputs cannot masquerade as
+    human replies or delivery-gate decisions.
+    """
+    if policy.compact:
+        messages = [m for m in state.history[:1] if m.get("role") == "system"]
+        messages.append({"role": "user", "content": state.goal})
+        for question, reply in state.scratch.get("human_replies", []):
+            messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})
+        if feedback := state.scratch.get("delivery_feedback"):
+            messages.append({"role": "user", "content": feedback})
+    else:
+        messages = list(state.history)
+    if policy.instruction:
+        messages.append({"role": "user", "content": policy.instruction})
+    if correction := state.scratch.get("tool_protocol_feedback"):
+        messages.append({"role": "user", "content": correction})
+    if policy.allowed_tools == frozenset():
+        messages.append({"role": "user", "content": (
+            "本轮仅提交最终文字交接。根据已有证据说明结果及限制。"
+            "遇到阻塞请以 [BLOCKED] 开头写明原因。"
+        )})
+    return messages
+
+
 class StepRecord(BaseModel):
     """一步的审计记录 —— 也就是写进 trace 的东西。"""
 
@@ -265,6 +349,8 @@ class StepRecord(BaseModel):
     usage_source: UsageSource = "reported"
     request_attempts: RequestAttempts = 1
     request_id: str | None = None
+    recoverable_output_length: bool = False
+    unstructured_tool_call: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -279,7 +365,12 @@ ASK_HUMAN_TOOL = ToolSpec(
     description="向人类提问以澄清歧义，或请求危险操作的许可。只有在信息缺失、无法自行判断时使用。",
     parameters={
         "type": "object",
-        "properties": {"question": {"type": "string", "description": "要问人类的具体问题"}},
+        "properties": {
+            "question": {"type": "string", "description": "要问人类的具体问题"},
+            "decision_kind": {"type": "string", "description": "本问题需要的决策类型",
+                              "enum": ["business_requirement", "user_preference", "missing_user_data",
+                                       "external_permission", "internal_routing", "runtime_capability"]},
+        },
         "required": ["question"],
     },
 )
@@ -293,6 +384,11 @@ DELEGATE_TOOL = ToolSpec(
             "objective": {"type": "string", "description": "给执行者的目标描述"},
             "assignee": {"type": "string", "description": "目标智能体名（留空则由编排器决定）"},
             "acceptance": {"type": "string", "description": "该子任务的验收标准"},
+            "remaining_roles": {"type": "array", "items": {"type": "string"},
+                                "description": "群组计划中本次委派之后仍需参与的角色 ID，空数组表示本角色是最后一位。"},
+            "deliverable_paths": {"type": "array", "items": {"type": "string"},
+                                  "description": "本次委派由该成员负责交付的具体文件相对路径。仅阅读的输入文件不计入。"},
+            "recover_from": {"type": "string", "description": "接手已有受阻草稿时，填写该成员的角色 ID。"},
         },
         "required": ["objective"],
     },
@@ -329,7 +425,7 @@ RAO_SYSTEM_SUFFIX = """
 ## 纪律
 1. 一次只做一件事；工具报错先读错误信息再改，不要重复同样的调用。
 2. 不要编造事实；不确定就在最终答复里说明缺什么。
-3. 产出文档只用 .md 或 .txt；所有路径都是相对路径。
+3. 文档使用 .md 或 .txt，代码按任务选择扩展名；所有路径都是相对路径。
 """
 
 
@@ -355,6 +451,9 @@ class RAOUnit:
         loop_warn: int = 3,
         loop_stop: int = 5,
         enable_control_tools: bool = True,
+        action_recorder: Callable[[RAOState, list[Action]], list[str]] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        human_request_gate: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> None:
         self.name = name
         self.provider = provider
@@ -364,18 +463,33 @@ class RAOUnit:
         self.temperature = temperature
         self.approve = approve
         self.human_handler = human_handler
+        self.human_request_gate = human_request_gate
         self.delegate_handler = delegate_handler
         self.max_actions_per_step = max_actions_per_step
         self.loop_warn = loop_warn
         self.loop_stop = loop_stop
         self.enable_control_tools = enable_control_tools
+        self.action_recorder = action_recorder
+        self.should_cancel = should_cancel
 
     # ------------------------------------------------------------------ 工具
-    def tool_specs(self) -> list[ToolSpec]:
+    def tool_specs(self, allowed_tools: frozenset[str] | None = None,
+                   allowed_write_paths: frozenset[str] | None = None) -> list[ToolSpec]:
         specs = self.registry.specs()
         if self.enable_control_tools:
             specs += list(CONTROL_TOOLS.values())
-        return specs
+        if allowed_tools is not None:
+            specs = [spec for spec in specs if spec.name in allowed_tools]
+        if allowed_write_paths is None:
+            return specs
+        scoped = []
+        for spec in specs:
+            if not allowed_write_paths or spec.name not in {"write_file", "edit_file", "append_file"}:
+                continue
+            properties = dict(spec.parameters["properties"])
+            properties["path"] = {**properties["path"], "enum": sorted(allowed_write_paths)}
+            scoped.append(spec.model_copy(update={"parameters": {**spec.parameters, "properties": properties}}))
+        return scoped
 
     # ---------------------------------------------------------------- Reason
     @staticmethod
@@ -432,10 +546,24 @@ class RAOUnit:
         except (ValueError, TypeError, RecursionError):
             return {}, "参数不是合法 JSON 对象"
 
-    def decide(self, state: RAOState) -> tuple[Decision, LLMResponse]:
-        response = self.provider.chat(
-            state.history, self.tool_specs(), temperature=self.temperature
-        )
+    def decide(self, state: RAOState, request_history: list[dict[str, Any]] | None = None,
+               max_output_tokens: int | None = None,
+               allowed_tools: frozenset[str] | None = None,
+               request_seconds: float | None = None,
+               allowed_write_paths: frozenset[str] | None = None,
+               required_tool: str | None = None) -> tuple[Decision, LLMResponse]:
+        messages = state.history if request_history is None else request_history
+        tools = self.tool_specs(allowed_tools, allowed_write_paths)
+        if isinstance(self.provider, DeepSeekProvider) and max_output_tokens is not None:
+            limits = {"max_output_tokens": max_output_tokens}
+            if required_tool is not None and self.provider.thinking == "disabled":
+                limits["required_tool"] = required_tool
+            if request_seconds is not None:
+                limits["deadline_seconds"] = request_seconds
+            response = self.provider.chat(messages, tools, temperature=self.temperature,
+                                          **limits)
+        else:
+            response = self.provider.chat(messages, tools, temperature=self.temperature)
         return self.parse_response(response), response
 
     def parse_response(self, response: LLMResponse) -> Decision:
@@ -457,6 +585,9 @@ class RAOUnit:
                 or (not response.tool_calls and response.finish_reason == "tool_calls")):
             reason = "finish_reason 与实际工具调用不一致。"
             return Decision(kind="act", reason=reason, protocol_error=reason)
+        if response.text and _unstructured_tool_call(response.text):
+            reason = "模型在正文中输出了工具调用标记；本轮工具未执行，不能作为最终答复。"
+            return Decision(kind="act", reason=reason, protocol_error=reason, unstructured_tool_call=True)
         if response.tool_calls:
             actions = []
             for call in response.tool_calls:
@@ -483,7 +614,9 @@ class RAOUnit:
 
     # ------------------------------------------------------------------- Act
     def act(
-        self, state: RAOState, decision: Decision, budget: Budget
+        self, state: RAOState, decision: Decision, budget: Budget,
+        allowed_tools: frozenset[str] | None = None, token_reserve: int = 0,
+        allowed_write_paths: frozenset[str] | None = None,
     ) -> tuple[str, list[Observation], str | None]:
         """执行决策。返回 (实际决策形态, 观察列表, 终止原因)。"""
         observations: list[Observation] = []
@@ -518,19 +651,84 @@ class RAOUnit:
             state.history.append({"role": "user", "content": f"[系统提示] {obs.content}"})
             return "act", [obs], None
 
+        # Bind the whole batch before any side effect. These are durable intent
+        # identities, not execution receipts or an authorization/lease decision.
+        try:
+            identities = (self.action_recorder(state, actions) if self.action_recorder
+                          else [f"action-{uuid.uuid4().hex}" for _ in actions])
+            if (len(identities) != len(actions) or len(set(identities)) != len(identities)
+                    or any(not isinstance(value, str) or not value.strip() for value in identities)):
+                raise ValueError("invalid action identity result")
+            actions = [action.model_copy(update={"action_id": identity})
+                       for action, identity in zip(actions, identities)]
+        except Exception:
+            observations = []
+            for action in actions:
+                obs = Observation(
+                    step_id=step_id, tool_call_id=action.id, source=action.tool,
+                    ok=False, error_class=ErrorClass.T_STORE,
+                    content="动作身份持久化失败，本轮动作均未执行。", ts=time.time(),
+                )
+                observations.append(obs)
+                state.history.append(obs.to_message(action.id))
+            return "act", observations, ErrorClass.T_STORE
+
         kind = "act"
         repeat = state.scratch.setdefault("repeat", {"sig": "", "count": 0})
         feedback: list[dict[str, str]] = []
+        budget_timer = time.perf_counter()
+        # Check the actual advertised tools, including whether control handlers
+        # are enabled. A mixed batch is rejected before its first side effect.
+        batch_denial = ""
+        for i, action in enumerate(actions):
+            parsed, error = self._arguments(action.raw_arguments, action.arguments, action.parse_error)
+            actions[i] = action.model_copy(update={"arguments": parsed, "parse_error": error})
+        if allowed_tools is not None or allowed_write_paths is not None:
+            offered = {spec.name for spec in self.tool_specs(allowed_tools, allowed_write_paths)}
+            if any(action.tool not in offered for action in actions):
+                unavailable = sorted({action.tool for action in actions} - offered)
+                batch_denial = ("本批次含当前阶段未开放的工具，全部未执行。收到：" + ", ".join(unavailable)
+                                + "。当前可调用：" + (", ".join(sorted(offered)) or "无；请给出最终文字交接") + "。")
+            elif allowed_write_paths is not None:
+                for action in actions:
+                    path = action.arguments.get("path")
+                    try:
+                        target = self.sandbox.relative(self.sandbox.resolve(path)) if isinstance(path, str) else None
+                    except (SandboxError, OSError, ValueError, RuntimeError):
+                        target = None
+                    if target not in allowed_write_paths:
+                        batch_denial = "本批次写入路径超出本次补交范围，全部未执行。请只写指定文件。"
+                        break
+            if batch_denial:
+                state.scratch["policy_denials"] = state.scratch.get("policy_denials", 0) + 1
+                state.scratch["policy_error"] = batch_denial
+                state.scratch["delivery_feedback"] = batch_denial
+            else:
+                state.scratch.pop("policy_denials", None)
+                if state.scratch.get("delivery_feedback") == state.scratch.pop("policy_error", None):
+                    state.scratch.pop("delivery_feedback", None)
 
         for index, action in enumerate(actions):
+            now = time.perf_counter()
+            budget.spend(seconds=now - budget_timer)
+            budget_timer = now
             call_id = action.id
-            arguments, parse_error = self._arguments(action.raw_arguments, action.arguments, action.parse_error)
-            action = action.model_copy(update={"arguments": arguments, "parse_error": parse_error})
+            if self.should_cancel and self.should_cancel():
+                terminate = ErrorClass.T_CANCEL
+            elif budget.tokens_left < 0 or budget.seconds_left <= 0:
+                terminate = ErrorClass.T_BUDGET
             if terminate:
                 obs = Observation(
                     step_id=step_id, source=action.tool, ok=False,
                     error_class=ErrorClass.A_SKIPPED,
-                    content="未执行：前序动作已终止本轮任务。", ts=time.time(),
+                    content=("未执行：用户请求停止。" if terminate == ErrorClass.T_CANCEL
+                             else "未执行：时间或 token 预算已耗尽。" if terminate == ErrorClass.T_BUDGET
+                             else "未执行：前序动作已终止本轮任务。"), ts=time.time(),
+                )
+            elif batch_denial or budget.tokens_left < token_reserve:
+                obs = Observation(
+                    step_id=step_id, source=action.tool, ok=False, error_class=ErrorClass.A_SKIPPED,
+                    content=batch_denial or "本轮剩余 token 已进入收尾预留额度，未执行动作。", ts=time.time(),
                 )
             elif index >= self.max_actions_per_step:
                 obs = Observation(
@@ -559,6 +757,10 @@ class RAOUnit:
                 )
             elif action.tool in CONTROL_TOOLS and self.enable_control_tools:
                 kind, obs, terminate = self._run_control(action, state, step_id)
+                if obs.source == "human" and obs.ok:
+                    state.scratch.setdefault("human_replies", []).append((obs.meta["question"], obs.content))
+                elif not obs.ok:
+                    state.scratch["delivery_feedback"] = f"[{action.tool} 未完成] {obs.content[:1000]}"
             else:
                 result = self.registry.dispatch(
                     action.tool,
@@ -569,6 +771,23 @@ class RAOUnit:
                 )
                 obs = self._observe(result, action, step_id)
                 budget.spend(actions=1)
+
+                # Test commands can vary every round while returning exactly the
+                # same findings. This is a prompt to reassess, not a verdict on
+                # side effects: successful commands can be deliberately silent.
+                if action.tool in {"run_python", "run_shell"} and len(obs.content) >= 64:
+                    digest = hashlib.sha256(obs.content.encode("utf-8")).hexdigest()
+                    previous, count = state.scratch.get("command_result", (None, 0))
+                    count = count + 1 if digest == previous else 1
+                    state.scratch["command_result"] = (digest, count)
+                    if count == self.loop_warn:
+                        feedback.append({"role": "user", "content": (
+                            f"[测试进展提醒] 连续 {count} 次命令调用返回了相同的输出。"
+                            "检查子进程真实退出码和剩余失败断言；已有证据足够时直接交付，"
+                            "仍有失败时先定位原因再复测，避免反复改写和运行同一项测试。"
+                        )})
+                else:
+                    state.scratch.pop("command_result", None)
 
                 # 循环检测：同一动作连续重复
                 signature = action.signature
@@ -589,18 +808,33 @@ class RAOUnit:
                         }
                     )
 
+            obs = obs.model_copy(update={"action_id": action.action_id, "tool_call_id": call_id})
             observations.append(obs)
             state.history.append(obs.to_message(call_id))
 
         # Keep all tool results adjacent to their assistant batch. Interleaving
         # a user warning before the final result breaks subsequent requests.
         state.history.extend(feedback)
+        # Repeated clarification requests can otherwise consume the whole task
+        # while the coordinator is waiting for an answer it already received.
+        # A batch that did other work is allowed to continue.
+        duplicate_only = observations and all(obs.source == "human_gate" and "answered_action" in obs.meta
+                                              for obs in observations)
+        if duplicate_only:
+            answered = sorted({obs.meta["answered_action"] for obs in observations})
+            if state.scratch.get("duplicate_question_turn") == answered and terminate is None:
+                terminate = ErrorClass.T_LOOP
+            state.scratch["duplicate_question_turn"] = answered
+        else:
+            state.scratch.pop("duplicate_question_turn", None)
+        budget.spend(seconds=time.perf_counter() - budget_timer)
         return kind, observations, terminate
 
     # --------------------------------------------------------------- Observe
     def _observe(self, result: ToolResult, action: Action, step_id: str) -> Observation:
         artifacts = list(result.meta.get("artifacts") or [])
-        if not artifacts and isinstance(result.meta.get("path"), str):
+        if (not artifacts and action.tool not in {"read_file", "read_lines", "list_dir", "find_files", "search_files"}
+                and isinstance(result.meta.get("path"), str)):
             artifacts = [result.meta["path"]]
         error_class = None if result.ok else classify_failure(result.content)
         return Observation(
@@ -612,7 +846,7 @@ class RAOUnit:
             artifacts=artifacts,
             meta=dict(result.meta),
             bytes=len(result.content.encode("utf-8")),
-            truncated="[已截断" in result.content,
+            truncated=bool(result.meta.get("truncated")) or "[已截断" in result.content,
             ts=time.time(),
         )
 
@@ -621,7 +855,7 @@ class RAOUnit:
         self, action: Action, state: RAOState, step_id: str
     ) -> tuple[str, Observation, str | None]:
         if action.tool == "ask_human":
-            return self._ask_human(action, step_id)
+            return self._ask_human(action, state, step_id)
         if action.tool == "delegate_task":
             return self._delegate(action, step_id)
         if action.tool == "abort_task":
@@ -643,9 +877,28 @@ class RAOUnit:
         ), None
 
     def _ask_human(
-        self, action: Action, step_id: str
+        self, action: Action, state: RAOState, step_id: str
     ) -> tuple[str, Observation, str | None]:
         question = str(action.arguments.get("question") or "")
+        if self.human_request_gate and (reason := self.human_request_gate(action.arguments)):
+            return "ask_human", Observation(
+                step_id=step_id, source="human_gate", ok=False, error_class=ErrorClass.A_HUMAN_DENIED,
+                content=reason, ts=time.time(),
+            ), None
+        decision_kind = action.arguments.get("decision_kind")
+        confirmed = None
+        if decision_kind in ("business_requirement", "user_preference") and question:
+            confirmed = state.scratch.setdefault("confirmed_clarifications", {}).setdefault(decision_kind, {})
+            if question in confirmed:
+                # This is a host observation about an existing decision. It
+                # does not call the human channel, copy an answer as new input,
+                # or confer any approval. Exact text is scoped to this attempt.
+                return "ask_human", Observation(
+                    step_id=step_id, source="human_gate", ok=False, error_class=ErrorClass.A_HUMAN_DENIED,
+                    content="本次执行中用户已经回答了这条相同的业务问题。请依照先前的答复继续分工或交付。"
+                            "如需新的授权，请使用 external_permission 并说明具体操作。",
+                    meta={"answered_action": confirmed[question]}, ts=time.time(),
+                ), None
         if self.human_handler is None:
             obs = Observation(
                 step_id=step_id,
@@ -674,6 +927,8 @@ class RAOUnit:
                 ts=time.time(),
             )
             return "ask_human", obs, None
+        if confirmed is not None:
+            confirmed[question] = action.action_id or action.id
         obs = Observation(
             step_id=step_id,
             source="human",
@@ -688,6 +943,8 @@ class RAOUnit:
         self, action: Action, step_id: str
     ) -> tuple[str, Observation, str | None]:
         payload = dict(action.arguments or {})
+        # This linkage is runtime-owned; never trust a model-supplied identity.
+        payload["__runtime_action_id"] = action.action_id
         if self.delegate_handler is None:
             obs = Observation(
                 step_id=step_id,
@@ -715,12 +972,26 @@ class RAOUnit:
         return "delegate", obs, None
 
     # ------------------------------------------------------------------ Step
-    def step(self, state: RAOState, budget: Budget) -> StepRecord:
+    def step(self, state: RAOState, budget: Budget,
+             request_history: list[dict[str, Any]] | None = None,
+             max_output_tokens: int | None = None,
+             allowed_tools: frozenset[str] | None = None, token_reserve: int = 0,
+             request_seconds: float | None = None,
+             allowed_write_paths: frozenset[str] | None = None,
+             required_tool: str | None = None) -> StepRecord:
         """完整的一步：Reason → Act → Observe，并把观察追加进历史。"""
         started = time.perf_counter()
         state.step_index += 1
 
-        decision, response = self.decide(state)
+        if self.should_cancel and self.should_cancel():
+            return StepRecord(step=state.step_index, ok=False, decision_kind="abort",
+                              error_class=ErrorClass.T_CANCEL, terminate_reason=ErrorClass.T_CANCEL)
+        if budget.tokens_left < 0 or budget.seconds_left <= 0:
+            return StepRecord(step=state.step_index, ok=False,
+                              error_class=ErrorClass.T_BUDGET, terminate_reason=ErrorClass.T_BUDGET)
+        decision, response = self.decide(state, request_history, max_output_tokens=max_output_tokens,
+                                         allowed_tools=allowed_tools, request_seconds=request_seconds, required_tool=required_tool,
+                                         allowed_write_paths=allowed_write_paths)
         try:
             raw_usage = getattr(response, "usage", None)
             if isinstance(raw_usage, Usage):
@@ -729,6 +1000,7 @@ class RAOUnit:
         except (ValueError, TypeError, AttributeError):
             usage = Usage(source="unknown")
         budget.spend(tokens=usage.total)
+        budget.spend(seconds=time.perf_counter() - started)
 
         terminate: str | None = None
         observations: list[Observation] = []
@@ -738,11 +1010,16 @@ class RAOUnit:
         if message is not None:
             state.history.append(message)
         protocol_error = decision.protocol_error or envelope_error
-        if protocol_error:
-            terminate = ErrorClass.T_PROTOCOL
+        cancelled = bool(self.should_cancel and self.should_cancel())
+        budget_overrun = budget.tokens_left < 0 or budget.seconds_left <= 0
+        if protocol_error or cancelled or budget_overrun:
+            terminate = (ErrorClass.T_CANCEL if cancelled else ErrorClass.T_BUDGET
+                         if budget_overrun else ErrorClass.T_PROTOCOL)
             observations.append(Observation(
                 step_id=f"{state.task_id}:s{state.step_index}", source="provider", ok=False,
-                error_class=ErrorClass.T_PROTOCOL, content=protocol_error, ts=time.time(),
+                error_class=terminate,
+                content=("用户请求停止。" if cancelled else "时间或 token 预算已耗尽。"
+                         if budget_overrun else protocol_error), ts=time.time(),
             ))
             # A well-formed but incomplete response can be retained as history;
             # none of its calls may execute, but each still needs a tool result.
@@ -750,12 +1027,15 @@ class RAOUnit:
                 obs = Observation(
                     step_id=f"{state.task_id}:s{state.step_index}", source=call["function"]["name"],
                     ok=False, error_class=ErrorClass.A_SKIPPED,
-                    content="未执行：本轮模型响应未正常结束。", ts=time.time(),
+                    content=("未执行：用户请求停止。" if cancelled
+                             else "未执行：时间或 token 预算已耗尽。" if budget_overrun
+                             else "未执行：本轮模型响应未正常结束。"), ts=time.time(),
                 )
                 observations.append(obs)
                 state.history.append(obs.to_message(call["id"]))
         elif decision.kind != "answer":
-            kind, observations, terminate = self.act(state, decision, budget)
+            kind, observations, terminate = self.act(state, decision, budget, allowed_tools, token_reserve,
+                                                    allowed_write_paths)
 
         failed = [obs for obs in observations if not obs.ok]
         return StepRecord(
@@ -773,7 +1053,7 @@ class RAOUnit:
                 for obs in observations
                 if obs.source not in CONTROL_TOOLS and obs.error_class is None
             ),
-            answer=decision.answer if decision.kind == "answer" and not protocol_error else "",
+            answer=decision.answer if decision.kind == "answer" and not protocol_error and not cancelled and not budget_overrun else "",
             terminate_reason=terminate,
             finish_reason=getattr(response, "finish_reason", "") if isinstance(getattr(response, "finish_reason", ""), str) else "",
             model=getattr(response, "model", "") if isinstance(getattr(response, "model", ""), str) else "",
@@ -782,6 +1062,9 @@ class RAOUnit:
                               if type(getattr(response, "request_attempts", 1)) is int
                               and getattr(response, "request_attempts", 1) >= 1 else 1),
             request_id=getattr(response, "request_id", None) if isinstance(getattr(response, "request_id", None), str) else None,
+            recoverable_output_length=(not cancelled and not budget_overrun and envelope_error is None
+                                       and getattr(response, "finish_reason", "") == "length"),
+            unstructured_tool_call=decision.unstructured_tool_call and not cancelled and not budget_overrun,
         )
 
 
@@ -797,6 +1080,8 @@ __all__ = [
     "RAOUnit",
     "RAOState",
     "StepRecord",
+    "StepPolicy",
+    "policy_messages",
     "accept_files",
     "classify_failure",
     "evaluate_acceptance",

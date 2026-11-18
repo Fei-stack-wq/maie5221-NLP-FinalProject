@@ -1,6 +1,10 @@
 # Python 3.10+
-# 只依赖 pydantic：LLM 调用用标准库 urllib 实现，换 SDK 只是可选项。
+# LLM 调用使用标准库 urllib。psutil 用于回收群成员启动的本地测试进程。
 pydantic>=2.7,<3
+psutil>=6,<8
+ripgrep>=14,<16
+Pillow>=11,<14
+playwright>=1.48,<2
 
 # 可选：想用官方 SDK 代替 urllib 时再取消注释
 # openai>=1.40

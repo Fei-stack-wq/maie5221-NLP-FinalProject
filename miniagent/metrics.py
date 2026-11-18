@@ -13,7 +13,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -40,7 +40,7 @@ class Tracer:
         record = {
             "schema_version": 2,
             "ts": round(time.time(), 4),
-            "iso": datetime.now().isoformat(timespec="milliseconds"),
+            "iso": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "kind": kind,
             **payload,
         }
