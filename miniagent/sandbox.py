@@ -33,6 +33,7 @@ class Sandbox:
     def __init__(self, root: Path | str, agent_name: str = "agent") -> None:
         self.agent_name = agent_name
         self.process_env: dict[str, str] = {}
+        self.command_sessions = None
         self.track_shell_group: Callable[[int], None] | None = None
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)

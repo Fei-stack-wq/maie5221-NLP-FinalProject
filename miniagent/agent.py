@@ -19,6 +19,7 @@ import uuid
 from typing import Callable
 
 from .config import Settings
+from .shell_tool import CommandSessions
 from .compaction import RollingCompactor
 from .request_window import fit_history, output_headroom
 from .context_window import ContextLimitError, TaskTokenLimitError, UsageAnchor
@@ -267,12 +268,15 @@ class Agent:
                 return f"超过时间上限 {initial_seconds:.0f}s"
             if not budget.has_tokens(0):
                 return f"超过 token 预算 {initial_tokens}"
-            if budget.steps_left <= 0:
+            if not budget.has_steps(1):
                 return f"超过最大步数 {initial_steps}"
-            if budget.actions_left <= 0:
+            if not budget.has_actions(1):
                 return f"超过动作总数上限 {initial_actions}"
             return budget.reason(limits)
 
+        owned_commands = self.sandbox.command_sessions is None
+        if owned_commands:
+            self.sandbox.command_sessions = CommandSessions()
         try:
             acceptance = bind(acceptance, self.sandbox.root, task_id=task_id, objective=task)
             while True:
@@ -284,8 +288,8 @@ class Agent:
                 offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
                 text_only = step_policy is not None and not offered
                 # The final text needs a model step, but consumes no tool actions.
-                if (budget.steps_left <= 0 or not budget.has_tokens(0) or budget.seconds_left <= 0
-                        or (budget.actions_left <= 0 and not text_only)):
+                if (not budget.has_steps(1) or not budget.has_tokens(0) or budget.seconds_left <= 0
+                        or (not budget.has_actions(1) and not text_only)):
                     error = budget_reason()
                     break
 
@@ -417,7 +421,7 @@ class Agent:
                         request_seconds=budget.seconds_left - policy.seconds_reserve if step_policy else None,
                     )
                 except ProviderError as exc:
-                    if (exc.code != "context_length_exceeded" or overflow_used or budget.steps_left <= 0
+                    if (exc.code != "context_length_exceeded" or overflow_used or not budget.has_steps(1)
                             or len(state.history) != history_start or cancellation_observed()):
                         raise
                     overflow_used = True
@@ -463,7 +467,7 @@ class Agent:
                 if record.unstructured_tool_call:
                     protocol = "text" if text_only else "tools"
                     already_corrected = protocol in corrected_protocols
-                    can_retry = not already_corrected and budget.steps_left > 0 and budget.has_tokens(1)
+                    can_retry = not already_corrected and budget.has_steps(1) and budget.has_tokens(1)
                     if self.tracer:
                         self.tracer.event("tool_protocol_correction", **identity, step=record.step,
                                           retry=can_retry, phase=policy.phase, protocol=protocol)
@@ -533,7 +537,10 @@ class Agent:
                         answer = record.answer
                         status, error = "error", answer
                         break
-                    if before_answer is not None and (reason := before_answer()):
+                    reason = self.sandbox.command_sessions.pending_reason()
+                    if not reason and before_answer is not None:
+                        reason = before_answer()
+                    if reason:
                         answer_guard_retries += 1
                         if self.tracer:
                             self.tracer.event("delivery_blocked", **identity, reason=reason)
@@ -633,6 +640,10 @@ class Agent:
                 status, error = "error", f"模型调用失败：{exc}"
         except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
             status, error = "error", f"{type(exc).__name__}: {exc}"
+        finally:
+            if owned_commands:
+                self.sandbox.command_sessions.close()
+                self.sandbox.command_sessions = None
 
         if durable_task is not None:
             persistent_status = (status if status in {"completed", "unverified"}
@@ -727,9 +738,9 @@ class Agent:
         )
         for obs in record.observations:
             command_metrics = {}
-            if obs.source in {"run_shell", "run_python", "run_browser"}:
+            if obs.source in {"run_shell", "run_python", "run_browser", "poll_process"}:
                 metrics = ("exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
-                           "stdout_bytes", "stderr_bytes", "truncated")
+                           "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state")
                 command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
             self.tracer.event(
                 "tool_result",

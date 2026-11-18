@@ -255,17 +255,17 @@ class RoomCrew:
         # smaller allowance for looking into genuinely new information.
         available = budget.available_tokens(self.close_tokens)
         seconds = max(.1, budget.seconds_left - self.close_seconds)
-        steps = max(1, budget.steps_left - 2)
+        steps = None if budget.steps_left is None else max(1, budget.steps_left - 2)
         if self.inspection_revision != self.project_version:
             self.inspection_revision = self.project_version
             self.revision_reads = _ReadAllowance(None if available is None else max(1024, math.ceil(.03*available)),
-                                                 max(1.0, .045*seconds), max(2, math.ceil(.09*steps)))
+                                                 max(1.0, .045*seconds), 9 if steps is None else max(2, math.ceil(.09*steps)))
             self.inspection_decision = None
         decision = (self.project_version, len(self.reports))
         if self.inspection_decision != decision:
             self.inspection_decision = decision
             self.decision_reads = _ReadAllowance(None if available is None else max(768, math.ceil(.015*available)),
-                                                 max(.5, .018*seconds), max(2, math.ceil(.05*steps)))
+                                                 max(.5, .018*seconds), 5 if steps is None else max(2, math.ceil(.05*steps)))
             self.inspection_notified = False
         self.nested_seconds = 0.0
 
@@ -408,7 +408,9 @@ class RoomCrew:
                  "published_peers": peers[-3:]}
         reviews = self._review_requests(role)
         if reviews:
-            facts["pending_independent_checks"] = reviews
+            facts["pending_independent_checks"] = [
+                {k: v for k, v in item.items() if k in {"task", "author", "changes", "verification"}}
+                for item in reviews]
             facts["review_instructions"] = self._review_instructions(reviews)
         current = self._decisions(self.room_events(self.run_id))[-4:]
         # Share source data seen on the current public revision; restored
@@ -495,7 +497,7 @@ class RoomCrew:
         if can_inspect and not budget.has_tokens(self.close_tokens + decision_input + 1):
             allowed = controls
             decision_input = input_cost(controls)
-        if (budget.steps_left <= (2 if self.assigned else 1) or budget.seconds_left <= self.close_seconds
+        if (not budget.has_steps(3 if self.assigned else 2) or budget.seconds_left <= self.close_seconds
                 or not budget.has_tokens(self.close_tokens + decision_input + 1)):
             return closing
         dispatch_limit = decision_input + 8192
@@ -504,12 +506,12 @@ class RoomCrew:
                           seconds_reserve=self.close_seconds, required_tool="delegate_task" if force_dispatch else None)
 
     def _review_requests(self, role):
-        return [item for item in self.pending_check_reviews.values() if item["author"] != role]
+        return [item for item in self.pending_check_reviews.values() if role not in {item["author"], item.get("last_editor")}]
 
     @staticmethod
     def _review_instructions(requests):
         ids = ", ".join(r["task"] for r in requests)
-        return ("前一位成员修订了自己的探索性测试。请对照用户需求核验已修订的预期，执行能验证这些行为的测试。"
+        return ("前一位成员有待独立复核的测试。请对照用户需求核验修订的预期；带有 scope 的待验证检查需要在原工作目录直接完整重跑并保留退出码。"
                 "如亲自核验成功，在最终交接写 [CHECKED 原任务ID] 并说明测试和依据。无法确认时说明缺口。"
                 "等待核验的原任务ID：" + ids)
 
@@ -517,16 +519,37 @@ class RoomCrew:
         """A revised self-check can reach a peer. The author cannot approve it."""
         reviewed = []
         changed = {entry["path"] for entry in changes}
+        versions = {entry["path"]: entry.get("sha256") for entry in changes}
+        for pending in self.pending_check_reviews.values():
+            candidate = pending.get("candidate", {})
+            touched = candidate.keys() & changed
+            if touched:
+                # A new published revision needs its own independent run.
+                # The editor may supply a fix but cannot approve that fix.
+                candidate.update({path: versions[path] for path in touched})
+                pending["last_editor"] = role
+                for check in pending.get("verification", []):
+                    if check["path"] in touched:
+                        check["current_sha256"] = versions[check["path"]]
         for item in self._review_requests(role):
             marker = "[CHECKED " + item["task"] + "]"
+            scopes = item.get("verification", [])
             if (marker in summary and evidence.get("check_signals")
+                    and all(c["scope"] in evidence.get("complete_verification", {}) for c in scopes)
+                    and all(original.get(path) == digest for path, digest in item.get("candidate", {}).items())
+                    and all(not c["path"] or c["path"] not in changed and
+                            original.get(c["path"]) == c.get("current_sha256") for c in scopes)
                     and all(original.get(f["path"]) == f["current_sha256"] and f["path"] not in changed
                             for f in item["changes"])):
                 del self.pending_check_reviews[item["task"]]
                 reviewed.append(item["task"])
         revised = evidence.get("superseded_member_checks", [])
-        if revised:
-            self.pending_check_reviews[task_id] = {"author": role, "task": task_id, "changes": revised}
+        verification = evidence.get("pending_verification", [])
+        if revised or verification:
+            candidate = {entry["path"]: entry.get("sha256") for entry in changes} if verification else {}
+            candidate.update({c["path"]: c["current_sha256"] for c in verification if c.get("path")})
+            self.pending_check_reviews[task_id] = {"author": role, "task": task_id, "changes": revised,
+                                                  "verification": [dict(c) for c in verification], "candidate": candidate}
         return reviewed
 
     def before_answer(self):
@@ -537,7 +560,7 @@ class RoomCrew:
         if pending:
             return "这些成员的交接尚未完成或未通过用户验收：" + "、".join(sorted(pending)) + "。请安排其解决缺口。"
         if self.pending_check_reviews:
-            return ("成员修订过探索性测试，仍需另一位成员独立复核。请委派他人按用户需求检查并报告："
+            return ("成员的测试修订或未完成检查仍需另一位成员独立复核。请委派他人按用户需求检查并报告："
                     + "、".join(self.pending_check_reviews))
         return None
 
@@ -555,16 +578,18 @@ class RoomCrew:
         b = self.budget
         available_seconds = min(b.seconds_left, self.deadline - time.monotonic())
         next_dispatch = min(14000, self.close_tokens + 2000)
-        lead_retry = int(b.steps_left >= 4 * count + 1)
-        reserved = Budget(steps_left=count + lead_retry, actions_left=count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
+        lead_retry = int(b.has_steps(4 * count + 1))
+        reserved = Budget(steps_left=None if b.steps_left is None else count + lead_retry,
+                          actions_left=None if b.actions_left is None else count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
                           seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count-1))
-        child = Budget(steps_left=(b.steps_left-reserved.steps_left)//count,
-                       actions_left=(b.actions_left-reserved.actions_left)//count,
+        child = Budget(steps_left=None if b.steps_left is None else (b.steps_left-reserved.steps_left)//count,
+                       actions_left=None if b.actions_left is None else (b.actions_left-reserved.actions_left)//count,
                        tokens_left=None if b.tokens_left is None else (b.tokens_left-reserved.tokens_left)//count,
                        seconds_left=(available_seconds-reserved.seconds_left)/count)
         # A repeated assignment cannot borrow from an elected peer who has not
         # started. Illustrative roles outside the elected plan receive no lease.
         floors = {"steps_left": 6, "actions_left": 8, "seconds_left": 30}
+        floors = {field: floor for field, floor in floors.items() if getattr(b, field) is not None}
         if b.tokens_left is not None:
             floors["tokens_left"] = 28000
         for peer in ((planned or set()) | set(self.child_checks)) - self.started_roles - {role}:
@@ -584,6 +609,9 @@ class RoomCrew:
             setattr(child, field, min(max(getattr(child, field), entitlement), maximum))
         return child, reserved
 
+    def _dispatch_limit_reached(self):
+        return self.budget.steps_left is not None and len(self.handoffs) >= 16
+
     def _eligible_repairs(self, origin):
         elected = list(dict.fromkeys([*self.plan_order, *self.child_checks]))
         eligible = []
@@ -597,7 +625,7 @@ class RoomCrew:
 
     def _decline_retry(self, role, reason, payload):
         eligible = self._eligible_repairs(role)
-        if not eligible or self.should_cancel() or len(self.handoffs) >= 16:
+        if not eligible or self.should_cancel() or self._dispatch_limit_reached():
             self.dispatch_ended = reason
             return self._observation(False, reason)
         if role not in self.refused_retry:
@@ -714,8 +742,8 @@ class RoomCrew:
             return self._observation(False, message)
         self.approved_roles.discard(role)
         allocated, reserved = self._allocation(role, plan)
-        if len(self.handoffs) >= 16 or allocated.exhausted or not allocated.has_tokens(1000) or self.should_cancel():
-            if role in self.started_roles and self.untapped_shares and len(self.handoffs) < 16 and not self.should_cancel():
+        if self._dispatch_limit_reached() or allocated.exhausted or not allocated.has_tokens(1000) or self.should_cancel():
+            if role in self.started_roles and self.untapped_shares and not self._dispatch_limit_reached() and not self.should_cancel():
                 return self._decline_retry(role, "其他计划成员的额度仍被保留。本成员无法继续重试，"
                                            "请给其他成员分工，需要时使用 recover_from 接手草稿。", payload)
             self.dispatch_ended = "已无委派预算，或本轮已被取消。"
@@ -783,6 +811,7 @@ class RoomCrew:
         repair_context = ""
         if recovered:
             progress.restore_failed_checks(draft["failed_checks"])
+            progress.restore_pending_verification(draft.get("evidence", {}).get("pending_verification", []))
             repair_context = ("已恢复 " + draft["role"] + " 的私有草稿。上次仍缺：" + _json(draft["missing"])
                               + "。上次真实执行/检查证据：" + _clip(_json(draft["evidence"]), 2000)
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
@@ -824,6 +853,7 @@ class RoomCrew:
                                     versions=dict(list(changed_versions.items())[-6:]), reads=progress.read_checkpoint(),
                                     checks=evidence["check_signals"], failed=evidence["observed_failure"],
                                     superseded_member_checks=evidence.get("superseded_member_checks", []),
+                                    diagnostic_checks=evidence["diagnostic_checks"], pending_verification=evidence["pending_verification"],
                                     runs=[{k:v for k,v in run.items() if k != "output_tail"} for run in recent_runs])
                 if self.tracer:
                     self.tracer.event("member_work_checkpoint", root_id=self.run_id, parent_task_id=self.run_id,
@@ -840,12 +870,17 @@ class RoomCrew:
             # MemberProgress already holds one turn for the first handoff.
             # Keep one more for a protocol correction without spending more
             # than the allocation or taking another member's share.
-            spendable = budget.model_copy(update={"steps_left": budget.steps_left - 1,
+            spendable = budget.model_copy(update={"steps_left": None if budget.steps_left is None else budget.steps_left - 1,
                                                   "tokens_left": budget.available_tokens(reserve),
                                                   "seconds_left": budget.seconds_left - handoff_seconds})
             if preflight:
                 progress.require_handoff("工作调用的受保护输入超过可用 token；使用保留的最终交接额度")
             phase = progress.phase(spendable, state.scratch.get("delivery_feedback", ""))
+            pending_command = member.sandbox.command_sessions.pending_reason()
+            wants_handoff = phase == "handoff" or state.scratch.get("delivery_feedback") == pending_command
+            if pending_command and wants_handoff and not preflight and spendable.has_steps(2) and not spendable.exhausted:
+                return StepPolicy("work", pending_command, frozenset({"poll_process"}),
+                                  token_reserve=reserve, seconds_reserve=handoff_seconds)
             evidence = progress.evidence()
             handoff = ("根据已完成的分工给负责人写最终交接，列出文件、真实检查和剩余问题。"
                        "\n群内用户确认的问答：" + _json(group_decisions) +
@@ -897,8 +932,8 @@ class RoomCrew:
                                     on_step=observe, before_answer=progress.blocked_reason,
                                     preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True))
         finally:
-            usage = {"steps": initial.steps_left - allocated.steps_left,
-                     "actions": initial.actions_left - allocated.actions_left,
+            usage = {"steps": allocated.steps_used - initial.steps_used,
+                     "actions": allocated.actions_used - initial.actions_used,
                      "tokens": allocated.tokens_used - initial.tokens_used}
             self.budget.spend(**usage)
             usage["seconds"] = round(time.monotonic() - started, 3)

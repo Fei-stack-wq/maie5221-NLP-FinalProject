@@ -23,7 +23,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.request_deadline_seconds, 3600)
         self.assertEqual(settings.limits.max_total_tokens, 0)
         self.assertEqual(settings.limits.max_seconds, 3600)
-        self.assertEqual(settings.limits.max_steps, 100)
+        self.assertEqual(settings.limits.max_steps, 0)
         self.assertEqual(settings.max_retries, 2)
         self.assertEqual(settings.temperature, 0)
 
@@ -184,7 +184,7 @@ class SettingsTest(unittest.TestCase):
     def test_limits_are_not_shared_between_settings(self) -> None:
         first, second = Settings(), Settings()
         first.limits.max_steps = 99
-        self.assertEqual(second.limits.max_steps, 100)
+        self.assertEqual(second.limits.max_steps, 0)
 
     def test_task_budget_environment_and_recovery_options(self):
         with patch.dict(os.environ, {"MA_MAX_STEPS": "250", "MA_MAX_TOTAL_TOKENS": "5000000",
@@ -197,7 +197,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(value.max_output_recovery_attempts, 1)
 
     def test_invalid_budget_configuration_never_silently_disables_a_limit(self):
-        for key, values in {"max_steps": [0, 1001, True, "12", 1.5],
+        for key, values in {"max_steps": [-1, 1001, True, "12", 1.5],
                             "max_total_tokens": [-1, 100000001, True, "100"],
                             "max_seconds": [0, 86401, float("nan"), float("inf"), True]}.items():
             for value in values:
@@ -207,7 +207,7 @@ class SettingsTest(unittest.TestCase):
             configured_limits(Limits(), {"unknown": 3})
         base = Limits(tool_timeout_seconds=7)
         changed = configured_limits(base, {"max_steps": 300})
-        self.assertEqual((base.max_steps, changed.max_steps, changed.tool_timeout_seconds), (100, 300, 7))
+        self.assertEqual((base.max_steps, changed.max_steps, changed.tool_timeout_seconds), (0, 300, 7))
 
     def test_context_and_recovery_ranges_are_strict(self):
         for key, values in {"context_window_tokens": [1023, 1000001, True, "1024"],

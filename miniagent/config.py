@@ -106,8 +106,8 @@ def _env_number(name: str, default: str) -> float:
 class Limits:
     """任务执行预算和单步工具约束。"""
 
-    max_steps: int = 100
-    """最多几轮 LLM 调用。超过就判定 limit_exceeded，而不是无限循环。"""
+    max_steps: int = 0
+    """模型轮数上限。0 表示持续计数，无累计轮数和派生动作数上限。"""
 
     max_seconds: float = 3600.0
     """单个任务的总墙钟时间上限。"""
@@ -118,8 +118,8 @@ class Limits:
     max_tool_calls_per_step: int = 4
     """单轮模型回复里最多执行几个工具调用，防止一次生成几十个调用。"""
 
-    tool_timeout_seconds: float = 20.0
-    """单个工具（尤其是 run_python）的超时。"""
+    tool_timeout_seconds: float = 600.0
+    """前台命令的最长运行时间，至多使用剩余任务墙钟。"""
 
 
 def configured_limits(base: Limits, changes: dict) -> Limits:
@@ -128,7 +128,7 @@ def configured_limits(base: Limits, changes: dict) -> Limits:
     if set(changes) - {"max_steps", "max_seconds", "max_total_tokens"}:
         raise ValueError("unknown task budget")
     if "max_steps" in changes:
-        _integer("max_steps", changes["max_steps"], 1, 1000)
+        _integer("max_steps", changes["max_steps"], 0, 1000)
     if "max_total_tokens" in changes:
         _integer("max_total_tokens", changes["max_total_tokens"], 0, 100_000_000)
     if "max_seconds" in changes:
@@ -189,7 +189,7 @@ class Settings:
             context_window_tokens=_env_integer("MA_CONTEXT_WINDOW_TOKENS", "1000000"),
             max_output_recovery_attempts=_env_integer("MA_OUTPUT_RECOVERY_ATTEMPTS", "2"),
             limits=configured_limits(Limits(), {
-                "max_steps": _env_integer("MA_MAX_STEPS", "100"),
+                "max_steps": _env_integer("MA_MAX_STEPS", str(Limits.max_steps)),
                 "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", str(Limits.max_total_tokens)),
                 "max_seconds": _env_number("MA_MAX_SECONDS", "3600"),
             }),

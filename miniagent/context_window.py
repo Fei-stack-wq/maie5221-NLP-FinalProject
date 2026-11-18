@@ -58,7 +58,7 @@ def project_history(
     excluded_ranges: list[tuple[int, int]] | None = None,
     usage_anchor: UsageAnchor | None = None,
     reported_assistant_tokens: dict[int, tuple[dict[str, Any], int]] | None = None,
-    task_tokens_left: int | None = None, steps_left: int = 1,
+    task_tokens_left: int | None = None, steps_left: int | None = 1,
     replay_input_target: int | None = None,
 ) -> RequestProjection:
     """Build a valid request view, retaining original history and call ID pairs.
@@ -81,7 +81,7 @@ def project_history(
     # replay cost, never a ceiling on a single substantive read or generation.
     hard_limit = input_limit if task_tokens_left is None else min(input_limit, task_tokens_left - 1)
     replay_target = hard_limit if task_tokens_left is None else min(
-        hard_limit, task_tokens_left // max(1, min(steps_left, 48))
+        hard_limit, task_tokens_left // (48 if steps_left is None else max(1, min(steps_left, 48)))
     )
     if replay_input_target is not None:
         replay_target = min(replay_target, max(1, replay_input_target))

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import psutil
 
+from .shell_tool import CommandSessions
+
 _MARKER = "MINIAGENT_MEMBER_PROCESS_SCOPE"
 
 
@@ -46,9 +48,15 @@ def managed_member_processes(sandbox):
             groups[pgid] = survivors
 
     sandbox.track_shell_group = track_group
+    commands = CommandSessions()
+    sandbox.command_sessions = commands
     try:
         yield receipt
     finally:
+        if commands.jobs:
+            receipt["uncollected_commands"] = len(commands.jobs)
+        commands.close()
+        sandbox.command_sessions = None
         sandbox.process_env = {}
         sandbox.track_shell_group = None
         try:

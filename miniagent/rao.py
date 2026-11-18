@@ -197,24 +197,26 @@ class Observation(BaseModel):
 class Budget(BaseModel):
     """四维预算。单调递减，父任务可向子任务切分。"""
 
-    steps_left: int = Field(default_factory=lambda: Limits().max_steps)
+    steps_left: int | None = Field(default_factory=lambda: Limits().max_steps or None)
     seconds_left: float = Field(default_factory=lambda: Limits().max_seconds)
     # None disables the cumulative cap. Zero is an exhausted finite allocation.
     tokens_left: int | None = Field(default_factory=lambda: Limits().max_total_tokens or None)
     _tokens_used: int = PrivateAttr(default=0)
-    actions_left: int = Field(default_factory=lambda: Limits().max_steps * Limits().max_tool_calls_per_step)
+    actions_left: int | None = Field(default_factory=lambda: Limits().max_steps * Limits().max_tool_calls_per_step or None)
+    _steps_used: int = PrivateAttr(default=0)
+    _actions_used: int = PrivateAttr(default=0)
 
     @classmethod
     def from_limits(cls, limits: Limits, *, factor: float = 1.0) -> "Budget":
         """按 Limits 造一份预算。factor < 1 用于给子任务打折。"""
         return cls(
-            steps_left=max(1, int(limits.max_steps * factor)),
+            steps_left=max(1, int(limits.max_steps * factor)) if limits.max_steps else None,
             seconds_left=limits.max_seconds * factor,
             tokens_left=int(limits.max_total_tokens * factor) if limits.max_total_tokens else None,
             actions_left=max(
                 1,
                 int(limits.max_steps * max(1, limits.max_tool_calls_per_step) * factor),
-            ),
+            ) if limits.max_steps else None,
         )
 
     def spend(
@@ -225,8 +227,12 @@ class Budget(BaseModel):
         tokens: int = 0,
         seconds: float = 0.0,
     ) -> "Budget":
-        self.steps_left -= steps
-        self.actions_left -= actions
+        self._steps_used += steps
+        self._actions_used += actions
+        if self.steps_left is not None:
+            self.steps_left -= steps
+        if self.actions_left is not None:
+            self.actions_left -= actions
         self._tokens_used += tokens
         if self.tokens_left is not None:
             self.tokens_left -= tokens
@@ -242,14 +248,28 @@ class Budget(BaseModel):
         """Whether a reservation or request is affordable in this allocation."""
         return self.tokens_left is None or self.tokens_left >= minimum
 
+    @property
+    def steps_used(self) -> int:
+        return self._steps_used
+
+    @property
+    def actions_used(self) -> int:
+        return self._actions_used
+
+    def has_steps(self, minimum: int) -> bool:
+        return self.steps_left is None or self.steps_left >= minimum
+
+    def has_actions(self, minimum: int) -> bool:
+        return self.actions_left is None or self.actions_left >= minimum
+
     def available_tokens(self, reserve: int = 0) -> int | None:
         return None if self.tokens_left is None else self.tokens_left - reserve
 
     @property
     def exhausted(self) -> bool:
         return (
-            self.steps_left <= 0
-            or self.actions_left <= 0
+            not self.has_steps(1)
+            or not self.has_actions(1)
             or not self.has_tokens(0)
             or self.seconds_left <= 0
         )
@@ -258,10 +278,10 @@ class Budget(BaseModel):
         if self.seconds_left <= 0:
             total = limits.max_seconds if limits else 0
             return f"超过时间上限 {total:.0f}s"
-        if self.steps_left <= 0:
+        if not self.has_steps(1):
             total = limits.max_steps if limits else 0
             return f"超过最大步数 {total}"
-        if self.actions_left <= 0:
+        if not self.has_actions(1):
             return "超过动作总数上限"
         if not self.has_tokens(0):
             total = limits.max_total_tokens if limits else 0
@@ -272,16 +292,18 @@ class Budget(BaseModel):
         """给子任务切一块预算，自己保留其余部分（默认各半）。"""
         ratio = min(max(ratio, 0.0), 1.0)
         child = Budget(
-            steps_left=max(1, int(self.steps_left * ratio)) if self.steps_left > 1 else self.steps_left,
+            steps_left=max(1, int(self.steps_left * ratio)) if self.steps_left is not None and self.steps_left > 1 else self.steps_left,
             seconds_left=self.seconds_left * ratio,
             tokens_left=None if self.tokens_left is None else int(self.tokens_left * ratio),
-            actions_left=max(1, int(self.actions_left * ratio)),
+            actions_left=max(1, int(self.actions_left * ratio)) if self.actions_left is not None and self.actions_left > 1 else self.actions_left,
         )
-        self.steps_left -= child.steps_left
+        if self.steps_left is not None:
+            self.steps_left -= child.steps_left
         self.seconds_left -= child.seconds_left
         if self.tokens_left is not None:
             self.tokens_left -= child.tokens_left
-        self.actions_left -= child.actions_left
+        if self.actions_left is not None:
+            self.actions_left -= child.actions_left
         return child
 
 
@@ -634,8 +656,11 @@ class RAOUnit:
         self, state: RAOState, decision: Decision, budget: Budget,
         allowed_tools: frozenset[str] | None = None, token_reserve: int = 0,
         allowed_write_paths: frozenset[str] | None = None,
+        tool_deadline: float | None = None,
     ) -> tuple[str, list[Observation], str | None]:
         """执行决策。返回 (实际决策形态, 观察列表, 终止原因)。"""
+        if tool_deadline is None:
+            tool_deadline = time.monotonic() + budget.seconds_left
         observations: list[Observation] = []
         terminate: str | None = None
         step_id = f"{state.task_id}:s{state.step_index}"
@@ -756,7 +781,7 @@ class RAOUnit:
                     content="未执行：超过单步动作上限，请减少一次生成的数量。",
                     ts=time.time(),
                 )
-            elif budget.actions_left <= 0:
+            elif not budget.has_actions(1):
                 terminate = ErrorClass.T_BUDGET
                 obs = Observation(
                     step_id=step_id, source=action.tool, ok=False,
@@ -783,7 +808,8 @@ class RAOUnit:
                     action.tool,
                     action.arguments,
                     ToolContext(
-                        sandbox=self.sandbox, limits=self.limits, approve=self.approve
+                        sandbox=self.sandbox, limits=self.limits, approve=self.approve,
+                        deadline=tool_deadline, should_cancel=self.should_cancel,
                     ),
                 )
                 obs = self._observe(result, action, step_id)
@@ -998,6 +1024,8 @@ class RAOUnit:
              required_tool: str | None = None) -> StepRecord:
         """完整的一步：Reason → Act → Observe，并把观察追加进历史。"""
         started = time.perf_counter()
+        tool_deadline = time.monotonic() + min(budget.seconds_left, request_seconds
+                                                if request_seconds is not None else budget.seconds_left)
         state.step_index += 1
 
         if self.should_cancel and self.should_cancel():
@@ -1052,7 +1080,7 @@ class RAOUnit:
                 state.history.append(obs.to_message(call["id"]))
         elif decision.kind != "answer":
             kind, observations, terminate = self.act(state, decision, budget, allowed_tools, token_reserve,
-                                                    allowed_write_paths)
+                                                    allowed_write_paths, tool_deadline)
 
         failed = [obs for obs in observations if not obs.ok]
         return StepRecord(

@@ -313,7 +313,7 @@ class StudioCrewTest(unittest.TestCase):
                   assign("reviewer", "Check the published draft"), tool("read_file", path="work.txt"),
                   {"text": "The text covers the request."}, {"text": "Ready."}]
         detail, provider = self.execute(script, group, objective="Prepare a reviewed draft",
-                                        limits={"max_total_tokens": 1_000_000}, acceptance_files=["work.txt"])
+                                        limits={"max_steps": 100, "max_total_tokens": 1_000_000}, acceptance_files=["work.txt"])
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         self.assertIn("reviewer", str(provider.requests[4][0]))
         self.assertEqual(provider.requests[-1][1], [])
@@ -445,7 +445,7 @@ class StudioCrewTest(unittest.TestCase):
                           {"text":"Ready."}, {"text":"Ready after review."}]
                 kwargs = {"child_checks":{"writer":{"files":["guide.md"]}}} if role_bound else {}
                 detail,provider = self.execute(script, roster("lead", "writer", "review"), objective="Deliver app and guide",
-                                               limits={"max_total_tokens": 1_000_000}, acceptance_files=["guide.md", "app.py"], **kwargs)
+                                               limits={"max_steps": 100, "max_total_tokens": 1_000_000}, acceptance_files=["guide.md", "app.py"], **kwargs)
                 self.assertEqual(detail["run"]["status"], "failed" if role_bound else "completed",detail["diagnostics"])
                 assignments = [e for e in detail["room_events"] if e["kind"]=="assignment"]
                 self.assertEqual([e["recipient"] for e in assignments], ["writer", "writer", "review"])

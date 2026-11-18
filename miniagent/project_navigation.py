@@ -74,7 +74,7 @@ def _page(ctx, args, *, filenames):
         def expire():
             expired.set()
             proc.kill()
-        timer = threading.Timer(max(0.1, ctx.limits.tool_timeout_seconds), expire)
+        timer = threading.Timer(max(0.1, min(20, ctx.limits.tool_timeout_seconds)), expire)
         timer.daemon = True
         timer.start()
         try:

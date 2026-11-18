@@ -214,7 +214,7 @@ class RaoStepTest(unittest.TestCase):
 
 class BudgetTest(unittest.TestCase):
     def test_unlimited_cumulative_tokens_propagate_to_forks_without_losing_usage(self):
-        parent = Budget.from_limits(Limits(max_total_tokens=0))
+        parent = Budget.from_limits(Limits(max_steps=100, max_total_tokens=0))
         child = parent.fork()
         for budget in (parent, child):
             self.assertIsNone(budget.tokens_left)

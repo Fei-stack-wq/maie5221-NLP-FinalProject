@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
+from .check_provenance import python_check_source, python_invocation, shell_invocation
 from .project_data import PROJECT_CACHE_DIRS
 from .rao import Budget, Observation, RAOState, StepRecord
 
@@ -37,7 +38,7 @@ _EMPTY_FAILURE_DETAILS = re.compile(
 _NESTED_EXIT = re.compile(r"(?im)(?:^\s*|CompletedProcess\([^\n]*?,\s*)(?:returncode|exit(?:[_ ]?code)?)\s*[=:]\s*(-?\d{1,8})\b")
 _TRACEBACK = re.compile(r"(?ms)^Traceback \(most recent call last\):\s*\n\s+File .+?"
                         r"^(?:[\w.]+(?:Error|Exception)|SystemExit)(?::|$)")
-_MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "run_browser", "write_file", "edit_file", "append_file", "delete_file"}
+_MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "poll_process", "run_browser", "write_file", "edit_file", "append_file", "delete_file"}
 _READER = {"open", "read_text", "read_bytes"}
 _SCAN_FILES = 1000
 _SCAN_BYTES = 20 * 1024 * 1024
@@ -332,7 +333,7 @@ def _script_run(layouts, current, command, cwd, obs, status):
     # An echo wrapper must directly observe the runner's exit and print it last.
     match = re.fullmatch(r'\s*python(?:\d+(?:\.\d+)*)?\s+([\w./-]+\.py)'
                          r'(?:\s*;\s*echo\s+(?:"EXIT=\$\?"|EXIT=\$\?))?\s*', command)
-    if not match or obs.truncated or obs.meta.get("timed_out"):
+    if not match or _output_truncated(obs) or obs.meta.get("timed_out"):
         return None
     path = Path(cwd) / match[1]
     if path.is_absolute() or ".." in path.parts or str(path) not in current:
@@ -416,6 +417,13 @@ def _check_key(suite: str, case: str = "") -> str:
     return hashlib.sha256((suite + "\0" + caption).encode()).hexdigest()
 
 
+def _output_truncated(obs: Observation) -> bool:
+    # Legacy run_python embedded an exact adapter-generated marker. A case
+    # title or fixture containing the word "truncated" is ordinary output.
+    return bool(obs.truncated or obs.meta.get("truncated") or
+                re.search(r"(?m)^\.\.\.\[已截断，原文 [0-9]+ 字符\]\s*\Z", obs.content))
+
+
 def _check(obs: Observation, command: str, reading: bool, exit_position: int | None) -> _Check | None:
     # Ignore lines that merely render source, e.g. print(Path(...).read_text()).
     # A known check command which reads input fixtures may still emit a result.
@@ -469,7 +477,7 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
         return _Check(suite, "failed", "工具输出 FAIL · " + failed_cases[0][:72], tuple(failed_cases))
     if failure or report.reported_failure or nested_exception or (check_context and bad_exit):
         return _Check(suite, "failed", f"{framework} 执行失败")
-    if report.incomplete or obs.truncated or not obs.ok or "截断" in output[-80:]:
+    if report.incomplete or _output_truncated(obs) or not obs.ok:
         return None
     if unit and int(unit[1]) and _UNIT_OK.search(output[unit.end():]):
         return _Check(suite, "passed", f"unittest · {unit[1]} tests OK", tuple(passed_cases))
@@ -522,6 +530,7 @@ class MemberProgress:
         self.workspace = Path(workspace)
         self.required = set(required_paths)
         self._cache = {}
+        self._assertive_scripts = {}
         self._authored = set()
         self._layouts = {}
         self._restored_keys = set()
@@ -538,6 +547,9 @@ class MemberProgress:
         self._read_hint = ""
         self._inspected = set()
         self._passes = {}
+        self._diagnostic_checks = {}
+        self._pending_verification = {}
+        self._complete_verification = {}
         self._failures = {}
         self._prior_passes = []
         self._executions = self._shell_calls = self._browser_calls = self._clean_exits = 0
@@ -588,6 +600,8 @@ class MemberProgress:
                     spent += len(data)
                     files[key] = hashlib.sha256(data).hexdigest()
                     self._cache[key] = (sig, files[key])
+                    if key.endswith(".py") and len(data) <= 256 * 1024 and python_check_source(data):
+                        self._assertive_scripts[key] = files[key]
                     if key in self._authored and len(data) <= 256 * 1024:
                         try:
                             layout = _script_layout(data.decode("utf-8"))
@@ -625,6 +639,7 @@ class MemberProgress:
                     del self._active_retirements[key]
             self._prior_passes = list(dict.fromkeys([*self._prior_passes, *self._passes.values()]))[-4:]
             self._passes.clear()
+            self._complete_verification.clear()
             self._repeat_pass = False
             self._after_pass = 0
             self._reads.clear()
@@ -637,6 +652,13 @@ class MemberProgress:
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
         for index, obs in enumerate(record.observations):
             parameters = args.get(obs.tool_call_id, {})
+            if obs.source == "poll_process":
+                if obs.meta.get("process_state") not in {"exited", "timed_out", "cancelled"}:
+                    continue
+                parameters = {"command": obs.meta.get("command", ""), "cwd": obs.meta.get("cwd", ".")}
+                obs = obs.model_copy(update={"source": "run_shell"})
+            if obs.source == "run_shell" and obs.meta.get("process_state") == "running":
+                continue
             reads = set()
             if obs.source in {"read_file", "read_lines"} and obs.ok:
                 path = obs.meta.get("path") or parameters.get("path")
@@ -659,10 +681,12 @@ class MemberProgress:
                 advances |= self._navigation_result(obs, query, search=obs.source != "list_dir")
             elif obs.source in {"run_python", "run_shell", "run_browser"}:
                 self._clean_exits += int(obs.ok and obs.meta.get("exit_code") == 0)
-                signal = None
+                signal = invocation = None
+                cwd = str(parameters.get("cwd") or ".")
                 reading = False
                 if obs.source == "run_shell":
                     self._shell_calls += 1
+                    invocation = shell_invocation(str(parameters.get("command", "")), cwd)
                     reads, command, reading = _shell_inputs(str(parameters.get("command", "")),
                                                             str(parameters.get("cwd") or "."), self._current)
                     if not obs.ok:
@@ -676,9 +700,89 @@ class MemberProgress:
                     signal = _browser_check(obs, str(parameters.get("code", "")), str(parameters.get("cwd", ".")))
                 else:
                     self._executions += 1
+                    invocation = python_invocation(str(parameters.get("code", "")), cwd)
                     paths, command, exit_position, reading = _script_inputs(str(parameters.get("code", "")))
                     reads.update((p, 0) for p in paths if obs.ok and p in self._current)
                     signal = _check(obs, command, reading, exit_position)
+                exit_code = obs.meta.get("exit_code")
+                missing_exit = False
+                if invocation and invocation.exit_footer and exit_code == 0:
+                    stdout = obs.content.partition("\nstderr:\n")[0]
+                    footer = re.search(r"(?m)^EXIT=(-?\d{1,8})\s*\Z", stdout)
+                    exit_code = int(footer[1]) if footer else None
+                    missing_exit = exit_code is None
+                    if missing_exit:
+                        signal = _Check(command, "inconclusive", "")
+                if (not signal and invocation and invocation.complete and obs.source == "run_shell"
+                        and _output_truncated(obs) and obs.ok and exit_code == 0
+                        and not obs.meta.get("timed_out") and (
+                            not invocation.script or self._current.get(invocation.script) is not None and
+                            self._assertive_scripts.get(invocation.script) == self._current[invocation.script])):
+                    # The process completed even when its display buffer filled. An
+                    # exact exit receipt doesn't resolve any prior named assertion.
+                    signal = _Check(command, "runner_exit", invocation.caption + " 完整运行退出 0（输出已截断）")
+                if signal:
+                    # Trust which process/assertion produced the result before interpreting
+                    # its text. A wrapper printing an edited summary has its own stdout.
+                    native = obs.source == "run_browser" or (
+                        obs.source == "run_python" and command.startswith("assert "))
+                    scoped_rows = (obs.source == "run_shell" and signal.cases and
+                                   _shell_case_suite(str(parameters.get("command", "")), cwd))
+                    interrupted = obs.meta.get("timed_out") or obs.meta.get("cancelled") or obs.meta.get("exit_code") in {-9, -15}
+                    # A safe output filter may relay exact individual cases. Its
+                    # outer exit code and aggregate totals do not certify a run.
+                    full = native or bool(invocation and invocation.complete)
+                    trusted_rows = bool(scoped_rows and not full and
+                                        (signal.status == "passed" or any(
+                                            int(code) != 0 for code in _NESTED_EXIT.findall(obs.content))))
+                    # For a direct custom script, stdout claiming failure despite a
+                    # verified zero exit is conflicting evidence, not a failed assertion.
+                    conflict = (full and invocation and invocation.script in self._current and signal.status == "failed"
+                                and obs.source == "run_shell" and exit_code == 0)
+                    unavailable = (signal.status == "failed" and invocation and obs.source == "run_shell" and (
+                        obs.meta.get("exit_code") in {126, 127} or "pytest" in invocation.caption
+                        and not invocation.script and obs.meta.get("exit_code") in {2, 3, 4, 5}))
+                    unconfirmed_claim = (full and invocation and invocation.script.endswith(".py")
+                                         and invocation.script in self._current and signal.status == "passed"
+                                         and signal.cases and self._assertive_scripts.get(invocation.script)
+                                         != self._current[invocation.script])
+                    if missing_exit or interrupted or unavailable or conflict or unconfirmed_claim or not full and not trusted_rows:
+                        reason = ("未取得测试进程的退出码" if missing_exit else
+                                  "执行中断，未取得完整检查结果" if interrupted else
+                                  "未识别到可执行断言，已保留该脚本的输出" if unconfirmed_claim else
+                                  "运行器未能完成测试" if unavailable else
+                                  "检查文本与脚本退出状态不一致" if conflict else
+                                  "命令包装或输出处理无法归属为完整用例结果")
+                        key = (obs.source, reason, invocation.scope if invocation else "")
+                        note = {"tool": obs.source, "step": record.step, "reason": reason,
+                                "check": invocation.caption if invocation else "",
+                                "exit_code": obs.meta.get("exit_code")}
+                        self._diagnostic_checks[key] = note
+                        if len(self._diagnostic_checks) > 8:
+                            del self._diagnostic_checks[next(iter(self._diagnostic_checks))]
+                        needs_review = missing_exit or interrupted or unavailable or conflict or signal.status == "failed" and invocation and not full
+                        # Wrappers can't introduce a second obligation for the same
+                        # script when an observed interrupted launch already names it.
+                        covered = invocation and invocation.script and any(
+                            item.get("selection") == invocation.selection and not full
+                            or item["scope"] == invocation.scope for item in self._pending_verification.values())
+                        if (needs_review and invocation and not covered
+                                and (not invocation.script or invocation.script in self._current)):
+                            self._pending_verification[invocation.scope] = {
+                                "scope": invocation.scope, "selection": invocation.selection, "check": invocation.caption, "path": invocation.script,
+                                "at_sha256": self._current.get(invocation.script)}
+                        signal = None
+                    elif full and signal.status in {"passed", "runner_exit"} and invocation and obs.source == "run_shell" and (
+                            obs.ok and exit_code == 0
+                            and (not changed or index >= last_mutation)):
+                        script_digest = self._current.get(invocation.script)
+                        eligible = (not invocation.script or script_digest is not None and
+                                    self._assertive_scripts.get(invocation.script) == script_digest)
+                        if eligible:
+                            self._complete_verification[invocation.scope] = invocation.caption
+                        prior = self._pending_verification.get(invocation.scope)
+                        if eligible and prior and prior.get("at_sha256") == script_digest:
+                            del self._pending_verification[invocation.scope]
                 if signal:
                     suite, status, label, cases = signal
                     case_suite = suite
@@ -717,8 +821,10 @@ class MemberProgress:
                     elif not changed or index >= last_mutation:
                         advances |= suite not in self._passes
                         self._repeat_pass |= self._passes.get(suite) == label
-                        self._passes[suite] = label
-                        self._failures.pop(suite_key, None)
+                        if full:
+                            self._passes[suite] = label
+                            if status != "runner_exit":
+                                self._failures.pop(suite_key, None)
                         for case in cases:
                             self._failures.pop(_check_key(versioned, case), None)
                             # Pre-versioned checklists used only the runner and caption.
@@ -834,6 +940,11 @@ class MemberProgress:
         self._failures.update(previous)
         self._restored_keys.update(previous)
 
+    def restore_pending_verification(self, previous):
+        for entry in previous:
+            if isinstance(entry, dict) and re.fullmatch(r"[0-9a-f]{64}", str(entry.get("scope", ""))):
+                self._pending_verification[entry["scope"]] = {k: entry.get(k) for k in ("scope", "selection", "check", "path", "at_sha256")}
+
     def require_handoff(self, reason: str) -> None:
         self._stop = reason
 
@@ -858,7 +969,7 @@ class MemberProgress:
             return "handoff"
         if not self._steps and not self._resumed:
             return "work"
-        if (budget.steps_left <= 1 or budget.actions_left <= 1
+        if (not budget.has_steps(2) or not budget.has_actions(2)
                 or not budget.has_tokens(1) or budget.seconds_left <= 0):
             self._stop = "为最终交接保留本次分工的剩余额度"
         elif self._quiet >= 7:
@@ -872,6 +983,9 @@ class MemberProgress:
     def blocked_reason(self) -> str | None:
         if self._failures:
             return "仍有检查失败：" + "、".join(sorted(set(self._failures.values()))[:4])
+        if self._pending_verification and not self._passes:
+            return "本版本尚无正常完成的检查。请直接运行以下检查并保留真实退出码：" + "、".join(
+                item["check"] for item in list(self._pending_verification.values())[:4])
         missing = sorted(self.required - self._current.keys())
         if missing:
             return "缺少约定的交付文件：" + "、".join(missing[:8])
@@ -894,6 +1008,10 @@ class MemberProgress:
             "distinct_searches": len(self._searches),
             "check_signals": list(dict.fromkeys(self._passes.values()))[-8:],
             "superseded_member_checks": [dict(entry) for entry in self._retired],
+            "diagnostic_checks": list(self._diagnostic_checks.values()),
+            "pending_verification": [{**item, "current_sha256": self._current.get(item["path"])}
+                                     for item in self._pending_verification.values()],
+            "complete_verification": dict(self._complete_verification),
             "observed_failure": list(dict.fromkeys(self._failures.values()))[-4:],
             "stop_reason": self._stop,
             "prior_check_signals_before_edits": self._prior_passes,
@@ -906,7 +1024,7 @@ class MemberProgress:
         if self._read_hint and not self._stop:
             if not (self._failures or self.pending_paths() or self._unchanged_outputs()):
                 return self._read_hint
-        if not (self._stop or self._resumed or self._passes or self._failures or self._read_hint or self._quiet >= 3
+        if not (self._stop or self._resumed or self._passes or self._failures or self._pending_verification or self._read_hint or self._quiet >= 3
                 or self._steps and self.pending_paths()):
             return ""
         evidence = self.evidence()
@@ -924,6 +1042,9 @@ class MemberProgress:
             return (f"本次分工还需交付 {missing}。与分工起点一致的文件：{unchanged}。"
                     "请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。"
                     "已有文件可作输入，只有实际修改和检查才构成本轮交付证据。已观察记录：" + facts)
+        if self._pending_verification and not self._failures:
+            return ("此前的检查曾中断，请在工作目录直接完整运行对应脚本，保留真实退出码和输出。"
+                    "已有当前版本的其他完整检查时，可注明未确认范围并交给独立成员复查。已观察记录：" + facts)
         if self._failures:
             return "已有未解决的检查失败。请针对失败修复并重跑相应检查，或明确交接阻塞。已观察记录：" + facts
         return ("新发现和必需文件已齐备时请直接提交最终交接；还有明确缺项请只处理缺项。"

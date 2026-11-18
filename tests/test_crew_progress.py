@@ -674,3 +674,91 @@ sys.exit(bool(errors))
                 self.observe("run_shell", "PASS A real case\n" + total, args={"command": "python3 test_count.py"},
                              meta={"exit_code": 0})
                 self.assertEqual(self.p.evidence()["check_signals"], [])
+
+    def test_booking04_timeout_and_wrapper_observations_leave_exact_recheck(self):
+        target = self.root / "test_api.py"
+        target.write_text("assert 2 + 2 == 4")
+        self.observe("write_file", args={"path": target.name})
+        initial = {"command": 'python3 test_api.py 2>&1 | tail -60; echo "=== EXIT: ${PIPESTATUS[0]} ==="'}
+        self.observe("run_shell", "exit_code=-9\n命令执行超时（20 秒），已停止。", args=initial,
+                     ok=False, meta={"exit_code": -9, "timed_out": True})
+        snippet = """import subprocess, sys
+p = subprocess.Popen([sys.executable, "-u", "test_api.py"], stdout=subprocess.PIPE)
+stdout, _ = p.communicate()
+lines = stdout.decode().splitlines()
+print("FAIL lines:", [line for line in lines if "FAIL" in line] or "none")
+"""
+        self.observe("run_python", "exit_code=0\nstdout:\nEXIT=0 in 2.0s\nFAIL lines: none\nPASS A",
+                     args={"code": snippet}, meta={"exit_code": 0})
+        self.assertFalse(self.p.failed_checks())
+        evidence = self.p.evidence()
+        self.assertEqual(len(evidence["diagnostic_checks"]), 2)
+        self.assertEqual(len(evidence["pending_verification"]), 1)
+        scope = evidence["pending_verification"][0]["scope"]
+        self.assertTrue(self.p.blocked_reason())  # No completed check of this candidate so far.
+        self.observe("run_browser", args={"code": "assert page.title() == 'Rooms'"}, meta={"exit_code": 0})
+        self.assertIsNone(self.p.blocked_reason())  # Candidate may be seen by another member.
+        for args in ({"command": "python3 test_api.py selected"}, {"command": "python3 test_api.py | tail -1"}):
+            self.observe("run_shell", "PASS A", args=args, meta={"exit_code": 0})
+            self.assertTrue(self.p.evidence()["pending_verification"])
+        self.observe("run_shell", "PASS A", args={"command": "python3 test_api.py"}, meta={"exit_code": 0})
+        self.assertFalse(self.p.evidence()["pending_verification"])
+        self.assertIn(scope, self.p.evidence()["complete_verification"])
+
+    def test_mixed_shell_cannot_invent_a_blocker_or_a_green_suite(self):
+        for text in ("FAIL strange diagnostic in any language", "PASS A\nPASS B", "3 passed in 0.1s"):
+            self.observe("run_shell", text, args={"command": "python3 app.py; echo 'rendered report'"},
+                         meta={"exit_code": 0})
+        self.assertFalse(self.p.failed_checks())
+        self.assertFalse(self.p.evidence()["check_signals"])
+        self.assertTrue(self.p.evidence()["diagnostic_checks"])
+
+    def test_poll_only_uses_terminal_host_receipt_for_its_original_command(self):
+        command = "python3 test_inventory.py"
+        self.observe("run_shell", "still running", args={"command": command}, meta={"process_state":"running"})
+        self.observe("poll_process", "PASS synthetic progress", meta={"process_state":"running"})
+        self.assertEqual(self.p.evidence()["executions"]["run_shell_calls"], 0)
+        self.observe("poll_process", "FAIL inventory", args={"command":"python3 irrelevant.py"},
+                     ok=False, meta={"process_state":"exited","command":command,"cwd":".","exit_code":1})
+        self.assertTrue(self.p.failed_checks())
+        self.observe("run_shell", "PASS inventory", args={"command":command}, meta={"exit_code":0})
+        self.assertFalse(self.p.failed_checks())
+        self.assertEqual(self.p.evidence()["executions"]["run_shell_calls"], 2)
+
+    def test_real_truncation_metadata_is_distinct_from_business_text(self):
+        self.observe("run_shell", "PASS 截断的 JSON 可以读取", args={"command":"python3 test_formats.py"},
+                     meta={"exit_code":0, "truncated":False})
+        self.assertIn("1 项 PASS", self.p.evidence()["check_signals"][0])
+        src = self.root / "test_formats.py"
+        src.write_text("assert len('xy') == 2")
+        self.observe("write_file", args={"path":src.name})
+        command = {"command":"python3 test_formats.py"}
+        self.observe("run_shell", "FAIL named case", args=command, meta={"exit_code":1}, ok=False)
+        self.observe("run_shell", "PASS another case\n…[已截断]…\nPASS last", args=command,
+                     meta={"exit_code":0, "truncated":True})
+        self.assertTrue(self.p.failed_checks())
+        self.assertIn("输出已截断", self.p.evidence()["check_signals"][-1])
+
+    def test_clipped_print_only_script_cannot_confirm_a_pending_verification(self):
+        path = self.root / "dummy.py"
+        path.write_text("print('PASS ' * 9000)")
+        self.observe("write_file", args={"path":path.name})
+        self.observe("run_shell", "PASS yes", args={"command":"python3 dummy.py"},
+                     meta={"exit_code":0,"truncated":True})
+        self.assertFalse(self.p.evidence()["complete_verification"])
+        self.observe("run_shell", "PASS yes", args={"command":"python3 dummy.py"}, meta={"exit_code":0})
+        self.assertFalse(self.p.evidence()["check_signals"])
+
+    def test_echo_wrapper_only_certifies_the_final_child_exit_receipt(self):
+        path = self.root / "test_inventory.py"
+        path.write_text("assert 2 == 2")
+        self.observe("write_file", args={"path":path.name})
+        cmd = {"command": 'python3 test_inventory.py; echo "EXIT=$?"'}
+        self.observe("run_shell", "PASS inventory", args=cmd, meta={"exit_code":0,"truncated":True})
+        self.assertTrue(self.p.evidence()["pending_verification"])
+        self.assertFalse(self.p.evidence()["complete_verification"])
+        self.observe("run_shell", "FAIL inventory\nEXIT=1", args=cmd, meta={"exit_code":0})
+        self.assertTrue(self.p.failed_checks())
+        self.observe("run_shell", "PASS inventory\nEXIT=0", args=cmd, meta={"exit_code":0})
+        self.assertFalse(self.p.failed_checks())
+        self.assertFalse(self.p.evidence()["pending_verification"])

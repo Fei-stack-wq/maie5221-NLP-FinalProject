@@ -132,3 +132,13 @@ print("PASS: submitted the booking through the visible form")
 `pytest.TestReport` 将用例身份、执行阶段和结果单独保存，捕获的标准输出属于诊断信息。TAP 同样区分逐项结果与说明。Studio 接受普通脚本的文本输出，因此只识别其中可核对的简易格式。当脚本给出 `PASS n/n, FAIL 0` 且 n 大于零时，紧随其后的 `FAIL details: []`、`FAIL 明细：无` 等空清单属于汇总。同一工具把这段清单再次显示时可保留原始日志；空清单不会生成用例。总数行自身不会授予通过。实际逐项 FAIL、非零退出、相互矛盾的总数或缺失计数仍保留原来可见的失败证据。[pytest 8.3.5 的 TestReport](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py) · [TAP 13 的结果与诊断](https://testanything.org/tap-version-13-specification.html)
 
 QA 重新编写脚本时可沿用 `C4` 等编号。两个不同脚本中的编号和标题即使完全相同，也无法建立可靠的用例对应关系。新脚本记录自己的执行结果，原脚本的失败继续留在交接清单。负责人的诊断可以分别引用两份证据。[回归测试](../tests/test_crew_progress.py)
+
+### 执行结果、诊断输出与待复验的候选版本
+
+Shell 回执记录实际执行的命令、退出码、超时和输出裁剪；Python 包装程序打印的文字只证明该包装程序输出了这些文字。成员进度只把可归属的用例或断言失败计入硬失败。诊断脚本自己加工的输出、无法归属的混合命令与中断检查保留为观察。成员报告和检查点最多公布八条诊断摘要，每条包括工具、步骤、原因和实际退出码。回执不会复制任意命令内容或参数值到其他成员的提示中。后台任务只在宿主返回终态时记录执行结果。
+
+当已知套件中断或返回矛盾结果时，成员可在原工作目录直接重跑同一命令。完整的当前版本回执可解除待复验项。输出缓冲已裁剪时，宿主仍可记录受识别的测试进程已完整退出；这种回执不提供缺失的逐项结果，也不能核销已有断言失败。成员在当前候选版本上有其他完成的检查时可以交接工件。未确认的范围随工件送到另一成员。负责人收尾前，独立成员须对同一参数范围实际复验并在交接中说明。改变候选文件后需要复核新版本。用户绑定的验收条件仍由独立验收器执行。
+
+在 booking-04 中，20 秒系统超时产生了第一个旧阻塞。后来的 Python 包装程序在套件退出 0 后打印的 `FAIL lines: none` 产生了第二个。直接重跑套件时，“截断的 JSON”是用例名称，通过宿主的 `truncated` 字段可以区分该名称与输出裁剪。普通测试文本不能替代该字段。测试在独立项目副本上完整运行，实际退出 0，返回 6,083 字节标准输出。宿主记录完整进程的状态和裁剪情况；套件自身报告 132 项通过。
+
+Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与截取输出。pytest 的 TestReport 将用例身份、结果与捕获的标准输出分开，原生退出码还能区分断言失败、用户中断、命令用法错误、缺少测试等情况。本项目复用这两个边界，并用工件摘要和执行范围约束跨成员复验。[Pi Bash 固定版本](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L388-L437) · [Pi 进程已退出而管道超时的回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/suite/regressions/11613-bash-timeout-after-shell-exit.test.ts#L16-L48) · [pytest TestReport](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py) · [pytest 退出码](https://docs.pytest.org/en/stable/reference/exit-codes.html)

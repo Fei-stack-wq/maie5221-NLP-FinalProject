@@ -18,12 +18,13 @@ import sqlite3
 import sys
 import uuid
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote
 
 from .agent import Agent
-from .config import Settings
+from .config import Settings, configured_limits
 from .metrics import Tracer, load_events, render_report, summarize
 from .providers import DeepSeekProvider, Provider, ProviderError, ScriptedProvider
 from .acceptance import AcceptanceInput, accept_files
@@ -155,7 +156,15 @@ def _main(argv: list[str] | None = None) -> int:
     studio.add_argument("--no-env", action="store_true", help="只使用进程环境变量")
     studio.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
 
+    for cmd in (run, demo, evaluate, orchestrate):
+        cmd.add_argument("--max-steps", type=int, help="模型累计轮数上限，0 为不限，默认读取任务配置")
+
     args = parser.parse_args(argv)
+    if getattr(args, "max_steps", None) is not None:
+        try:
+            settings = replace(settings, limits=configured_limits(settings.limits, {"max_steps": args.max_steps}))
+        except ValueError as exc:
+            parser.error(str(exc))
 
     if args.command == "studio":
         return _cmd_studio(args, settings)
@@ -496,7 +505,6 @@ def _make_provider_factory(
 
 
 def _cmd_provider_smoke(args: argparse.Namespace, settings: Settings) -> int:
-    from dataclasses import replace
     from .provider_smoke import run_provider_smoke
 
     settings = replace(settings, thinking=args.thinking)

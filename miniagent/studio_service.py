@@ -436,6 +436,11 @@ class StudioService(RoomDiscussion, StudioRoles):
         except ValueError:
             duration = 0
         thread = thread_info(path.name, meta)
+        limits = dict(meta.get("effective_limits", meta.get("request", {}).get("limits", {})))
+        if "max_steps" not in limits:
+            config = next((e.get("configuration", {}) for e in events if e.get("kind") == "studio_configuration"), {})
+            if "max_steps" in config:
+                limits["max_steps"] = config["max_steps"]
         return {"conversation_id": thread["id"] if thread else None,
                 "conversation_kind": thread["kind"] if thread else None,
                 "recipient": thread["recipient"] if thread else None,
@@ -443,7 +448,7 @@ class StudioService(RoomDiscussion, StudioRoles):
                 "status": status, "created_at": created, "finished_at": ended,
                 "duration_ms": None if status == "interrupted" else round(duration, 2),
                 "task_count": len(tasks), "completed_count": sum(task["status"] == "completed" for task in tasks),
-                "limits": meta.get("request", {}).get("limits", {}),
+                "limits": limits,
                 "workspace_path": meta.get("workspace_path"),
                 "workspace_delivery": meta.get("workspace_delivery"),
                 "workspace_member_delivery": meta.get("workspace_member_delivery"),
@@ -858,7 +863,9 @@ class StudioService(RoomDiscussion, StudioRoles):
             published = False
             try:
                 staged = Path(tempfile.mkdtemp(prefix=".studio-pending-", dir=self.runs_dir))
+                effective = configured_limits(self.settings.limits, request.get("limits", {}))
                 meta = {"schema_version": 1, "request_id": request["request_id"], "fingerprint": fingerprint,
+                        "effective_limits": {k: getattr(effective, k) for k in ("max_steps", "max_total_tokens", "max_seconds")},
                         "request": request, "title": request["objective"], "mode": request["mode"],
                         "state": "queued", "created_at": _now()}
                 assignee = "orchestrator" if request["mode"] in {"team", "team-demo"} else "worker"
@@ -1192,8 +1199,9 @@ class StudioService(RoomDiscussion, StudioRoles):
         # optional Studio import becoming a module cycle.
         from .cli import DEMO_SCRIPT, _load_orchestration_acceptance
         path = self._directory(run_id)
+        saved_limits = self._meta(path).get("effective_limits", request.get("limits", {}))
         settings = replace(self.settings, thinking=request["thinking"],
-                           limits=configured_limits(self.settings.limits, request.get("limits", {})))
+                           limits=configured_limits(self.settings.limits, saved_limits))
         should_cancel = self._cancellations[run_id].is_set
         mode = request["mode"]
         examples = Path(__file__).resolve().parent.parent / "examples"

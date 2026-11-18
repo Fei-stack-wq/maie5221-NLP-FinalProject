@@ -25,7 +25,7 @@ from .config import Limits
 from .project_navigation import find_files, read_lines, search_files
 from .research import http_get as _http_get, search_sources
 from .sandbox import Sandbox, SandboxError
-from .shell_tool import project_environment, run_posix_argv, run_shell as _run_shell
+from .shell_tool import command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell
 from .schemas import ToolResult, ToolSpec
 from .file_tools import (MAX_READ_CHARS, MAX_WRITE_CHARS, read_file as _read_file,
                          write_file as _write_file, edit_file as _edit_file, append_file as _append_file)
@@ -94,6 +94,8 @@ class ToolContext:
     limits: Limits
     approve: Callable[[str], bool] | None = None
     """返回 False 即拒绝。默认 None = 一律拒绝危险操作。"""
+    deadline: float | None = None
+    should_cancel: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -203,8 +205,9 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"))
 
     # Keep the native Python path on hosts without POSIX process groups.
-    timeout = float(args.get("timeout") or ctx.limits.tool_timeout_seconds)
-    timeout = min(timeout, ctx.limits.tool_timeout_seconds)
+    timeout = command_timeout(ctx, args.get("timeout"))
+    if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
+        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
 
     # -I: 隔离模式（忽略 PYTHONPATH / 用户 site-packages），避免环境污染。
     # cwd 设为沙箱根目录，相对路径天然落在 agent 自己的目录里。
@@ -360,7 +363,7 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "description": "要执行的 Python 源码"},
-                    "timeout": {"type": "number", "description": "运行时限（秒），最大为工具配置时限"},
+                    "timeout": {"type": "number", "description": "默认 120 秒，可显式申请更长；受部署上限与任务剩余时间约束。"},
                 },
                 "required": ["code"],
             },
@@ -375,9 +378,20 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
             parameters={"type": "object", "properties": {
                 "command": {"type": "string", "description": "交给 /bin/sh -c 的命令"},
                 "cwd": {"type": "string", "description": "项目内已有的相对目录，默认项目根目录"},
-                "timeout": {"type": "number", "description": "运行时限（秒），最大为工具配置时限"},
+                "timeout": {"type": "number", "description": "默认 120 秒，可显式申请更长；受部署上限与任务剩余时间约束。"},
+                "yield_after_seconds": {"type": "number", "description": "成员可选提前返回的等待秒数；未结束则返回进程句柄，须用 poll_process 领取真实退出码。"},
             }, "required": ["command"]},
             fn=_run_shell,
+        )
+    )
+    registry.add(
+        Tool(
+            name="poll_process",
+            description="领取本成员 run_shell 的进程结果。运行中只返回句柄，终态返回一次真实退出码和输出。",
+            parameters={"type":"object", "properties":{
+                "process_id":{"type":"string"}, "wait_seconds":{"type":"number", "description":"最多等待秒数，默认 10，0 为立即查询。"}},
+                "required":["process_id"]},
+            fn=poll_process,
         )
     )
     registry.add(
@@ -389,7 +403,7 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
             parameters={"type": "object", "properties": {
                 "code": {"type": "string", "description": "Python 源码。可直接使用完整的 Playwright 同步 API"},
                 "cwd": {"type": "string", "description": "项目内已有的相对目录，默认项目根目录"},
-                "timeout": {"type": "number", "description": "整次测试的时限（秒），最大为工具配置时限"},
+                "timeout": {"type": "number", "description": "浏览器测试默认 120 秒，可显式延长，仍受宿主上限和任务剩余时间约束。"},
             }, "required": ["code"]},
             fn=run_browser,
         )

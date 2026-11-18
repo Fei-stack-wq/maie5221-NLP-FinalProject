@@ -7,7 +7,11 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,13 +90,15 @@ def _stop_timed_out_process(process):
             pass
 
 
-def _drain(process, stdout, stderr, deadline):
+def _drain(process, stdout, stderr, deadline, should_cancel):
     with selectors.DefaultSelector() as poller:
         for stream, sink in [(process.stdout, stdout), (process.stderr, stderr)]:
             poller.register(stream, selectors.EVENT_READ, sink)
         exited_at = None
-        while poller.get_map():
+        while poller.get_map() or process.poll() is None:
             now = time.monotonic()
+            if should_cancel and should_cancel():
+                return False
             if process.poll() is not None:
                 # An intentional background service may retain a pipe after
                 # its launching shell exits. Only drain already pending output.
@@ -103,6 +109,9 @@ def _drain(process, stdout, stderr, deadline):
             if now >= deadline and exited_at is None:
                 raise subprocess.TimeoutExpired(process.args, 0)
             wait = 0 if exited_at is not None else min(0.1, max(0, deadline - now))
+            if not poller.get_map():
+                time.sleep(wait)
+                continue
             events = poller.select(wait)
             if not events and exited_at is not None:
                 break
@@ -112,7 +121,7 @@ def _drain(process, stdout, stderr, deadline):
                     key.data.add(chunk)
                 else:
                     poller.unregister(key.fileobj)
-    process.wait(timeout=max(0, deadline - time.monotonic()))
+    return True
 
 
 def run_shell(ctx: ToolContext, args: dict) -> ToolResult:
@@ -124,29 +133,49 @@ def run_shell(ctx: ToolContext, args: dict) -> ToolResult:
     cwd = ctx.sandbox.resolve(args.get("cwd", "."), must_exist=True)
     if not cwd.is_dir():
         return ToolResult.failure("命令工作目录必须是项目中的目录。")
-    return run_posix_argv(ctx, ["/bin/sh", "-c", command], cwd, args.get("timeout"))
+    argv = ["/bin/sh", "-c", command]
+    if "yield_after_seconds" in args:
+        sessions = ctx.sandbox.command_sessions
+        if sessions is None:
+            return ToolResult.failure("此工作区没有活动进程作用域，请省略 yield_after_seconds 以前台执行。")
+        return sessions.start(ctx, argv, cwd, args)
+    return run_posix_argv(ctx, argv, cwd, args.get("timeout"))
+
+
+def command_timeout(ctx, requested):
+    seconds = 120.0 if requested is None else float(requested)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("超时秒数必须是有限正数。")
+    timeout = min(seconds, ctx.limits.tool_timeout_seconds)
+    if ctx.deadline is not None:
+        timeout = min(timeout, max(0, ctx.deadline - time.monotonic()))
+    return timeout
 
 
 def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeout=None) -> ToolResult:
-    limit = ctx.limits.tool_timeout_seconds
-    timeout = min(float(requested_timeout) if requested_timeout is not None else limit, limit)
-    if not math.isfinite(timeout) or timeout <= 0:
-        return ToolResult.failure("超时秒数必须是正数。")
+    try:
+        timeout = command_timeout(ctx, requested_timeout)
+    except ValueError as exc:
+        return ToolResult.failure(str(exc))
+    if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
+        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
     started = time.monotonic()
     stdout, stderr = _Output(), _Output()
     timed_out = False
+    cancelled = False
     with subprocess.Popen(
         argv, cwd=cwd, env=project_environment(ctx), stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
     ) as process:
         try:
-            _drain(process, stdout, stderr, started + timeout)
+            cancelled = not _drain(process, stdout, stderr, started + timeout, ctx.should_cancel)
         except subprocess.TimeoutExpired:
             timed_out = True
-            _stop_timed_out_process(process)
-            process.wait()
         finally:
-            if not timed_out:
+            if timed_out or cancelled:
+                _stop_timed_out_process(process)
+                process.wait()
+            else:
                 if process.poll() is None or ctx.sandbox.track_shell_group is None:
                     # Only managed members can own a background server between calls.
                     _kill_group(process.pid)
@@ -156,14 +185,91 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     parts = [f"exit_code={process.returncode}"]
     if timed_out:
         parts.append(f"命令执行超时（{timeout:g} 秒），已停止。")
+    if cancelled:
+        parts.append("命令已取消，已回收进程。")
     for name, stream in [("stdout", stdout), ("stderr", stderr)]:
         if stream.count:
             parts.append(f"{name}:\n{stream.text()}")
     if not stdout.count and not stderr.count and not timed_out:
         parts.append("（无输出）")
     return ToolResult(
-        ok=not timed_out and process.returncode == 0, content="\n".join(parts),
+        ok=not timed_out and not cancelled and process.returncode == 0, content="\n".join(parts),
         meta={"exit_code": process.returncode, "elapsed_ms": elapsed, "timeout_s": timeout,
-              "timed_out": timed_out, "cwd": ctx.sandbox.relative(cwd), "stdout_bytes": stdout.count,
+              "timed_out": timed_out, "cancelled": cancelled, "cwd": ctx.sandbox.relative(cwd), "stdout_bytes": stdout.count,
               "stderr_bytes": stderr.count, "truncated": stdout.truncated or stderr.truncated},
     )
+
+
+class CommandSessions:
+    """Uncollected shell results belong to one member scope, including after exit."""
+
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="miniagent-shell")
+        self.stopping = threading.Event()
+        self.jobs = {}
+
+    def start(self, ctx, argv, cwd, args):
+        wait = args["yield_after_seconds"]
+        if not math.isfinite(wait) or wait < 0:
+            return ToolResult.failure("等待时间须为非负有限秒数。")
+        if len(self.jobs) >= 4:
+            return ToolResult.failure("当前成员已有四个未领取的进程结果，请先用 poll_process 领取。")
+        # Validate before issuing a handle, even when the caller asks for an immediate yield.
+        timeout = command_timeout(ctx, args.get("timeout"))
+        if timeout <= 0:
+            return ToolResult.failure("本次执行时间已用完。")
+        handle = uuid.uuid4().hex
+        def cancelled():
+            return self.stopping.is_set() or bool(ctx.should_cancel and ctx.should_cancel())
+        worker = replace(ctx, should_cancel=cancelled)
+        future = self.executor.submit(run_posix_argv, worker, argv, cwd, timeout)
+        self.jobs[handle] = (future, args["command"])
+        return self.poll(handle, min(wait, timeout))
+
+    def poll(self, handle, wait):
+        job = self.jobs.get(handle)
+        if job is None:
+            return ToolResult.failure("当前分工没有该进程，或它的最终结果已领取。")
+        if not math.isfinite(wait) or wait < 0:
+            return ToolResult.failure("等待时间须为非负有限秒数。")
+        future, command = job
+        try:
+            result = future.result(timeout=wait)
+        except FutureTimeout:
+            # A completion racing this timeout remains available on the next poll.
+            return ToolResult.success(f"运行中：{handle}。用 poll_process 领取最终输出和退出码。",
+                                      process_id=handle, process_state="running")
+        except Exception:
+            del self.jobs[handle]
+            raise
+        del self.jobs[handle]
+        state = "exited" if "exit_code" in result.meta else "not_started"
+        if result.meta.get("cancelled"):
+            state = "cancelled"
+        elif result.meta.get("timed_out"):
+            state = "timed_out"
+        result.meta.update(process_id=handle, process_state=state, command=command)
+        return result
+
+    def close(self):
+        self.stopping.set()
+        self.executor.shutdown(wait=True)
+        self.jobs.clear()
+
+    def pending_reason(self):
+        if self.jobs:
+            return "命令尚未领取最终结果。请用 poll_process 查询这些句柄：" + "、".join(self.jobs)
+        return ""
+
+
+def poll_process(ctx, args):
+    sessions = ctx.sandbox.command_sessions
+    if sessions is None:
+        return ToolResult.failure("此工作区没有活动进程作用域。")
+    wait = args.get("wait_seconds", 10.0)
+    if not math.isfinite(wait) or wait < 0:
+        return ToolResult.failure("等待时间须为非负有限秒数。")
+    wait = min(wait, ctx.limits.tool_timeout_seconds)
+    if ctx.deadline is not None:
+        wait = min(wait, max(0, ctx.deadline - time.monotonic()))
+    return sessions.poll(args["process_id"], wait)
