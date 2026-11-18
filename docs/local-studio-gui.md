@@ -234,7 +234,7 @@ POST 使用 `application/json` 和 bootstrap 下发的 `X-Studio-Token`，同时
 
 最新游戏任务实际耗尽的是 **12 轮调用**：全部响应 `finish_reason=tool_calls`，累计 completion 为 31709 tokens；四个代码文件已生成。完整复盘、开源依据、基础能力验收及下一阶段见 [Harness 基础能力](harness-foundations.md)。历史运行保持原样，页面从日志区分轮数、输出截断、累计 token、时间、重复循环与验收失败。
 
-新的默认值：100 轮、累计 1000000 tokens、3600 秒；单次输出仍为 300000。真实模型任务的“选项”可覆盖前三项，只影响新运行。`limits` 示例为 `{"max_steps":200,"max_total_tokens":3000000,"max_seconds":7200}`；允许范围分别是整数 1..1000、整数 1..100000000、数值 1..86400。环境入口为 `MA_MAX_STEPS`、`MA_MAX_TOTAL_TOKENS`、`MA_MAX_SECONDS`。这些限制不是严格费用预留，实际调用可能在收到响应后才确认超支。
+当前默认 100 轮、3600 秒、累计 token 不限（0）。单次输出上限仍为 300000。真实模型任务的“选项”可覆盖前三项，只影响新运行。`limits` 示例为 `{"max_steps":200,"max_total_tokens":3000000,"max_seconds":7200}`；允许范围分别是整数 1..1000、整数 0..100000000、数值 1..86400。续聊时可点“本轮设为不限”覆盖上一轮的累计额度，历史配置仍可核查。环境入口为 `MA_MAX_STEPS`、`MA_MAX_TOTAL_TOKENS`、`MA_MAX_SECONDS`。这些限制不是严格费用预留，实际调用可能在收到响应后才确认超支。
 
 默认最多进行两次输出截断恢复；不完整工具调用不执行，恢复也消耗原任务轮数和 token。旧历史与下一轮请求视图分离，必要时按完整工具批次裁剪；这是明确告知的历史省略，尚未实现语义摘要。文件工具新增 `edit_file` 和 `append_file`，`read_file` 支持分页并返回完整文件 hash，避免反复重写整个文件。
 

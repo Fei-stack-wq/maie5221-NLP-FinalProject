@@ -213,6 +213,18 @@ class RaoStepTest(unittest.TestCase):
 
 
 class BudgetTest(unittest.TestCase):
+    def test_unlimited_cumulative_tokens_propagate_to_forks_without_losing_usage(self):
+        parent = Budget.from_limits(Limits(max_total_tokens=0))
+        child = parent.fork()
+        for budget in (parent, child):
+            self.assertIsNone(budget.tokens_left)
+            budget.spend(tokens=1_250_000)
+            self.assertFalse(budget.exhausted)
+            self.assertIsNone(budget.available_tokens(reserve=100))
+            self.assertEqual(budget.tokens_used, 1_250_000)
+        child.spend(steps=child.steps_left)
+        self.assertTrue(child.exhausted)
+
     def test_spend_and_exhaust(self) -> None:
         budget = Budget(steps_left=2, seconds_left=10.0, tokens_left=100, actions_left=4)
         self.assertFalse(budget.exhausted)

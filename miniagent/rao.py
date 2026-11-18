@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from .config import Limits
 from .providers import DeepSeekProvider, Provider
@@ -199,7 +199,9 @@ class Budget(BaseModel):
 
     steps_left: int = Field(default_factory=lambda: Limits().max_steps)
     seconds_left: float = Field(default_factory=lambda: Limits().max_seconds)
-    tokens_left: int = Field(default_factory=lambda: Limits().max_total_tokens)
+    # None disables the cumulative cap. Zero is an exhausted finite allocation.
+    tokens_left: int | None = Field(default_factory=lambda: Limits().max_total_tokens or None)
+    _tokens_used: int = PrivateAttr(default=0)
     actions_left: int = Field(default_factory=lambda: Limits().max_steps * Limits().max_tool_calls_per_step)
 
     @classmethod
@@ -208,7 +210,7 @@ class Budget(BaseModel):
         return cls(
             steps_left=max(1, int(limits.max_steps * factor)),
             seconds_left=limits.max_seconds * factor,
-            tokens_left=int(limits.max_total_tokens * factor),
+            tokens_left=int(limits.max_total_tokens * factor) if limits.max_total_tokens else None,
             actions_left=max(
                 1,
                 int(limits.max_steps * max(1, limits.max_tool_calls_per_step) * factor),
@@ -225,16 +227,30 @@ class Budget(BaseModel):
     ) -> "Budget":
         self.steps_left -= steps
         self.actions_left -= actions
-        self.tokens_left -= tokens
+        self._tokens_used += tokens
+        if self.tokens_left is not None:
+            self.tokens_left -= tokens
         self.seconds_left -= seconds
         return self
+
+    @property
+    def tokens_used(self) -> int:
+        """Measured usage is independent of the remaining allocation."""
+        return self._tokens_used
+
+    def has_tokens(self, minimum: int) -> bool:
+        """Whether a reservation or request is affordable in this allocation."""
+        return self.tokens_left is None or self.tokens_left >= minimum
+
+    def available_tokens(self, reserve: int = 0) -> int | None:
+        return None if self.tokens_left is None else self.tokens_left - reserve
 
     @property
     def exhausted(self) -> bool:
         return (
             self.steps_left <= 0
             or self.actions_left <= 0
-            or self.tokens_left < 0
+            or not self.has_tokens(0)
             or self.seconds_left <= 0
         )
 
@@ -247,7 +263,7 @@ class Budget(BaseModel):
             return f"超过最大步数 {total}"
         if self.actions_left <= 0:
             return "超过动作总数上限"
-        if self.tokens_left < 0:
+        if not self.has_tokens(0):
             total = limits.max_total_tokens if limits else 0
             return f"超过 token 预算 {total}"
         return "预算耗尽"
@@ -258,12 +274,13 @@ class Budget(BaseModel):
         child = Budget(
             steps_left=max(1, int(self.steps_left * ratio)) if self.steps_left > 1 else self.steps_left,
             seconds_left=self.seconds_left * ratio,
-            tokens_left=int(self.tokens_left * ratio),
+            tokens_left=None if self.tokens_left is None else int(self.tokens_left * ratio),
             actions_left=max(1, int(self.actions_left * ratio)),
         )
         self.steps_left -= child.steps_left
         self.seconds_left -= child.seconds_left
-        self.tokens_left -= child.tokens_left
+        if self.tokens_left is not None:
+            self.tokens_left -= child.tokens_left
         self.actions_left -= child.actions_left
         return child
 
@@ -715,7 +732,7 @@ class RAOUnit:
             call_id = action.id
             if self.should_cancel and self.should_cancel():
                 terminate = ErrorClass.T_CANCEL
-            elif budget.tokens_left < 0 or budget.seconds_left <= 0:
+            elif not budget.has_tokens(0) or budget.seconds_left <= 0:
                 terminate = ErrorClass.T_BUDGET
             if terminate:
                 obs = Observation(
@@ -725,7 +742,7 @@ class RAOUnit:
                              else "未执行：时间或 token 预算已耗尽。" if terminate == ErrorClass.T_BUDGET
                              else "未执行：前序动作已终止本轮任务。"), ts=time.time(),
                 )
-            elif batch_denial or budget.tokens_left < token_reserve:
+            elif batch_denial or not budget.has_tokens(token_reserve):
                 obs = Observation(
                     step_id=step_id, source=action.tool, ok=False, error_class=ErrorClass.A_SKIPPED,
                     content=batch_denial or "本轮剩余 token 已进入收尾预留额度，未执行动作。", ts=time.time(),
@@ -986,7 +1003,7 @@ class RAOUnit:
         if self.should_cancel and self.should_cancel():
             return StepRecord(step=state.step_index, ok=False, decision_kind="abort",
                               error_class=ErrorClass.T_CANCEL, terminate_reason=ErrorClass.T_CANCEL)
-        if budget.tokens_left < 0 or budget.seconds_left <= 0:
+        if not budget.has_tokens(0) or budget.seconds_left <= 0:
             return StepRecord(step=state.step_index, ok=False,
                               error_class=ErrorClass.T_BUDGET, terminate_reason=ErrorClass.T_BUDGET)
         decision, response = self.decide(state, request_history, max_output_tokens=max_output_tokens,
@@ -1011,7 +1028,7 @@ class RAOUnit:
             state.history.append(message)
         protocol_error = decision.protocol_error or envelope_error
         cancelled = bool(self.should_cancel and self.should_cancel())
-        budget_overrun = budget.tokens_left < 0 or budget.seconds_left <= 0
+        budget_overrun = not budget.has_tokens(0) or budget.seconds_left <= 0
         if protocol_error or cancelled or budget_overrun:
             terminate = (ErrorClass.T_CANCEL if cancelled else ErrorClass.T_BUDGET
                          if budget_overrun else ErrorClass.T_PROTOCOL)

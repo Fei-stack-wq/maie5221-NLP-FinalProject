@@ -176,7 +176,43 @@ def _parse_response(raw: bytes, attempts: int) -> dict[str, Any]:
         raise ProviderError("Provider returned an invalid JSON object", code="invalid_response", attempts=attempts) from None
 
 
-def _http_error(status: int, attempts: int) -> ProviderError:
+def _is_context_overflow(response, status, deadline, timeout, attempts):
+    """Classify only a bounded structured error. Never forward its message."""
+    if status not in (400, 413, 422):
+        return False
+    reader = getattr(response, "read1", None)
+    if not callable(reader):
+        return False
+    buf = bytearray()
+    try:
+        while len(buf) <= 8192:
+            _clamp_socket_timeout(response, min(timeout, _remaining(deadline, attempts)))
+            part = reader(8193 - len(buf))
+            if not isinstance(part, bytes):
+                return False
+            if not part:
+                break
+            buf.extend(part)
+        if len(buf) > 8192:
+            return False
+        error = json.loads(buf).get("error", {})
+        if not isinstance(error, dict):
+            return False
+        code = str(error.get("code", "")).lower()
+        if code in {"context_length_exceeded", "context_window_exceeded", "prompt_too_long"}:
+            return True
+        message = str(error.get("message", "")).lower()
+        return any(phrase in message for phrase in (
+            "maximum context length is", "exceeds the model's context length",
+            "input length exceeds the context length", "prompt is too long"))
+    except (ValueError, AttributeError, OSError, RecursionError, http.client.HTTPException):
+        return False
+
+
+def _http_error(status: int, attempts: int, overflow: bool = False) -> ProviderError:
+    if overflow:
+        return ProviderError("Provider rejected a request exceeding its context window",
+                             code="context_length_exceeded", status_code=status, attempts=attempts)
     redirect = 300 <= status < 400
     return ProviderError(
         "Provider redirect was refused" if redirect else "Provider returned an HTTP error",
@@ -243,6 +279,8 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
                 if type(status) is not int:
                     raise ProviderError("Provider response lacks an HTTP status", code="invalid_response", attempts=attempt)
                 if not 200 <= status < 300:
+                    if _is_context_overflow(response, status, deadline, timeout, attempt):
+                        raise _http_error(status, attempt, overflow=True)
                     raise urllib.error.HTTPError(url, status, "", response.headers, None)
                 raw = _read_response(response, deadline, timeout, attempt)
                 data = _parse_response(raw, attempt)
@@ -254,9 +292,12 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
         except ProviderError:
             raise
         except urllib.error.HTTPError as exc:
-            error = _http_error(exc.code, attempt)
+            try:
+                overflow = _is_context_overflow(exc, exc.code, deadline, timeout, attempt)
+            finally:
+                _close(exc)
+            error = _http_error(exc.code, attempt, overflow)
             retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
-            _close(exc)
         except urllib.error.URLError as exc:
             timed_out = isinstance(exc.reason, TimeoutError)
             error = ProviderError("Provider request timed out" if timed_out else "Provider network request failed",

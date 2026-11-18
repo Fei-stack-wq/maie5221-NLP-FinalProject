@@ -530,7 +530,7 @@ class MemberProgress:
         if not self._steps and not self._resumed:
             return "work"
         if (budget.steps_left <= 1 or budget.actions_left <= 1
-                or budget.tokens_left <= 0 or budget.seconds_left <= 0):
+                or not budget.has_tokens(1) or budget.seconds_left <= 0):
             self._stop = "为最终交接保留本次分工的剩余额度"
         elif self._quiet >= 7:
             self._stop = "连续七轮没有新的文件、来源或检查结果"

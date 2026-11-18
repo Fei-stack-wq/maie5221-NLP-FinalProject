@@ -111,6 +111,7 @@ class StudioHarnessTest(unittest.TestCase):
         default_config = next(event["configuration"] for event in default_detail["events"]
                               if event["kind"] == "studio_configuration")
         self.assertEqual(default_config["max_steps"], 100)
+        self.assertEqual(default_config["max_total_tokens"], 0)
         self.assertEqual(self.service.settings.limits.max_steps, 100)
         self.assertEqual(self.service.detail(run["id"])["run"]["status"], "failed")
         with self.archive(run["id"]) as archive:
@@ -119,7 +120,7 @@ class StudioHarnessTest(unittest.TestCase):
     def test_invalid_budget_ranges_and_types_do_not_create_runs(self):
         invalid = [None, [], {"unknown": 2}, {"max_steps": 0}, {"max_steps": 1001},
                    {"max_steps": True}, {"max_steps": 2.5}, {"max_steps": "20"},
-                   {"max_total_tokens": 0}, {"max_total_tokens": 100000001},
+                   {"max_total_tokens": -1}, {"max_total_tokens": 100000001},
                    {"max_total_tokens": False}, {"max_seconds": 0}, {"max_seconds": 86401},
                    {"max_seconds": float("inf")}, {"max_seconds": float("nan")},
                    {"max_seconds": True}]

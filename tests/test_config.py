@@ -21,7 +21,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.max_output_tokens, 300_000)
         self.assertEqual(settings.request_timeout_seconds, 120)
         self.assertEqual(settings.request_deadline_seconds, 3600)
-        self.assertEqual(settings.limits.max_total_tokens, 1_000_000)
+        self.assertEqual(settings.limits.max_total_tokens, 0)
         self.assertEqual(settings.limits.max_seconds, 3600)
         self.assertEqual(settings.limits.max_steps, 100)
         self.assertEqual(settings.max_retries, 2)
@@ -198,7 +198,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_invalid_budget_configuration_never_silently_disables_a_limit(self):
         for key, values in {"max_steps": [0, 1001, True, "12", 1.5],
-                            "max_total_tokens": [0, 100000001, True, "100"],
+                            "max_total_tokens": [-1, 100000001, True, "100"],
                             "max_seconds": [0, 86401, float("nan"), float("inf"), True]}.items():
             for value in values:
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):

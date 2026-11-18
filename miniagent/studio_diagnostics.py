@@ -87,7 +87,7 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
                 prompt, output = event.get("prompt_tokens"), event.get("completion_tokens")
                 if type(prompt) is int and type(output) is int:
                     error += f"。本次累计输入 {prompt:,}、输出 {output:,}，合计 {prompt + output:,} tokens。"
-                suggestion = "每轮重发的历史也计入输入。可查看逐轮消耗和重复工具结果，按需要从保留的工件继续。"
+                suggestion = "每轮重发的历史也计入累计用量。新一轮可将累计 token 预算设为 0（不限），继续使用保留的工件。"
                 if any(e.get("kind") == "token_budget_preflight" and scope(e) == scope(event) for e in events):
                     title = "剩余 token 预算不足以发起下一轮"
             elif "时间" in error:
@@ -105,6 +105,10 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
         if any(e.get("kind") == "context_limit" and e.get("task_id") == identity for e in events):
             code, title = "context_limit", "上下文估计超过当前请求空间"
             suggestion = "旧历史已按完整工具批次裁剪；受保护的指令和最近批次仍过大，需要拆分任务或缩短输入。"
+        if any(e.get("kind") == "provider_error" and e.get("code") == "context_length_exceeded"
+               and scope(e) == scope(event) and not e.get("recovery") for e in events):
+            code, title = "provider_context_limit", "模型服务拒绝了超出窗口的请求"
+            suggestion = "检查本轮输入和工具回执大小，以及是否已有缩小请求的重试。"
         issues.append({"code": code, "severity": "error", "task_id": identity,
                        "title": title, "message": error, "suggestion": suggestion})
     for event in events:

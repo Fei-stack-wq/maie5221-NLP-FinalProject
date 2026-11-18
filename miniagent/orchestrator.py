@@ -462,6 +462,7 @@ class Orchestrator:
                 )
                 raise
             self._planner_tokens += response.usage.total
+            self._global_budget.spend(tokens=response.usage.total)
             self._event(
                 "plan_usage", task_id=self._root_id, attempt_id=self._root_attempt_id,
                 run_id=self._root_run_id,
@@ -1258,7 +1259,7 @@ class Orchestrator:
         return self.acceptances.get(task.id, self.default_acceptance)
 
     def _global_exhausted(self) -> bool:
-        return self._global_budget.exhausted or self._global_budget.tokens_left <= 0
+        return self._global_budget.exhausted or not self._global_budget.has_tokens(1)
 
 
 __all__ = [

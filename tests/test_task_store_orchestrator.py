@@ -136,9 +136,12 @@ class TaskStoreOrchestratorTest(unittest.TestCase):
         self.assertTrue(child.run_id)
 
     def test_budget_skipped_children_are_cancelled_without_attempts(self):
-        settings = Settings(limits=Limits(max_total_tokens=0))
+        # The planner consumes the entire finite budget (20 input and 10 output).
+        settings = Settings(limits=Limits(max_total_tokens=30))
         orchestrator = self.orchestrator(settings=settings)
         result = orchestrator.run("no execution budget")
+        self.assertEqual(orchestrator._global_budget.tokens_left, 0)
+        self.assertEqual(result.tokens, 30)
         child = result.subtasks[0]
         record = orchestrator.task_service.store.get(child.task_id)
         self.assertEqual(child.status, "skipped")

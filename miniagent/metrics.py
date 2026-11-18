@@ -88,7 +88,7 @@ def _percentile(sorted_values: list[float], ratio: float) -> float:
 _STARTS = {"task_start", "subtask_start", "orchestration_start"}
 _ENDS = {"task_end", "subtask_end", "orchestration_end"}
 _REGISTRATIONS = {"case_registered", "task_registered"}
-_USAGE_EVENTS = {"step", "plan_usage", "provider_error"}
+_USAGE_EVENTS = {"step", "plan_usage", "compaction_usage", "provider_error"}
 _TASK_EVENTS = _STARTS | _ENDS | _REGISTRATIONS | {"acceptance"} | _USAGE_EVENTS
 _SUCCESS = {"completed", "done"}
 

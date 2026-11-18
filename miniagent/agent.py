@@ -19,7 +19,9 @@ import uuid
 from typing import Callable
 
 from .config import Settings
-from .context_window import ContextLimitError, TaskTokenLimitError, UsageAnchor, project_history
+from .compaction import RollingCompactor
+from .request_window import fit_history, output_headroom
+from .context_window import ContextLimitError, TaskTokenLimitError, UsageAnchor
 from .acceptance import AcceptanceInput, bind, evaluate
 from .metrics import Tracer
 from .providers import Provider, ProviderError, provider_configuration
@@ -208,16 +210,14 @@ class Agent:
             task_id=task_id,
             history=history,
         )
-        budget = budget or Budget(
-            steps_left=limits.max_steps,
-            seconds_left=limits.max_seconds,
-            tokens_left=limits.max_total_tokens,
-            actions_left=limits.max_steps * max(1, limits.max_tool_calls_per_step),
-        )
+        budget = budget or Budget.from_limits(limits)
         initial_seconds = min(budget.seconds_left, limits.max_seconds)
         initial_steps, initial_tokens = budget.steps_left, budget.tokens_left
         initial_actions = budget.actions_left
         excluded_ranges: list[tuple[int, int]] = []
+        compactor = RollingCompactor()
+        overflow_used = False
+        retry_envelope = None
         output_recoveries = 0
         last_omitted = 0
         warned_budgets: set[str] = set()
@@ -263,7 +263,7 @@ class Agent:
         def budget_reason() -> str:
             if budget.seconds_left <= 0:
                 return f"超过时间上限 {initial_seconds:.0f}s"
-            if budget.tokens_left < 0:
+            if not budget.has_tokens(0):
                 return f"超过 token 预算 {initial_tokens}"
             if budget.steps_left <= 0:
                 return f"超过最大步数 {initial_steps}"
@@ -282,7 +282,7 @@ class Agent:
                 offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
                 text_only = step_policy is not None and not offered
                 # The final text needs a model step, but consumes no tool actions.
-                if (budget.steps_left <= 0 or budget.tokens_left < 0 or budget.seconds_left <= 0
+                if (budget.steps_left <= 0 or not budget.has_tokens(0) or budget.seconds_left <= 0
                         or (budget.actions_left <= 0 and not text_only)):
                     error = budget_reason()
                     break
@@ -291,7 +291,7 @@ class Agent:
                     ("steps", budget.steps_left, initial_steps),
                     ("tokens", budget.tokens_left, initial_tokens),
                 ):
-                    if dimension not in warned_budgets and remaining <= max(1, initial * 0.2):
+                    if remaining is not None and dimension not in warned_budgets and remaining <= max(1, initial * 0.2):
                         warned_budgets.add(dimension)
                         state.history.append({
                             "role": "user", "content": (
@@ -308,19 +308,20 @@ class Agent:
                     output_reserve = self.settings.max_output_tokens
                 def project(policy, offered):
                     schemas = [spec.to_api() for spec in offered]
-                    available = budget.tokens_left - policy.token_reserve
-                    view = project_history(
+                    available = budget.available_tokens(policy.token_reserve)
+                    view, pruned = fit_history(
                         policy_messages(state, policy), tool_schemas=schemas,
-                        context_window_tokens=self.settings.context_window_tokens,
-                        output_reserve=output_reserve, excluded_ranges=None if policy.compact else excluded_ranges,
+                        window=self.settings.context_window_tokens, ceiling=output_reserve,
+                        replay_target=retry_envelope[0] // 2 if retry_envelope else None,
+                        excluded_ranges=None if policy.compact else excluded_ranges,
                         usage_anchor=None if policy.compact else usage_anchor,
                         reported_assistant_tokens=None if policy.compact else reported_assistant_tokens,
-                        task_tokens_left=available, steps_left=budget.steps_left,
+                        available=available, steps_left=budget.steps_left,
                     )
-                    return schemas, available, view
+                    return schemas, available, view, pruned
 
                 try:
-                    tool_schemas, spendable_tokens, projection = project(policy, offered)
+                    tool_schemas, spendable_tokens, projection, pruned = project(policy, offered)
                 except TaskTokenLimitError as exc:
                     if (preflight_handoff is None or preflight_handoff_used or text_only
                             or not policy.token_reserve):
@@ -331,16 +332,48 @@ class Agent:
                     preflight_handoff_used = True
                     if self.tracer:
                         self.tracer.event("handoff_preflight_recovery", **identity, step=state.step_index+1,
-                                          work_phase=policy.phase, work_tokens=budget.tokens_left-policy.token_reserve,
+                                          work_phase=policy.phase, work_tokens=budget.available_tokens(policy.token_reserve),
                                           tokens_remaining=budget.tokens_left, reason=str(exc))
                     policy, offered, text_only = closing, [], True
-                    tool_schemas, spendable_tokens, projection = project(policy, offered)
-                request_output_limit = min(output_reserve, spendable_tokens - projection.estimated_input_tokens)
+                    tool_schemas, spendable_tokens, projection, pruned = project(policy, offered)
+                if not policy.compact:
+                    summary = compactor.update(
+                        policy_messages(state, policy), projection, self.provider,
+                        context_window_tokens=self.settings.context_window_tokens,
+                        available_tokens=spendable_tokens,
+                        seconds_left=initial_seconds - (time.perf_counter() - started) - policy.seconds_reserve,
+                        force=retry_envelope is not None,
+                    )
+                    projection = summary.projection
+                    if summary.attempted:
+                        usage = usage.merged(summary.usage)
+                        budget.spend(tokens=summary.usage.total)
+                        spendable_tokens = budget.available_tokens(policy.token_reserve)
+                        if self.tracer:
+                            self.tracer.event("compaction_usage", **identity, call_id=f"summary-{uuid.uuid4().hex}",
+                                              step=state.step_index + 1, transport=self.provider.transport,
+                                              status=summary.status, covered_groups=summary.covered_groups,
+                                              new_groups=summary.new_groups, usage=summary.usage.model_dump(),
+                                              usage_source=summary.usage.source, request_attempts=summary.request_attempts)
+                window = self.settings.context_window_tokens
+                capacity = window - max(256, window // 100) - projection.estimated_input_tokens
+                request_output_limit = min(output_reserve, capacity)
+                if spendable_tokens is not None:
+                    request_output_limit = min(request_output_limit, spendable_tokens - projection.estimated_input_tokens)
+                    if request_output_limit <= 0:
+                        raise TaskTokenLimitError("累计 token 预算不足以支付当前请求及答复。")
+                if retry_envelope:
+                    old_input, old_output = retry_envelope
+                    request_output_limit = min(request_output_limit, max(1, old_output // 2))
+                    if projection.estimated_input_tokens + request_output_limit >= old_input + old_output:
+                        raise ContextLimitError("服务端报告上下文过长，保留当前用户要求后无法再缩小请求。")
+                if request_output_limit <= 0:
+                    raise ContextLimitError("保留当前指令后没有可用的单次输出空间。")
                 if projection.omitted_groups != last_omitted:
                     if self.tracer:
                         self.tracer.event(
                             "context_compacted", **identity, step=state.step_index + 1,
-                            strategy="deterministic_omission", omitted_groups=projection.omitted_groups,
+                            strategy="semantic_summary" if not policy.compact and summary.status in {"applied", "cached"} else "deterministic_omission", omitted_groups=projection.omitted_groups,
                             omitted_messages=projection.omitted_messages,
                             original_input_tokens=projection.original_input_tokens,
                             estimated_input_tokens=projection.estimated_input_tokens,
@@ -362,10 +395,11 @@ class Agent:
                         allowed_write_paths=sorted(policy.allowed_write_paths) if policy.allowed_write_paths is not None else None,
                         provider_config=provider_configuration(self.provider),
                         seconds_remaining=round(max(0, budget.seconds_left), 2),
-                        tokens_remaining=budget.tokens_left,
+                        tokens_remaining=budget.tokens_left, tokens_used=budget.tokens_used,
                         steps_remaining=budget.steps_left,
                         context_window_tokens=self.settings.context_window_tokens,
-                        output_reserve_tokens=output_reserve,
+                        output_reserve_tokens=output_headroom(window, output_reserve),
+                        output_ceiling_tokens=output_reserve, tool_results_pruned=pruned,
                         request_output_limit=request_output_limit,
                         estimated_input_tokens=projection.estimated_input_tokens,
                         input_limit_tokens=projection.input_limit,
@@ -373,12 +407,29 @@ class Agent:
                     )
                 history_start = len(state.history)
                 state.scratch.pop("tool_protocol_feedback", None)
-                record = self.unit.step(
-                    state, budget, request_history=projection.messages, max_output_tokens=request_output_limit,
-                    allowed_tools=policy.allowed_tools, token_reserve=policy.token_reserve,
-                    allowed_write_paths=policy.allowed_write_paths, required_tool=policy.required_tool,
-                    request_seconds=budget.seconds_left - policy.seconds_reserve if step_policy else None,
-                )
+                try:
+                    record = self.unit.step(
+                        state, budget, request_history=projection.messages, max_output_tokens=request_output_limit,
+                        allowed_tools=policy.allowed_tools, token_reserve=policy.token_reserve,
+                        allowed_write_paths=policy.allowed_write_paths, required_tool=policy.required_tool,
+                        request_seconds=budget.seconds_left - policy.seconds_reserve if step_policy else None,
+                    )
+                except ProviderError as exc:
+                    if (exc.code != "context_length_exceeded" or overflow_used or budget.steps_left <= 0
+                            or len(state.history) != history_start or cancellation_observed()):
+                        raise
+                    overflow_used = True
+                    retry_envelope = (projection.estimated_input_tokens, request_output_limit)
+                    usage_anchor = None
+                    if exc.attempts:
+                        usage = usage.merged(Usage(source="unknown"))
+                    if self.tracer:
+                        self.tracer.event("provider_error", **identity, call_id=f"error-{uuid.uuid4().hex}",
+                                          step=state.step_index, code=exc.code, http_status=exc.status_code,
+                                          transport=self.provider.transport, request_attempts=exc.attempts,
+                                          usage_source="unknown", recovery="shrink_and_retry")
+                    continue
+                retry_envelope = None
                 usage = usage.merged(
                     Usage(prompt_tokens=record.prompt_tokens,
                           completion_tokens=record.completion_tokens,
@@ -404,11 +455,11 @@ class Agent:
                     status, error = "aborted", "用户请求停止"
                     break
                 budget.seconds_left = initial_seconds - (time.perf_counter() - started)
-                if record.terminate_reason == ErrorClass.T_BUDGET or budget.tokens_left < 0 or budget.seconds_left <= 0:
+                if record.terminate_reason == ErrorClass.T_BUDGET or not budget.has_tokens(0) or budget.seconds_left <= 0:
                     status, error = "limit_exceeded", budget_reason()
                     break
                 if record.unstructured_tool_call:
-                    can_retry = not tool_protocol_correction_used and budget.steps_left > 0 and budget.tokens_left > 0
+                    can_retry = not tool_protocol_correction_used and budget.steps_left > 0 and budget.has_tokens(1)
                     if self.tracer:
                         self.tracer.event("tool_protocol_correction", **identity, step=record.step,
                                           retry=can_retry, phase=policy.phase)

@@ -765,7 +765,7 @@ class StudioService(RoomDiscussion, StudioRoles):
                 raise ValueError()
             configured_limits(self.settings.limits, limits)
         except (ValueError, TypeError):
-            raise StudioError("预算无效：轮数 1–1000、累计 token 1–100000000、时限 1–86400 秒。") from None
+            raise StudioError("预算无效：轮数 1–1000、累计 token 0–100000000（0 表示不限）、时限 1–86400 秒。") from None
         result = {"request_id": identity, "mode": mode, "objective": objective,
                   "scheduler": scheduler, "thinking": thinking, "acceptance_files": files}
         if "workspace_path" in payload:

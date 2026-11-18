@@ -34,7 +34,7 @@ _INCIDENTAL_DATA = SQLITE_EXTENSIONS | {".log", ".csv", ".tsv", ".jsonl"}
 
 @dataclass
 class _ReadAllowance:
-    max_tokens: int
+    max_tokens: int | None
     max_seconds: float
     max_rounds: int
     tokens: int = 0
@@ -43,7 +43,8 @@ class _ReadAllowance:
 
     @property
     def exhausted(self):
-        return self.tokens >= self.max_tokens or self.seconds >= self.max_seconds or self.rounds >= self.max_rounds
+        return ((self.max_tokens is not None and self.tokens >= self.max_tokens)
+                or self.seconds >= self.max_seconds or self.rounds >= self.max_rounds)
 
     def record(self, tokens, seconds):
         self.tokens += tokens
@@ -113,7 +114,7 @@ class RoomCrew:
         self.last_dispatch_error = ""
         self.close_tokens = 0
         self.close_seconds = min(90, self.budget.seconds_left * .12)
-        self.close_state_bytes = min(8000, max(1200, self.budget.tokens_left // 16))
+        self.close_state_bytes = 8000 if self.budget.tokens_left is None else min(8000, max(1200, self.budget.tokens_left // 16))
         self.inventory = self._inventory()
         self.private_read = ""
         self.navigation = []
@@ -223,18 +224,18 @@ class RoomCrew:
         # Retain a cumulative ceiling on the same canonical bytes across
         # unsuccessful handoffs. Each new dispatch decision receives a
         # smaller allowance for looking into genuinely new information.
-        available = max(1, budget.tokens_left - self.close_tokens)
+        available = budget.available_tokens(self.close_tokens)
         seconds = max(.1, budget.seconds_left - self.close_seconds)
         steps = max(1, budget.steps_left - 1)
         if self.inspection_revision != self.project_version:
             self.inspection_revision = self.project_version
-            self.revision_reads = _ReadAllowance(max(1024, math.ceil(.03*available)),
+            self.revision_reads = _ReadAllowance(None if available is None else max(1024, math.ceil(.03*available)),
                                                  max(1.0, .045*seconds), max(2, math.ceil(.09*steps)))
             self.inspection_decision = None
         decision = (self.project_version, len(self.reports))
         if self.inspection_decision != decision:
             self.inspection_decision = decision
-            self.decision_reads = _ReadAllowance(max(768, math.ceil(.015*available)),
+            self.decision_reads = _ReadAllowance(None if available is None else max(768, math.ceil(.015*available)),
                                                  max(.5, .018*seconds), max(2, math.ceil(.05*steps)))
             self.inspection_notified = False
         self.nested_seconds = 0.0
@@ -448,15 +449,15 @@ class RoomCrew:
         def input_cost(names):
             return message_cost + estimate_tokens([self.coordinator_schemas[n] for n in sorted(names)])
         decision_input = input_cost(allowed)
-        if inspect_public and budget.tokens_left <= self.close_tokens + decision_input:
+        if inspect_public and not budget.has_tokens(self.close_tokens + decision_input + 1):
             allowed = controls
             decision_input = input_cost(controls)
         if (budget.steps_left <= 1 or budget.seconds_left <= self.close_seconds
-                or budget.tokens_left <= self.close_tokens + decision_input):
+                or not budget.has_tokens(self.close_tokens + decision_input + 1)):
             return closing
         dispatch_limit = decision_input + 8192
         return StepPolicy("coordinate", instruction, allowed, compact=True,
-                          token_reserve=max(self.close_tokens, budget.tokens_left - dispatch_limit),
+                          token_reserve=0 if budget.tokens_left is None else max(self.close_tokens, budget.tokens_left - dispatch_limit),
                           seconds_reserve=self.close_seconds, required_tool="delegate_task" if force_dispatch else None)
 
     def before_answer(self):
@@ -481,25 +482,27 @@ class RoomCrew:
         b = self.budget
         available_seconds = min(b.seconds_left, self.deadline - time.monotonic())
         next_dispatch = min(14000, self.close_tokens + 2000)
-        reserved = Budget(steps_left=count, actions_left=count, tokens_left=self.close_tokens + (count-1)*next_dispatch,
+        reserved = Budget(steps_left=count, actions_left=count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
                           seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count-1))
         child = Budget(steps_left=(b.steps_left-reserved.steps_left)//count,
                        actions_left=(b.actions_left-reserved.actions_left)//count,
-                       tokens_left=(b.tokens_left-reserved.tokens_left)//count,
+                       tokens_left=None if b.tokens_left is None else (b.tokens_left-reserved.tokens_left)//count,
                        seconds_left=(available_seconds-reserved.seconds_left)/count)
         # A repeated assignment cannot borrow from an elected peer who has not
         # started. Illustrative roles outside the elected plan receive no lease.
+        floors = {"steps_left": 6, "actions_left": 8, "seconds_left": 30}
+        if b.tokens_left is not None:
+            floors["tokens_left"] = 28000
         for peer in ((planned or set()) | set(self.child_checks)) - self.started_roles - {role}:
             if record_shares and peer not in self.untapped_shares and not child.exhausted:
                 # A meaningful minimum for each elected peer. The unreserved
                 # balance can fund a substantive implementation after discovery.
-                floors = {"steps_left": 6, "tokens_left": 28000, "actions_left": 8, "seconds_left": 30}
-                self.untapped_shares[peer] = Budget(**{
+                self.untapped_shares[peer] = child.model_copy(update={
                     f: min(getattr(child, f), max(minimum, math.ceil(.6 * getattr(child, f))))
                     for f,minimum in floors.items()
                 })
         unstarted = [v for k, v in self.untapped_shares.items() if k != role]
-        for field in type(b).model_fields:
+        for field in floors:
             current = available_seconds if field == "seconds_left" else getattr(b, field)
             protected = sum(getattr(v, field) for v in unstarted)
             entitlement = getattr(self.untapped_shares[role], field) if role in self.untapped_shares else 0
@@ -514,7 +517,7 @@ class RoomCrew:
             if role == origin or (self.project_version, origin, role) in self.routed_repairs:
                 continue
             allocation, _ = self._allocation(role, self.planned, record_shares=False)
-            if not allocation.exhausted and allocation.tokens_left >= 1000:
+            if not allocation.exhausted and allocation.has_tokens(1000):
                 eligible.append(role)
         return sorted(eligible, key=lambda r: r in self.started_roles)
 
@@ -637,7 +640,7 @@ class RoomCrew:
             return self._observation(False, message)
         self.approved_roles.discard(role)
         allocated, reserved = self._allocation(role, plan)
-        if len(self.handoffs) >= 16 or allocated.exhausted or allocated.tokens_left < 1000 or self.should_cancel():
+        if len(self.handoffs) >= 16 or allocated.exhausted or not allocated.has_tokens(1000) or self.should_cancel():
             if role in self.started_roles and self.untapped_shares and len(self.handoffs) < 16 and not self.should_cancel():
                 return self._decline_retry(role, "其他计划成员的额度仍被保留。本成员无法继续重试，"
                                            "请给其他成员分工，需要时使用 recover_from 接手草稿。", payload)
@@ -751,13 +754,13 @@ class RoomCrew:
                                       run_id=execution.run.run_id, level="subtask", step=record.step,
                                       checkpoint=work_receipt.copy())
         record_id = record.task_id
-        handoff_limit = min(6000, max(800, allocated.tokens_left // 48))
+        handoff_limit = 6000 if allocated.tokens_left is None else min(6000, max(800, allocated.tokens_left // 48))
         group_decisions = self._handoff_decisions(min(1400, handoff_limit // 3))
 
         def member_policy(state, budget, *, preflight=False):
             bare = StepPolicy("handoff", allowed_tools=frozenset(), compact=True)
-            reserve = estimate_tokens(policy_messages(state, bare)) + handoff_limit + 1344
-            spendable = budget.model_copy(update={"tokens_left": budget.tokens_left - reserve,
+            reserve = 0 if budget.tokens_left is None else estimate_tokens(policy_messages(state, bare)) + handoff_limit + 1344
+            spendable = budget.model_copy(update={"tokens_left": budget.available_tokens(reserve),
                                                   "seconds_left": budget.seconds_left - handoff_seconds})
             if preflight:
                 progress.require_handoff("工作调用的受保护输入超过可用 token；使用保留的最终交接额度")
@@ -782,7 +785,7 @@ class RoomCrew:
                 # locally when its allocation still fits that request.
                 if evidence.get("inspected") and not (evidence.get("files") or evidence.get("check_signals")):
                     detailed = StepPolicy("handoff", handoff, frozenset())
-                    if estimate_tokens(policy_messages(state, detailed)) + 2048 < budget.tokens_left:
+                    if budget.has_tokens(estimate_tokens(policy_messages(state, detailed)) + 2049):
                         return detailed
                 return closing
             # The first call can use a small allocation for a self-contained
@@ -796,7 +799,7 @@ class RoomCrew:
                 steering += "\n宿主工作记录（文件版本、已读位置、真实检查）：" + _clip(_json(work_receipt), 2200)
             work = StepPolicy("work", steering, work_tools)
             minimum = estimate_tokens(work_schemas) + 768 + estimate_tokens(state.history[:3])
-            if budget.tokens_left <= reserve + minimum:
+            if not budget.has_tokens(reserve + minimum + 1):
                 return closing if state.step_index else work
             return StepPolicy("work", steering, work_tools, token_reserve=reserve, seconds_reserve=handoff_seconds)
 
@@ -812,7 +815,7 @@ class RoomCrew:
         finally:
             usage = {"steps": initial.steps_left - allocated.steps_left,
                      "actions": initial.actions_left - allocated.actions_left,
-                     "tokens": initial.tokens_left - allocated.tokens_left}
+                     "tokens": allocated.tokens_used - initial.tokens_used}
             self.budget.spend(**usage)
             usage["seconds"] = round(time.monotonic() - started, 3)
         status = result.status

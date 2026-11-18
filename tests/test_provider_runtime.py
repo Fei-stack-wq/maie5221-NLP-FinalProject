@@ -11,7 +11,7 @@ from unittest.mock import patch
 from miniagent.agent import Agent
 from miniagent.acceptance import accept_files
 from miniagent.cli import main, _make_provider_factory
-from miniagent.config import Settings
+from miniagent.config import Limits, Settings
 from miniagent.metrics import Tracer, load_events, summarize
 from miniagent.orchestrator import Orchestrator
 from miniagent.provider_http import HTTPResult, ProviderError
@@ -87,7 +87,7 @@ class ProviderRuntimeTest(unittest.TestCase):
         self.assertEqual(steps[-1]["finish_reason"], "stop")
 
     @patch("miniagent.providers.post_json")
-    def test_large_tool_response_can_continue_to_acceptance_with_default_child_budget(self, post):
+    def test_large_tool_response_can_continue_to_acceptance_with_fixed_child_budget(self, post):
         # Reported usage models a large output without generating or paying for it.
         # The old 160k child budget stopped immediately after the first tool call.
         from miniagent.rao import Budget
@@ -103,7 +103,7 @@ class ProviderRuntimeTest(unittest.TestCase):
         with Tracer(self.root / "trace") as tracer:
             result = self.agent(DeepSeekProvider("test-key"), tracer).run(
                 "write and verify", acceptance=accept_files("proof.md", min_bytes=1),
-                budget=Budget.from_limits(Settings().limits, factor=0.8))
+                budget=Budget.from_limits(Limits(max_total_tokens=1_000_000), factor=0.8))
         self.assertEqual(result.status, "completed", result.error)
         self.assertEqual(post.call_count, 2)
         self.assertEqual(result.usage.total, 600320)

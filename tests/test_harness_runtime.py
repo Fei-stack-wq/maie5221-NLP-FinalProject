@@ -141,14 +141,14 @@ class HarnessRuntimeTest(unittest.TestCase):
         self.assertEqual(provider.requests, [])
         self.assertTrue(any(e["kind"] == "context_limit" for e in load_events(self.root / "trace")))
 
-    def test_output_reservation_larger_than_context_reports_actual_limits(self):
+    def test_tiny_window_reports_actual_projected_input_after_reducing_output_headroom(self):
         provider = RecordingProvider([])
         result = self.agent(provider, settings=Settings(context_window_tokens=1024)).run("small task")
         self.assertEqual(result.status, "limit_exceeded")
         self.assertEqual(provider.requests, [])
         self.assertIn("context_window_tokens=1024", result.error)
-        self.assertIn("max_output_tokens=300000", result.error)
-        self.assertIn("input_limit_tokens=0", result.error)
+        self.assertIn("protected_input_estimate=", result.error)
+        self.assertIn("input_limit_tokens=640", result.error)
 
     def test_cancel_before_request_makes_no_provider_call(self):
         provider = RecordingProvider([])
@@ -255,6 +255,7 @@ class HarnessRuntimeTest(unittest.TestCase):
 
         with Tracer(self.root / "trace") as tracer:
             result = self.agent(provider, tracer).run("build 39 artifacts", on_step=before_compaction,
+                                                       budget=Budget(tokens_left=1_000_000),
                                                        acceptance=accept_files("part-39.txt"))
         self.assertEqual(result.status, "completed", result.error)
         self.assertEqual(len(provider.requests), 40)

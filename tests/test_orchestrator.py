@@ -264,7 +264,11 @@ class OrchestratorTest(unittest.TestCase):
             _plan(_subtask("s1", "写 d.md"), _subtask("s2", "写 e.md", deps=["s1"])),
             {"写 d.md": [{"text": "d 完成"}], "写 e.md": [{"text": "e 完成"}]},
         )
-        result = self._orchestrator(provider).run("预算切分", scheduler="serial")
+        orch = self._orchestrator(provider, limits=Limits(max_total_tokens=0))
+        result = orch.run("预算切分", scheduler="serial")
+        self.assertIsNone(orch._global_budget.tokens_left)
+        self.assertEqual(orch._global_budget.tokens_used, result.tokens)
+        self.assertGreater(orch._global_budget.tokens_used, sum(task.tokens for task in result.subtasks))
         for task in result.subtasks:
             self.assertGreaterEqual(task.steps, 1)
             self.assertGreater(task.tokens, 0)

@@ -24,12 +24,21 @@
 |---|---|---|
 | 模型上下文窗口 | 一次请求可容纳的输入及相应输出空间 | 控制请求历史大小，为输出留空间；过大时有限恢复 |
 | 单次输出上限 | 本次模型响应最多生成多少 token，可能包含推理 | 截断时禁止执行不完整工具参数，尝试更小的工作单元 |
-| 任务累计 token 预算 | 多次调用的 prompt + completion 总和 | 每次消费入账；恢复调用也消耗原预算 |
+| 任务累计 token 预算 | 多次调用的 prompt + completion 总和 | 每次调用都记录用量。用户设置正数上限时，恢复调用也计入该上限 |
 | 步数预算 | 允许多少轮模型调用 | 合理默认、用户可调，终止时清楚显示已用 / 上限 |
 | 时间与请求超时 | 整个任务墙钟时间、单请求等待边界 | 剩余时间约束后续动作，避免新子任务重置时钟 |
 | 单工具输出及文件大小 | 防止一次读取或输出压垮进程和模型上下文 | 分页、明确截断标记、按需重读；不能静默伪造完整内容 |
 
 扩大某一项不会自动扩大其余各项。一次生成整份大文件不是唯一工作方式；分页读取、局部修改、分段构建和持续测试，可以让多个小而完整的操作完成同一目标。
+
+### 2.1 可选的累计 token 上限
+
+自 2026-11-18 这次修订起，新任务默认仅统计整个任务累计使用的输入和输出 token。即使一次请求只用 8 万个 token，二十次这样的请求也会累计为 160 万。单次请求能容纳多少输入和输出仍由模型上下文窗口决定。Studio 保留轮数、墙钟时间及用户取消等停止条件。
+
+- **CLI 与本机网页**。环境变量 `MA_MAX_TOTAL_TOKENS=0` 表示累计不限，缺省也是 0。设置为正整数可启用上限，例如 `1000000`。Studio 新运行会保存生效配置，诊断页把 0 显示为“不限”。上述选项均保留用量统计。
+- **单次任务与已有会话**。启动接口的 `limits.max_total_tokens` 可覆盖服务配置，接受 0 至 100000000 的整数。旧运行的请求、配置快照和已记录故障保留当时的值。在旧会话的“本轮选项与预算”中点击“本轮设为不限”，会为新一轮提交 0。明确写入环境或请求的正数上限继续生效。
+- **上游设计依据**。OpenAI Agents SDK 的 `Usage` 在每次运行中累加请求数及输入、输出 token，并提供逐请求明细。其 `Runner.run` 将 `max_turns` 作为独立的执行参数。Studio 同样把用量统计与停止策略分开，累计额度由用户选择。[OpenAI Agents SDK Usage](https://openai.github.io/openai-agents-python/usage/) · [Runner.run](https://openai.github.io/openai-agents-python/ref/run/#agents.run.Runner.run)
+- **上下文依据**。Pi 的指定版本中，工具及待处理消息驱动 `runLoop` 继续执行。编码助手在当前上下文接近模型窗口时生成摘要，并保留近期消息。Pi 的 `reserveTokens` 和 `keepRecentTokens` 分别调节当前窗口的预留空间和近期历史的保留数量。Studio 用独立配置项分别表达请求上下文容量和任务累计额度。[Pi agent loop，固定源码版本](https://github.com/earendil-works/pi/blob/efd284ecca3788ca1345fdcc927a1f97e7ceeeaf/packages/agent/src/agent-loop.ts) · [Pi 压缩机制，同一版本](https://github.com/earendil-works/pi/blob/efd284ecca3788ca1345fdcc927a1f97e7ceeeaf/packages/coding-agent/docs/compaction.md)
 
 ## 3. 开源项目提供了什么机制
 
@@ -51,7 +60,7 @@
 
 ### 4.1 配置、诊断和成果取回
 
-- `Limits`、配置入口及 Studio 负责一致的运行预算。默认 `max_steps=100`、任务累计 `max_total_tokens=1000000`、`max_seconds=3600`；单次模型输出仍为 `300000`。新任务保存实际生效快照，旧任务快照保持原样。
+- `Limits`、配置入口及 Studio 负责一致的运行预算。默认 `max_steps=100`、任务累计 `max_total_tokens=0`（不限）、`max_seconds=3600`；单次模型输出仍为 `300000`。新任务保存实际生效快照，旧任务快照保持原样。
 - `MA_MAX_STEPS`、`MA_MAX_TOTAL_TOKENS`、`MA_MAX_SECONDS` 支持本机默认；任务发起入口可覆盖相应预算。输入校验不能接受布尔值、非有限数或越界值。
 - `StudioService` / 诊断层根据真实退出原因显示限制名称、消费及上限；恢复事件显示为恢复过程。文件存在、模型自称完成、工具返回成功均不能升级为独立验收通过。
 - 已失败或已取消任务仍能下载工件。工作区 ZIP 是当时可读取的受支持文本 / 代码文件副本，不是不可变 ArtifactStore；每文件不超过 8 MiB、总内容不超过 20 MiB，超限拒绝导出而不截断文件。它不包含符号链接、隐藏文件、二进制文件或工作区外文件，也不把原始推理和密钥一并导出。
@@ -66,7 +75,7 @@
 - 原始消息历史与发给模型的精简视图分开。`context_compacted` 的 `strategy=deterministic_omission` 表示删除较早的完整批次；省略标记不是语义总结。当前 `state.history` 在内存中保留完整追加历史，trace 记录运行事件；这还不是崩溃后可重建的持久会话。模型也不能自动找回所有已省略的旧事实。
 - 当前请求如果只剩不可删除的目标或一个过大的必要批次，应明确报告不能容纳，而不是无限重试或静默丢掉任务目标。
 
-`step_start` 附带输入估计、输入限额、输出预留、上下文大小和剩余步数；`budget_warning` 在步数 / token 余额较低时各提示一次。长度恢复记录 `output_recovery` / `output_recovery_exhausted`；保留部分仍放不下时以 `context_limit` 结束。本轮没有根据供应商错误文本猜测上下文溢出并自动重试；确认溢出的语义压缩恢复属于后续工作。
+`step_start` 附带输入估计、输入限额、输出预留、上下文大小和剩余步数；`budget_warning` 在步数 / token 余额较低时各提示一次。长度恢复记录 `output_recovery` / `output_recovery_exhausted`；保留部分仍放不下时以 `context_limit` 结束。这是 11 月 17 日历史版本的行为。11 月 18 日加入的语义摘要及服务端窗口恢复见下节。
 
 ### 4.3 文件工作流
 
@@ -86,6 +95,12 @@
 Studio → service → scheduler / RAO 传递取消信号。收到信号后，在下一模型 / 工具动作前停止；当前 HTTP 返回后还要再次检查，不能执行它新提出的工具。重复取消请求幂等，已结束运行不改写历史终态。
 
 本轮为**协作式取消**：正在进行的同步 HTTP 或工具调用可能要返回或超时后才落终态。页面显示“正在停止”与实际结束的“已取消”，不能收到请求就假装底层工作已经停止。即时传输取消和子进程树终止留到 M0-H02 / M0-05。
+
+### 11 月 18 日实现与核验
+
+**运行内语义压缩。** 宿主选出可移除的连续工具交互批次。当前请求、真实人工答复和最近的完整工具交互继续以原文提供。单轮接近物理窗口时，系统为新工作腾出空间，必要时节选大型工具回执的首尾。DeepSeek 的辅助请求只读取旧批次的证据和上一次摘要，返回目标、决定、文件、检查、阻塞五个字段。摘要带模型生成标记，主调用仍使用自己的 thinking 配置。无效 JSON、被截断的摘要、经费或时间不足都会降级。每次辅助请求的用量与主调用一起记账。两次官方接口验证与用量见[实测证据](evidence/2026-11-18-semantic-compaction.md)。此阶段只在执行期间维护增量语义摘要；跨轮继续聊天使用持久对话与公开工件重建上下文。[Pi 压缩实现](https://github.com/earendil-works/pi/blob/efd284ecca3788ca1345fdcc927a1f97e7ceeeaf/packages/coding-agent/src/core/compaction/compaction.ts) · [DeepSeek Harness 摘要器](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/compaction/compaction-basic/src/summarizer.ts) · [DeepSeek 工具结果裁剪](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/compaction/compaction-tool-result-pruner/src/index.ts)
+
+**窗口拒绝与恢复。** 普通工具循环收到服务端明确的上下文过长错误后，以更小的输入和输出额度恢复一次。HTTP 层只分类结构化错误、保留已脱敏的错误代码，普通参数错误仍按原路径返回。宿主核对历史末端和新请求的大小，已执行的工具不会因重发而再次执行。当前可用输入空间和单次输出上限分别计算，需要时缩小本次输出。仍无法容纳用户强制保留的输入时，在 GUI 中区分本地预检、供应商窗口拒绝与累计预算不足。恢复测试包含真实路径上的一次文件写入，验证重试未再次写入文件。[Pi 溢出恢复](https://github.com/earendil-works/pi/blob/efd284ecca3788ca1345fdcc927a1f97e7ceeeaf/packages/coding-agent/src/core/agent-session.ts#L3171-L3213) · [Hermes 上下文管理](https://github.com/NousResearch/hermes-agent/blob/09ded63c4fedcc8fe975d37f9765797d904fc75d/website/docs/developer-guide/context-compression-and-caching.md) · [项目回归](../tests/test_context_recovery.py)
 
 ## 5. 必须有的可复现验收
 
@@ -126,3 +141,16 @@ HF01–HF09 可由 fixture 覆盖大部分边界；运行时专用回归见 `tes
 2026-11-17：完整离线回归第一次 624 项通过；修正上下文用量锚点后 630 项通过。700000 个 ASCII 字符、供应商报告 175000 completion tokens 的写文件响应，在 1M 上下文 / 300000 输出预留下继续下一轮并通过验收；这使用合成响应，不是实际付费生成。实际仓库最终回归 **631 项通过（6.684 秒）**，ResourceWarning 作为错误；新增非文本伪装产物的导出拒绝测试，避免 ZIP 解码损坏。
 
 真实浏览器在隔离的运行副本与离线模型夹具上验证：150 轮 / 2000000 tokens / 7200 秒覆盖进入配置快照；等待模型时点击取消，先显示待返回状态，返回的 `write_file` 没有写入，持久任务最终 cancelled。下载游戏 ZIP 后四个文件与原产物逐字节一致。9 项持续轮询 DOM 稳定性测试全部通过；390px 视口没有文档横向溢出；控制台无错误/警告。以上没有新增付费模型请求，原任务状态未被改写，亦未将游戏计作 HF10 功能验收通过。
+
+### 累计用量与单次窗口的回放
+
+沿用 OpenAI Agents SDK 逐次记录调用量的做法，Studio 独立保存已用 token 和任务剩余额度。上游的运行循环也把轮数作为单独的停止条件。Studio 默认允许累计用量增长，用户显式设置正数时启用本任务的累计预算。每次发送的输入和输出仍须适配模型窗口。[上游用量记录](https://openai.github.io/openai-agents-python/usage/) · [上游运行循环](https://openai.github.io/openai-agents-python/ref/run/)
+
+2026-11-18 使用任务 `studio-20261117-233025-9ea412ddcfa4` 的 40 组已报告用量做离线回放。原始轨迹 SHA-256 为 `2165c1ba09d7c354f1ff547ebdb9863722648d9e779c2a253aad01785c782d5f`。单次最多输入 43,380 tokens，从头到尾共输入 1,010,961、输出 24,388。测试使用固定的本地动作，在临时目录写入 39 份回执，最后给出答复。每步用量沿用原记录，独立文件断言逐份比对内容。这项实验检验限额行为，未重演模型决策，软件题成绩另行验收。
+
+| 同一组用量 | 实际调用轮数 | 计入用量 | 结果 |
+| --- | ---: | ---: | --- |
+| 默认不限制累计 token | 40 | 1,035,349 | 39 份回执验收通过 |
+| 用户指定累计 1,000,000 | 39 | 991,690 | 剩余 8,310，下一轮输入预检停止，验收尚未执行 |
+
+在仓库中运行 `python -m unittest tests.test_task_token_replay` 即可复算。测试自带 40 对纯数值用量，不需要原机器的记录、凭据或网络。[回放输入和断言](../tests/test_task_token_replay.py)

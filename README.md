@@ -74,7 +74,7 @@ python -m miniagent run "调研 ReAct 并写一份 notes.md"
 python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-parallel 2
 ```
 
-默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 300000 token；请求重试与 deadline 可配置。任务默认最多 100 轮、累计 1000000 tokens、3600 秒；网页选项可按任务设置预算，运行时可请求停止，结束后可下载保留相对目录的产物 ZIP。输出截断最多恢复两次，上下文按完整工具批次裁剪，大文件支持分页读取、局部编辑及追加；详见 [Harness 基础能力](docs/harness-foundations.md)。除 `studio` 的本地配置加载入口外，`.env` 不自动加载；变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
+默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 300000 token；请求重试与 deadline 可配置。任务默认最多 100 轮、3600 秒，持续统计累计 token；需要累计上限时可以设置正数预算；网页选项可按任务设置预算，运行时可请求停止，结束后可下载保留相对目录的产物 ZIP。输出截断最多恢复两次，上下文按完整工具批次裁剪，大文件支持分页读取、局部编辑及追加；详见 [Harness 基础能力](docs/harness-foundations.md)。除 `studio` 的本地配置加载入口外，`.env` 不自动加载；变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
 
 > `--mock` 只能配 `--scheduler serial`：`ScriptedProvider` 带游标、不是线程安全的，
 > 并发/事件驱动请用真实模型（或用 `agent_factory` 注入独立 provider）。

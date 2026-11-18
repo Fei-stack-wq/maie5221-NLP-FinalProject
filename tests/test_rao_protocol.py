@@ -128,7 +128,7 @@ class RaoProtocolTest(unittest.TestCase):
                              finish_reason="tool_calls", usage=Usage(prompt_tokens=5, completion_tokens=2))
         final = LLMResponse(text="  已完成检查。\n", reasoning_content="final private reasoning", finish_reason="stop")
         unit, provider = self.unit([first, second, final])
-        state, budget = self.state(), Budget()
+        state, budget = self.state(), Budget(tokens_left=2500)
         records = [unit.step(state, budget) for _ in range(3)]
         self.assertEqual([record.decision_kind for record in records], ["act", "act", "answer"])
         self.assertEqual(records[-1].answer, "已完成检查。")
@@ -140,7 +140,7 @@ class RaoProtocolTest(unittest.TestCase):
         self.assertEqual(provider.requests[2][4]["tool_call_id"], "read-2")
         self.assertEqual(state.history[-1], final.to_assistant_message())
         self.assertNotIn("private reasoning", json.dumps([record.model_dump() for record in records]))
-        self.assertEqual(budget.tokens_left, Limits().max_total_tokens - 12)
+        self.assertEqual(budget.tokens_left, 2500 - 12)
 
     def test_bad_envelope_rejects_entire_batch_before_first_write(self) -> None:
         bad_calls = [write_call("", "bad.txt"), write_call("  ", "bad.txt"),
@@ -152,12 +152,12 @@ class RaoProtocolTest(unittest.TestCase):
             with self.subTest(call=bad_call):
                 unit, _ = self.unit([LLMResponse(tool_calls=[write_call("first", "first.txt"), bad_call],
                                                 finish_reason="tool_calls", usage=Usage(prompt_tokens=7))])
-                state, budget = self.state(), Budget()
+                state, budget = self.state(), Budget(tokens_left=2500)
                 record = unit.step(state, budget)
                 self.assertEqual(record.terminate_reason, ErrorClass.T_PROTOCOL)
                 self.assertEqual(record.prompt_tokens, 7)
                 self.assertEqual(record.tool_calls, 0)
-                self.assertEqual(budget.tokens_left, Limits().max_total_tokens - 7)
+                self.assertEqual(budget.tokens_left, 2500 - 7)
                 self.assertFalse((self.workspace / "first.txt").exists())
                 self.assertEqual(len(state.history), 1)
 

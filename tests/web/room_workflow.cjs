@@ -32,6 +32,9 @@ async function room(page, url) {
   await form.locator('[name="member"][value="lead"]').check();
   await form.locator('[name="recipient"]').selectOption('lead');
   assert.equal(await form.locator('[name="dispatch"]').inputValue(), 'team');
+  await form.getByRole('button',{name:'选项',exact:true}).click();
+  assert.equal(await form.locator('[name="max_total_tokens"]').inputValue(), '0');
+  await form.locator('[name="max_total_tokens"]').fill('1000000');
   await form.locator('[name="objective"]').fill('请协作写一份模拟说明。');
   await form.getByRole('button', {name:'发送'}).click();
   const human = page.locator('.human-form');
@@ -47,11 +50,13 @@ async function room(page, url) {
   assert.equal(detail.conversation.profiles.find(p=>p.id==='lead').prompt, '负责协调并委派独立评审。');
   await reply.getByText('本轮选项与预算').click();
   await reply.locator('[name="base"]').selectOption('failed');
-  await reply.locator('[name="max_total_tokens"]').fill('420000');
+  assert.equal(requests[0].limits.max_total_tokens, 1000000);
+  assert.equal(await reply.locator('[name="max_total_tokens"]').inputValue(), '1000000');
+  await reply.getByRole('button',{name:'本轮设为不限'}).click();
   await reply.locator('[name="acceptance_files"]').fill('working.md');
   await reply.locator('[name="dispatch"]').selectOption('single');
   assert.equal(await reply.locator('[name="base"]').inputValue(), 'failed');
-  assert.equal(await reply.locator('[name="max_total_tokens"]').inputValue(), '420000');
+  assert.equal(await reply.locator('[name="max_total_tokens"]').inputValue(), '0');
   const created = page.waitForResponse(r => r.url() === url + 'api/runs' && r.request().method() === 'POST');
   await reply.getByRole('button', {name:'发送'}).click();
   const response = await created;
@@ -60,7 +65,7 @@ async function room(page, url) {
   await page.waitForURL('**/#run/' + latest + '/chat');
   await page.getByText('已接续并完成修订。').waitFor();
   assert.equal(requests[1].mode, 'single');
-  assert.equal(requests[1].limits.max_total_tokens, 420000);
+  assert.equal(requests[1].limits.max_total_tokens, 0);
   assert.equal(requests[1].conversation.recover_failed, true);
   await page.locator('.thread-workspace code').getByText(project, {exact:true}).waitFor();
   const firstTurn = page.locator('.chat-turn').first();

@@ -188,7 +188,9 @@ class StepPolicyTest(unittest.TestCase):
         (agent.sandbox.root/"source.md").write_text("读" * 5000)
         fallback_calls = []
         def work(state,budget):
-            reserve = max(0,budget.tokens_left - 18352) if state.step_index else 3000
+            # Even after excerpting both tools, the current goal, schemas and
+            # framing cannot fit into the 600 tokens left for another work step.
+            reserve = max(0, budget.tokens_left - 600) if state.step_index else 3000
             return StepPolicy("work", allowed_tools=frozenset({"read_file"}), token_reserve=reserve)
         def handoff(state,budget):
             fallback_calls.append((state.step_index,budget.tokens_left))

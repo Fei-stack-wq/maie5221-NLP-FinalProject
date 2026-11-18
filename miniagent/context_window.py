@@ -1,6 +1,7 @@
 """Bounded request projection without rewriting the append-only execution history.
 
-This is deterministic history omission, not semantic summarization.  Complete
+This layer selects host-verified boundaries; RollingCompactor may replace the
+omission notice with a semantic summary for those same ranges. Complete
 assistant/tool batches are indivisible; every system/user message and the latest
 two assistant batches stay available. Provider-reported usage anchors exact
 request prefixes and complete assistant messages. Unknown new input uses a
@@ -32,6 +33,9 @@ class RequestProjection:
     omitted_groups: int = 0
     omitted_messages: int = 0
     estimate_source: str = "utf8_bytes_upper_estimate"
+    # Half-open indices into the original (unfiltered) history, never model supplied.
+    omitted_spans: tuple[tuple[int, int], ...] = ()
+    notice_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,7 @@ def project_history(
     usage_anchor: UsageAnchor | None = None,
     reported_assistant_tokens: dict[int, tuple[dict[str, Any], int]] | None = None,
     task_tokens_left: int | None = None, steps_left: int = 1,
+    replay_input_target: int | None = None,
 ) -> RequestProjection:
     """Build a valid request view, retaining original history and call ID pairs.
 
@@ -78,13 +83,17 @@ def project_history(
     replay_target = hard_limit if task_tokens_left is None else min(
         hard_limit, task_tokens_left // max(1, min(steps_left, 48))
     )
+    if replay_input_target is not None:
+        replay_target = min(replay_target, max(1, replay_input_target))
     excluded = excluded_ranges or []
     visible = []
+    original_indices = []
     measured_costs: dict[int, int] = {}
     for index, message in enumerate(history):
         if any(start <= index < end for start, end in excluded):
             continue
         visible.append(message)
+        original_indices.append(index)
         measured = (reported_assistant_tokens or {}).get(index)
         if measured and message == measured[0] and message.get("role") == "assistant":
             # Completion usage includes thinking and function-call output;
@@ -94,8 +103,10 @@ def project_history(
     # result or remove only part of a parallel tool-call batch.
     groups: list[list[dict[str, Any]]] = []
     removable: list[int] = []
+    spans: list[tuple[int, int]] = []
     i = 0
     while i < len(visible):
+        start_index = i
         message = visible[i]
         role = message.get("role")
         if role == "tool":
@@ -118,6 +129,7 @@ def project_history(
         if role == "assistant":
             removable.append(len(groups))
         groups.append(group)
+        spans.append((original_indices[start_index], original_indices[i] + 1))
         i += 1
 
     # Tool schemas and a framing allowance occupy input space too.
@@ -155,6 +167,8 @@ def project_history(
     messages = visible
     best = visible
     best_cost, best_source, best_omitted, best_count = original, original_source, 0, 0
+    best_spans = ()
+    best_notice = None
     paths = {}
     # Preserve recent actions and actual human responses even across many rounds.
     for group_index in removable[:-2]:
@@ -187,6 +201,7 @@ def project_history(
         for index, group in enumerate(groups):
             if index in dropped:
                 if not inserted:
+                    notice_index = len(messages)
                     messages.append(notice)
                     inserted = True
             else:
@@ -195,11 +210,13 @@ def project_history(
         if estimated < best_cost:
             best, best_cost, best_source = messages, estimated, estimate_source
             best_omitted, best_count = len(dropped), omitted_messages
+            best_spans = tuple(spans[g] for g in sorted(dropped))
+            best_notice = notice_index
         if estimated <= replay_target:
             break
     if best_cost <= hard_limit:
         return RequestProjection(copy.deepcopy(best), best_cost, original, hard_limit,
-                                 best_omitted, best_count, best_source)
+                                 best_omitted, best_count, best_source, best_spans, best_notice)
     if task_tokens_left is not None and hard_limit < input_limit:
         raise TaskTokenLimitError(
             f"累计 token 预算剩余 {task_tokens_left}，保留用户要求和近期工具结果后"

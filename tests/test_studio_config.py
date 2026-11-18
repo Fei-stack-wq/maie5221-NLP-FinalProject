@@ -15,6 +15,18 @@ from tests.support import cleanup, make_temp_dir
 
 
 class StudioConfigTest(unittest.TestCase):
+    def test_zero_in_environment_or_file_removes_only_the_cumulative_cap(self):
+        self.path.write_text("MA_MAX_TOTAL_TOKENS=0\n")
+        base = Settings(limits=Limits(max_total_tokens=2500, max_steps=7))
+        with patch.dict(os.environ, {}, clear=True):
+            loaded = load_studio_settings(base, self.path)
+        self.assertEqual((loaded.limits.max_total_tokens, loaded.limits.max_steps), (0, 7))
+        self.assertEqual(base.limits.max_total_tokens, 2500)
+        self.path.write_text("MA_MAX_TOTAL_TOKENS=1000000\n")
+        with patch.dict(os.environ, {"MA_MAX_TOTAL_TOKENS": "0"}, clear=True):
+            loaded = load_studio_settings(Settings.from_env(), self.path)
+        self.assertEqual(loaded.limits.max_total_tokens, 0)
+
     def test_nested_budgets_load_and_environment_wins_without_resetting_other_limits(self):
         self.path.write_text("MA_MAX_STEPS=250\nMA_MAX_TOTAL_TOKENS=4000000\nMA_MAX_SECONDS=7200\n"
                              "MA_OUTPUT_RECOVERY_ATTEMPTS=1\nMA_CONTEXT_WINDOW_TOKENS=900000\n")
@@ -25,7 +37,7 @@ class StudioConfigTest(unittest.TestCase):
         self.assertEqual((value.limits.max_steps, value.limits.max_total_tokens, value.limits.max_seconds),
                          (175, 4000000, 7200))
         self.assertEqual(value.limits.tool_timeout_seconds, 17)
-        self.assertEqual(original.limits.max_total_tokens, 1000000)
+        self.assertEqual(original.limits.max_total_tokens, 0)
         self.assertEqual(value.max_output_recovery_attempts, 1)
         self.assertEqual(value.context_window_tokens, 900000)
 

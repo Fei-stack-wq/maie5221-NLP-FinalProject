@@ -104,7 +104,7 @@ def _env_number(name: str, default: str) -> float:
 
 @dataclass
 class Limits:
-    """护栏。任何一个缺失，agent 都会在某天烧掉你的余额或永远卡住。"""
+    """任务执行预算和单步工具约束。"""
 
     max_steps: int = 100
     """最多几轮 LLM 调用。超过就判定 limit_exceeded，而不是无限循环。"""
@@ -112,8 +112,8 @@ class Limits:
     max_seconds: float = 3600.0
     """单个任务的总墙钟时间上限。"""
 
-    max_total_tokens: int = 1_000_000
-    """单个任务的 token 预算（prompt+completion 累计）。"""
+    max_total_tokens: int = 0
+    """任务累计输入和输出 token 上限。0 表示仅记录用量。"""
 
     max_tool_calls_per_step: int = 4
     """单轮模型回复里最多执行几个工具调用，防止一次生成几十个调用。"""
@@ -130,7 +130,7 @@ def configured_limits(base: Limits, changes: dict) -> Limits:
     if "max_steps" in changes:
         _integer("max_steps", changes["max_steps"], 1, 1000)
     if "max_total_tokens" in changes:
-        _integer("max_total_tokens", changes["max_total_tokens"], 1, 100_000_000)
+        _integer("max_total_tokens", changes["max_total_tokens"], 0, 100_000_000)
     if "max_seconds" in changes:
         _number("max_seconds", changes["max_seconds"], 1, 86400)
     return replace(base, **changes)
@@ -190,7 +190,7 @@ class Settings:
             max_output_recovery_attempts=_env_integer("MA_OUTPUT_RECOVERY_ATTEMPTS", "2"),
             limits=configured_limits(Limits(), {
                 "max_steps": _env_integer("MA_MAX_STEPS", "100"),
-                "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", "1000000"),
+                "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", str(Limits.max_total_tokens)),
                 "max_seconds": _env_number("MA_MAX_SECONDS", "3600"),
             }),
         )

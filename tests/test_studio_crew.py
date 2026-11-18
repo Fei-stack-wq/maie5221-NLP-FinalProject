@@ -251,6 +251,34 @@ class StudioCrewTest(unittest.TestCase):
                 self.assertNotIn("campus.md", {a["name"] for a in current["artifacts"]})
             previous = current
 
+    def test_no_cumulative_cap_delegates_and_counts_usage_past_a_million(self):
+        # Every individual prompt fits the model window. Only the sum exceeds 1M.
+        class Metered(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0):
+                result = super().chat(messages, tools, temperature)
+                return result.model_copy(update={"usage": Usage(prompt_tokens=310_000, completion_tokens=100)})
+
+        provider = Metered([tool("delegate_task", assignee="dev", objective="write the file",
+                                 remaining_roles=[], deliverable_paths=["work.txt"]),
+                            write("work.txt", "Completed: existing project files verified."),
+                            {"text": "I wrote work.txt."}, {"text": "Delivered."}])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+            run = self.service.start(request("team", conversation=roster("lead", "dev"),
+                                             objective="write a file", acceptance_files=["work.txt"],
+                                             child_checks={"dev": {"files": ["work.txt"]}}, limits={"max_total_tokens": 0}))
+            detail = finished(self.service, run["id"])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        calls = [e for e in detail["events"] if e["kind"] == "step_start"]
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(all(e["tokens_remaining"] is None for e in calls))
+        self.assertEqual([e["tokens_used"] for e in calls], [0, 0, 310_100, 930_300])
+        steps = [e for e in detail["events"] if e["kind"] == "step"]
+        self.assertEqual(sum(e["prompt_tokens"] + e["completion_tokens"] for e in steps), 1_240_400)
+        [lease] = [e for e in detail["room_events"] if e["kind"] == "assignment"]
+        self.assertIsNone(lease["allocation"]["tokens_left"])
+        self.assertEqual(lease["reserved"]["tokens_left"], 0)
+        self.assertEqual(calls[-1]["offered_tools"], [])
+
     def test_shared_tokens_debit_lead_before_child_and_charge_child_to_lead(self):
         class Metered(RecordingProvider):
             def chat(self, messages, tools=None, temperature=0):
@@ -284,7 +312,8 @@ class StudioCrewTest(unittest.TestCase):
                   {"text": "Published work.txt."}, {"text": "Premature completion"},
                   assign("reviewer", "Check the published draft"), tool("read_file", path="work.txt"),
                   {"text": "The text covers the request."}, {"text": "Ready."}]
-        detail, provider = self.execute(script, group, objective="Prepare a reviewed draft", acceptance_files=["work.txt"])
+        detail, provider = self.execute(script, group, objective="Prepare a reviewed draft",
+                                        limits={"max_total_tokens": 1_000_000}, acceptance_files=["work.txt"])
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         self.assertIn("reviewer", str(provider.requests[4][0]))
         self.assertEqual(provider.requests[-1][1], [])
@@ -385,7 +414,7 @@ class StudioCrewTest(unittest.TestCase):
                           {"text":"Ready."}, {"text":"Ready after review."}]
                 kwargs = {"child_checks":{"writer":{"files":["guide.md"]}}} if role_bound else {}
                 detail,provider = self.execute(script, roster("lead", "writer", "review"), objective="Deliver app and guide",
-                                               acceptance_files=["guide.md", "app.py"], **kwargs)
+                                               limits={"max_total_tokens": 1_000_000}, acceptance_files=["guide.md", "app.py"], **kwargs)
                 self.assertEqual(detail["run"]["status"], "failed" if role_bound else "completed",detail["diagnostics"])
                 assignments = [e for e in detail["room_events"] if e["kind"]=="assignment"]
                 self.assertEqual([e["recipient"] for e in assignments], ["writer", "writer", "review"])
