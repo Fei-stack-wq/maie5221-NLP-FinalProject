@@ -161,6 +161,33 @@ class MemberProgressTest(unittest.TestCase):
         self.assertEqual(len(self.p.inline_failures()),16)
         self.assertEqual(self.p.evidence()["undisclosed_failure_probes"],[])
 
+    def test_long_browser_failure_keeps_full_original_evidence_with_bounded_limits(self):
+        code = "assert not js_errors\n" + "# diagnostic setup\n" * 360
+        error = "exit_code=1\nstdout:\n" + "checked current page\n" * 50 + "stderr:\nNameError: js_errors"
+        self.assertGreater(len(code.encode()), 6000)
+        self.observe("run_browser", error, args={"code":code}, ok=False,
+                     meta={"exit_code":1}, call_id="original-browser")
+        scope, = self.p.failed_checks()
+        self.assertEqual(self.p.inline_failures()[scope]["code"],code)
+        self.assertEqual(self.p.inline_failures()[scope]["error"],error)
+        self.observe("run_browser", error, args={"code":code}, ok=False,
+                     meta={"exit_code":1}, call_id="repeat-browser")
+        self.assertEqual(self.p.inline_failures()[scope]["tool_call_id"],"original-browser")
+        for oversized, output, meta in [
+                (code + "#" * 32768, error, {"exit_code":1}),
+                (code, error + "x" * 8192, {"exit_code":1}),
+                (code, error, {"exit_code":1,"truncated":True}),
+                (code, error, {"exit_code":1,"timed_out":True}),
+                (code, error, {"exit_code":1,"cancelled":True}),
+                (code, error, {})]:
+            with self.subTest(meta=meta, code_bytes=len(oversized), error_bytes=len(output)):
+                self.p = MemberProgress(self.root)
+                self.observe("run_browser", output, args={"code":oversized}, ok=False, meta=meta)
+                if not meta.get('timed_out') and not meta.get('cancelled'):
+                    self.assertTrue(self.p.failed_checks())
+                self.assertFalse(self.p.evidence()['check_signals'])
+                self.assertFalse(self.p.inline_failures())
+
     def test_stale_checks_require_rerun_after_modification(self):
         self.check("1 passed in 0.12s", "pytest")
         self.src.write_text("new contents")
@@ -677,6 +704,44 @@ sys.exit(bool(failures))
         self.assertEqual(retired["current_caption"], "busy 150")
         self.assertNotEqual(retired["prior_sha256"], retired["current_sha256"])
         self.assertIn("pending_independent_acceptance", retired["disposition"])
+
+    def test_named_failures_disclose_the_original_script_for_each_actual_case_scope(self):
+        import hashlib
+        source = self._custom_script.replace('len(actual), 3', 'len(actual), 4')
+        self.run_custom(source)
+        failures = self.p.failed_checks()
+        probes = self.p.inline_failures()
+        self.assertEqual(len(failures), 2)
+        self.assertEqual(set(probes), set(failures))
+        for scope, probe in probes.items():
+            self.assertEqual(probe['case_label'], failures[scope])
+            self.assertEqual(probe['code'], source)
+            self.assertEqual(probe['sha256'], hashlib.sha256(source.encode()).hexdigest())
+            self.assertEqual(probe['path'], 'test_member.py')
+            self.assertEqual(probe['exit_code'], 1)
+            self.assertEqual(probe['tool_call_id'], 'one')
+            self.assertIn('FAIL busy 180', probe['error'])
+            self.assertIn('FAIL all intervals', probe['error'])
+        # A different script with identical case captions cannot clear them.
+        other = self.root / 'another.py'
+        other.write_text(source.replace('45, 60, 45', '60, 60, 60, 0'))
+        self.observe('write_file', args={'path':other.name})
+        self.observe('run_shell', 'exit_code=0\nstdout:\nPASS busy 180\nPASS all intervals',
+                     args={'command':'python3 another.py'}, meta={'exit_code':0})
+        self.assertEqual(self.p.failed_checks(), failures)
+        self.assertEqual(self.p.inline_failures(), probes)
+
+    def test_named_probe_still_requires_observed_member_edit_and_complete_failure(self):
+        self.run_custom(self._custom_script, baseline=True)
+        self.assertTrue(self.p.failed_checks())
+        self.assertFalse(self.p.inline_failures())
+        changed = self._custom_script.replace('actual =', '# member edit\nactual =')
+        self.run_custom(changed, truncated=True)
+        self.assertFalse(self.p.inline_failures())
+        self.run_custom(None)
+        probe, = self.p.inline_failures().values()
+        self.assertEqual(probe['code'], changed)
+        self.assertTrue(self.p.failed_checks())
 
     def test_preexisting_script_cannot_retire_or_mask_an_old_check(self):
         self.run_custom(self._custom_script, baseline=True)

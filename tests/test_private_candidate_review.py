@@ -1,11 +1,13 @@
 """Exercise provisional candidate selection, peer review and guarded promotion through Studio."""
+import ast
 import hashlib
 import unittest
 from unittest.mock import patch
 
 from miniagent.config import Settings
-from miniagent.crew_progress import MemberProgress, _check_key, _script_inputs, _shell_inputs
+from miniagent.crew_progress import MemberProgress, _check_key, _script_inputs, _shell_inputs, _shell_case_suite
 from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
+from miniagent.schemas import ToolResult
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, tool
@@ -196,6 +198,77 @@ if FAIL:
         self.assertTrue(reports[-1]["published"])
         self.assertFalse(reports[-1]["evidence"]["observed_failure"])
         self.assertFalse(any(e["kind"]=="runtime_reroute" for e in detail["room_events"]))
+
+    def test_named_snapshot_check_can_be_independently_adjudicated_without_editing_it(self):
+        label = "10 units confirmed for the warehouse."
+        source = '{"retrieved_at":"2026-11-18T16:53:23+00:00","url":"https://example.org/source"}\n'
+        original = r'''import json, re, sys
+from pathlib import Path
+snapshot = json.loads(Path("sources/entry.json").read_text())
+# This check incorrectly rejects an ISO timestamp because T is a word character.
+ok = bool(re.search(r"\b20\d{2}-\d{2}-\d{2}\b", json.dumps(snapshot)))
+print("PASS snapshot date" if ok else "FAIL snapshot date")
+sys.exit(0 if ok else 1)
+'''
+        command = "python3 verify.py"
+        source_sha = hashlib.sha256(original.encode()).hexdigest()
+        case_suite = _shell_case_suite(command, ".") + "\0sha256=" + source_sha
+        disputed = _check_key(case_suite, "snapshot date")
+        independent = ('import json\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n'
+                       's = json.loads(Path("sources/entry.json").read_text())\n'
+                       'assert s["url"].startswith("https://")\n'
+                       'assert datetime.fromisoformat(s["retrieved_at"]) <= datetime(2026,11,19,tzinfo=timezone.utc)\n'
+                       'assert "10 units" in Path("delivery.txt").read_text()\n'
+                       'print("PASS independent source and delivery")\n')
+        proof = "pass:" + _check_key(_script_inputs(independent)[1])
+        files = {**manifest(label), "verify.py":source_sha,
+                 "sources/entry.json":hashlib.sha256(source.encode()).hexdigest()}
+        finding = {"criterion_id":"independent_recheck", "verdict":"passed", "evidence":[proof],
+                   "reason":"Checked the actual label and parsed the retained source timestamp."}
+        prior = {**finding, "criterion_id":"probe_" + disputed,
+                 "reason":"The frozen named assertion rejects an ISO date followed by T. Independent parsing verifies the actual retrieval date without changing the source or original assertion."}
+        browser_code = "assert not js_errors\n" + "# browser setup diagnostic\n" * 250
+        browser_scope = _check_key("browser " + hashlib.sha256(
+            (".\0" + ast.dump(ast.parse(browser_code))).encode()).hexdigest())
+        browser_finding = {**finding, "criterion_id":"probe_" + browser_scope,
+                           "reason":"The original browser probe refers to an undefined harness variable. Independently checked the original requested delivery and source traceability; a harness variable is not a product requirement."}
+        steps = [tool("delegate_task",assignee="builder",objective="Deliver ten units and retain traceable source metadata.",
+                      remaining_roles=["inspector"],deliverable_paths=[PATH]),
+                 write(PATH,label),write("sources/entry.json",source),write("verify.py",original),
+                 tool("run_shell",command=command),{"text":"[BLOCKED] Named date assertion failed."},
+                 tool("delegate_task",assignee="builder",objective="Investigate the failure without fabricating dates."),
+                 tool("run_shell",command=command),tool("run_browser",code=browser_code),
+                 {"text":"[BLOCKED] Original assertion and a browser harness error preserved for independent review."},
+                 tool("delegate_task",assignee="builder",objective="Resolve remaining checker dispute.",deliverable_paths=[PATH]),
+                 tool("run_python",code=independent),
+                 tool("submit_review",candidate_version=digest(files),results=[finding,prior,browser_finding]),
+                 {"text":"Independently adjudicated the original named failure."},{"text":"Delivered."}]
+        captured = []
+        open_review = ReviewQueue.open
+        def capture(queue, *args, **kwargs):
+            review = open_review(queue, *args, **kwargs)
+            captured.append(review)
+            return review
+        browser_error = "exit_code=1\nstderr:\nNameError: name 'js_errors' is not defined"
+        with patch.object(ReviewQueue,"open",capture), patch("miniagent.tools.run_browser",
+                return_value=ToolResult.failure(browser_error,exit_code=1,truncated=False)):
+            detail,reports = self.run_steps(steps,acceptance_checks=[{"kind":"contains","path":PATH,"text":"10 units"}])
+        self.assertEqual(detail["run"]["status"],"completed",reports)
+        self.assertEqual([r["role"] for r in reports],["builder","builder","inspector"])
+        self.assertTrue(reports[0]["evidence"]["observed_failure"])
+        self.assertTrue(reports[1]["evidence"]["observed_failure"])
+        self.assertEqual(captured[-1].objective,reports[0]["objective"])
+        probe = captured[-1].probes[disputed]
+        self.assertEqual(probe["code"],original)
+        self.assertEqual(probe["sha256"],source_sha)
+        self.assertEqual(probe["exit_code"],1)
+        self.assertIn("snapshot date",probe["case_label"])
+        self.assertEqual(probe["task_id"],reports[0]["task_id"])
+        self.assertEqual(captured[-1].probes[browser_scope]["code"],browser_code)
+        self.assertEqual(captured[-1].probes[browser_scope]["error"],browser_error)
+        self.assertEqual((self.local/"verify.py").read_text(),original)
+        self.assertEqual((self.local/"sources/entry.json").read_text(),source)
+        self.assertEqual(reports[-1]["native_review"]["state"],"passed")
 
     def test_pass_promotes_original_under_author_identity_with_records(self):
         detail,reports = self.run_steps(initial()+[submit(OLD),{"text":"Independently verified."},{"text":"Delivered."}])

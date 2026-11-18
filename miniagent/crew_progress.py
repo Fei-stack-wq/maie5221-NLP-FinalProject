@@ -928,10 +928,17 @@ class MemberProgress:
                                 "task_id":state.task_id, "arguments":dict(parameters)})
                         if obs.source == "run_browser" or (obs.source == "run_python" and command.startswith("assert ")):
                             code = parameters.get("code", "")
-                            if obs.tool_call_id and 0 < len(code.encode()) <= 6000:
-                                self._record_probe(suite_key, {"code":code, "error":obs.content[-800:],
+                            # Inline and file-backed checks share the same bounded
+                            # full-source/full-error review contract. A browser
+                            # probe does not lose its review route at 6,001 bytes.
+                            if (obs.tool_call_id and 0 < len(code.encode()) <= 32768
+                                    and len(obs.content.encode()) <= 8192 and not _output_truncated(obs)
+                                    and type(exit_code) is int and exit_code != 0
+                                    and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
+                                self._record_probe(suite_key, {"code":code, "error":obs.content,
+                                    "exit_code":exit_code,
                                     "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
-                        elif (not cases and obs.source == "run_shell" and invocation and invocation.complete
+                        elif (obs.source == "run_shell" and invocation and invocation.complete
                               and invocation.script in self._edited_scripts and not _output_truncated(obs)
                               and type(exit_code) is int and exit_code != 0
                               and self._current.get(invocation.script) == before.get(invocation.script)):
@@ -941,12 +948,18 @@ class MemberProgress:
                             # is a review subject, never a waived failed assertion.
                             if (original and original[0] == before.get(invocation.script)
                                     and len(obs.content.encode()) <= 8192 and obs.tool_call_id):
-                                self._record_probe(suite_key, {
-                                    "kind":"edited_script", "code":original[1], "error":obs.content,
-                                    "path":invocation.script, "sha256":original[0], "exit_code":exit_code,
-                                    "check":invocation.caption, "tool":obs.source,
-                                    "tool_call_id":obs.tool_call_id, "task_id":state.task_id,
-                                })
+                                # Named failures use versioned case scopes, not
+                                # the aggregate suite scope. Bind the same frozen
+                                # source to each actual failure so a peer can
+                                # adjudicate it without rewriting the assertion.
+                                for scope, failure in failures.items():
+                                    self._record_probe(scope, {
+                                        "kind":"edited_script", "code":original[1], "error":obs.content,
+                                        "path":invocation.script, "sha256":original[0], "exit_code":exit_code,
+                                        "check":invocation.caption, "tool":obs.source,
+                                        "tool_call_id":obs.tool_call_id, "task_id":state.task_id,
+                                        "case_label":failure,
+                                    })
                         if run:
                             self._failed_runs[(case_suite, run.digest)] = run
                         self._passes.pop(suite, None)
