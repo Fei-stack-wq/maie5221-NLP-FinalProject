@@ -22,6 +22,39 @@ class ResearchTest(unittest.TestCase):
     def tearDown(self):
         cleanup(self.root)
 
+    def test_official_index_preserves_named_public_links_using_final_url_and_base(self):
+        page = Page("https://campus.example/final/news/index", "text/html",
+                    (b'<head><base href="../press/"></head><a href="/nav">Navigation</a>'
+                     b'<article><a href="launch#section">Campus <strong>AI</strong> event</a>'
+                     b'<a href="launch#repeat">Same article</a><a href="//partner.example/page">'
+                     b'<img alt="Partner evidence"></a></article>'
+                     b'<a href="javascript:alert(1)">JS</a><a href="http://127.0.0.1/x">Private</a>'
+                     b'<a href="#here">Self</a><a href="https://u:p@example.org/">Credentials</a>'
+                     b'<template><a href="dummy">Invisible</a></template>'), False)
+        with patch("miniagent.research.fetch", return_value=page):
+            result = self.registry.dispatch("http_get", {"url":"https://campus.example/start"}, self.ctx)
+        self.assertTrue(result.ok, result.content)
+        evidence = json.loads((self.root/result.meta["path"]).read_text())
+        self.assertEqual(evidence["links"], [
+            {"title":"Campus AI event", "url":"https://campus.example/final/press/launch"},
+            {"title":"Partner evidence", "url":"https://partner.example/page"},
+            {"title":"Navigation", "url":"https://campus.example/nav"}])
+        self.assertFalse(evidence["links_truncated"])
+        self.assertIn("https://campus.example/final/press/launch", result.content)
+        self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(page.body).hexdigest())
+
+    def test_link_index_is_bounded_and_primary_content_survives_a_long_menu(self):
+        html = ''.join(f'<a href="/nav/{i}">Menu {i}</a>' for i in range(450))
+        html += '<main><a href="/story">A recent campus announcement</a></main>'
+        page = Page("https://campus.example/", "text/html", html.encode(), False)
+        with patch("miniagent.research.fetch", return_value=page):
+            result = self.registry.dispatch("http_get", {"url":page.url}, self.ctx)
+        data = json.loads((self.root/result.meta["path"]).read_text())
+        self.assertEqual(data["links"][0]["url"], "https://campus.example/story")
+        self.assertTrue(data["links_truncated"])
+        self.assertLessEqual(len(data["links"]), 160)
+        self.assertLess(len(result.content), 6500)
+
     def test_news_discovery_fetch_and_handoff(self):
         article = "https://example.org/campus-event"
         news = {"articles": [{"title": "Campus news", "url": article, "seendate":"20261110T120000Z"},

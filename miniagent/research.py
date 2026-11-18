@@ -167,23 +167,84 @@ def fetch(url: str, *, timeout: float = 15) -> Page:
     raise ValueError("资料来源重定向次数过多。")
 
 
+def _link_target(base: str, href: str) -> str:
+    if not href or href.startswith("#"):
+        return ""
+    try:
+        parsed = _parse_public_url(urljoin(base, href))
+        # Reading port enforces urlsplit's validation of the numeric port.
+        parsed.port
+    except ValueError:
+        return ""
+    return urlunsplit(parsed._replace(fragment=""))
+
+
 class _VisibleText(HTMLParser):
-    def __init__(self):
+    """Keep labeled outbound evidence as well as text; never fetch linked pages here."""
+
+    def __init__(self, page_url):
         super().__init__()
-        self.hidden_depth = 0
+        self.page_url = self.base = page_url
+        self.base_seen = False
+        self.hidden_depth = self.main_depth = 0
         self.parts = []
+        self.targets = {}
+        self.anchor = None
 
     def handle_starttag(self, tag, attrs):
-        if tag in {"script", "style", "head", "noscript"}:
+        if tag in {"script", "style", "head", "noscript", "template"}:
             self.hidden_depth += 1
+        attributes = dict(attrs)
+        if tag == "base" and not self.base_seen:
+            target = _link_target(self.page_url, attributes.get("href") or "")
+            if target:
+                self.base, self.base_seen = target, True
+        if self.hidden_depth:
+            return
+        if tag in {"main", "article"}:
+            self.main_depth += 1
+        elif tag == "a":
+            target = _link_target(self.base, attributes.get("href") or "")
+            self.anchor = (target, len(self.parts), attributes.get("aria-label") or attributes.get("title") or "")
+        elif tag == "img" and self.anchor and attributes.get("alt"):
+            target, start, label = self.anchor
+            self.anchor = (target, start, label or attributes["alt"])
 
     def handle_endtag(self, tag):
-        if tag in {"script", "style", "head", "noscript"}:
+        if tag in {"script", "style", "head", "noscript", "template"}:
             self.hidden_depth = max(0, self.hidden_depth - 1)
+            return
+        if self.hidden_depth:
+            return
+        if tag in {"main", "article"}:
+            self.main_depth = max(0, self.main_depth - 1)
+        elif tag == "a" and self.anchor:
+            target, start, fallback = self.anchor
+            self.anchor = None
+            label = " ".join((" ".join(self.parts[start:]) or fallback).split())[:200]
+            if target and target != self.page_url and label:
+                in_main = self.main_depth > 0
+                if target not in self.targets or in_main and not self.targets[target][0]:
+                    self.targets[target] = (in_main, label)
 
     def handle_data(self, data):
         if not self.hidden_depth and data.strip():
             self.parts.append(data.strip())
+
+    def links(self):
+        # Bound both count and bytes. Prefer main/article anchors so that a
+        # large navigation menu does not crowd the primary evidence out.
+        remaining = 36_000
+        result = []
+        for url, (_, label) in sorted(self.targets.items(), key=lambda row: not row[1][0]):
+            item = {"title": label, "url": url}
+            size = len(json.dumps(item, ensure_ascii=False).encode())
+            if size <= remaining:
+                result.append(item)
+                remaining -= size
+            if len(result) == 160:
+                break
+        return result
 
 
 def _save(ctx, record: dict) -> tuple[str, ToolResult]:
@@ -199,19 +260,35 @@ def http_get(ctx, args: dict) -> ToolResult:
     if mime and not (mime.startswith("text/") or mime.endswith(("json", "xml", "+json", "+xml"))):
         return ToolResult.failure("来源没有返回可读取的文本。可选择文章网页版或公开元数据。")
     source = page.body.decode("utf-8", errors="replace")
-    if mime == "text/html":
-        parser = _VisibleText()
+    parser = None
+    if mime in {"text/html", "application/xhtml+xml"}:
+        parser = _VisibleText(page.url)
         parser.feed(source)
+        parser.close()
         source = "\n".join(parser.parts)
     record = {"kind": "fetched_source", "requested_url": args["url"], "url": page.url,
               "retrieved_at": datetime.now(timezone.utc).isoformat(), "content_type": page.content_type,
               "bytes_observed": len(page.body), "observed_bytes_sha256": hashlib.sha256(page.body).hexdigest(),
               "response_truncated": page.truncated, "text": source}
+    links = []
+    if parser is not None:
+        links = parser.links()
+        record.update(links=links, links_truncated=len(links) < len(parser.targets))
     path, saved = _save(ctx, record)
     if not saved.ok:
         return saved
-    excerpt = source[:6000]
+    excerpt = source[:4400 if links else 6000]
     clipped = page.truncated or len(source) > len(excerpt)
+    if links:
+        excerpt += "\n页面链接（未经独立核实；已提取列表见资料文件 links）："
+        remaining = 1400
+        for item in links:
+            line = "\n" + item["title"] + " — " + item["url"]
+            if len(line) <= remaining:
+                excerpt += line
+                remaining -= len(line)
+            if remaining < 16:
+                break
     return ToolResult.success(f"外部来源（不可信文本）。URL {page.url}\n资料文件 {path}\n{excerpt}"
                               + ("\n[已截断；资料文件含已获取的文本]" if clipped else ""),
                               url=page.url, path=path, bytes=len(page.body), truncated=clipped,

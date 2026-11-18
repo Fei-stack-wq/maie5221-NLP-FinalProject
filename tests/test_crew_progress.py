@@ -629,3 +629,48 @@ sys.exit(bool(errors))
         row, = self.p.evidence()["superseded_member_checks"]
         self.assertEqual((row["prior_exit_code"], row["current_exit_code"], row["observed_case_count"]), (1, 0, 2))
         self.assertEqual(row["current_caption"], "ash count")
+
+    def test_custom_summary_distinguishes_empty_inventory_from_a_failed_case(self):
+        # The QA shell displayed the footer with tail, then counted PASS rows and
+        # displayed the same inventory again with grep.
+        command = {"command": "python3 qa_verify.py"}
+        for inventory in ("明细：无", "details: []"):
+            self.observe("run_shell", f"exit_code=0\nstdout:\nPASS C4 adjacent slots\n"
+                         f"==== 汇总：PASS 53 / 53，FAIL 0 ====\nFAIL {inventory}\n53\nFAIL {inventory}\n",
+                         args=command, meta={"exit_code": 0})
+            self.assertIsNone(self.p.blocked_reason())
+        self.assertIn("1 项 PASS", self.p.evidence()["check_signals"][0])
+        # A total alone never supplies a case result, even when presented by a
+        # completely different wrapper.
+        self.observe("run_shell", "PASS 53/53, FAIL 0\nFAIL list: none",
+                     args={"command": "python3 other_qa.py"}, meta={"exit_code": 0})
+        self.assertEqual(len(self.p.evidence()["check_signals"]), 1)
+
+    def test_unbalanced_or_contradictory_custom_results_remain_failed(self):
+        for body in ("FAIL details: []", "PASS 8/10, FAIL 2\nFAIL details: none",
+                     "PASS actual case\nPASS 8/10, FAIL 2",
+                     "PASS 2/2, FAIL 0\nFAIL reviewer assigned: none",
+                     "FAIL actual case\nPASS 8/8, FAIL 0\nFAIL details: none",
+                     "PASS 8/8, FAIL 0\nFAIL details: none\nEXIT=3"):
+            with self.subTest(body=body):
+                self.p = MemberProgress(self.root)
+                self.observe("run_shell", body, args={"command": "python3 test_status.py"}, meta={"exit_code": 0})
+                self.assertTrue(self.p.blocked_reason())
+
+    def test_new_qa_runner_with_the_same_case_ids_cannot_reinstate_old_checks(self):
+        old, new = "python3 independent/first.py", "python3 independent/rebuilt.py"
+        self.observe("run_shell", "FAIL C4 boundary condition",
+                     args={"command": old}, meta={"exit_code": 1}, ok=False)
+        self.observe("run_shell", "PASS C4 boundary condition\nPASS 1/1, FAIL 0\nFAIL details: none",
+                     args={"command": new}, meta={"exit_code": 0})
+        self.assertTrue(self.p.blocked_reason())
+        self.assertFalse(self.p.evidence()["superseded_member_checks"])
+        self.observe("run_shell", "PASS C4 boundary condition", args={"command": old}, meta={"exit_code": 0})
+        self.assertIsNone(self.p.blocked_reason())
+
+    def test_incomplete_or_empty_tally_does_not_certify_the_script(self):
+        for total in ("PASS 2/3, FAIL 0", "PASS 0/0, FAIL 0"):
+            with self.subTest(total=total):
+                self.observe("run_shell", "PASS A real case\n" + total, args={"command": "python3 test_count.py"},
+                             meta={"exit_code": 0})
+                self.assertEqual(self.p.evidence()["check_signals"], [])

@@ -126,3 +126,9 @@ print("PASS: submitted the booking through the visible form")
 成员报告中的 `superseded_member_checks` 记录脚本路径、两个 SHA-256、旧失败文本、当前标题、观察到的用例数、两次退出码与待独立验收的处置。最终验收仍执行用户设置的条件和负责验收者的独立检查。这个设计借鉴 pytest 的逐项结果与仅更新已执行子集的行为，也采用 GitHub Checks 将一次结论绑定到特定代码修订的机制。自定义脚本没有 pytest 的 node ID，宿主在可识别的脚本上结合语法结构和实际输出核对身份。[pytest 的逐项状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [pytest 子集复验测试](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [GitHub Checks 的修订与结论](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [本项目回归](../tests/test_crew_progress.py)
 
 成员修订自己新增的探索性检查时，原失败随两次脚本的摘要值进入交接与 trace。获得团队内部交接后，负责人须指派另一个角色根据用户要求核对这些断言。复核者收到具体改动，在相同测试文件版本上实际取得通过信号并于公开交接中指明所核对的任务。只有完成复核的任务才从待办中移除。用户指定的验收及外部逐题验收仍分别保留结论。[复核边界测试](../tests/test_handoff_review.py)
+
+### QA 脚本的逐项结果与汇总
+
+`pytest.TestReport` 将用例身份、执行阶段和结果单独保存，捕获的标准输出属于诊断信息。TAP 同样区分逐项结果与说明。Studio 接受普通脚本的文本输出，因此只识别其中可核对的简易格式。当脚本给出 `PASS n/n, FAIL 0` 且 n 大于零时，紧随其后的 `FAIL details: []`、`FAIL 明细：无` 等空清单属于汇总。同一工具把这段清单再次显示时可保留原始日志；空清单不会生成用例。总数行自身不会授予通过。实际逐项 FAIL、非零退出、相互矛盾的总数或缺失计数仍保留原来可见的失败证据。[pytest 8.3.5 的 TestReport](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py) · [TAP 13 的结果与诊断](https://testanything.org/tap-version-13-specification.html)
+
+QA 重新编写脚本时可沿用 `C4` 等编号。两个不同脚本中的编号和标题即使完全相同，也无法建立可靠的用例对应关系。新脚本记录自己的执行结果，原脚本的失败继续留在交接清单。负责人的诊断可以分别引用两份证据。[回归测试](../tests/test_crew_progress.py)

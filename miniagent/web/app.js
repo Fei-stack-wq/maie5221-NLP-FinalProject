@@ -703,8 +703,8 @@ function roomMessages(events,runId) {
    <span>变更 ${e(handoff.changes_total??0)} 个文件</span>
    ${handoff.remaining_issue?`<p>${e(handoff.remaining_issue)}</p>`:''}
    ${checks.map(check=>`<p>${e(check)}</p>`).join('')}
-   ${handoff.published && row.artifacts?.length ? `<details class="turn-files member-files" ${row.artifacts.length<=5?'open':''}>
-    <summary>成员交付文件 · ${row.artifacts.length}</summary><div>${row.artifacts.map(file=>artifactLink(runId,file)).join('')}</div></details>` : ''}</div>` : '';
+   ${row.artifacts?.length ? `<details class="turn-files member-files" ${row.artifacts.length<=5?'open':''}>
+    <summary>${handoff.published?'成员交付文件':'成员诊断报告'} · ${row.artifacts.length}</summary><div>${row.artifacts.map(file=>artifactLink(runId,file)).join('')}</div></details>` : ''}</div>` : '';
   return `<div class="room-event"><strong>${e(kinds[row.kind]||row.kind)} · ${e(row.role==='user'?'你':roleLabel(row.role))}</strong>${row.recipient?` → ${e(roleLabel(row.recipient))}`:''}
    <p>${e(row.text)}</p>${receipt}${reserve?`<small>后续委派与收尾预留 · ${e(reserve.steps_left)} 步 · ${e(Number(reserve.tokens_left).toLocaleString())} token</small>`:''}</div>`;
  }).join('');

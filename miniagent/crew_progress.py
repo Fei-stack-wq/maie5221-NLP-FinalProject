@@ -26,6 +26,14 @@ _PYTEST = re.compile(r"(?m)^\s*=*\s*(?:\d+ (?:skipped|warnings?), )*(\d{1,8}) pa
 _FAILURE = re.compile(r"(?m)^\s*(?:=+\s*)?(?:FAILED\s*\(|(?:\d+ (?:passed|skipped|warnings?), )*"
                       r"[1-9]\d* (?:failed|errors?)\b|FAILED \S+::)")
 _CASE = re.compile(r"(?im)^\s*(PASS|FAIL)\s*[:|–-]?\s+([^\n]+)")
+# Custom test scripts may append a balanced tally, then key-value diagnostics.
+# Unlike a result event, an empty failure inventory has no test identity.
+_CASE_TOTALS = re.compile(
+    r"[ \t=*-]*(?:[^:\n：]{1,40}[:：][ \t]*)?PASS[ \t]+(\d{1,8})[ \t]*/[ \t]*(\d{1,8})"
+    r"[ \t]*[,，][ \t]*FAIL[ \t]+(\d{1,8})[ \t=*-]*", re.I)
+_EMPTY_FAILURE_DETAILS = re.compile(
+    r"(?:details?|list|failed (?:cases?|tests?)|明细|详情|列表|失败(?:明细|列表|用例))"
+    r"\s*[:：]\s*(?:none|null|\[\s*\]|\{\s*\}|无|空)", re.I)
 _NESTED_EXIT = re.compile(r"(?im)(?:^\s*|CompletedProcess\([^\n]*?,\s*)(?:returncode|exit(?:[_ ]?code)?)\s*[=:]\s*(-?\d{1,8})\b")
 _TRACEBACK = re.compile(r"(?ms)^Traceback \(most recent call last\):\s*\n\s+File .+?"
                         r"^(?:[\w.]+(?:Error|Exception)|SystemExit)(?::|$)")
@@ -278,6 +286,36 @@ def _script_layout(source: str) -> _ScriptLayout | None:
         return None
 
 
+class _CaseReport(NamedTuple):
+    rows: list[tuple[str, str]]
+    reported_failure: bool
+    incomplete: bool
+
+
+def _case_report(output: str) -> _CaseReport:
+    rows = []
+    reported_failure = incomplete = False
+    after_complete_tally = False
+    for line in output.splitlines():
+        totals = _CASE_TOTALS.fullmatch(line)
+        if totals:
+            passed, total, failed = map(int, totals.groups())
+            reported_failure |= failed > 0
+            incomplete |= passed + failed != total or total == 0
+            after_complete_tally = passed == total and total > 0 and failed == 0
+            continue
+        case = _CASE.fullmatch(line)
+        if case:
+            status, name = case[1].upper(), case[2].strip()
+            if after_complete_tally and status == "FAIL" and _EMPTY_FAILURE_DETAILS.fullmatch(name):
+                continue
+            rows.append((status, name))
+            after_complete_tally = False
+        elif after_complete_tally and line.strip() and not line.strip().isdigit():
+            after_complete_tally = False
+    return _CaseReport(rows, reported_failure, incomplete)
+
+
 class _ScriptRun(NamedTuple):
     path: str
     digest: str
@@ -312,7 +350,10 @@ def _script_run(layouts, current, command, cwd, obs, status):
     if not layout or version != digest:
         return None
     order, failed = [], {}
-    for result, name in _CASE.findall(re.sub(r"\x1b\[[0-9;]*m", "", obs.content)):
+    report = _case_report(re.sub(r"\x1b\[[0-9;]*m", "", obs.content))
+    if report.incomplete:
+        return None
+    for result, name in report.rows:
         name = name.strip()
         matches = [i for i, cap in enumerate(layout.captions)
                    if name == cap or result.upper() == "FAIL" and name.startswith(cap + " ")]
@@ -397,7 +438,8 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
                 pass
     unit = _UNIT.search(output)
     passed = _PYTEST.search(output)
-    cases = _CASE.findall(output)
+    report = _case_report(output)
+    cases = report.rows
     failed_cases = [name.strip() for status, name in cases if status.upper() == "FAIL"]
     passed_cases = [name.strip() for status, name in cases if status.upper() == "PASS"]
     failure = _FAILURE.search(output)
@@ -425,9 +467,9 @@ def _check(obs: Observation, command: str, reading: bool, exit_position: int | N
     nested_exception = (is_test or inline_assertions) and _TRACEBACK.search(output) and not unit
     if failed_cases:
         return _Check(suite, "failed", "工具输出 FAIL · " + failed_cases[0][:72], tuple(failed_cases))
-    if failure or nested_exception or (check_context and bad_exit):
+    if failure or report.reported_failure or nested_exception or (check_context and bad_exit):
         return _Check(suite, "failed", f"{framework} 执行失败")
-    if obs.truncated or not obs.ok or "截断" in output[-80:]:
+    if report.incomplete or obs.truncated or not obs.ok or "截断" in output[-80:]:
         return None
     if unit and int(unit[1]) and _UNIT_OK.search(output[unit.end():]):
         return _Check(suite, "passed", f"unittest · {unit[1]} tests OK", tuple(passed_cases))

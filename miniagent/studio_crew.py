@@ -17,6 +17,7 @@ from pathlib import Path
 from .acceptance import _relative_name
 from .agent import Agent
 from .context_window import estimate_tokens
+from .crew_diagnostics import RoomDiagnostics
 from .crew_progress import MemberProgress
 from .member_processes import managed_member_processes
 from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_project_file
@@ -93,6 +94,8 @@ class RoomCrew:
         self.deadline = time.monotonic() + self.budget.seconds_left
         self.handoffs = {}
         self.reports = []
+        self.diagnostics = RoomDiagnostics(path, settings.api_key)
+        self.prior_diagnostics = []
         self.assigned = set()
         self.project_version = 0
         self.assignment_results = {}
@@ -155,6 +158,7 @@ class RoomCrew:
                 "每次只委派给一人。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
                 "验收只列该成员负责的工作。其他成员的独立验证、交付说明和打包工作请留给其实际负责人，"
                 "不要把整个项目的全部最终验收原样转给执行第一阶段的人。下一人的分工基于实际交接。"
+                "分派分析、审阅或测试报告时，用 deliverable_paths 指定报告。即使交接受阻，也可读其诊断并按实证分工。"
                 "同一人可以续修未发布的草稿。若同一人原地踏步，可点名另一位成员，用 recover_from 显式接手缺文件的有效草稿。"
                 "你负责协调、转交缺陷或汇总。具体文件由成员处理。成员完成且用户要求得到满足时立即交付。"
                 "团队内选谁、补交、返工、是否由负责人读源码，均由你自主决定。"
@@ -193,6 +197,25 @@ class RoomCrew:
                     "如另有独立的业务或许可问题，请单独提问。")
         return None
 
+    def _diagnostic_context(self):
+        latest = {r["role"]:r for r in self.reports}
+        entries = []
+        for r in reversed(self.reports):
+            if r is not latest[r["role"]] or not r.get("diagnostics"):
+                continue
+            for item in r["diagnostics"][:3]:
+                entries.append({"role":r["role"], "task_id":r["task_id"], "path":item["path"],
+                                "excerpt":item["excerpt"]})
+            if len(entries) >= 3:
+                break
+        for entry in self.prior_diagnostics:
+            if entry["role"] not in latest and len(entries) < 3:
+                entries.append(entry)
+        if not entries:
+            return ""
+        return ("\n受阻成员的诊断资料。以下是成员陈述，尚未独立核验。区分检查方法的问题与可复现的交付缺陷，"
+                "再分派修复和独立复测。用 read_handoff_report(task_id,path,offset) 可读完整报告。\n" + _json(entries[:3]))
+
     def _public_state(self, *, final):
         rows = {}
         for r in self.reports:
@@ -218,6 +241,8 @@ class RoomCrew:
                  "\n已计划成员：" + _json(sorted(self.planned) if self.planned is not None else None) +
                  "\n可接手返工的已选成员：" + _json(self._eligible_repairs(None)) +
                  "\n本轮用户决定：" + _clip(decisions, 1800) + "\n公开交接：" + receipts)
+        diagnostics = self._diagnostic_context()
+        state += _clip(diagnostics, 800) if final else diagnostics
         if not final:
             state += "\n宿主已核实的当前公共工作区文件（列出前 64 个，未发布草稿不影响该清单）：" + _json(self.inventory)
         if self.last_dispatch_error:
@@ -254,7 +279,8 @@ class RoomCrew:
             self.navigation_seen.clear()
             self.navigation_repeats = 0
             return
-        observations = [o for o in record.observations if o.source in _PROJECT_READS | _KNOWLEDGE_READS]
+        observations = [o for o in record.observations
+                        if o.source in _PROJECT_READS | _KNOWLEDGE_READS | {"read_handoff_report"}]
         if not observations:
             return
         # Step latency includes synchronous member runs; only the lead's own
@@ -300,6 +326,7 @@ class RoomCrew:
     @cached_property
     def coordinator_schemas(self):
         registry = build_default_registry(read_only=True)
+        registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(self.lead, registry, read_only=True)
         specs = [*registry.specs(), *CONTROL_TOOLS.values()]
@@ -389,7 +416,7 @@ class RoomCrew:
         landmarks = []
         if self.navigation_version == self.project_version:
             for row in reversed(self.navigation):
-                if not row["ok"] or row["tool"] in {"list_dir", "find_files"}:
+                if not row["ok"] or row["tool"] in {"list_dir", "find_files", "read_handoff_report"}:
                     continue
                 location = {k: row[k] for k in ("tool", "path", "query", "start_line", "offset") if k in row}
                 entry = {**location, "excerpt": _clip(row["excerpt"], 650)}
@@ -402,7 +429,7 @@ class RoomCrew:
         return ("你在本地项目副本中完成当前分工。可用工具以本轮接口为准。"
                 "请按实际文件和测试结果交接成果与限制，仍有阻塞时以 [BLOCKED] 说明原因。"
                 "\n当前分工资料：" + _json(facts) + "\n本轮真实用户答复：" + _json(current)
-                + self._prior_context(include_model_answers=False) + ("\n" + repair if repair else ""))
+                + self._diagnostic_context() + self._prior_context(include_model_answers=False) + ("\n" + repair if repair else ""))
 
     def coordinator_policy(self, state, budget):
         closing = StepPolicy("finalize", "请根据成员公开交接汇总交付，说明证据、使用方法和局限。"
@@ -434,18 +461,21 @@ class RoomCrew:
                               "尚有交付缺口时以 [BLOCKED] 汇报受阻原因。", frozenset(), compact=True)
         controls = frozenset({"delegate_task", "abort_task"} if self.routing_denied else
                              {"delegate_task", "ask_human", "abort_task"})
+        inspect_reports = bool(self.diagnostics.files)
         inspect_public = not self.reports or (not self.reports[-1]["published"] and self.inventory["total"] > 0)
+        can_inspect = inspect_reports or inspect_public
         intake_full = self.revision_reads.exhausted or self.decision_reads.exhausted
-        if inspect_public and intake_full and not self.inspection_notified:
+        if can_inspect and intake_full and not self.inspection_notified:
             self.inspection_notified = True
             if self.tracer:
                 self.tracer.event("coordinator_intake_limit", task_id=self.run_id, root_id=self.run_id,
                                   public_revision=self.project_version, revision=asdict(self.revision_reads),
                                   decision=asdict(self.decision_reads))
-        force_dispatch = denied >= 2 or self.navigation_repeats >= 2 or (inspect_public and intake_full)
+        force_dispatch = denied >= 2 or self.navigation_repeats >= 2 or (can_inspect and intake_full)
         if force_dispatch:
             controls = frozenset({"delegate_task"})
             inspect_public = False
+            inspect_reports = False
             if intake_full:
                 instruction += "\n本次或本版本的负责人勘察额度已用完，依据已有回执给合适成员分工。"
             else:
@@ -453,6 +483,8 @@ class RoomCrew:
         elif inspect_public and len(self.navigation_seen) >= 3:
             instruction += "\n已收集多项背景信息。只补足直接影响分工的缺口，否则现在进行委派。"
         allowed = controls | _PROJECT_READS if inspect_public else controls
+        if inspect_reports:
+            allowed |= {"read_handoff_report"}
         if inspect_public and not force_dispatch and self.role_session and self.lead in self.role_session.saved:
             allowed |= _KNOWLEDGE_READS
         decision = StepPolicy("coordinate", instruction, frozenset(allowed), compact=True)
@@ -460,7 +492,7 @@ class RoomCrew:
         def input_cost(names):
             return message_cost + estimate_tokens([self.coordinator_schemas[n] for n in sorted(names)])
         decision_input = input_cost(allowed)
-        if inspect_public and not budget.has_tokens(self.close_tokens + decision_input + 1):
+        if can_inspect and not budget.has_tokens(self.close_tokens + decision_input + 1):
             allowed = controls
             decision_input = input_cost(controls)
         if (budget.steps_left <= (2 if self.assigned else 1) or budget.seconds_left <= self.close_seconds
@@ -737,6 +769,8 @@ class RoomCrew:
         handoff_seconds = min(30, allocated.seconds_left * .1)
         human_deadline = time.monotonic() + allocated.seconds_left - handoff_seconds
         registry = build_default_registry()
+        if self.diagnostics.files:
+            registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(role, registry)
         member = Agent(name=role, provider=self.provider, registry=registry,
@@ -906,6 +940,9 @@ class RoomCrew:
                   "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
         if not published:
+            artifacts = self.diagnostics.capture(assignment, role, required, original, record.task_id)
+            if artifacts:
+                report["diagnostics"] = [{"path": a["project_path"], "excerpt": a.pop("excerpt")} for a in artifacts]
             self._remember_draft(role, assignment, required, report, progress.failed_checks(),
                                  {"runs": recent_runs, "reads": recent_reads}, original)
         self.reports.append(report)

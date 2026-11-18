@@ -1010,6 +1010,34 @@ class StudioService(RoomDiscussion, StudioRoles):
             return candidates[0]
         return None
 
+    def _load_prior_diagnostics(self, crew, thread):
+        parent = thread.get("parent_run_id")
+        if not parent or not thread.get("inherit_files", True):
+            return
+        source = self._directory(parent)
+        meta = self._meta(source)
+        previous = thread_info(parent, meta)
+        if (meta.get("state") != "failed" or not previous or previous["kind"] != "group"
+                or previous["id"] != thread["id"] or previous["intent"] != "edit"):
+            return
+        events = self.room_events(parent)
+        handoffs = {e["task_id"]: e["handoff"] for e in events
+                    if e["kind"] == "member_report" and e.get("published") is False and e.get("handoff")}
+        # Earlier releases recorded the requested and observed files but had no
+        # diagnostic receipt. Reconstruct only those named, changed documents
+        # from the direct parent's TaskStore-bound, frozen member assignment.
+        for checkpoint, info in self._room_checkpoints(source, previous, events):
+            task_id, role = info["task_id"], info["role"]
+            handoff = handoffs.get(task_id, {})
+            expected = set(handoff.get("deliverable_paths", []))
+            child = meta.get("request", {}).get("child_checks", {}).get(role, {})
+            expected.update(child.get("files", []))
+            paths = sorted(expected.intersection(handoff.get("evidence", {}).get("files", [])))
+            attachments = crew.diagnostics.capture(checkpoint.parent, role, paths, {}, task_id, checkpoint=checkpoint)
+            for item in attachments:
+                crew.prior_diagnostics.append({"role": role, "task_id": task_id, "path": item["project_path"],
+                                               "excerpt": item["excerpt"], "source_run": parent})
+
     @staticmethod
     def _workspace(path: Path, thread: dict) -> Path:
         if thread["intent"] == "question":
@@ -1236,9 +1264,12 @@ class StudioService(RoomDiscussion, StudioRoles):
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
                                     {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])},
                                     role_session=roles)
+                    self._load_prior_diagnostics(crew, thread)
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
                 registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
+                if crew:
+                    registry.add(crew.diagnostics.tool())
                 agent = Agent(name=recipient, provider=provider, registry=registry,
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
                               human_handler=(self._human_handler(run_id, recipient, deadline=crew.deadline - crew.close_seconds)
