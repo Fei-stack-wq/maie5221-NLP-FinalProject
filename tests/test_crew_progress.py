@@ -482,3 +482,150 @@ class MemberProgressTest(unittest.TestCase):
         self.assertIsNone(self.p.blocked_reason())
         self.assertIn("含浏览器断言的脚本退出 0", self.p.evidence()["check_signals"])
         self.assertEqual(self.p.evidence()["executions"]["run_browser_calls"],5)
+
+    _custom_script = """import sys
+failures = []
+def expect(caption, got, want):
+    if got == want:
+        print("PASS " + caption)
+    else:
+        print("FAIL " + caption, got, want)
+        failures.append(caption)
+actual = [45, 60, 45]
+expect("busy 180", sum(actual), 180)
+expect("all intervals", len(actual), 3)
+sys.exit(bool(failures))
+"""
+
+    def run_custom(self, source, *, baseline=False, command="python3 test_member.py",
+                   output=None, truncated=False):
+        import subprocess
+        import sys
+        path = self.root / "test_member.py"
+        write = "edit_file" if path.exists() else "write_file"
+        if source is not None:
+            path.write_text(source)
+            if baseline:
+                self.p = MemberProgress(self.root)
+            self.observe(write, args={"path": path.name})
+        result = subprocess.run([sys.executable, str(path)], capture_output=True, text=True, check=False)
+        if output is None:
+            output = result.stdout
+        if "; echo" in command:
+            output += f"EXIT={result.returncode}\n"
+        status = 0 if "; echo" in command else result.returncode
+        args = {"command": command}
+        state = RAOState(goal="", task_id="t", history=[{"role": "assistant", "tool_calls": [
+            {"id": "one", "function": {"name": "run_shell", "arguments": json.dumps(args)}}]}])
+        obs = Observation(step_id="s", source="run_shell", ok=status == 0, content="exit_code=%s\nstdout:\n%s" % (status, output),
+                          truncated=truncated, meta={"exit_code": status}, tool_call_id="one")
+        self.p.observe(StepRecord(step=1, observations=[obs], prompt_tokens=1), state)
+
+    def test_complete_revised_member_script_retires_old_version_for_qa(self):
+        direct = 'python3 test_member.py; echo "EXIT=$?"'
+        self.run_custom(self._custom_script, command=direct)
+        old = self.p.failed_checks()
+        self.assertEqual(len(old), 1)
+        self.run_custom(self._custom_script.replace("180", "150"), command=direct)
+        self.assertIsNone(self.p.blocked_reason())
+        retired, = self.p.evidence()["superseded_member_checks"]
+        self.assertEqual(retired["prior_failure"], next(iter(old.values())))
+        self.assertEqual(retired["current_caption"], "busy 150")
+        self.assertNotEqual(retired["prior_sha256"], retired["current_sha256"])
+        self.assertIn("pending_independent_acceptance", retired["disposition"])
+
+    def test_preexisting_script_cannot_retire_or_mask_an_old_check(self):
+        self.run_custom(self._custom_script, baseline=True)
+        fixed = self._custom_script.replace("180", "150")
+        self.run_custom(fixed)
+        self.assertTrue(self.p.blocked_reason())
+        self.run_custom('print("PASS busy 180 150 180")')
+        self.assertTrue(self.p.blocked_reason())
+        self.assertFalse(self.p.evidence()["superseded_member_checks"])
+
+    def test_member_revisions_preserve_assertions_reporter_and_observed_expressions(self):
+        fixed = self._custom_script.replace("180", "150")
+        for changed in (fixed.replace('expect("all intervals", len(actual), 3)', ''),
+                        fixed.replace('if got == want:', 'if True:'),
+                        fixed.replace('sum(actual), 150', '150, 150'),
+                        'print("PASS busy 180 150 180")\nprint("PASS all intervals")',
+                        fixed.replace('sys.exit(bool(failures))', 'sys.exit(0)')):
+            with self.subTest(changed=changed[-80:]):
+                path = self.root / "test_member.py"
+                path.unlink(missing_ok=True)
+                self.p = MemberProgress(self.root)
+                self.run_custom(self._custom_script)
+                self.run_custom(changed)
+                self.assertTrue(self.p.blocked_reason())
+                self.assertFalse(self.p.evidence()["superseded_member_checks"])
+
+    def test_retirement_requires_full_output_order_and_an_unfiltered_runner(self):
+        self.run_custom(self._custom_script)
+        fixed = self._custom_script.replace("180", "150")
+        self.run_custom(fixed, command="python3 test_member.py | tail -2")
+        self.run_custom(None, command="python3 test_member.py selected_case")
+        self.run_custom(None, output="PASS busy 150\n")
+        self.run_custom(None, output="PASS all intervals\nPASS busy 150\n")
+        self.run_custom(None, truncated=True)
+        self.assertTrue(self.p.blocked_reason())
+        self.run_custom(None)
+        self.assertIsNone(self.p.blocked_reason())
+
+    def test_changed_member_script_invalidates_previous_revision_receipt(self):
+        self.run_custom(self._custom_script)
+        corrected = self._custom_script.replace("180", "150")
+        self.run_custom(corrected)
+        self.run_custom('print("PASS busy 180 150 180")')
+        self.assertTrue(self.p.blocked_reason())
+        self.assertIn("invalidated_at_step", self.p.evidence()["superseded_member_checks"][0])
+        self.run_custom(corrected)
+        self.assertIsNone(self.p.blocked_reason())
+
+    def test_same_version_clears_dynamic_failure_detail_only_after_full_run(self):
+        data = self.root / "minutes"
+        data.write_text("45")
+        source = self._custom_script.replace("actual = [45, 60, 45]",
+            "from pathlib import Path\nactual = [45, 60, int(Path(__file__).with_name('minutes').read_text())]")
+        self.run_custom(source)
+        self.assertTrue(self.p.blocked_reason())
+        data.write_text("75")
+        self.run_custom(None)
+        self.assertIsNone(self.p.blocked_reason())
+        self.assertEqual(self.p.evidence()["superseded_member_checks"], [])
+
+    def test_recovered_fixed_checks_remain_bound_to_original_script_bytes(self):
+        original = self._custom_script
+        self.run_custom(original)
+        failed = self.p.failed_checks()
+        self.p = MemberProgress(self.root)
+        self.p.restore_failed_checks(failed)
+        self.run_custom('print("PASS busy 180")')
+        self.assertTrue(self.p.blocked_reason())
+        self.assertEqual(self.p.failed_checks(), failed)
+
+    def test_renamed_text_corpus_cases_require_the_original_reporter(self):
+        corpus = """import sys
+errors = []
+def record(title, observed, target):
+    if observed == target:
+        print("PASS " + title)
+    else:
+        print("FAIL " + title)
+        errors.append(title)
+words = "elm elm ash".split()
+record("two elm", words.count("elm"), 2)
+record("three ash", words.count("ash"), 3)
+sys.exit(bool(errors))
+"""
+        self.run_custom(corpus)
+        self.assertTrue(self.p.blocked_reason())
+        corrected = corpus.replace('"elm elm ash".split()', '["fir", "ash", "fir", "ash"]')
+        corrected = corrected.replace('"two elm", words.count("elm")', '"fir count", words.count("fir")')
+        corrected = corrected.replace('"three ash", words.count("ash"), 3', '"ash count", words.count("ash"), 2')
+        self.run_custom(corrected.replace("if observed == target:", "if True:"))
+        self.assertTrue(self.p.blocked_reason())
+        self.run_custom(corrected)
+        self.assertIsNone(self.p.blocked_reason())
+        row, = self.p.evidence()["superseded_member_checks"]
+        self.assertEqual((row["prior_exit_code"], row["current_exit_code"], row["observed_case_count"]), (1, 0, 2))
+        self.assertEqual(row["current_caption"], "ash count")

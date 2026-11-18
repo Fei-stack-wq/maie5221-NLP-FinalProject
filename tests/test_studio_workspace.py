@@ -112,6 +112,86 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(detail["conversation"]["turns"][0]["artifacts"][0]["name"], "notes.md")
         self.assertFalse((self.local / "notes.md").exists())
 
+    def blocked_drafts(self, *, later_publication=False):
+        from tests.test_studio_crew import roster, write
+        second = "Published peer work." if later_publication else "[BLOCKED] waiting for verification"
+        model = RecordingProvider([
+            tool("delegate_task", assignee="author", objective="draft A", remaining_roles=["reviewer"]),
+            write("a.md", "private work from author"), {"text": "[BLOCKED] waiting for review"},
+            tool("delegate_task", assignee="reviewer", objective="draft B", remaining_roles=[]),
+            write("b.md", "private work from reviewer"), {"text": second},
+            {"text": "[BLOCKED] root still needs review"},
+        ])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=model):
+            run = self.svc.start(request("team", objective="collaborate", conversation=roster("lead", "author", "reviewer"),
+                                         workspace_path=str(self.local)))
+            detail = finished(self.svc, run["id"])
+        self.assertEqual(detail["run"]["status"], "failed", detail["diagnostics"])
+        ids = {row["role"]: row["task_id"] for row in detail["room_events"] if row["kind"] == "member_report"}
+        self.assertEqual(ids.keys(), {"author", "reviewer"})
+        return run["id"], ids, detail["conversation"]["recovery_candidates"]
+
+    def recover(self, parent, *, acceptance_files=None, **fields):
+        return self.svc.start(request("single", objective="resume", acceptance_files=acceptance_files or [], conversation={
+            "parent_run_id": parent, "intent": "edit", "recipient": "lead", "recover_failed": True, **fields}))
+
+    def test_choose_member_task_when_a_failed_group_has_multiple_private_drafts(self):
+        parent, ids, candidates = self.blocked_drafts()
+        self.assertEqual([(c["task_id"], c["objective"]) for c in candidates],
+                         [(ids["reviewer"], "draft B"), (ids["author"], "draft A")])
+        with self.assertRaises(StudioError) as error:
+            self.recover(parent)
+        self.assertEqual(error.exception.code, "recovery_selection_required")
+        model = RecordingProvider([tool("read_file", path="a.md"), {"text":"[BLOCKED] another check is needed"}])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=model):
+            run = self.recover(parent, recover_task_id=ids["author"], acceptance_files=["required.md"])
+            detail = finished(self.svc, run["id"])
+        self.assertIn("private work from author", str(model.requests[-1][0]))
+        self.assertFalse((self.svc.runs_dir / run["id"] / "agents/lead/b.md").exists())
+        self.assertEqual(detail["conversation"]["turns"][-1]["recovery_source"],
+                         {"role": "author", "task_id": ids["author"]})
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertFalse((self.local / "a.md").exists())
+        with self.assertRaises(StudioError) as stale:
+            self.recover(parent, recover_task_id=ids["author"])
+        self.assertEqual(stale.exception.code, "stale_head")
+
+    def test_recovery_rejects_foreign_tasks_paths_symlinks_partial_copies_and_user_edits(self):
+        parent, ids, _ = self.blocked_drafts()
+        other, foreign, _ = self.blocked_drafts()
+        for invalid in [foreign["author"], "../../" + other, parent, False]:
+            with self.subTest(invalid=invalid), self.assertRaises(StudioError):
+                self.recover(parent, recover_task_id=invalid)
+        directories = self.svc.runs_dir / parent / "assignments"
+        [leaf] = directories.glob("*/checkpoint/agents/author")
+        leaf.rename(leaf.with_name("backup"))
+        leaf.symlink_to(leaf.with_name("backup"))
+        with self.assertRaises(StudioError) as unsafe:
+            self.recover(parent, recover_task_id=ids["author"])
+        self.assertEqual(unsafe.exception.code, "invalid_recovery_checkpoint")
+        leaf.unlink()
+        leaf.with_name("backup").rename(leaf)
+        (leaf / "a.md").unlink()
+        self.assertEqual([c["task_id"] for c in self.svc.detail(parent)["conversation"]["recovery_candidates"]],
+                         [ids["reviewer"]])
+        with self.assertRaises(StudioError) as partial:
+            self.recover(parent, recover_task_id=ids["author"])
+        self.assertEqual(partial.exception.code, "unsupported_snapshot")
+        (self.local / "my.md").write_text("human changes")
+        with self.assertRaises(StudioError) as changed:
+            self.recover(parent, recover_task_id=ids["reviewer"])
+        self.assertEqual(changed.exception.code, "workspace_conflict")
+        self.assertEqual([p.name for p in self.local.iterdir()], ["my.md"])
+        self.assertEqual(len(self.svc.list_runs()["runs"]), 2)
+
+    def test_later_publication_invalidates_older_drafts(self):
+        parent, ids, candidates = self.blocked_drafts(later_publication=True)
+        self.assertEqual(candidates, [])
+        with self.assertRaises(StudioError) as error:
+            self.recover(parent, recover_task_id=ids["author"])
+        self.assertEqual(error.exception.code, "invalid_recovery_checkpoint")
+        self.assertEqual((self.local / "b.md").read_text(), "private work from reviewer")
+
     def test_control_directory_credential_and_hidden_paths(self):
         for invalid in (str(self.svc.runs_dir), str(self.svc.runs_dir.parent), "relative"):
             with self.subTest(invalid=invalid), self.assertRaises(StudioError):

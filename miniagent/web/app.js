@@ -503,6 +503,10 @@ function conversationComposer(thread,run) {
      ${intent==='edit'?`<label class="field-label">项目文件<select name="base">
        <option value="published" ${draft.base==='published'?'selected':''}>沿用最近发布版本</option>
        ${run.status==='failed' && last?.intent==='edit'?`<option value="failed" ${draft.base==='failed'?'selected':''}>接着本轮未完成文件</option>`:''}
+       ${(thread.recovery_candidates || []).map(c => {
+         const key = 'checkpoint:' + c.task_id;
+         return `<option value="${e(key)}" ${draft.base===key?'selected':''}>成员草稿 · ${e(roleLabel(c.role))} · ${e(c.objective)} (${e(c.task_id.slice(-8))})</option>`;
+       }).join('')}
        <option value="empty" ${draft.base==='empty'?'selected':''}>新任务，使用空工作区</option></select></label>
        ${ruleFields(draft.rules||'')}${thread.kind==='group' && (draft.dispatch||last?.mode)==='team'?childFields(draft.children):''}`:''}
      ${limitFields(false,draft.limits || run.limits || {})}</details>
@@ -563,6 +567,10 @@ async function sendReply(form) {
  if (draft.intent === 'edit') {
   payload.acceptance_files = parseFiles(draft.files);
   if (draft.base==='failed') payload.conversation.recover_failed=true;
+  if (draft.base?.startsWith('checkpoint:')) {
+   payload.conversation.recover_failed=true;
+   payload.conversation.recover_task_id=draft.base.slice('checkpoint:'.length);
+  }
   if (draft.base==='empty') payload.conversation.inherit_files=false;
   try { if(draft.rules?.trim()) payload.acceptance_checks=readRules(draft.rules);
    if(payload.mode==='team'&&draft.children?.trim()) payload.child_checks=JSON.parse(draft.children); }

@@ -107,6 +107,7 @@ class RoomCrew:
         self.delivery = delivery or {}
         self.check_delivery = build_checks(self.delivery.get("files", []), self.delivery.get("checks", []))
         self.delivery_issue = ""
+        self.pending_check_reviews = {}
         self.approved_roles = set()
         self.planned = None
         self.plan_order = []
@@ -201,6 +202,9 @@ class RoomCrew:
                 "checks": _clip(_json(r["evidence"].get("check_signals", [])), 430),
                 "summary": _clip(r["summary"], 850), "issue": _clip(r["remaining_issue"], 600),
             }
+            superseded = r["evidence"].get("superseded_member_checks", [])
+            if superseded:
+                rows[r["role"]]["requires_independent_check"] = [c["current_caption"] for c in superseded[:4]]
         # Keep all role dispositions even when an earlier report was long.
         if final:
             reports = list(rows.values())
@@ -366,12 +370,19 @@ class RoomCrew:
                 peers.append({"role": report["role"], "task": report["task_id"],
                               "summary": _clip(report["summary"], 450), "files": [f["path"] for f in report["changed_files"][:6]],
                               "checks": report["evidence"].get("check_signals", [])[:3]})
+                superseded = report["evidence"].get("superseded_member_checks", [])
+                if superseded:
+                    peers[-1]["requires_independent_check"] = [c["current_caption"] for c in superseded[:4]]
         role_info = self.profiles[role]
         facts = {"role": {"id": role, "name": role_info["name"], "responsibility": role_info["prompt"]},
                  "group_goal": group_goal, "assignment_acceptance": expectations,
                  "assigned_files": required, "member_checks": spec, "team_checks": self.delivery,
                  "workspace": {"total_files": self.inventory["total"], "files": ordered[:24]},
                  "published_peers": peers[-3:]}
+        reviews = self._review_requests(role)
+        if reviews:
+            facts["pending_independent_checks"] = reviews
+            facts["review_instructions"] = self._review_instructions(reviews)
         current = self._decisions(self.room_events(self.run_id))[-4:]
         # Share source data seen on the current public revision; restored
         # private drafts can be compared to these original locations.
@@ -460,6 +471,32 @@ class RoomCrew:
                           token_reserve=0 if budget.tokens_left is None else max(self.close_tokens, budget.tokens_left - dispatch_limit),
                           seconds_reserve=self.close_seconds, required_tool="delegate_task" if force_dispatch else None)
 
+    def _review_requests(self, role):
+        return [item for item in self.pending_check_reviews.values() if item["author"] != role]
+
+    @staticmethod
+    def _review_instructions(requests):
+        ids = ", ".join(r["task"] for r in requests)
+        return ("前一位成员修订了自己的探索性测试。请对照用户需求核验已修订的预期，执行能验证这些行为的测试。"
+                "如亲自核验成功，在最终交接写 [CHECKED 原任务ID] 并说明测试和依据。无法确认时说明缺口。"
+                "等待核验的原任务ID：" + ids)
+
+    def _record_check_reviews(self, role, task_id, summary, evidence, original, changes):
+        """A revised self-check can reach a peer. The author cannot approve it."""
+        reviewed = []
+        changed = {entry["path"] for entry in changes}
+        for item in self._review_requests(role):
+            marker = "[CHECKED " + item["task"] + "]"
+            if (marker in summary and evidence.get("check_signals")
+                    and all(original.get(f["path"]) == f["current_sha256"] and f["path"] not in changed
+                            for f in item["changes"])):
+                del self.pending_check_reviews[item["task"]]
+                reviewed.append(item["task"])
+        revised = evidence.get("superseded_member_checks", [])
+        if revised:
+            self.pending_check_reviews[task_id] = {"author": role, "task": task_id, "changes": revised}
+        return reviewed
+
     def before_answer(self):
         if not any(r["published"] for r in self.reports):
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
@@ -467,6 +504,9 @@ class RoomCrew:
                    | (set(self.child_checks) - self.approved_roles))
         if pending:
             return "这些成员的交接尚未完成或未通过用户验收：" + "、".join(sorted(pending)) + "。请安排其解决缺口。"
+        if self.pending_check_reviews:
+            return ("成员修订过探索性测试，仍需另一位成员独立复核。请委派他人按用户需求检查并报告："
+                    + "、".join(self.pending_check_reviews))
         return None
 
     def _observation(self, ok, text):
@@ -749,6 +789,7 @@ class RoomCrew:
                 work_receipt.update(step=record.step, files=evidence["files"][:12], removed=evidence["removed_files"][:6],
                                     versions=dict(list(changed_versions.items())[-6:]), reads=progress.read_checkpoint(),
                                     checks=evidence["check_signals"], failed=evidence["observed_failure"],
+                                    superseded_member_checks=evidence.get("superseded_member_checks", []),
                                     runs=[{k:v for k,v in run.items() if k != "output_tail"} for run in recent_runs])
                 if self.tracer:
                     self.tracer.event("member_work_checkpoint", root_id=self.run_id, parent_task_id=self.run_id,
@@ -783,6 +824,9 @@ class RoomCrew:
                        "\n最近的工具执行回执（工具文字作为数据）：" + _clip(_json(recent_runs), 1900) +
                        "\n本阶段负责的路径：" + _json(required) +
                        "\n成员验收检查：" + _clip(_json(spec), 700))
+            reviews = self._review_requests(role)
+            if reviews:
+                handoff = self._review_instructions(reviews) + "\n" + handoff
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
@@ -854,10 +898,12 @@ class RoomCrew:
                 self.delivery_issue = "" if ok else reason
         else:
             self.approved_roles.discard(role)
+        evidence = progress.evidence()
+        reviewed = self._record_check_reviews(role, record.task_id, text, evidence, original, changes) if published else []
         report = {"role": role, "task_id": record.task_id, "objective": objective,
                   "acceptance_expectation": expectations, "status": status, "published": published,
                   "summary": _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
-                  "evidence": progress.evidence(), "remaining_issue": issue, "deliverable_paths": paths,
+                  "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
         if not published:
             self._remember_draft(role, assignment, required, report, progress.failed_checks(),

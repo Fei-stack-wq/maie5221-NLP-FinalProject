@@ -36,7 +36,7 @@
 | --- | --- |
 | 保存可复用角色 | POST /api/profiles，字段为 id、name、prompt |
 | 群内自动分工 | POST /api/runs，mode 为 team，conversation.kind 为 group，recipient 为负责人，首次请求附所选自定义 profiles |
-| 原群继续 | POST /api/runs，conversation.parent_run_id 指向最新一轮，可指定 inherit_files=false 或 recover_failed=true |
+| 原群继续 | POST /api/runs，conversation.parent_run_id 指向最新一轮。recover_failed=true 时可用 recover_task_id 指定该轮成员草稿。inherit_files=false 用于另起空项目 |
 | 回答执行中的问题 | POST /api/runs/{run}/questions/{request}，字段为 answer |
 | 记录人工评审 | POST /api/runs/{run}/review，字段为 verdict 和 note |
 | 交互预览 | GET /api/runs/{run}/preview?path={已生成的 HTML 路径} |
@@ -101,10 +101,28 @@ print("PASS: submitted the booking through the visible form")
 
 负责人可以在同一次委派中声明成员负责的 `deliverable_paths`。分工已有测试证据但还缺指定的文本产物时，成员会看到缺失路径、最近的检查结果，并保留编辑源码和复测的工具。系统保存上一次未发布的草稿及其公共版本，恢复时会把实际检查、缺失路径和工作目录一并交还。对同一组缺口反复改写任务描述，仍计入同一次返工；为其他已选成员保留的执行额度会单独计算。日志可区分成员间发布、草稿续修、向本机工作区写回和最后一次独立验收。
 
-在「接着本轮未完成文件」续聊时优先使用负责人保存的项目。若负责人还没有公开文件，且只有一名受阻成员、其最后一次任务留有完整且经过宿主校验的项目检查点，可以从该检查点恢复。新回合记录源任务和角色，原回合的失败状态可在历史消息中核对。只读提问和默认续聊沿用已经发布的版本。
+最近一轮群组编辑失败后，打开「项目对话 → 本轮选项与预算 → 项目文件」。每个可接续的「成员草稿」显示成员、委派目标和任务编号的末八位。选定后发送，新轮会基于该任务保存的完整文件执行，验收仍按新轮配置运行。聊天记录保留 `recovery_source` 的成员和任务编号。
+
+客户端读取 `GET /api/runs/<群头运行编号>` 的 `conversation.recovery_candidates`，每项含 `task_id`、`role` 和 `objective`。发送时，`conversation` 传入最新 `parent_run_id`、`intent: "edit"`、回复角色、`recover_failed: true` 和选中的 `recover_task_id`。草稿可以交给群中其他角色继续。无需提供本地路径。
+
+宿主把委派和成员回报与直接父任务的 TaskStore 执行上下文核对，在受控目录复验文件，并逐文件比对原任务与检查点的 SHA-256。新的公开交接会淘汰之前的候选。用户已编辑绑定工作区时返回 `workspace_conflict`。群头前移时返回 `stale_head`，跨群或无效的成员任务返回 `invalid_recovery_checkpoint`。草稿不会直接发布到用户文件夹。
+
+保留旧客户端的「接着本轮未完成文件」操作。有公开交接时载入公开项目。负责人尚无文件、只有一名成员有合格草稿时可自动接续该成员最新检查点；多名成员有合格草稿且该轮没有公开交接时，返回 `recovery_selection_required` 并保留原群头。只读问答与默认续聊沿用已有项目。
+
+选择机制参考 LangGraph 的 SQLite 检查点，每个显式版本按线程、命名空间和检查点编号联合查找。LangGraph 的搜索测试覆盖多线程与命名空间过滤。Studio 使用已有的直接父轮、角色与持久任务身份，额外检查本机目录版本和快照完整性。实现未引入上游代码或依赖。[LangGraph SQLite 实现](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/checkpoint-sqlite/langgraph/checkpoint/sqlite/__init__.py#L244-L268) · [上游搜索测试](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/checkpoint-sqlite/tests/test_sqlite.py#L78-L119) · [LangGraph 官方恢复文档](https://docs.langchain.com/oss/python/langgraph/use-time-travel)
 
 ### 按检查身份核销已修复的失败
 
 在 2026-11-18 的软件组真题中，开发者改正了重复取消与取消不存在的预约所返回的 HTTP 状态。第 13 轮和第 21 轮均执行同一个 `python3 selftest.py`。两次使用了不同的临时日志、去色和检索命令。旧版本将整条 shell 命令纳入用例身份，导致两项新 PASS 与旧 FAIL 同时留在交接清单。
 
 宿主借鉴 pytest 按稳定 node ID 更新 `lastfailed` 的做法。对于可识别的自定义逐项输出，它将工作目录、实际运行的脚本及参数与完整用例标题组合成检查身份。相同运行器可以改变日志名、使用文本筛选或去掉显示颜色。只看到一个通过项时，只核销该项。读取历史日志、混合执行多个脚本、可能改写结果的管道、不同的工作目录或运行参数都不能借用原检查身份。复杂 shell 仍使用原命令匹配。完整业务验收由独立验收器执行。[pytest 8.3.5 的状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [不同调用与子集复验用例](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [本项目回归](../tests/test_crew_progress.py)
+
+### 开发成员修订自己的探索用例
+
+会议室预订系统的开发成员曾将三个预约时段的总长写成 180 分钟。实际建立的三个时段分别为 45、60、45 分钟，合计 150 分钟。成员在自己的脚本里改正该数值、剩余分钟和两个时间窗，完整重跑得到 58 个 PASS。由于四个旧 FAIL 的标题包含旧预期或实际值，调度器曾一直阻止移交。
+
+逐项检查的身份包含工作目录、运行器、参数和脚本内容摘要，同名旧失败保留在原版本。对于成员在本次分工通过写文件工具新建的 Python 脚本，宿主可将较早版本的失败登记为“开发自测已替代，待独立验收”。要求两次直接执行同一无筛选脚本，取得真实的完整退出状态和未截断的输出，修订前后实际输出的用例顺序、数量和来源断言位置均相符。宿主核对两版的断言数量、检查表达式形状以及报告函数和退出逻辑；测试数据及预期字面值可修订。业务含义由独立验收判定。删除断言、换成恒真条件、改写报告函数或仅打印 PASS 均保留原阻塞。现有项目脚本及用户提供的脚本按原来的版本复验。宿主认可的修订再次变化时，原阻塞会重新打开。
+
+成员报告中的 `superseded_member_checks` 记录脚本路径、两个 SHA-256、旧失败文本、当前标题、观察到的用例数、两次退出码与待独立验收的处置。最终验收仍执行用户设置的条件和负责验收者的独立检查。这个设计借鉴 pytest 的逐项结果与仅更新已执行子集的行为，也采用 GitHub Checks 将一次结论绑定到特定代码修订的机制。自定义脚本没有 pytest 的 node ID，宿主在可识别的脚本上结合语法结构和实际输出核对身份。[pytest 的逐项状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [pytest 子集复验测试](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [GitHub Checks 的修订与结论](https://docs.github.com/en/rest/checks/runs#create-a-check-run) · [本项目回归](../tests/test_crew_progress.py)
+
+成员修订自己新增的探索性检查时，原失败随两次脚本的摘要值进入交接与 trace。获得团队内部交接后，负责人须指派另一个角色根据用户要求核对这些断言。复核者收到具体改动，在相同测试文件版本上实际取得通过信号并于公开交接中指明所核对的任务。只有完成复核的任务才从待办中移除。用户指定的验收及外部逐题验收仍分别保留结论。[复核边界测试](../tests/test_handoff_review.py)

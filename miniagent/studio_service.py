@@ -261,13 +261,15 @@ class StudioService(RoomDiscussion, StudioRoles):
             meta.update(updates)
             _write_json(path, "studio.json", meta)
 
-    def _records(self, path: Path) -> tuple[list[dict], list[dict]]:
-        """Read the existing schema without constructing/mutating TaskStore."""
+    @contextmanager
+    def _record_snapshot(self, path: Path):
+        """Read the existing TaskStore without its constructor's initialization side effects."""
         database = path / "tasks.sqlite3"
         if database.is_symlink():
             raise StudioError("任务数据库无法读取。", "storage_error", 409)
         if not database.exists():
-            return [], []
+            yield None
+            return
         if not database.is_file():
             raise StudioError("任务数据库无法读取。", "storage_error", 409)
         for name in ("tasks.sqlite3-wal", "tasks.sqlite3-shm"):
@@ -284,6 +286,18 @@ class StudioService(RoomDiscussion, StudioRoles):
             _schema(connection)
             snapshot = StoreTransaction(connection, writable=False)
             snapshot._validate()
+            yield connection, snapshot
+        except (sqlite3.Error, ValueError, KeyError, TypeError):
+            raise StudioError("任务数据库无法读取，原始记录未被修改。", "storage_error", 409) from None
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _records(self, path: Path) -> tuple[list[dict], list[dict]]:
+        with self._record_snapshot(path) as records:
+            if records is None:
+                return [], []
+            connection, _ = records
             rows = connection.execute(
                 "SELECT kind,id,version,payload FROM records WHERE kind IN ('TaskRecord','AttemptRecord','AcceptanceReport','AcceptanceSpec')"
             ).fetchall()
@@ -324,11 +338,6 @@ class StudioService(RoomDiscussion, StudioRoles):
                                    "spec": spec.model_dump(mode="json") if spec else None,
                                    "receipts": receipts})
             return sorted(tasks, key=lambda task: task["created_at"]), acceptance
-        except (sqlite3.Error, ValueError, KeyError, TypeError):
-            raise StudioError("任务数据库无法读取，原始记录未被修改。", "storage_error", 409) from None
-        finally:
-            if connection is not None:
-                connection.close()
 
     def _events(self, path: Path) -> tuple[list[dict], bool]:
         data, truncated = _read_file(path, "trace.jsonl", MAX_LOG_BYTES, missing=True, tail=True)
@@ -574,7 +583,13 @@ class StudioService(RoomDiscussion, StudioRoles):
                           "recipient": thread["recipient"], "answer": answer_text, "answer_truncated": truncated,
                           "intent": thread["intent"], "status": state})
         head = turns[-1] if turns else {}
+        candidates = []
+        if (with_answers and before is None and initial["kind"] == "group"
+                and head.get("status") == "failed" and head["intent"] == "edit"):
+            candidates = [meta for _, meta in self._room_checkpoints(
+                related[-1][1], related[-1][3], public_events, verify=True)]
         return {"id": initial["id"], "kind": initial["kind"], "members": initial["members"],
+                "recovery_candidates": candidates,
                 "head_run_id": head.get("run_id"), "artifact_run_id": artifact_id,
                 "profiles": (related[-1][3] if related else initial).get("profiles", []),
                 "saved_roles": sorted(set(initial.get("saved_roles", [])) | set(self.linked_roles(initial["id"]))),
@@ -597,6 +612,8 @@ class StudioService(RoomDiscussion, StudioRoles):
             last = room["turns"][-1]
             if last["status"] != "failed" or last["intent"] != "edit":
                 raise StudioError("只有最近一轮修改失败后，才能接续该轮文件。", "invalid_recovery")
+            if message.get("recover_task_id") and room["kind"] != "group":
+                raise StudioError("成员草稿必须来自当前群组。", "invalid_recovery")
             base = parent
         saved_roles = room.get("saved_roles", [])
         profiles = [self.current_role(p["id"]) if p["id"] in saved_roles else p for p in room["profiles"]]
@@ -877,15 +894,20 @@ class StudioService(RoomDiscussion, StudioRoles):
                                                   "workspace_conflict", 409)
                             shutil.rmtree(self._workspace(staged, thread))
                         source = self._directory(thread["base_run_id"])
-                        author = thread_info(source.name, self._meta(source))["recipient"]
-                        if thread.get("recover_failed") and not any((source / "agents" / author).glob("*")):
-                            candidate = self._failed_room_checkpoint(source)
-                            if candidate:
-                                source, author, task_id = candidate
-                                thread["recovery_source"] = {"role": author, "task_id": task_id}
+                        source_thread = thread_info(source.name, self._meta(source))
+                        author = source_thread["recipient"]
+                        candidate = None
+                        if thread.get("recover_failed") and source_thread["kind"] == "group":
+                            candidate = self._select_room_checkpoint(source, source_thread, thread.get("recover_task_id"))
                         try:
-                            copy_project(source, author, self._workspace(staged, thread), _EXTENSIONS,
-                                         secret=self.settings.api_key)
+                            target = self._workspace(staged, thread)
+                            if candidate:
+                                checkpoint, info = candidate
+                                author = info["role"]
+                                self._copy_member_checkpoint(checkpoint, author, target)
+                                thread["recovery_source"] = {"role": author, "task_id": info["task_id"]}
+                            else:
+                                copy_project(source, author, target, _EXTENSIONS, secret=self.settings.api_key)
                         except SnapshotError as exc:
                             raise StudioError(str(exc), "unsupported_snapshot", 409) from None
                 _write_json(staged, "studio.json", meta)
@@ -910,33 +932,83 @@ class StudioService(RoomDiscussion, StudioRoles):
                 if staged and staged.exists():
                     shutil.rmtree(staged)
 
-    def _failed_room_checkpoint(self, path):
-        # Only the explicit recover_failed branch reaches here. A checkpoint is
-        # a host-validated project snapshot, separate from the member's private
-        # execution directory. Never choose between unrelated drafts implicitly.
+    def _copy_member_checkpoint(self, checkpoint, role, target=None):
+        # Legacy hosts could leave a partial copy after a validation error.
+        original, restored = {}, {}
+        copy_project(checkpoint.parent, role, None, _EXTENSIONS, secret=self.settings.api_key, manifest=original)
+        copy_project(checkpoint, role, target, _EXTENSIONS, secret=self.settings.api_key, manifest=restored)
+        if original != restored:
+            raise SnapshotError("成员草稿与原任务文件不一致，无法完整恢复。")
+
+    def _room_checkpoints(self, path, thread, events, *, verify=False):
+        # Member executions are serialized. Every published handoff advances the
+        # public base for recovery purposes, even on older journals with no diff.
+        assignments, reports = {}, []
+        for event in events:
+            task_id = event.get("task_id")
+            if event["kind"] == "assignment":
+                assignments[task_id] = event.get("recipient")
+            elif event["kind"] == "member_report":
+                if event.get("published") is True:
+                    assignments.clear()
+                    reports.clear()
+                elif event.get("published") is False and assignments.get(task_id) == event["role"]:
+                    reports.append(event)
+        if not reports:
+            return []
+        candidates = []
+        with self._record_snapshot(path) as records:
+            if records is None:
+                return []
+            _, store = records
+            tasks = {r.task_id: r for r in store.list("TaskRecord")}
+            attempts = {r.attempt_id: r for r in store.list("AttemptRecord")}
+            for row in reversed(reports):
+                task = tasks.get(row["task_id"])
+                role = row["role"]
+                if (not task or role not in thread["members"] or role == thread["recipient"]
+                        or task.parent_id != path.name or task.root_id != path.name or task.assignee_profile_id != role):
+                    continue
+                attempt = attempts.get(task.current_attempt_id)
+                if not attempt or attempt.task_id != task.task_id or not attempt.context_ref:
+                    continue
+                ctx = store.get_blob(attempt.context_ref)["context"]
+                if (ctx.get("role") != role or ctx.get("public_room") != thread["id"]
+                        or not isinstance(ctx.get("workspace"), str)):
+                    continue
+                workspace = Path(ctx["workspace"])
+                assignment = workspace.parent.parent
+                checkpoint = assignment / "checkpoint"
+                leaf = checkpoint / "agents" / role
+                if (assignment.parent != path / "assignments" or not assignment.name.startswith("member-")
+                        or workspace != assignment / "agents" / role or not leaf.is_dir()
+                        or any(p.is_symlink() for p in (assignment.parent, assignment, checkpoint, leaf.parent, leaf))):
+                    continue
+                if verify:
+                    try:
+                        self._copy_member_checkpoint(checkpoint, role)
+                    except SnapshotError:
+                        continue
+                candidates.append((checkpoint, {"task_id": task.task_id, "role": role, "objective": task.objective[:180]}))
+        return candidates
+
+    def _select_room_checkpoint(self, path, thread, requested):
         events = self.room_events(path.name)
-        reports = [r for r in events if r["kind"] == "member_report"]
-        if not reports or any(r.get("published") for r in reports) or len({r["role"] for r in reports}) != 1:
-            return None
-        row = reports[-1]
-        store = TaskStore(path / "tasks.sqlite3")
-        task = store.get(row["task_id"])
-        if task.parent_id != path.name or task.assignee_profile_id != row["role"]:
-            return None
-        attempts = store.attempts(task.task_id)
-        if not attempts or not attempts[-1].context_ref:
-            return None
-        ctx = store.get_blob(attempts[-1].context_ref)["context"]
-        workspace = Path(ctx.get("workspace", ""))
-        assignment = workspace.parent.parent
-        checkpoint = assignment / "checkpoint"
-        if (assignment.parent != path / "assignments" or not assignment.name.startswith("member-")
-                or workspace != assignment / "agents" / row["role"]
-                or ctx.get("public_room") != thread_info(path.name, self._meta(path))["id"]
-                or any(p.is_symlink() for p in (assignment.parent, assignment, checkpoint))
-                or not (checkpoint / "agents" / row["role"]).is_dir()):
-            return None
-        return checkpoint, row["role"], task.task_id
+        candidates = self._room_checkpoints(path, thread, events, verify=requested is None)
+        if requested:
+            for candidate in candidates:
+                if candidate[1]["task_id"] == requested:
+                    return candidate
+            raise StudioError("该成员任务没有可恢复的本轮草稿，请重新选择当前群的检查点。",
+                              "invalid_recovery_checkpoint", 409)
+        if any(e["kind"] == "member_report" and e.get("published") is True for e in events):
+            return None  # Existing requests prefer the public handoff.
+        if len({info["role"] for _, info in candidates}) > 1:
+            raise StudioError("本轮有多位成员保存了草稿，请在项目文件中选择要接续的成员任务。",
+                              "recovery_selection_required", 409)
+        if candidates and not any((path / "agents" / thread["recipient"]).glob("*")):
+            return candidates[0]
+        return None
 
     @staticmethod
     def _workspace(path: Path, thread: dict) -> Path:

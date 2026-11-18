@@ -206,6 +206,130 @@ def _shell_case_suite(command: str, cwd: str) -> str | None:
     return f"shell case {Path(cwd or '.')} {suite}" if suite else None
 
 
+
+class _ScriptLayout(NamedTuple):
+    shape: str
+    captions: tuple[str, ...]
+
+
+class _AssertionShape(ast.NodeTransformer):
+    """Permit revised literal samples while retaining operators and real operands."""
+    def visit_Constant(self, node):
+        if type(node.value) in (int, float, str, bytes):
+            return ast.Constant("<" + type(node.value).__name__ + ">")
+        return node
+
+    def visit_Subscript(self, node):
+        # Changing which property supplies the observation needs a new review.
+        return node
+
+
+def _script_layout(source: str) -> _ScriptLayout | None:
+    """Fingerprint reporting and assertion coverage for an eligible QA handoff.
+
+    Fixtures may change. This compares neither business semantics nor the rest
+    of the program; only independent acceptance can approve that change.
+    """
+    try:
+        tree = ast.parse(source)
+        functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        reporters = set()
+        for name, function in functions.items():
+            terms = " ".join(n.value for n in ast.walk(function)
+                             if isinstance(n, ast.Constant) and isinstance(n.value, str)).upper()
+            if "PASS" in terms and "FAIL" in terms:
+                reporters.add(name)
+        if not reporters:
+            return None
+        # Recognize wrappers forwarding their caller's caption to the reporter.
+        # Exact function bodies must survive, including their comparisons.
+        while True:
+            wrappers = {name for name, function in functions.items() if name not in reporters and any(
+                isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in reporters
+                and n.args and isinstance(n.args[0], ast.Name)
+                and n.args[0].id in {a.arg for a in function.args.args} for n in ast.walk(function))}
+            if not wrappers:
+                break
+            reporters.update(wrappers)
+        protocol = [ast.dump(functions[name]) for name in sorted(reporters)]
+        internal = {n for name in reporters for n in ast.walk(functions[name])}
+        nodes = sorted((n for n in ast.walk(tree) if isinstance(n, (ast.Call, ast.Assert, ast.Return, ast.Raise))
+                        and n not in internal), key=lambda n: (n.lineno, n.col_offset))
+        captions = []
+        for node in nodes:
+            if isinstance(node, ast.Call):
+                func = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", "")
+                if func in reporters and isinstance(node.func, ast.Name) and len(node.args) >= 2:
+                    caption = node.args[0]
+                    if isinstance(caption, ast.Constant) and isinstance(caption.value, str):
+                        captions.append(caption.value)
+                    protocol.append(ast.dump(_AssertionShape().visit(node)))
+                elif func in {"print", "exit", "_exit", "quit", "write"}:
+                    protocol.append(ast.dump(node))
+            elif isinstance(node, ast.Assert):
+                protocol.append(ast.dump(_AssertionShape().visit(node)))
+            else:
+                protocol.append(ast.dump(node))
+        if not captions or len(set(captions)) != len(captions):
+            return None
+        shape = hashlib.sha256("\n".join(protocol).encode()).hexdigest()
+        return _ScriptLayout(shape, tuple(captions))
+    except (ValueError, SyntaxError, RecursionError):
+        return None
+
+
+class _ScriptRun(NamedTuple):
+    path: str
+    digest: str
+    layout: _ScriptLayout
+    # One entry per result, in actual emission order. Static captions are
+    # represented by their source index, dynamic passing captions by exact text.
+    order: tuple
+    failed: dict
+    exit_code: int
+
+
+def _script_run(layouts, current, command, cwd, obs, status):
+    # Only a complete, unfiltered local script invocation certifies a revision.
+    # An echo wrapper must directly observe the runner's exit and print it last.
+    match = re.fullmatch(r'\s*python(?:\d+(?:\.\d+)*)?\s+([\w./-]+\.py)'
+                         r'(?:\s*;\s*echo\s+(?:"EXIT=\$\?"|EXIT=\$\?))?\s*', command)
+    if not match or obs.truncated or obs.meta.get("timed_out"):
+        return None
+    path = Path(cwd) / match[1]
+    if path.is_absolute() or ".." in path.parts or str(path) not in current:
+        return None
+    digest = current[str(path)]
+    exit_code = obs.meta.get("exit_code")
+    if ";" in command:
+        last = re.search(r"(?m)^EXIT=(-?\d+)\s*\Z", obs.content)
+        if exit_code != 0 or not last:
+            return None
+        exit_code = int(last[1])
+    if type(exit_code) != int or ((status == "passed") != (exit_code == 0)):
+        return None
+    version, layout = layouts.get(str(path), (None, None))
+    if not layout or version != digest:
+        return None
+    order, failed = [], {}
+    for result, name in _CASE.findall(re.sub(r"\x1b\[[0-9;]*m", "", obs.content)):
+        name = name.strip()
+        matches = [i for i, cap in enumerate(layout.captions)
+                   if name == cap or result.upper() == "FAIL" and name.startswith(cap + " ")]
+        if len(matches) == 1:
+            key = matches[0]
+        elif result.upper() == "PASS" and not matches:
+            key = name
+        else:
+            return None
+        order.append(key)
+        if result.upper() == "FAIL":
+            failed[name] = key
+    if not order or len(set(order)) != len(order):
+        return None
+    return _ScriptRun(str(path), digest, layout, tuple(order), failed, exit_code)
+
+
 class _Check(NamedTuple):
     suite: str
     status: str
@@ -356,7 +480,14 @@ class MemberProgress:
         self.workspace = Path(workspace)
         self.required = set(required_paths)
         self._cache = {}
+        self._authored = set()
+        self._layouts = {}
+        self._restored_keys = set()
+        self._failed_runs = {}
+        self._retired = []
+        self._active_retirements = {}
         self._current = self._scan()
+        self._starting = self._current.copy()
         # A recovered member starts from its private checkpoint, while work
         # credited to the assignment is always relative to the public project.
         self._initial = self._current.copy() if public_baseline is None else dict(public_baseline)
@@ -415,6 +546,12 @@ class MemberProgress:
                     spent += len(data)
                     files[key] = hashlib.sha256(data).hexdigest()
                     self._cache[key] = (sig, files[key])
+                    if key in self._authored and len(data) <= 256 * 1024:
+                        try:
+                            layout = _script_layout(data.decode("utf-8"))
+                        except UnicodeError:
+                            layout = None
+                        self._layouts[key] = (files[key], layout)
                 except OSError:
                     continue
         return files
@@ -424,12 +561,26 @@ class MemberProgress:
         if not record.observations:
             return
         self._read_hint = ""
+        args = _tool_args(state)
+        before = self._current
+        for obs in record.observations:
+            if obs.ok and obs.source == "write_file":
+                path = obs.meta.get("path") or args.get(obs.tool_call_id, {}).get("path")
+                if isinstance(path, str):
+                    path = str(Path(path))
+                    if path.endswith(".py") and path not in before and path not in self._initial:
+                        self._authored.add(path)
         changed = False
         if any(o.source in _MUTATORS for o in record.observations):
             files = self._scan()
             changed = files != self._current
             self._current = files
         if changed:
+            for key, entry in list(self._active_retirements.items()):
+                if self._current.get(entry["path"]) != entry["current_sha256"]:
+                    self._failures[key] = entry["prior_failure"]
+                    entry["invalidated_at_step"] = self._steps
+                    del self._active_retirements[key]
             self._prior_passes = list(dict.fromkeys([*self._prior_passes, *self._passes.values()]))[-4:]
             self._passes.clear()
             self._repeat_pass = False
@@ -441,7 +592,6 @@ class MemberProgress:
                     del self._read_coverage[path]
         seen_before = bool(self._passes)
         advances = changed
-        args = _tool_args(state)
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
         for index, obs in enumerate(record.observations):
             parameters = args.get(obs.tool_call_id, {})
@@ -490,15 +640,34 @@ class MemberProgress:
                 if signal:
                     suite, status, label, cases = signal
                     case_suite = suite
+                    source = run = None
                     if cases and obs.source == "run_shell":
-                        case_suite = _shell_case_suite(str(parameters.get("command", "")),
-                                                     str(parameters.get("cwd") or ".")) or suite
+                        command = str(parameters.get("command", ""))
+                        cwd = str(parameters.get("cwd") or ".")
+                        attributed = _shell_case_suite(command, cwd)
+                        case_suite = attributed or suite
+                        if attributed:
+                            argv = shlex.split(attributed.removeprefix(f"shell case {Path(cwd)} "))
+                            path = str(Path(cwd) / argv[1])
+                            if path in self._current:
+                                source = (path, self._current[path])
+                                if source[1] == before.get(path):
+                                    run = _script_run(self._layouts, self._current, command, cwd, obs, status)
+                    # Bind a named case to its script bytes even when its checklist
+                    # is restored into another member process without the prior AST.
+                    versioned = case_suite + "\0sha256=" + source[1] if source else case_suite
                     suite_key = _check_key(suite)
                     if status == "failed":
-                        failures = ({_check_key(case_suite, case): "工具输出 FAIL · " + case[:72] for case in cases}
-                                    if cases else {suite_key: label})
+                        failures = {}
+                        for case in cases:
+                            caption = run.layout.captions[run.failed[case]] if run and case in run.failed else case
+                            failures[_check_key(versioned, caption)] = "工具输出 FAIL · " + case[:72]
+                        if not cases:
+                            failures[suite_key] = label
                         advances |= not failures.keys() <= self._failures.keys()
                         self._failures.update(failures)
+                        if run:
+                            self._failed_runs[(case_suite, run.digest)] = run
                         self._passes.pop(suite, None)
                         self._repeat_pass = False
                     elif status == "clean_exit":
@@ -509,7 +678,14 @@ class MemberProgress:
                         self._passes[suite] = label
                         self._failures.pop(suite_key, None)
                         for case in cases:
-                            self._failures.pop(_check_key(case_suite, case), None)
+                            self._failures.pop(_check_key(versioned, case), None)
+                            # Pre-versioned checklists used only the runner and caption.
+                            # Match these only against unchanged, restored script bytes.
+                            legacy = _check_key(case_suite, case)
+                            if source and self._starting.get(source[0]) == source[1] and legacy in self._restored_keys:
+                                self._failures.pop(legacy, None)
+                        if run:
+                            self._retire_revisions(case_suite, run)
                 elif obs.ok and not reading:
                     # Different observed results from real data/API queries
                     # are useful investigation. Repeated clocks and elapsed
@@ -534,6 +710,34 @@ class MemberProgress:
         if not advances and state.scratch.get("repeat", {}).get("count", 0) >= 4:
             self._stop = "同一动作连续四次且未增加证据"
         self._after_pass = self._after_pass + 1 if self._passes and seen_before and not advances else 0
+
+    def _retire_revisions(self, suite: str, run: _ScriptRun) -> None:
+        for identity, prior in list(self._failed_runs.items()):
+            if identity[0] != suite or prior.path != run.path:
+                continue
+            if prior.layout.shape != run.layout.shape or prior.order != run.order:
+                continue
+            old_suite = suite + "\0sha256=" + prior.digest
+            old_keys = []
+            for slot in prior.failed.values():
+                key = _check_key(old_suite, prior.layout.captions[slot])
+                old_keys.append(key)
+                if key not in self._failures:
+                    continue
+                original = self._failures.pop(key)
+                if prior.digest != run.digest:
+                    entry = {
+                        "path": run.path, "prior_sha256": prior.digest, "current_sha256": run.digest,
+                        "prior_failure": original, "current_caption": run.layout.captions[slot][:120],
+                        "source": "member_created", "observed_case_count": len(run.order),
+                        "prior_exit_code": prior.exit_code, "current_exit_code": run.exit_code,
+                        "disposition": "superseded_member_check_pending_independent_acceptance",
+                    }
+                    self._retired.append(entry)
+                    self._active_retirements[key] = entry
+            if not any(key in self._active_retirements or key in self._failures for key in old_keys):
+                del self._failed_runs[identity]
+
 
     def _navigation_result(self, obs, query, *, search):
         key = (obs.source, query, hashlib.sha256(obs.content.encode()).digest())
@@ -586,6 +790,7 @@ class MemberProgress:
         ):
             raise ValueError("无效的检查恢复清单")
         self._failures.update(previous)
+        self._restored_keys.update(previous)
 
     def require_handoff(self, reason: str) -> None:
         self._stop = reason
@@ -646,6 +851,7 @@ class MemberProgress:
             "inspected": sorted(self._inspected)[:12],
             "distinct_searches": len(self._searches),
             "check_signals": list(dict.fromkeys(self._passes.values()))[-8:],
+            "superseded_member_checks": [dict(entry) for entry in self._retired],
             "observed_failure": list(dict.fromkeys(self._failures.values()))[-4:],
             "stop_reason": self._stop,
             "prior_check_signals_before_edits": self._prior_passes,
@@ -662,6 +868,8 @@ class MemberProgress:
                 or self._steps and self.pending_paths()):
             return ""
         evidence = self.evidence()
+        if evidence["superseded_member_checks"]:
+            evidence = {**evidence, "superseded_member_checks": evidence["superseded_member_checks"][-4:]}
         facts = json.dumps(evidence, ensure_ascii=False)
         if self._read_hint:
             facts += "\n" + self._read_hint

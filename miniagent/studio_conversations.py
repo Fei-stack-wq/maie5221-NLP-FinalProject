@@ -6,6 +6,7 @@ conversation head without being the current project version.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,10 +34,14 @@ def validate_conversation(value: object) -> dict:
     if "parent_run_id" in value:
         required = {"parent_run_id", "intent", "recipient"}
         parent = value["parent_run_id"]
-        if (not required <= value.keys() <= required | {"inherit_files", "recover_failed"}
+        if (not required <= value.keys() <= required | {"inherit_files", "recover_failed", "recover_task_id"}
                 or type(parent) is not str or not parent or len(parent) > 128
                 or any(type(value[k]) is not bool for k in ("inherit_files", "recover_failed") if k in value)):
             raise ValueError("后续消息必须指向上一轮，成员与职责由原会话继承。")
+        if "recover_task_id" in value and (
+                not value.get("recover_failed") or not isinstance(value["recover_task_id"], str)
+                or not re.fullmatch(r"task-[0-9a-f]{32}", value["recover_task_id"])):
+            raise ValueError("请选择本轮失败后要接续的成员任务。")
         if (value.get("recover_failed") and (not value.get("inherit_files", True) or intent != "edit")
                 or intent == "question" and not value.get("inherit_files", True)):
             raise ValueError("只可在修改项目时选择新文件或继续失败版本。")
@@ -132,16 +137,18 @@ class SnapshotError(ValueError):
     """Only a complete, validated set of supported project files may be used."""
 
 
-def copy_project(source: Path, recipient: str, target: Path, extensions: set[str], *, secret: str = "") -> None:
-    """Never follow links or import run control files. Target is private staging."""
+def copy_project(source: Path, recipient: str, target: Path | None, extensions: set[str], *,
+                 secret: str = "", manifest: dict | None = None) -> None:
+    """Validate every file. Optionally copy to private staging or record its digest."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     total_bytes, entries = 0, 0
 
-    def visit(directory: int, destination: Path, depth: int) -> None:
+    def visit(directory: int, relative: Path, depth: int) -> None:
         nonlocal total_bytes, entries
         if depth > 64:
             raise SnapshotError("项目目录层级过深。")
-        destination.mkdir(parents=True, exist_ok=True)
+        if target is not None:
+            (target / relative).mkdir(parents=True, exist_ok=True)
         with os.scandir(directory) as children:
             for child in children:
                 if child.name.startswith(".") or (child.name in PROJECT_CACHE_DIRS and child.is_dir(follow_symlinks=False)):
@@ -155,7 +162,7 @@ def copy_project(source: Path, recipient: str, target: Path, extensions: set[str
                 if stat.S_ISDIR(info.st_mode):
                     fd = os.open(child.name, flags, dir_fd=directory)
                     try:
-                        visit(fd, destination / child.name, depth + 1)
+                        visit(fd, relative / child.name, depth + 1)
                     finally:
                         os.close(fd)
                     continue
@@ -179,7 +186,11 @@ def copy_project(source: Path, recipient: str, target: Path, extensions: set[str
                     validate_project_data(child.name, data, secret=secret, reject_credentials=True)
                 except ValueError as exc:
                     raise SnapshotError(str(exc)) from None
-                (destination / child.name).write_bytes(data)
+                name = relative / child.name
+                if target is not None:
+                    (target / name).write_bytes(data)
+                if manifest is not None:
+                    manifest[name.as_posix()] = hashlib.sha256(data).hexdigest()
                 total_bytes += len(data)
 
     descriptors = []
@@ -187,7 +198,7 @@ def copy_project(source: Path, recipient: str, target: Path, extensions: set[str
         descriptors.append(os.open(source, flags))
         for name in ("agents", recipient):
             descriptors.append(os.open(name, flags, dir_fd=descriptors[-1]))
-        visit(descriptors[-1], target, 0)
+        visit(descriptors[-1], Path(), 0)
     except OSError as exc:
         raise SnapshotError("读取原项目失败，无权读取的文件或链接无法交接。") from exc
     finally:
