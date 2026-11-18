@@ -27,6 +27,7 @@ from .studio_conversations import SnapshotError, copy_project, member_profiles
 from .tools import build_default_registry
 
 
+_KNOWLEDGE_READS = frozenset({"recall_role_knowledge", "read_role_knowledge"})
 _PROJECT_READS = frozenset({"find_files", "list_dir", "search_files", "read_file", "read_lines"})
 _INCIDENTAL_DATA = SQLITE_EXTENSIONS | {".log", ".csv", ".tsv", ".jsonl"}
 
@@ -70,7 +71,8 @@ def _manifest(staged):
 class RoomCrew:
     def __init__(self, run_id, path, thread, history, provider, settings, tracer,
                  service, should_cancel, human_handler, record_event, room_events, extensions, child_checks,
-                 delivery=None):
+                 delivery=None, *, role_session=None):
+        self.role_session = role_session
         self.run_id = run_id
         self.path = path
         self.thread = thread
@@ -113,6 +115,7 @@ class RoomCrew:
         self.close_seconds = min(90, self.budget.seconds_left * .12)
         self.close_state_bytes = min(8000, max(1200, self.budget.tokens_left // 16))
         self.inventory = self._inventory()
+        self.private_read = ""
         self.navigation = []
         self.navigation_seen = set()
         self.navigation_repeats = 0
@@ -246,7 +249,7 @@ class RoomCrew:
             self.navigation_seen.clear()
             self.navigation_repeats = 0
             return
-        observations = [o for o in record.observations if o.source in _PROJECT_READS]
+        observations = [o for o in record.observations if o.source in _PROJECT_READS | _KNOWLEDGE_READS]
         if not observations:
             return
         # Step latency includes synchronous member runs; only the lead's own
@@ -274,6 +277,10 @@ class RoomCrew:
             if obs.ok and signature not in self.navigation_seen:
                 advanced = True
                 self.navigation_seen.add(signature)
+            if obs.source in _KNOWLEDGE_READS:
+                # Only the lead's next compact prompt may see this receipt.
+                self.private_read = body if len(body.encode()) <= 12000 else _clip(body, 8500) + " … " + body[-800:]
+                continue
             excerpt = _clip(body, 1800)
             if len(body.encode()) > 1800:
                 excerpt += " … " + _clip(body[-280:], 400)
@@ -287,7 +294,10 @@ class RoomCrew:
 
     @cached_property
     def coordinator_schemas(self):
-        specs = [*build_default_registry(read_only=True).specs(), *CONTROL_TOOLS.values()]
+        registry = build_default_registry(read_only=True)
+        if self.role_session:
+            registry = self.role_session.registry(self.lead, registry, read_only=True)
+        specs = [*registry.specs(), *CONTROL_TOOLS.values()]
         return {s.name:s.to_api() for s in specs}
 
     @staticmethod
@@ -394,7 +404,13 @@ class RoomCrew:
         plan_finished = self.planned is not None or set(self.profiles) - {self.lead} <= self.approved_roles
         if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
             return closing
-        instruction = self.instructions() + self._prior_context() + self._public_state(final=False)
+        personal = self.role_session.context(self.lead, state.goal) if self.role_session else ""
+        instruction = self.instructions() + self._prior_context()
+        if personal:
+            instruction += "\n" + personal
+        if self.private_read:
+            instruction += "\n负责人自己的角色知识工具回执：\n" + self.private_read
+        instruction += self._public_state(final=False)
         self.navigation_version = self.project_version
         if self.navigation:
             # Latest request first so the most recent result survives clipping.
@@ -425,7 +441,9 @@ class RoomCrew:
         elif inspect_public and len(self.navigation_seen) >= 3:
             instruction += "\n已收集多项背景信息。只补足直接影响分工的缺口，否则现在进行委派。"
         allowed = controls | _PROJECT_READS if inspect_public else controls
-        decision = StepPolicy("coordinate", instruction, allowed, compact=True)
+        if inspect_public and not force_dispatch and self.role_session and self.lead in self.role_session.saved:
+            allowed |= _KNOWLEDGE_READS
+        decision = StepPolicy("coordinate", instruction, frozenset(allowed), compact=True)
         message_cost = estimate_tokens(policy_messages(state, decision)) + 768
         def input_cost(names):
             return message_cost + estimate_tokens([self.coordinator_schemas[n] for n in sorted(names)])
@@ -673,7 +691,10 @@ class RoomCrew:
                                        context={"role": role, "workspace": str(workspace), "public_room": self.thread["id"]})
         handoff_seconds = min(30, allocated.seconds_left * .1)
         human_deadline = time.monotonic() + allocated.seconds_left - handoff_seconds
-        member = Agent(name=role, provider=self.provider, registry=build_default_registry(),
+        registry = build_default_registry()
+        if self.role_session:
+            registry = self.role_session.registry(role, registry)
+        member = Agent(name=role, provider=self.provider, registry=registry,
                        sandbox=Sandbox(workspace, agent_name=role), settings=self.settings, tracer=self.tracer,
                        task_service=self.service, human_handler=self.human_handler(self.run_id, role, deadline=human_deadline),
                        should_cancel=self.should_cancel)
@@ -688,6 +709,11 @@ class RoomCrew:
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context)
+
+        if self.role_session:
+            personal = self.role_session.context(role, objective)
+            if personal:
+                member_context += "\n" + personal
 
         work_tools = frozenset(s.name for s in member.unit.tool_specs() if s.name != "delegate_task")
         work_schemas = [s.to_api() for s in member.unit.tool_specs(work_tools)]

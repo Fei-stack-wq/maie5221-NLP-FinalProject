@@ -90,7 +90,7 @@ function toast(message){$('#toast').textContent=message;$('#toast').hidden=false
 async function api(path,options={}){const response=await fetch(path,{...options,headers:{'Accept':'application/json',...(options.body?{'Content-Type':'application/json','X-Studio-Token':state.config?.csrf_token || ''}:{}),...options.headers}});let data;try{data=await response.json();}catch{throw new Error('服务未返回可读取的数据，请检查本地服务。');}if(!response.ok){const err=new Error(typeof data.error==='string'?data.error:'请求失败，请稍后重试。');err.code=data.code;err.status=response.status;throw err;}return data;}
 function setOnline(value){state.online=value;$('#connection-banner').hidden=value;patchHTML($('#server-status'),`<span class="dot"></span>${value?'本地服务':'重新连接中'}`);}
 function mobileNav(){const open=$('#sidebar').classList.contains('open');$('#sidebar').inert=window.matchMedia('(max-width:650px)').matches&&!open;const button=$('[data-action="menu"]');button.setAttribute('aria-expanded',String(open));}
-function updateSidebar(){mobileNav(); setText($('#nav-count'),state.runs.length);patchHTML($('#recent-nav'),state.runs.slice(0,4).map(r=>`<a class="recent-link" data-key="recent-${e(r.id)}" href="#run/${encodeURIComponent(r.id)}">${icon(stateIcon(r.status))}<span>${e(r.title)}</span></a>`).join('')||'<p class="side-empty">你的任务会显示在这里</p>');document.querySelectorAll('[data-nav]').forEach(n=>n.classList.toggle('active',n.dataset.nav===state.route || (state.route==='detail'&&n.dataset.nav===(state.tab==='chat'?'chats':'runs'))));$('#breadcrumb-current').textContent=state.route==='detail'?'任务详情':state.route==='runs'?'全部任务':state.route==='chats'?'对话':'工作台';if(state.config){$('#provider-label').textContent=state.config.provider_ready?'DeepSeek 已配置':'离线模式就绪';$('#provider-caption').textContent=state.config.provider_ready?state.config.model:'无需 API key，即可体验';$('#provider-dot').classList.toggle('ready',state.config.provider_ready);}}
+function updateSidebar(){mobileNav(); setText($('#nav-count'),state.runs.length);patchHTML($('#recent-nav'),state.runs.slice(0,4).map(r=>`<a class="recent-link" data-key="recent-${e(r.id)}" href="#run/${encodeURIComponent(r.id)}">${icon(stateIcon(r.status))}<span>${e(r.title)}</span></a>`).join('')||'<p class="side-empty">你的任务会显示在这里</p>');document.querySelectorAll('[data-nav]').forEach(n=>n.classList.toggle('active',n.dataset.nav===state.route || (state.route==='detail'&&n.dataset.nav===(state.tab==='chat'?'chats':'runs'))));$('#breadcrumb-current').textContent=state.route==='detail'?'任务详情':state.route==='runs'?'全部任务':state.route==='chats'?'对话':state.route==='roles'?'角色库':'工作台';if(state.config){$('#provider-label').textContent=state.config.provider_ready?'DeepSeek 已配置':'离线模式就绪';$('#provider-caption').textContent=state.config.provider_ready?state.config.model:'无需 API key，即可体验';$('#provider-dot').classList.toggle('ready',state.config.provider_ready);}}
 const runLimitFields = [
  {name:'max_steps',label:'执行轮数上限',value:100,min:1,max:1000},
  {name:'max_total_tokens',label:'累计 token 预算',value:1000000,min:1,max:100000000},
@@ -205,13 +205,248 @@ function chatsPage() {
  return `<section class="page"><div class="page-top chat-page-top"><h1>对话</h1>
   <div class="chat-actions"><button class="secondary" data-action="new-group">${icon('users')}新建群聊</button>
   <button class="primary" data-action="new-dm">${icon('plus')}新建私聊</button></div></div>
-  <details class="studio-disclosure"><summary>工作室角色 · ${chatRoles().length}</summary>
-   <div class="role-library">${(state.config?.custom_profiles||[]).map(p=>`<div><strong>${e(p.name)}</strong> <code>${e(p.id)}</code><p>${e(p.prompt)}</p></div>`).join('')}
-   <form class="profile-form"><div class="reply-options"><label class="field-label">角色 ID<input name="id" maxlength="48" placeholder="lead" required></label>
-   <label class="field-label">名称<input name="name" maxlength="100" placeholder="技术负责人" required></label></div>
-   <label class="field-label">职责<textarea name="prompt" maxlength="4000" rows="2" placeholder="决定技术方案，委派开发和验证，跟进用户反馈。" required></textarea></label>
-   <button class="secondary" type="submit">保存角色</button></form></div></details>
+  <a class="back-link" href="#roles">${icon('book')}管理工作室角色</a>
   <div id="chat-list">${chatList(state.chats)}</div></section>`;
+}
+
+const roleView = {id:null, detail:null, error:'', serial:0, kind:'memory', filter:'current'};
+const knowledgeKinds = {memory:'记忆',skill:'技能'};
+const knowledgeStates = {active:'已启用',candidate:'待确认',archived:'已归档',rejected:'已拒绝'};
+const roleLink = role => '#roles/' + encodeURIComponent(role);
+const profileURL = role => '/api/profiles/' + encodeURIComponent(role);
+const entryId = row => row.id || row.entry_id;
+
+function roleMark(profile) {
+ const first = Array.from(profile.name.trim())[0] || '·';
+ const tone = Array.from(profile.id).reduce((n,c)=>n+c.codePointAt(0),0) % 4;
+ return `<span aria-hidden="true" class="role-mark tone-${tone}">${e(first)}</span>`;
+}
+
+function roleLibrary() {
+ const profiles = state.config?.custom_profiles || [];
+ const cards = profiles.map(p=>`<a class="role-card" href="${roleLink(p.id)}">
+   ${roleMark(p)}<div><h2>${e(p.name)}</h2><code>${e(p.id)}</code></div>
+   <p>${e(p.prompt)}</p><span class="card-open">打开角色 ${icon('arrow')}</span></a>`).join('');
+ return `<section class="page roles-page"><header class="page-top role-page-top"><div><h1>角色库</h1>
+   <p class="page-subtitle">管理长期协作的助手、项目对话和已确认的经验。</p></div>
+   <button type="button" class="primary" data-role-action="new-role">${icon('plus')}创建角色</button></header>
+   ${cards ? `<div class="role-cards">${cards}</div>` : empty('还没有自定义角色','创建一个角色，写下它的职责，就可以开始私聊。')}</section>`;
+}
+
+function roleConversations(chats) {
+ if (!chats.length) return '<p class="role-empty">这个角色还没有参加项目对话。</p>';
+ return `<div class="role-conversations">${chats.map(c=>`<a href="${chatLink(c.head_run_id)}">
+   ${icon(c.kind==='dm'?'cpu':'users')}<span><strong>${e(c.title)}</strong><small>${[c.kind==='dm'?'私聊':'群聊', c.status?labels[c.status] || c.status:'',c.turn_count?c.turn_count+' 轮':'', c.updated_at?dateText(c.updated_at):''].filter(Boolean).map(e).join(' · ')}</small></span>
+   ${icon('chevron')}</a>`).join('')}</div>`;
+}
+
+function legacyConversations(rooms) {
+ if (!rooms.length) return '';
+ return `<section class="legacy-rooms"><h3>可关联的旧会话</h3>
+  <p>关联后，从下一轮开始使用这个角色的记忆和技能。</p>
+  ${rooms.map(c=>`<div class="legacy-room" data-key="legacy-${e(c.id)}">
+    <a href="${chatLink(c.head_run_id)}">${e(c.title)}</a><small>${c.kind==='dm'?'私聊':'群聊'}</small>
+    <button type="button" class="secondary" data-role-action="bind" data-room="${e(c.id)}" data-head="${e(c.head_run_id)}">关联已有会话</button>
+   </div>`).join('')}</section>`;
+}
+
+function knowledgeCard(row, conversations, latest) {
+ const key = e(entryId(row));
+ const label = knowledgeKinds[row.kind];
+ const project = conversations.find(c=>c.project===row.project || c.id===row.project);
+ const scope = row.scope==='project' ? '项目 · '+(project?.title || row.project) : '角色通用';
+ const change = (status,name) => `<button type="button" class="text-button" data-role-action="entry-status" data-entry="${key}" data-status="${status}">${name}</button>`;
+ const sourceRun = row.origin_run || row.source_run;
+ const older = latest && row.revision!==latest.revision;
+ return `<article class="knowledge-card" data-key="entry-${key}" data-entry-id="${key}"><div class="knowledge-heading">
+  <h3>${e(row.title || label)}</h3><span class="knowledge-state ${e(row.status)}">${e(knowledgeStates[row.status] || row.status)}</span></div>
+  <p class="knowledge-text">${e(row.text)}</p>
+  <div class="entry-meta"><span title="${e(row.project)}">${e(scope)}</span><span>v${e(row.revision)}</span><span>${(row.origin_source || row.source)==='agent'?'角色建议':'用户添加'}</span>
+   ${row.active_revision && row.active_revision!==row.revision?`<span>正在使用 v${e(row.active_revision)}</span>`:''}
+   ${sourceRun?`<a href="${chatLink(sourceRun)}">来源对话 ${icon('link')}</a>`:''}</div>
+  <div class="entry-actions">${older?`<small>最新修订 v${e(latest.revision)} · ${e(knowledgeStates[latest.status])}</small>
+   <button type="button" class="text-button" data-role-action="edit-active" data-entry="${key}">编辑当前版本</button>${change('archived','归档整个条目')}`:`
+   ${row.status==='candidate'?change('active','确认启用')+change('rejected','拒绝'):''}
+   ${['active','candidate'].includes(row.status)?`<button class="text-button" data-role-action="edit-entry" data-entry="${key}" aria-label="编辑${e(row.title || label)}">编辑</button>`:''}
+   ${row.status==='active'?change('archived','归档'):row.status==='archived'?change('active','恢复使用'):''}`}
+  </div></article>`;
+}
+
+function knowledgePanel(entries, activeEntries, conversations) {
+ const kind = roleView.kind;
+ const matching = entries.filter(row=>row.kind===kind);
+ const filters = {current:'当前',candidate:'待确认',history:'已处理'};
+ const visible = roleView.filter==='current' ? activeEntries.filter(row=>row.kind===kind)
+   : matching.filter(row=>roleView.filter==='history'?['archived','rejected'].includes(row.status):row.status==='candidate');
+ const selected = roleView.filter;
+ return `<section class="panel knowledge-panel" aria-label="记忆与技能"><div class="knowledge-controls">
+  <div class="role-switch" role="group" aria-label="经验类型">${Object.entries(knowledgeKinds).map(([key,name])=>
+   `<button type="button" aria-pressed="${kind===key}" data-role-action="choose-kind" data-value="${key}">${icon(key==='memory'?'book':'layers')}${name}</button>`).join('')}</div>
+  <button class="secondary" data-role-action="new-entry">${icon('plus')}添加${knowledgeKinds[kind]}</button></div>
+  <div class="knowledge-filters" role="group" aria-label="经验状态">${Object.entries(filters).map(([key,name])=>
+   `<button type="button" aria-pressed="${selected===key}" data-role-action="choose-filter" data-value="${key}">${name}${key==='candidate'?`<span>${matching.filter(x=>x.status==='candidate').length}</span>`:''}</button>`).join('')}</div>
+  <div class="knowledge-list">${visible.length?visible.map(row=>knowledgeCard(row,conversations,matching.find(x=>entryId(x)===entryId(row)))).join(''):
+    `<p class="role-empty">${selected==='candidate'?'暂时没有待确认的建议。':selected==='history'?'没有已归档或拒绝的条目。':kind==='memory'?'还没有已启用的记忆。可以添加偏好、约束或长期事实。':'还没有已启用的技能。可以添加可重复使用的工作步骤。'}</p>`}</div></section>`;
+}
+
+function rolePage() {
+ if (!roleView.id) return roleLibrary();
+ const back = `<a class="back-link" href="#roles">${icon('left')}返回角色库</a>`;
+ if (!roleView.detail) return `<section class="page roles-page">${back}${roleView.error?`<p class="error-panel" role="alert">${e(roleView.error)} <button data-role-action="reload">重试</button></p>`:'<p class="muted-note">正在读取角色…</p>'}</section>`;
+ const {role,entries,active_entries,conversations} = roleView.detail;
+ const dm = conversations.find(c=>c.kind==='dm');
+ const openDM = `<button type="button" class="${dm?'secondary':'primary'}" data-role-action="start-dm">${icon('plus')}新建私聊</button>`;
+ return `<section class="page roles-page">${back}<header class="role-detail-head"><div class="role-title">${roleMark(role)}
+  <div><h1>${e(role.name)}</h1><code>${e(role.id)}</code></div></div>
+  <div class="chat-actions">${dm?`<a class="primary" href="${chatLink(dm.head_run_id)}">继续最近私聊 ${icon('arrow')}</a>`:''}${openDM}</div></header>
+  <section class="role-brief"><div><h2>角色职责</h2><button class="text-button" data-role-action="edit-role">${icon('tune')}编辑角色</button></div><p>${e(role.prompt)}</p></section>
+  <div class="role-columns">${knowledgePanel(entries,active_entries,conversations)}
+   <section class="panel role-projects"><div class="panel-heading"><span>近期项目对话</span><small>${e(conversations.length)} 个</small></div>${roleConversations(conversations)}${legacyConversations(roleView.detail.unbound_conversations || [])}</section></div></section>`;
+}
+
+async function loadRole() {
+ const id = roleView.id;
+ const serial = ++roleView.serial;
+ try {
+  const data = await api(id ? profileURL(id)+'/knowledge' : '/api/profiles');
+  if (state.route!=='roles' || serial!==roleView.serial) return;
+  if (id) {
+   roleView.detail=data;
+   const profiles=state.config.custom_profiles || [];
+   state.config.custom_profiles=[...profiles.filter(p=>p.id!==id),data.role];
+  }
+  else if (Array.isArray(data.profiles)) state.config.custom_profiles=data.profiles;
+  roleView.error='';
+ } catch (error) {
+  if (state.route!=='roles' || serial!==roleView.serial) return;
+  roleView.error=error.message;
+  if (!id || roleView.detail) toast(error.message);
+ }
+ render();
+}
+
+function openRoleEditor(type, entry) {
+ const profile = roleView.detail?.role;
+ const profileForm = type==='new-role' || type==='edit-role';
+ const editing = type==='edit-role' || type==='edit-entry';
+ const kind = entry?.kind || roleView.kind;
+ const title = profileForm ? (editing?'编辑角色':'创建角色') : (editing?'编辑':'添加')+knowledgeKinds[kind];
+ const formRole = (profileForm && !editing) ? '' : profile.id;
+ const profileFields = () => `<label class="field-label">角色名称<input name="name" required maxlength="100" value="${editing?e(profile.name):''}" placeholder="例如，电脑维护助手"></label>
+   <label class="field-label">角色职责<textarea name="prompt" required maxlength="4000" rows="5" placeholder="它长期负责什么？哪些情况需要先和你确认？">${editing?e(profile.prompt):''}</textarea></label>
+   ${editing?`<div class="entry-meta">固定角色 ID <code>${e(profile.id)}</code></div>`:
+    '<details class="role-id-option"><summary>自定义角色 ID（选填）</summary><label class="field-label">角色 ID<input name="id" maxlength="48" pattern="[A-Za-z][A-Za-z0-9_\\-]{0,47}" placeholder="留空以自动生成"><small>以字母开头，可使用字母、数字、下划线和连字符。</small></label></details>'}`;
+ const knowledgeFields = () => {
+  const projects = new Map((roleView.detail.conversations || []).map(c=>[c.project,c.title]).filter(([key])=>key));
+  if (entry?.project && !projects.has(entry.project)) projects.set(entry.project,entry.project);
+  return `<label class="field-label">标题（选填）<input name="title" value="${e(entry?.title)}" maxlength="160" placeholder="${kind==='memory'?'例如，软件安装偏好':'例如，检查磁盘空间'}"></label>
+   <label class="field-label">${kind==='memory'?'记忆内容':'操作步骤'}<textarea name="text" required maxlength="8000" rows="6" placeholder="${kind==='memory'?'记录角色以后需要遵循的信息。':'写下适用条件、操作顺序和检查结果的方法。'}">${e(entry?.text)}</textarea></label>
+   <label class="field-label">适用范围<select name="scope" ${editing?'disabled':''}><option value="role">角色通用 · 跨项目使用</option>
+   <option value="project" ${entry?.scope==='project'?'selected':''} ${projects.size?'':'disabled'}>仅指定项目</option></select></label>
+   <label class="field-label" data-project-choice ${entry?.scope==='project'?'':'hidden'}>项目<select name="project" ${editing?'disabled':''}>
+    ${[...projects].map(([id,name])=>`<option value="${e(id)}" ${entry?.project===id?'selected':''}>${e(name)} · ${e(id)}</option>`).join('')}</select></label>`;
+ };
+ $('#role-dialog-title').textContent=title;
+ $('#role-editor').innerHTML=`<form class="role-editor" data-type="${type}" data-role="${e(formRole)}" data-kind="${e(kind)}"
+    data-entry="${e(entry && entryId(entry))}" data-revision="${e(entry?.revision)}">
+   ${profileForm?profileFields():knowledgeFields()}<p class="form-error" role="alert" hidden></p>
+   <div class="editor-actions"><button type="button" class="secondary" data-role-action="dismiss">取消</button>
+    <button type="submit" class="primary">${profileForm?'保存角色':entry?.status==='candidate'?'保存并启用':editing?'保存修改':'保存'+knowledgeKinds[kind]}</button></div></form>`;
+ $('#role-dialog').showModal();
+ if (type==='edit-role') $('#role-editor form').previousProfile={name:profile.name,prompt:profile.prompt};
+ $('#role-editor input:not([disabled])')?.focus();
+}
+
+async function saveRoleEditor(form) {
+ const submit = form.querySelector('[type="submit"]');
+ if (submit.disabled || !form.reportValidity()) return;
+ const {type,role,kind,entry,revision} = form.dataset;
+ const fields = form.elements;
+ const isProfile = type.endsWith('role');
+ let path, payload;
+ if (isProfile) {
+  payload={name:fields.name.value.trim(),prompt:fields.prompt.value.trim()};
+  path=type==='new-role'?'/api/profiles':profileURL(role)+'/edit';
+  if (!role) payload.id=fields.id.value.trim() || 'assistant-'+crypto.randomUUID().slice(0,8);
+  else payload.previous=form.previousProfile;
+ } else {
+  path=profileURL(role)+'/knowledge';
+  payload={kind,title:fields.title.value.trim(),text:fields.text.value.trim(),scope:fields.scope.value};
+  if (payload.scope==='project') payload.project=fields.project.value;
+  if (entry) payload.entry_id=entry;
+ }
+ if (revision) payload.expected_revision=Number(revision);
+ const errorBox=form.querySelector('.form-error');
+ errorBox.hidden=true;
+ submit.disabled=true;
+ try {
+  const result = await api(path,{method:'POST',body:JSON.stringify(payload)});
+  $('#role-dialog').close();
+  if (isProfile) {
+   const saved=result.profile;
+   state.config.custom_profiles=[...(state.config.custom_profiles||[]).filter(p=>p.id!==saved.id),saved];
+   if (roleView.id!==saved.id || state.route!=='roles') location.hash=roleLink(saved.id);
+   else await loadRole();
+  } else if (state.route==='roles' && roleView.id===role) await loadRole();
+  toast(isProfile?'角色已保存。':'已保存。');
+ } catch (error) {
+  if (error.status===409 && role && state.route==='roles' && role===roleView.id) await loadRole();
+  errorBox.textContent=error.message+(error.status===409 && (revision || type==='edit-role')?' 请保留修改内容，关闭窗口后重新打开最新版本。':'');
+  errorBox.hidden=false;
+ } finally {submit.disabled=false;}
+}
+
+async function runRoleAction(button) {
+ const action=button.dataset.roleAction;
+ if (action==='dismiss') {$('#role-dialog').close();return;}
+ if (action==='reload') {await loadRole();return;}
+ if (action==='new-role' || action==='edit-role' || action==='new-entry') {openRoleEditor(action);return;}
+ if (action==='choose-kind' || action==='choose-filter') {
+  if (action==='choose-kind') roleView.kind=button.dataset.value;
+  else roleView.filter=button.dataset.value;
+  render();return;
+ }
+ if (action==='start-dm') {
+  openForm('single');
+  $('#dialog-form [name="recipient"]').value=roleView.id;
+  return;
+ }
+ if (action==='bind' && !button.disabled) {
+  const id=roleView.id;
+  button.disabled=true;
+  try {
+   await api(profileURL(id)+'/bind',{method:'POST',body:JSON.stringify({
+    room_id:button.dataset.room,expected_head:button.dataset.head
+   })});
+   if (state.route==='roles' && roleView.id===id) await loadRole();
+   toast('会话已关联，下一轮将使用这个角色的记忆和技能。');
+  } catch (error) {
+   if (state.route==='roles' && roleView.id===id) await loadRole();
+   toast(error.message);
+  } finally {button.disabled=false;}
+  return;
+ }
+ const row=roleView.detail?.entries?.find(item=>entryId(item)===button.dataset.entry);
+ if (!row) return;
+ if (action==='edit-active') {
+  const active=roleView.detail.active_entries.find(x=>entryId(x)===entryId(row));
+  if (active) openRoleEditor('edit-entry',{...active,revision:row.revision});
+  return;
+ }
+ if (action==='edit-entry') {openRoleEditor(action,row);return;}
+ if (action==='entry-status' && !button.disabled) {
+  const id=roleView.id;
+  button.disabled=true;
+  try {
+   await api(profileURL(id)+'/knowledge/'+encodeURIComponent(entryId(row))+'/status',
+    {method:'POST',body:JSON.stringify({status:button.dataset.status,expected_revision:row.revision})});
+   if (state.route==='roles' && roleView.id===id) await loadRole();
+   toast('已更新条目。');
+  } catch (error) {
+   if (error.status===409 && state.route==='roles' && roleView.id===id) await loadRole();
+   toast(error.message);
+  } finally {button.disabled=false;}
+ }
 }
 
 async function refreshChats() {
@@ -475,19 +710,17 @@ function reviewForm(detail) {
 async function submitDiscussion(form) {
  const button=form.querySelector('button');
  if(button.disabled || !form.reportValidity())return;
- const profile=form.matches('.profile-form');
- const path=profile?'/api/profiles':'/api/runs/'+encodeURIComponent(form.dataset.run)+(form.matches('.human-form')?'/questions/'+encodeURIComponent(form.dataset.question):'/review');
+ const path='/api/runs/'+encodeURIComponent(form.dataset.run)+(form.matches('.human-form')?'/questions/'+encodeURIComponent(form.dataset.question):'/review');
  const body=Object.fromEntries(new FormData(form));
  button.disabled=true;
  try {
   await api(path,{method:'POST',body:JSON.stringify(body)});
   form.reset();
-  if(profile){state.config=await api('/api/bootstrap');render();toast('角色已保存，可在建群时选择。');}
-  else await refreshDetail();
+  await refreshDetail();
  }catch(error){toast(error.message);}finally{button.disabled=false;}
 }
 function detailContent(){if(!state.detail)return '<div class="initial-loading"><span class="spinner"></span>正在读取任务…</div>';const d=state.detail,r=d.run;const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page"><div class="detail-top"><a class="back-link" href="#runs">${icon('left')}返回全部任务</a><div class="detail-heading"><h1>${e(r.title)}</h1><div class="detail-actions">${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'&&endedWithoutChecks(d)?'':diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
-function render({reset=false}={}){const html=state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatsPage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();}
+function render({reset=false}={}){const html=state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatsPage():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();}
 function parseRoute() {
  const [hash, query=''] = location.hash.slice(1).split('?');
  if (hash.startsWith('run/')) {
@@ -497,14 +730,23 @@ function parseRoute() {
     file:tab==='artifacts' ? new URLSearchParams(query).get('path') : null};
   } catch { return {route:'runs',runId:null}; }
  }
+ if (hash==='roles' || hash.startsWith('roles/')) {
+  try {return {route:'roles',roleId:decodeURIComponent(hash.slice(6)) || null,runId:null};}
+  catch {return {route:'roles',roleId:null,runId:null};}
+ }
  return {route:['runs','chats'].includes(hash)?hash:'home',runId:null};
 }
-async function route(){const next=parseRoute();const changed=next.runId!==state.runId;state.route=next.route;state.runId=next.runId;if(changed){state.detail=null;state.detailSignature='';state.tab=next.tab||'overview';state.selectedFile=null;state.fileData=null;state.expanded.clear();state.logOpen.clear();}else if(next.tab){state.tab=next.tab;}$('#sidebar').classList.remove('open');render({reset:true});window.scrollTo({top:0,behavior:'instant'});if(state.route==='detail') {
+async function route(){const next=parseRoute();const changed=next.runId!==state.runId;
+ if (state.route!==next.route || roleView.id!==(next.roleId || null)) {
+  Object.assign(roleView,{id:next.roleId||null,detail:null,error:'',filter:'current',kind:'memory'});
+  if ($('#role-dialog')?.open) $('#role-dialog').close();
+ }
+ state.route=next.route;state.runId=next.runId;if(changed){state.detail=null;state.detailSignature='';state.tab=next.tab||'overview';state.selectedFile=null;state.fileData=null;state.expanded.clear();state.logOpen.clear();}else if(next.tab){state.tab=next.tab;}$('#sidebar').classList.remove('open');render({reset:true});window.scrollTo({top:0,behavior:'instant'});if(state.route==='detail') {
   if(next.file) await selectFile(next.file);
   await refreshDetail();
   if(state.runId===next.runId && state.tab==='artifacts' && !state.selectedFile && state.detail?.artifacts?.length)
    await selectFile(state.detail.artifacts[0].path);
- }if(state.route==='chats')await refreshChats();}
+ }if(state.route==='chats')await refreshChats();if(state.route==='roles')await loadRole();}
 async function refreshDetail(){const id=state.runId;if(!id)return;try{const detail=await api(`/api/runs/${encodeURIComponent(id)}`);if(state.runId!==id)return;const signature=JSON.stringify(detail);state.detail=detail;if(signature!==state.detailSignature){state.detailSignature=signature;render();if(state.tab==='artifacts'&&!state.selectedFile&&detail.artifacts?.length)selectFile(detail.artifacts[0].path);}setOnline(true);}catch(error){if(state.runId===id&&!state.detail)main.innerHTML=`<div class="page error-panel"><h2>暂时无法读取任务</h2><p>${e(error.message)}</p><a href="#runs" class="secondary">返回任务列表</a></div>`;if(!error.code)setOnline(false);}}
 async function refresh(){if(state.polling)return;state.polling=true;try{if(!state.config)state.config=await api('/api/bootstrap');const data=await api('/api/runs');state.runs=data.runs||[];setOnline(true);if(!state.initialized){state.initialized=true;await route();}updateSidebar();if(state.route==='home'&&$('#home-runs')){patchHTML($('#home-runs'),state.runs.length?`<div class="run-list">${state.runs.slice(0,5).map(runRow).join('')}</div>`:empty('工作室已经准备好了','运行上方演示，你的第一个任务会出现在这里。'));const count=$('.section-title .count-badge');setText(count,state.runs.length);}if(state.route==='runs'&&$('#all-runs'))patchHTML($('#all-runs'),runList());if(state.route==='detail')await refreshDetail();if(state.route==='chats')await refreshChats();}catch{setOnline(false);}finally{state.polling=false;}}
 function formTitle(mode){return mode==='group'?'新建群聊':mode==='single'?'新建私聊':'开始一个新任务';}
@@ -559,8 +801,6 @@ async function submit(form) {
   if (mode === 'group' && members.length < 2) return showError('请选择至少两位群成员。');
   if (!recipient || !members.includes(recipient)) return showError('请选择本轮回复的群成员或私聊角色。');
   payload.conversation = {kind:mode==='group'?'group':'dm',members,recipient,intent};
-  const profiles=(state.config.custom_profiles||[]).filter(p=>members.includes(p.id));
-  if (profiles.length) payload.conversation.profiles=profiles;
   if (mode==='group' && intent==='edit' && fields.get('dispatch')==='team') payload.mode='team';
  }
  if ((chat||mode==='team') && fields.get('intent')!=='question') {
@@ -609,12 +849,18 @@ async function downloadArtifacts(){
  }catch(error){toast(error.message);}
  finally{state.downloads.delete(id);if(state.runId===id)render();}
 }
-function showConnection(){const ready=state.config?.provider_ready;$('#connection-info').innerHTML=`<p>${ready?'DeepSeek 已从本机环境或 .env 读取配置。密钥不会发送到网页。':'离线演示已可用。使用真实模型前，在仓库根目录的 .env 中配置 DEEPSEEK_API_KEY，然后重启本地服务。'}</p><p>当前模型：<code>${e(state.config?.model||'尚未读取')}</code></p><p>单次输出上限：<code>${e(state.config?.max_output_tokens??'未知')} token</code>。可在 .env 中通过 DEEPSEEK_MAX_TOKENS 调整，重启服务后生效。</p><p>任务与文件保存在启动时选择的运行目录。可在对话页管理自定义角色。</p>`;$('#info-dialog').showModal();}
-document.addEventListener('submit',event=>{if(event.target.matches('.human-form,.review-form,.profile-form')){event.preventDefault();submitDiscussion(event.target);return;}if(event.target.matches('.reply-form')){event.preventDefault();sendReply(event.target);return;}if(event.target.matches('.task-form')){event.preventDefault();submit(event.target);}});
-document.addEventListener('change',event=>{const form=event.target.closest('form');if(form?.matches('.reply-form')){rememberReply(form);if(event.target.name==='intent'||event.target.name==='dispatch')render();return;}if(event.target.name==='member')updateMemberPicker(form);if(event.target.name==='intent')syncIntent(form);if(event.target.name==='mode')swapMode(event.target.closest('form'),event.target.value);if(event.target.id==='run-filter'){state.filter=event.target.value;patchHTML($('#all-runs'),runList());}if(event.target.id==='log-filter'){state.logFilter=event.target.value;render();}});
+function showConnection(){const ready=state.config?.provider_ready;$('#connection-info').innerHTML=`<p>${ready?'DeepSeek 已从本机环境或 .env 读取配置。密钥不会发送到网页。':'离线演示已可用。使用真实模型前，在仓库根目录的 .env 中配置 DEEPSEEK_API_KEY，然后重启本地服务。'}</p><p>当前模型：<code>${e(state.config?.model||'尚未读取')}</code></p><p>单次输出上限：<code>${e(state.config?.max_output_tokens??'未知')} token</code>。可在 .env 中通过 DEEPSEEK_MAX_TOKENS 调整，重启服务后生效。</p><p>任务与文件保存在启动时选择的运行目录。可在角色库管理自定义角色。</p>`;$('#info-dialog').showModal();}
+document.addEventListener('submit',event=>{if(event.target.matches('.role-editor')){event.preventDefault();saveRoleEditor(event.target);return;}if(event.target.matches('.human-form,.review-form')){event.preventDefault();submitDiscussion(event.target);return;}if(event.target.matches('.reply-form')){event.preventDefault();sendReply(event.target);return;}if(event.target.matches('.task-form')){event.preventDefault();submit(event.target);}});
+document.addEventListener('change',event=>{const form=event.target.closest('form');
+ if(form?.matches('.role-editor') && event.target.name==='scope'){
+  form.querySelector('[data-project-choice]').hidden=event.target.value!=='project';return;
+ }
+ if(form?.matches('.reply-form')){rememberReply(form);if(event.target.name==='intent'||event.target.name==='dispatch')render();return;}if(event.target.name==='member')updateMemberPicker(form);if(event.target.name==='intent')syncIntent(form);if(event.target.name==='mode')swapMode(event.target.closest('form'),event.target.value);if(event.target.id==='run-filter'){state.filter=event.target.value;patchHTML($('#all-runs'),runList());}if(event.target.id==='log-filter'){state.logFilter=event.target.value;render();}});
 document.addEventListener('input',event=>{const reply=event.target.closest('.reply-form');if(reply)rememberReply(reply);if(event.target.id==='run-search'){state.search=event.target.value;patchHTML($('#all-runs'),runList());}});
 document.addEventListener('toggle',event=>{if(event.target.matches?.('[data-log]')){const key=event.target.dataset.log;if(event.target.open)state.logOpen.add(key);else state.logOpen.delete(key);}},true);
 document.addEventListener('click',event=>{
+ const roleButton=event.target.closest('[data-role-action]');
+ if(roleButton){runRoleAction(roleButton);return;}
  const template=event.target.closest('[data-template]');if(template){const value=template.dataset.template,form=$('form[data-prefix="home"]');swapMode(form,value==='maintenance'?'single':value,value==='maintenance'?'生成一份电脑维护诊断计划 maintenance.md，包含信息收集、排查步骤和验证方法。':'');if(value==='maintenance'){const f=$('form[data-prefix="home"]');f.querySelector('[name="acceptance_files"]').value='maintenance.md';}$('#home-objective')?.focus();return;}
  const task=event.target.closest('[data-task]');if(task){const key=task.dataset.task;state.expanded.has(key)?state.expanded.delete(key):state.expanded.add(key);render();return;}
  const tab=event.target.closest('[data-tab]');if(tab){state.tab=tab.dataset.tab;render();if(state.tab==='artifacts'&&!state.selectedFile&&state.detail?.artifacts?.length)selectFile(state.detail.artifacts[0].path);return;}
@@ -628,7 +874,8 @@ document.addEventListener('click',event=>{
  if(action==='close-info')$('#info-dialog').close();
  if(action==='connection')showConnection();
  if(action==='menu'){$('#sidebar').classList.toggle('open');mobileNav();}
- if(action==='refresh')refresh().then(()=>toast(state.online?'任务状态已更新。':'服务未连接，请检查启动终端。'));
+ if(action==='refresh' && state.route==='roles')loadRole();
+ if(action==='refresh' && state.route!=='roles')refresh().then(()=>toast(state.online?'任务状态已更新。':'服务未连接，请检查启动终端。'));
  if(action==='advanced'){const button=event.target.closest('button'),panel=button.closest('form').querySelector('.advanced');panel.hidden=!panel.hidden;button.setAttribute('aria-expanded',String(!panel.hidden));}
  if(action==='cancel-run')cancelRun();
  if(action==='download-artifacts')downloadArtifacts();

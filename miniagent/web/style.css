@@ -520,3 +520,45 @@ main{padding:28px 18px}
 .studio-disclosure textarea,.human-form textarea{box-sizing:border-box;width:100%;font:inherit}
 
 .project-screenshot { display: block; max-width: 100%; height: auto; }
+.roles-page{max-width:1080px}
+.role-page-top,.role-detail-head,.role-title,.role-brief>div,.knowledge-controls,.knowledge-heading,.editor-actions{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.role-page-top{margin-bottom:28px}.role-page-top .page-subtitle{margin-top:3px}
+.role-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,245px),1fr));gap:16px}
+.role-card{min-width:0;display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:14px;border:1px solid var(--line);border-radius:10px;padding:20px;background:var(--surface);transition:border-color .16s,box-shadow .16s}
+.role-card:hover{border-color:#aebbdc;box-shadow:0 4px 14px #1e293b0a}
+.role-mark{width:45px;height:45px;flex:none;display:grid;place-items:center;border-radius:12px;background:#e6edff;color:#314c9e;font-size:21px;font-weight:600}
+.role-mark.tone-1{background:#edf0e4;color:#56653a}.role-mark.tone-2{background:#f6e9e2;color:#905236}.role-mark.tone-3{background:#eee8f5;color:#73528d}
+.role-card h2{font-size:16px}.role-card code,.role-title code{font:12px ui-monospace,monospace;color:var(--muted)}
+.role-card p{grid-column:1/-1;align-self:start;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere;font-size:13px;line-height:1.65;color:var(--muted);min-height:3.3em}
+.role-card .card-open{grid-column:1/-1;display:flex;align-items:center;gap:6px;color:var(--accent-dark);font-size:12px}.card-open svg,.entry-meta svg{width:12px;height:12px}
+.role-detail-head{margin:18px 0 22px}.role-title{justify-content:start;min-width:0}.role-title h1,.role-card h2,.knowledge-heading h3{overflow-wrap:anywhere}.role-title .role-mark{width:56px;height:56px;font-size:25px}
+.role-brief{border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:16px 0 21px;margin-bottom:24px}
+.role-brief h2{font-size:15px}.role-brief p,.knowledge-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.75;font-size:14px}
+.role-brief p{margin-top:7px;color:var(--muted)}
+.role-columns{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(225px,1fr);align-items:start;gap:20px}
+.knowledge-panel,.role-projects{min-width:0}.knowledge-controls{padding:16px 18px 12px;flex-wrap:wrap}
+.role-switch{display:flex;align-items:center;background:var(--sidebar);border:1px solid var(--line);padding:2px;border-radius:7px}
+.role-switch button{display:flex;align-items:center;gap:5px;border-radius:4px;padding:6px 10px;color:var(--muted);font-size:13px}
+.role-switch svg{width:14px;height:14px}.role-switch [aria-pressed=true]{background:white;color:var(--ink);box-shadow:0 1px 3px #23304a22}
+.knowledge-filters{padding:0 18px;display:flex;gap:16px;border-bottom:1px solid var(--line)}
+.knowledge-filters button{padding:10px 0 8px;font-size:12px;color:var(--muted);border-bottom:2px solid transparent}
+.knowledge-filters button[aria-pressed=true]{border-color:var(--accent);color:var(--accent-dark)}.knowledge-filters button span{margin-left:5px;font-variant-numeric:tabular-nums}
+.knowledge-card{padding:16px 18px}.knowledge-card+.knowledge-card{border-top:1px solid var(--line)}
+.knowledge-state{flex:none;border-radius:4px;padding:2px 6px;background:#edf0f5;color:#465369;font-size:11px}
+.knowledge-state.active{background:#e9f3ef;color:#346347}.knowledge-state.candidate{background:#fcf3d8;color:#745618}
+.knowledge-text{margin:8px 0;color:var(--ink)}.entry-meta,.entry-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.entry-meta a{color:var(--accent-dark)}.entry-actions{margin-top:8px;gap:5px}.entry-actions .text-button:first-child{padding-left:0}
+.role-empty{color:var(--muted);line-height:1.75;font-size:13px;padding:20px 18px}
+.role-conversations a{display:flex;align-items:center;gap:10px;padding:14px 16px}.role-conversations a+a{border-top:1px solid var(--line)}.role-conversations a:hover{background:var(--sidebar)}
+.role-conversations a>svg{color:var(--muted);width:15px}.role-conversations a>svg:last-child{width:13px;margin-left:auto}.role-conversations a>span{min-width:0}
+.role-conversations strong{font-size:13px;font-weight:500;overflow-wrap:anywhere}.role-conversations small{display:block;font-size:11px;margin-top:5px;color:var(--muted)}
+.role-dialog{max-width:530px}.role-editor,.role-id-option label{display:grid;gap:15px}.role-editor label.field-label{display:grid;gap:6px}
+.role-editor .field-label input,.role-editor .field-label textarea,.role-editor .field-label select{border:1px solid var(--line);background:white;border-radius:6px;padding:10px 11px;color:var(--ink);width:100%;font-size:14px}
+.role-editor .field-label textarea{line-height:1.65;resize:vertical}.role-id-option{font-size:12px;color:var(--muted)}.role-id-option summary{cursor:pointer}.role-id-option label{padding-top:9px}
+.role-editor .form-error{margin:0}.editor-actions{justify-content:flex-end;border-top:1px solid var(--line);padding-top:15px}
+@media(max-width:900px){.role-columns{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:650px){.role-detail-head,.role-page-top{align-items:flex-start;flex-wrap:wrap}.role-detail-head .chat-actions{flex-wrap:wrap}.knowledge-controls{gap:8px}.role-title{gap:10px}.role-title h1{font-size:23px}.role-detail-head .role-mark{width:44px;height:44px;font-size:21px}.role-dialog{padding:18px}}
+.legacy-rooms{border-top:1px solid var(--line);padding:16px}
+.legacy-rooms h3{font-size:13px}.legacy-rooms>p,.legacy-room small{font-size:12px;line-height:1.75;color:var(--muted)}
+.legacy-rooms>p{margin:4px 0 10px}.legacy-room{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:10px 0}
+.legacy-room+.legacy-room{border-top:1px solid var(--line)}.legacy-room a{font-size:13px;overflow-wrap:anywhere}.legacy-room a:hover{text-decoration:underline}.legacy-room .secondary{margin-left:auto}

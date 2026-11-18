@@ -131,6 +131,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/api/bootstrap":
             self._json(200, {**service.bootstrap(), "csrf_token": self.server.studio_token})
             return
+        if path == "/api/profiles":
+            self._json(200, {"profiles": service.profiles()})
+            return
         if path == "/api/runs":
             self._json(200, service.list_runs())
             return
@@ -138,6 +141,13 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._json(200, service.list_conversations())
             return
         parts = path.split("/")
+        if len(parts) in (5, 7) and parts[:3] == ["", "api", "profiles"] and parts[4] == "knowledge":
+            if len(parts) == 5:
+                self._json(200, service.role_library(parts[3]))
+                return
+            if parts[6] == "history":
+                self._json(200, service.role_operation(parts[3], "history", {}, parts[5]))
+                return
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room.zip":
             self._send(200, service.room_bundle(parts[3]), "application/zip", filename=f"{parts[3]}-room.zip")
             return
@@ -174,7 +184,10 @@ class StudioHandler(BaseHTTPRequestHandler):
         cancel = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "cancel"
         reply = len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "questions"
         review = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "review"
-        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick") and not (cancel or reply or review)) or url.query:
+        profile_op = parts[:3] == ["", "api", "profiles"] and (
+            len(parts) == 5 and parts[4] in {"edit", "knowledge", "bind"} or
+            len(parts) == 7 and parts[4] == "knowledge" and parts[6] in {"status", "restore"})
+        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick") and not (cancel or reply or review or profile_op)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -211,6 +224,17 @@ class StudioHandler(BaseHTTPRequestHandler):
             except (WorkspaceError, TimeoutError) as exc:
                 raise StudioError(str(exc), "picker_unavailable", 409) from None
             self._json(200, {"path": selected})
+            return
+        if profile_op:
+            service = self.server.studio_service
+            if parts[4] == "bind":
+                result = service.link_profile(parts[3], payload)
+            elif parts[4] == "edit":
+                result = {"profile": service.edit_profile(parts[3], payload)}
+            else:
+                result = service.role_operation(parts[3], parts[6] if len(parts) == 7 else "save",
+                                                payload, parts[5] if len(parts) == 7 else None)
+            self._json(200, result)
             return
         if url.path == "/api/profiles":
             self._json(200, {"profile": self.server.studio_service.add_profile(payload)})

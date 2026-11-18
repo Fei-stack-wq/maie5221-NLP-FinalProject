@@ -43,6 +43,8 @@ from .task_store import StoreTransaction, TaskStore, _schema
 from .tools import build_default_registry
 from .project_data import (PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, SQLITE_SIDECARS, is_database, is_png,
                            supported_project_file, validate_project_data)
+from .studio_roles import RoleSession, StudioRoles, knowledge_project
+from .studio_role_memory import RoleMemoryStore
 from . import studio_workspace
 from .studio_discussion import RoomDiscussion
 from .studio_diagnostics import diagnose
@@ -151,7 +153,7 @@ def _write_json(directory: Path, name: str, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
-class StudioService(RoomDiscussion):
+class StudioService(RoomDiscussion, StudioRoles):
     def __init__(self, runs_dir: Path | str, settings: Settings, *, max_workers: int = 2):
         if type(max_workers) is not int or not 1 <= max_workers <= 8:
             raise ValueError("max_workers must be between 1 and 8")
@@ -161,6 +163,7 @@ class StudioService(RoomDiscussion):
         supplied.mkdir(parents=True, exist_ok=True)
         self.runs_dir = supplied.resolve()
         self.settings = settings
+        self.role_memory = RoleMemoryStore(self.runs_dir / "studio-role-memory.sqlite3", secret=settings.api_key)
         self.max_workers = max_workers
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="studio-job")
@@ -519,10 +522,12 @@ class StudioService(RoomDiscussion):
                 related.append((thread["ordinal"], item, meta, thread))
         related.sort(key=lambda row: row[0])
         turns, artifact_id, previous = [], None, None
+        project_id = initial["id"]
         for index, (ordinal, directory, meta, thread) in enumerate(related, start=1):
             if ordinal != index or previous != thread["parent_run_id"]:
                 raise StudioError("会话历史不连续，无法安全继续。", "thread_conflict", 409)
             previous = directory.name
+            project_id = knowledge_project(thread, meta.get("workspace_path"), directory.name, project_id)
             answer_text, truncated = "", False
             if with_answers:
                 # Keep the selected run and newest response readable. Cap
@@ -571,14 +576,17 @@ class StudioService(RoomDiscussion):
         head = turns[-1] if turns else {}
         return {"id": initial["id"], "kind": initial["kind"], "members": initial["members"],
                 "head_run_id": head.get("run_id"), "artifact_run_id": artifact_id,
-                "profiles": initial.get("profiles", []),
+                "profiles": (related[-1][3] if related else initial).get("profiles", []),
+                "saved_roles": sorted(set(initial.get("saved_roles", [])) | set(self.linked_roles(initial["id"]))),
+                "knowledge_project_id": project_id,
                 "workspace_path": related[-1][2].get("workspace_path") if related else None,
                 "can_continue": head.get("status") in _TERMINAL, "turns": turns}
 
     def _next_turn(self, run_id: str, message: dict) -> dict:
         parent = message.get("parent_run_id")
         if parent is None:
-            return {**message, "id": run_id, "ordinal": 1, "parent_run_id": None, "base_run_id": None}
+            return {**self.bind_roles(message), "id": run_id, "knowledge_project_id": run_id,
+                    "ordinal": 1, "parent_run_id": None, "base_run_id": None}
         room = self._conversation(self._directory(parent), with_answers=False)
         if room is None or room["head_run_id"] != parent or not room["can_continue"]:
             raise StudioError("请等待本轮结束，并从会话的最新一轮发送。", "stale_head", 409)
@@ -590,8 +598,11 @@ class StudioService(RoomDiscussion):
             if last["status"] != "failed" or last["intent"] != "edit":
                 raise StudioError("只有最近一轮修改失败后，才能接续该轮文件。", "invalid_recovery")
             base = parent
-        return {**message, "id": room["id"], "kind": room["kind"], "members": room["members"],
-                "profiles": room["profiles"], "ordinal": len(room["turns"]) + 1, "base_run_id": base}
+        saved_roles = room.get("saved_roles", [])
+        profiles = [self.current_role(p["id"]) if p["id"] in saved_roles else p for p in room["profiles"]]
+        return {**message, "saved_roles": saved_roles, "id": room["id"], "kind": room["kind"], "members": room["members"],
+                "profiles": profiles, "ordinal": len(room["turns"]) + 1, "base_run_id": base,
+                "knowledge_project_id": room["knowledge_project_id"] if message.get("inherit_files", True) else run_id}
 
     def _artifact_data(self, run_id, name, limit):
         root = self._directory(run_id)
@@ -774,7 +785,7 @@ class StudioService(RoomDiscussion):
             if mode not in {"single", "team"} or scheduler != "serial":
                 raise StudioError("会话支持定向回复或群内协作，请使用串行调度。")
             try:
-                message = validate_conversation(payload["conversation"])
+                message = self.validate_role_refs(payload["conversation"])
             except ValueError as exc:
                 raise StudioError(str(exc)) from None
             if mode == "team" and (message["intent"] != "edit" or message.get("kind", "group") != "group"):
@@ -835,23 +846,27 @@ class StudioService(RoomDiscussion):
                         "state": "queued", "created_at": _now()}
                 assignee = "orchestrator" if request["mode"] in {"team", "team-demo"} else "worker"
                 local = request.get("workspace_path")
+                previous_local = None
                 if thread and thread["parent_run_id"] and thread.get("inherit_files", True):
                     previous_local = self._meta(self._directory(thread["parent_run_id"])).get("workspace_path")
-                    if local is not None and previous_local and previous_local != local:
-                        raise StudioError("本会话已绑定工作区，请新建会话以切换文件夹。")
                     local = local if local is not None else previous_local
                 if local is not None:
                     try:
                         local = studio_workspace.select_root(local, self.runs_dir)
+                        if previous_local and previous_local != local:
+                            raise StudioError("本会话已绑定工作区，请选择新项目以切换文件夹。")
                         active_thread = thread or thread_info(run_id, meta)
                         baseline = studio_workspace.checkout(local, self._workspace(staged, active_thread),
                                                              _EXTENSIONS, self.settings.api_key)
+                    except StudioError:
+                        raise
                     except (OSError, ValueError) as exc:
                         raise StudioError(str(exc) if isinstance(exc, ValueError) else "无法读取所选工作区。",
                                           "workspace_unavailable", 409) from None
                     meta["workspace_path"] = local
                     _write_json(staged, "workspace-baseline.json", baseline)
                 if thread:
+                    thread["knowledge_project_id"] = knowledge_project(thread, local, run_id)
                     meta["thread"] = thread
                     assignee = thread["recipient"]
                     if thread["base_run_id"] and (local is None or thread.get("recover_failed")):
@@ -1120,13 +1135,22 @@ class StudioService(RoomDiscussion):
             else:
                 tracer.event("case_registered", schema_version=2, root_id=run_id, task_id=run_id,
                              level="goal", task=request["objective"])
-                thread = thread_info(run_id, self._meta(path))
+                metadata = self._meta(path)
+                thread = thread_info(run_id, metadata)
+                roles = RoleSession(self.role_memory, thread, metadata.get("workspace_path"), run_id, settings.api_key)
                 recipient = thread["recipient"]
                 question = thread["intent"] == "question"
                 context = ""
                 if "conversation" in request:
                     room = self._conversation(path, before=thread["ordinal"])
                     context = project_context(thread, room["turns"])
+                    receipt = roles.remember_instruction(thread, request["objective"])
+                    if receipt:
+                        context += "\n" + receipt
+                        tracer.event("role_memory_receipt", task_id=run_id, role=recipient, message=receipt)
+                    knowledge = roles.context(recipient, request["objective"])
+                    if knowledge:
+                        context += "\n" + knowledge
                 if mode != "demo" and checks:
                     delivery = {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])}
                     context += "\n用户指定的交付检查：" + json.dumps(delivery, ensure_ascii=False)
@@ -1138,10 +1162,12 @@ class StudioService(RoomDiscussion):
                     crew = RoomCrew(run_id, path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
-                                    {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])})
+                                    {"files": request["acceptance_files"], "checks": request.get("acceptance_checks", [])},
+                                    role_session=roles)
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
-                agent = Agent(name=recipient, provider=provider, registry=build_default_registry(read_only=question),
+                registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
+                agent = Agent(name=recipient, provider=provider, registry=registry,
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
                               human_handler=(self._human_handler(run_id, recipient, deadline=crew.deadline - crew.close_seconds)
                                              if crew else self._human_handler(run_id, recipient)

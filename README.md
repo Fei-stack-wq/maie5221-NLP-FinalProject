@@ -270,3 +270,7 @@ python -m unittest discover -s tests -p 'test_contract*.py' -t . -v
 | P3     | 总线、S3 事件驱动、委派        | ✅（HITL 持久化待做） |
 | P4     | 记忆与演化 + A/B 实验          | ⏳ 下一步             |
 | P5     | 批量评测 + 基线对照 + 报告打磨 | ⏳                    |
+
+### 长期角色助手
+
+从本地 Studio 侧栏的「角色库」创建助手，填写职责后可以长期私聊或邀请进群。私聊中发送 `请记住：每次修改数据库前先备份。`，下次打开新的私聊仍可使用这条偏好。项目专属资料在角色详情中选择适用项目，技能建议也在这里审核。[个人角色库使用指南](docs/personal-role-library.md) · [执行框架与实验依据](docs/agent-harness-research.md)
