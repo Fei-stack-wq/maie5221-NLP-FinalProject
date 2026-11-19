@@ -262,3 +262,25 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 - [Agents SDK 交接与异常处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L545-L633) · [纠错和异常边界测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_handoff_failure_error_function.py#L31-L217) · [许可证](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/LICENSE)
 - [LangGraph 剩余计划路由测试](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_pregel.py#L5230-L5284) · [Command 目标校验](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/langgraph/pregel/_io.py#L56-L78) · [许可证](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/LICENSE)
 - [正常群入口和误路由反例](../tests/test_studio_peer_checks.py) · [同版本独立回执与反例](../tests/test_handoff_review.py)。这些是无付费模型请求的平台回归，不代表真实模型运行或原题交付已经通过。
+
+### 已签评审引用未决反证时的独立裁决
+
+评审人可能已提交原生 `passed`，同时明确引用自己检查中的一个真实 `failed_check`。例如，来源记录把公示稿 URL 放在 `links[].url`，评审人最初却只在 `text` 里查找；修订脚本后检查通过，旧版本的命名失败仍然成立。此时不能由改脚本的人直接清掉旧反证，也不能因为成员最后回复 `[BLOCKED]` 就丢失已提交的其他标准和来源回执。
+
+宿主只在以下条件同时成立时安排一次定向裁决：原生评审已接受 `passed`；每个当前未决失败都被已签结论显式引用；这些失败都来自本次评审人，且能提供完整原代码、真实错误与退出回执；候选及继承文件未变化，没有缺失交付文件或失败的用户显式验收。没有被正式引用的普通探索失败不因此新增产品标准。证据缺失、超出既有限额、其他未决失败或取消运行时仍明确阻塞。
+
+`reviewer_probe_pending` 事件保存原产品目标、版本、评审身份、完整已签结论，以及逐 scope 的冻结原检查。原 `Review.latest` 保留已签项，状态保持待审；负责人下一次正常 `delegate_task` 优先转给独立于产品作者和原评审人的成员。负责人及以上两位当事人均不能担任裁决者。没有符合身份的成员时保留证据并明确结束为阻塞。不会自动执行旧 shell 命令，也不会让负责人通过新建一个较宽松的 `review` 替换原标准。
+
+子复核复用既有 `Review.probes`、冻结私稿和发布检查。`kind=reviewer_probe` 与 `probe_parent` 连接原产品；`probe_<原scope>` 保留反证身份、原代码及实际错误，原涉事标准的 inspect/source 语义继续保留。source 裁决须读同候选的业务成稿并亲自打开来源；不强制使用 Python。execute 裁决须有当前冻结产品上的实际执行证据：支持直接读取文件数据的 Python 断言，以及打开本地冻结入口后对该页面执行的真实浏览器 `expect`/`assert`。宿主仅保守记录可归属的输入路径与 SHA，不声称静态分析能证明业务标准；裁决者仍须逐项说明原失败和实际行为。只读后 `assert True`、另一个版本、替换页后的无关 DOM 断言和仅进程退出 0 都不能提供所需执行依据。动态服务器 URL 无法归属本地候选时不凭猜测签发执行凭证，可改用可绑定入口的真实浏览器检查；不能降低原标准。
+
+裁决通过后仍先走原私稿发布、成员验收、最终用户检查及文件 SHA 校验，再恢复原产品评审人签署的结果；第三人不会代签其他产品标准。确认产品确有问题时回原产品作者修订，并保留原产品评审人及完整标准。无法核实、修改冻结 HTML/脚本、来源不足或新失败保持阻塞。`reviewer_probe_resolved` 记录具体 scope、裁决者、候选版本和结论；修复后的脚本 PASS 不覆盖历史失败回执。
+
+机制参考 LangGraph 按检查点/任务身份恢复未决项，并拒绝无法定位的恢复值；Studio 另以原产品版本和失败 scope 绑定子义务，不自动重放节点。也参考 OpenAI Agents SDK 在可恢复交接错误后保留调用状态、向调用者返回具体验证错误；这里的业务裁决仍使用 Studio 原来的独立评审和硬性验收。两项目均为 MIT 许可证，未复制源码或添加依赖。
+
+- [LangGraph 恢复及错误处理](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/langgraph/pregel/_loop.py#L1029-L1075) · [按未决身份恢复的测试](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_interrupt_state.py#L100-L143) · [歧义恢复反例](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_interrupt_state.py#L352-L367)
+- [Agents SDK 交接和异常处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L545-L633) · [失败返回与异常边界](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_handoff_failure_error_function.py#L31-L217)
+- [普通 Studio 入口、命名失败、来源及反例](../tests/test_bound_reviewer_probe.py) · [真实本地浏览器与替换页反例](../tests/test_bound_reviewer_browser.py)。这些为脚本模型、模拟来源及本地浏览器的平台回归，不代表原题成稿或真实模型重新执行已通过。
+
+壳命令仍向模型展示原有的 1,400 字节首部与 2,200 字节尾部。若真实非零退出的完整失败输出（含 stdout、stderr 和退出码）不超过 8 KiB，宿主另存 `complete_failure_output`；模型摘要的 `truncated=true` 原样保留，冻结探针的 `display_truncated` 表明二者区别。解析命名失败和移交原错误时使用这份有相同调用身份的完整宿主记录。输出超界、超时、取消或信号中止均不获该例外；成功但截断的输出仍只说明进程完成。旧运行没有存下完整原输出时不能事后补造，因此历史 T2-04 的 `a6b1f4…` 仍应显示缺少完整证据；本修复使相同真实输出规模的新调用可以完整保留、正常移交。
+
+这一分离参考 Pi 的 `OutputAccumulator`/shell 工具：模型展示截断内容，结构化结果引用独立保存的完整输出，并区分真实退出码与后台管道超时。Studio 只保存满足既有 8 KiB 探针上限的失败原输出，不增加模型展示预算或自动执行。未复制源码。[Pi 完整输出与截断显示](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L304-L436) · [真实退出与超时回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/suite/regressions/11613-bash-timeout-after-shell-exit.test.ts) · [MIT 许可证](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/LICENSE)

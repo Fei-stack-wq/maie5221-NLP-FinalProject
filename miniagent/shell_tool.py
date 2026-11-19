@@ -28,14 +28,21 @@ class _Output:
 
     head_limit = 1400
     tail_limit = 2200
+    evidence_limit = 8192
 
     def __init__(self):
         self.head = bytearray()
         self.tail = bytearray()
         self.count = 0
+        self.complete = bytearray()
 
     def add(self, chunk):
         self.count += len(chunk)
+        if self.complete is not None:
+            if self.count <= self.evidence_limit:
+                self.complete.extend(chunk)
+            else:
+                self.complete = None
         take = min(self.head_limit - len(self.head), len(chunk))
         self.head.extend(chunk[:take])
         self.tail.extend(chunk[take:])
@@ -192,11 +199,24 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
             parts.append(f"{name}:\n{stream.text()}")
     if not stdout.count and not stderr.count and not timed_out:
         parts.append("（无输出）")
+    failure_evidence = {}
+    if (process.returncode is not None and process.returncode > 0 and not timed_out and not cancelled
+            and (stdout.truncated or stderr.truncated)
+            and stdout.complete is not None and stderr.complete is not None):
+        complete = [f"exit_code={process.returncode}"]
+        complete.extend(f"{name}:\n{bytes(stream.complete).decode('utf-8', errors='replace')}"
+                        for name, stream in [("stdout", stdout), ("stderr", stderr)] if stream.count)
+        output = "\n".join(complete)
+        if len(output.encode()) <= _Output.evidence_limit:
+            # Preserve bounded original failure evidence without expanding the
+            # model-facing head/tail display or asserting that the check passed.
+            failure_evidence["complete_failure_output"] = output
     return ToolResult(
         ok=not timed_out and not cancelled and process.returncode == 0, content="\n".join(parts),
         meta={"exit_code": process.returncode, "elapsed_ms": elapsed, "timeout_s": timeout,
               "timed_out": timed_out, "cancelled": cancelled, "cwd": ctx.sandbox.relative(cwd), "stdout_bytes": stdout.count,
-              "stderr_bytes": stderr.count, "truncated": stdout.truncated or stderr.truncated},
+              "stderr_bytes": stderr.count, "truncated": stdout.truncated or stderr.truncated,
+              **failure_evidence},
     )
 
 

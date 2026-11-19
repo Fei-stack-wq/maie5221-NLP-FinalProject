@@ -25,7 +25,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
-from .studio_reviews import ReviewQueue, ReviewRequest, ReviewSession, digest, manifest_issue
+from .studio_reviews import Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
@@ -118,6 +118,7 @@ class RoomCrew:
         self.check_delivery = build_checks(self.delivery.get("files", []), self.delivery.get("checks", []))
         self.delivery_issue = ""
         self.pending_check_reviews = {}
+        self.reviewer_probe_reviews = {}
         self.native_reviews = ReviewQueue(self.delivery.get("required_source_review_paths", []))
         if self.native_reviews.required_source_paths and thread.get("inherit_files", True):
             for turn in history:
@@ -489,6 +490,146 @@ class RoomCrew:
                                  "required_criteria": [rule.id for rule in item.criteria if rule.required]})
         return tuple(receipts) if covered == expected else ()
 
+    def _next_review(self):
+        for item in getattr(self, "reviewer_probe_reviews", {}).values():
+            if not item.get("resolved"):
+                return item["review"]
+        return self.native_reviews.next(self._review_answers())
+
+    @staticmethod
+    def _bound_probe_conflicts(review, session, progress, task_id):
+        """Only an accepted finding's explicit contrary evidence is disputed.
+
+        Incidental exploratory failures do not acquire new product criteria.
+        Missing source or another unresolved failure remains a hard blocker.
+        """
+        if (not session or not session.assessment or review.kind != "product"
+                or session.assessment["verdict"] != "passed" or progress.pending_paths()
+                or session.snapshot_issue()):
+            return {}
+        failed = progress.failed_checks()
+        cited = {r["scope"] for finding in session.assessment["results"] for r in finding["receipts"]
+                 if finding["verdict"] == "passed" and r["kind"] == "failed_check"}
+        probes = progress.inline_failures()
+        if not failed or not failed.keys() <= cited or not failed.keys() <= probes.keys():
+            return {}
+        return {scope: probes[scope] for scope in failed} if all(
+            probes[scope].get("task_id") == task_id for scope in failed) else {}
+
+    def _queue_reviewer_probes(self, parent, report, draft, assessment, support):
+        # Even an unavailable independent actor must not erase accepted signed
+        # findings. State remains blocked/review until the obligation is resolved.
+        parent.latest = assessment
+        probes = draft["inline_failures"]
+        if (not draft["checkpoint"] or not draft["manifest"]
+                or set(probes) != set(draft["failed_checks"]) or len(probes) > 24):
+            return False
+        peers = [p for p in dict.fromkeys([*self.plan_order, *self.profiles])
+                 if p not in {self.lead, parent.reviewer, parent.author}]
+        if not peers:
+            parent.host_issue = "原评审引用的失败检查需要独立于产品作者和检查作者的裁决者，当前没有合格成员；保留原失败证据，不能自审通过。"
+            return False
+        # The reviewer tree and its original product inputs are already frozen
+        # by _remember_draft. Never recreate the old assertion from a summary.
+        extra = []
+        remaining = 98304 - sum(len((p["code"] + p["error"]).encode()) for p in probes.values())
+        for row in support:
+            data = _json(row).encode()
+            if len(data) > remaining:
+                continue
+            try:
+                validate_project_data("probe-support.txt", data, secret=self.settings.api_key, reject_credentials=True)
+            except ValueError:
+                continue
+            extra.append(row)
+            remaining -= len(data)
+        implicated = {finding["criterion_id"] for finding in assessment["results"]
+                      if any(r["kind"] == "failed_check" and r["scope"] in probes for r in finding["receipts"])}
+        original_rules = [rule for rule in parent.criteria if rule.id in implicated]
+        method = ("execute" if any(r.method == "execute" for r in original_rules) else
+                  "source" if any(r.method == "source" for r in original_rules) else "inspect")
+        rules = [Rule(id="probe_" + scope, method=method, description=(
+            "独立裁决原评审明确引用的失败检查 " + scope + "，说明原断言/真实错误为何与以下原业务标准冲突或一致：" +
+            _clip(_json([rule.model_dump() for rule in original_rules]), 950))) for scope in probes]
+        # Keep the original inspection/source semantics as well as the exact
+        # executable counterexample. A passing assertion alone cannot establish
+        # an externally sourced product claim.
+        rules.extend(Rule(id=("original_" + rule.id if len(rule.id) <= 71 else
+                              "original_" + hashlib.sha256(rule.id.encode()).hexdigest()),
+                          method=rule.method, description=rule.description, required=rule.required)
+                     for rule in original_rules if rule.method != "execute")
+        if len(rules) > 24:
+            parent.host_issue = "争议涉及的原标准和失败范围超过单次复核上限；保留全部证据，不能省略核销。"
+            return False
+        if not parent.files or any(draft["manifest"].get(p) != sha for p, sha in parent.files.items()):
+            parent.host_issue = "争议复核缺少原产品完整冻结版本，不能签发裁决。"
+            return False
+        product_paths = {r["path"] for finding in assessment["results"]
+                         if finding["criterion_id"] in implicated for r in finding["receipts"]
+                         if r["kind"] == "read" and r.get("extent", 0) > 0}
+        product_paths.update(parent.required_source_paths)
+        if not product_paths:
+            product_paths.update(self.delivery.get("files", []))
+        product_files = {p: sha for p, sha in parent.files.items() if p in product_paths}
+        if not product_files:
+            parent.host_issue = "争议缺少原业务标准对应的产品输入，无法把独立断言绑定到成稿。"
+            return False
+        child = Review(report["task_id"], parent.reviewer, peers[0],
+                       "复核评审者自建检查的争议；真实产品缺陷回原作者。原产品标准：" +
+                       _clip(_json([r.model_dump() for r in parent.criteria]), 5000),
+                       rules, dict(draft["manifest"]), draft_task=report["task_id"], probes=dict(probes),
+                       kind="reviewer_probe", probe_parent=parent.target, probe_support=extra,
+                       probe_product_files=product_files,
+                       required_source_paths=(set(parent.required_source_paths)
+                           if any(rule.method == "source" for rule in original_rules) else set()))
+        self.reviewer_probe_reviews[child.target] = {
+            "review": child, "parent": parent, "parent_version": parent.version,
+            "assessment": assessment, "report": report, "base": dict(draft["base"]), "resolved": False}
+        parent.state = "review"  # Suspended behind the exact child; never reopened with new rules.
+        parent.host_issue = "已签评审引用的失败检查待独立裁决：" + ", ".join(probes)
+        report["reviewer_probe_review"] = {"target": child.target, "parent": parent.target,
+            "candidate_version": child.version, "scopes": list(probes), "reviewer": child.reviewer}
+        self.record_event(self.run_id, "studio", "reviewer_probe_pending", parent.host_issue,
+                          task_id=report["task_id"], parent_target=parent.target, parent_version=parent.version,
+                          candidate_version=child.version, reviewer=child.reviewer, probes=probes,
+                          supporting_receipts=extra, accepted_assessment=assessment)
+        return True
+
+    def _finish_reviewer_probes(self, child, assessment, published, issue, changes):
+        item = self.reviewer_probe_reviews[child.target]
+        parent = item["parent"]
+        if parent.version != item["parent_version"]:
+            child.state = "blocked"
+            parent.host_issue = "原产品候选版本已变化，旧评审不能恢复。"
+            return
+        if assessment and assessment["verdict"] == "passed" and published:
+            if any(self.native_reviews.public_versions.get(p) != sha for p, sha in parent.files.items()):
+                child.state = "blocked"
+                parent.host_issue = "公共工件与原评审版本不符，旧签署仍待核对。"
+                return
+            parent.apply(item["assessment"], self._review_answers())
+            parent.host_issue = ""
+            original = item["report"]
+            # The original reviewer already ran these checks on the exact tree
+            # now independently promoted. Preserve that actor's attribution.
+            ledger = {**original["evidence"], "pending_verification": []}
+            self._record_check_reviews(original["role"], original["task_id"], original["summary"],
+                                      ledger, item["base"], changes, parent.target)
+            item["resolved"] = True
+            resolution = "probe_corrected"
+        elif assessment and assessment["verdict"] == "changes_requested" and not issue:
+            # The probe's author is not necessarily the product's author.
+            # Return the real defect to the original product repair/review path.
+            parent.state = "repair"
+            parent.host_issue = "独立复核确认产品缺陷：" + _clip(_json(assessment["results"]), 2500)
+            item["resolved"] = True
+            resolution = "product_defect"
+        else:
+            return  # Inconclusive, a new failed probe or a hard gate stays pending.
+        self.record_event(self.run_id, "studio", "reviewer_probe_resolved", resolution,
+                          task_id=child.target, parent_target=parent.target, parent_version=parent.version,
+                          evaluator=child.reviewer, scopes=list(child.probes), assessment=assessment)
+
     def _passed_review_receipts(self):
         """Product approval stays visible while a peer checks an edited test."""
         expected = set(self.delivery.get("files", [])) | set(self.native_reviews.required_source_paths)
@@ -516,7 +657,7 @@ class RoomCrew:
         # Never substitute test review for a pending product criterion, member
         # assignment, source review or delivery gate.
         return (bool(self.pending_check_reviews) and bool(self._reviewed_delivery()) and not self.delivery_issue
-                and self.native_reviews.next(self._review_answers()) is None
+                and self._next_review() is None
                 and not self.native_reviews.missing_source_reviews()
                 and any(r["published"] for r in self.reports)
                 and not (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
@@ -552,7 +693,7 @@ class RoomCrew:
         plan_finished = self.planned is not None or set(self.profiles) - {self.lead} <= self.approved_roles
         if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
             return closing
-        native = self.native_reviews.next(self._review_answers())
+        native = self._next_review()
         if native and native.state == "blocked":
             return StepPolicy("finalize", "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
                               _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
@@ -683,7 +824,7 @@ class RoomCrew:
     def before_answer(self):
         queue = getattr(self, "native_reviews", None)
         if queue and queue.items:
-            pending_review = queue.next(self._review_answers())
+            pending_review = self._next_review()
             if pending_review:
                 return ("独立验收尚未通过，需要 " + pending_review.owner + " 处理 " + pending_review.state +
                         ("。用 delegate_task 委派原验收者，省略 review 以沿用原标准；有新的可复核来源时告诉验收者。"
@@ -871,7 +1012,9 @@ class RoomCrew:
             return self._observation(False, "委派需要具体目标和运行时动作身份。")
         if action in self.handoffs:
             return self.handoffs[action]
-        review = self.native_reviews.next(self._review_answers())
+        review = self._next_review()
+        if review and review.kind == "reviewer_probe" and payload.get("review") is not None:
+            return self._observation(False, "当前须裁决已绑定的评审探针。请省略 review，沿用宿主逐项标准。")
         peer_check = False
         if self._only_peer_checks_remaining():
             selection = payload.get("review")
@@ -1038,7 +1181,8 @@ class RoomCrew:
                 self.record_event(self.run_id, "studio", "published_review_bound", "已绑定同群先前发布的原件，开始本轮独立复核。",
                                   task_id=self.run_id, reviewer=role, publication=review.publication,
                                   candidate_version=review.version, criteria=[r.model_dump() for r in review.criteria])
-            self.native_reviews.items[review.target] = review
+            if review.kind != "reviewer_probe":
+                self.native_reviews.items[review.target] = review
         if retry_gaps:
             self.record_event(self.run_id, "studio", "review_resumed", "原标准继续生效，已将未决项交给原验收者。",
                               task_id=self.run_id, requested=original_recipient, recipient=role, candidate_task=review.target,
@@ -1325,6 +1469,10 @@ class RoomCrew:
             return StepPolicy("work", steering, work_tools, token_reserve=reserve, seconds_reserve=handoff_seconds)
 
         def handoff_issue():
+            if not private and self._bound_probe_conflicts(review, session, progress, record_id):
+                # A valid signed assessment with explicit contrary evidence is
+                # handed to an independent peer, not silently made effective.
+                return None
             if session and not session.assessment:
                 return session.last_snapshot_issue or "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
             if session and session.assessment["verdict"] != "passed" and not progress.pending_paths():
@@ -1369,17 +1517,24 @@ class RoomCrew:
             usage["seconds"] = round(time.monotonic() - started, 3)
         status = result.status
         text = result.answer or result.error or status
+        bound_probes = self._bound_probe_conflicts(review, session, progress, record_id)
+        disputed = bool(bound_probes and not private and not self.should_cancel()
+                        and (status in {"completed", "unverified"} or text.startswith("[BLOCKED]"))
+                        and not (spec and not result.succeeded))
         issue = (result.error or status) if status not in {"completed", "unverified"} else ""
         if not issue:
             issue = handoff_issue() or ("任务已取消" if self.should_cancel() else "")
         if spec and not result.succeeded:
             issue = issue or "用户指定的成员验收未通过。"
+        if disputed:
+            issue = "已签评审明确引用仍未裁决的失败检查，保留原签署并交独立同伴复核。"
         changes = []
         artifacts = []
         assessment = session.assessment if session else None
         if assessment and (snapshot_issue := session.snapshot_issue()):
             issue = "验收提交后候选文件已变化，原结论失效。" + snapshot_issue
             assessment = None
+            disputed = False
         promotion = private and session and assessment and assessment["verdict"] == "passed"
         private_repair = private and not session
         host_repair = False
@@ -1445,6 +1600,7 @@ class RoomCrew:
                   "summary": _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
                   "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
+        queued_probe_review = False
         if published:
             if promotion:
                 report["promoted_candidate"] = {"author": review.author, "source_task": review.draft_task,
@@ -1467,6 +1623,9 @@ class RoomCrew:
             if not (private and session):
                 self._remember_draft(role, assignment, required, report, progress.failed_checks(),
                                      {"runs": recent_runs, "reads": recent_reads}, original, draft if recovered else None, progress.inline_failures())
+                if disputed:
+                    queued_probe_review = self._queue_reviewer_probes(
+                        review, report, self.private_drafts[role], assessment, progress.probe_support())
             if private_repair:
                 replacement = self.private_drafts[role]
                 if not issue and replacement["reviewable"] and replacement["manifest"] != review.files:
@@ -1477,9 +1636,11 @@ class RoomCrew:
                 else:
                     review.state = "blocked"
         if review:
+            if review.kind == "reviewer_probe":
+                self._finish_reviewer_probes(review, assessment, published, issue, changes)
             report["native_review"] = {**review.describe(), "assessment": assessment}
         self.reports.append(report)
-        private_outcome = private and not issue and (assessment is not None or private_repair and review.state == "review")
+        private_outcome = queued_probe_review or private and not issue and (assessment is not None or private_repair and review.state == "review")
         disposition = "published" if published else "assessed" if private_outcome and session else (
             "awaiting_review" if private_outcome else "blocked")
         self.record_event(self.run_id, role, "member_report", text + ("\n" + issue if issue and issue != text else ""),

@@ -15,6 +15,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import unquote, urlsplit
 
 from .check_provenance import python_check_source, python_invocation, shell_invocation
 from .project_data import PROJECT_CACHE_DIRS
@@ -113,6 +114,104 @@ def _script_inputs(code: str) -> tuple[set[str], str, int | None, bool]:
             command = "assert " + digest
     output_only = (bool(calls) and all(name in {"print", "format", "join", "str", "repr"} for name in calls))
     return paths, command, exit_position, reader_seen or output_only
+
+
+def _asserted_inputs(code: str) -> set[str]:
+    """Conservatively bind an executed top-level assertion to literal file inputs.
+
+    This is provenance, not a proof that an assertion implements a business rule.
+    The independent reviewer still owns that judgment. Unsupported dynamic
+    scripts must supply a small direct probe rather than mint an unrelated PASS.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    values, dependencies, checked = {}, {}, set()
+
+    def path_value(node):
+        if isinstance(node, ast.Name):
+            return values.get(node.id)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Call) and node.args:
+            name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+            if name in {"Path", "open"}:
+                return path_value(node.args[0])
+        return None
+
+    def inputs(node):
+        paths = set()
+        for part in ast.walk(node):
+            if isinstance(part, ast.Name):
+                paths.update(dependencies.get(part.id, ()))
+            if isinstance(part, ast.Call):
+                name = getattr(part.func, "id", "") or getattr(part.func, "attr", "")
+                candidate = (part.args[0] if name == "open" and part.args else
+                             part.func.value if name in {"read_text", "read_bytes", "read"}
+                             and isinstance(part.func, ast.Attribute) else None)
+                path = path_value(candidate)
+                if path:
+                    paths.add(path)
+        return paths
+
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and node.value is not None:
+                    values[target.id] = path_value(node.value)
+                    dependencies[target.id] = inputs(node.value)
+        elif isinstance(node, ast.Assert):
+            checked.update(inputs(node.test))
+    return checked
+
+
+def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
+    """Bind direct, successful page expectations to a local frozen entry point.
+
+    Only top-level navigation and assertions qualify. An arbitrary server URL,
+    set_content, another page, or an uncalled helper is not attributed to a file.
+    This narrow provenance path does not decide whether a selector proves the
+    original criterion; that remains the independent reviewer's signed finding.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    entry, checked = None, set()
+
+    def local_entry(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            url = urlsplit(node.value)
+            return Path(unquote(url.path)) if url.scheme == "file" and url.netloc in {"", "localhost"} else None
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"as_uri", "resolve", "absolute"}):
+            return local_entry(node.func.value)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path"
+                and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+            return root / cwd / node.args[0].value
+        return None
+
+    for statement in tree.body:
+        expr = statement.value if isinstance(statement, ast.Expr) else None
+        call = expr if isinstance(expr, ast.Call) else None
+        if call and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            if call.func.value.id == "page" and call.func.attr in {"goto", "set_content"}:
+                path = local_entry(call.args[0]) if call.func.attr == "goto" and call.args else None
+                try:
+                    entry = path.resolve().relative_to(root.resolve()).as_posix() if path else None
+                except (OSError, ValueError):
+                    entry = None
+        assertion = statement.test if isinstance(statement, ast.Assert) else None
+        if (call and isinstance(call.func, ast.Attribute) and call.func.attr.startswith(("to_", "not_to_"))
+                and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)
+                and call.func.value.func.id == "expect"):
+            assertion = call.func.value
+        if entry and assertion is not None and any(isinstance(node, ast.Name) and node.id == "page"
+                                                  for node in ast.walk(assertion)):
+            checked.add(entry)
+    return checked
 
 
 def _shell_inputs(command: str, cwd: str, files: dict) -> tuple[set, str, bool]:
@@ -561,6 +660,7 @@ class MemberProgress:
         self._passes = {}
         self._review_evidence = {}
         self._inline_failures = {}
+        self._probe_support = {}
         self._undisclosed_probes = {}
         self._browser_probes = {}
         self._diagnostic_checks = {}
@@ -644,6 +744,10 @@ class MemberProgress:
         self._inline_failures = {k:v for k,v in self._inline_failures.items() if k in self._failures}
         self._undisclosed_probes = {k:v for k,v in self._undisclosed_probes.items() if k in self._failures}
         return dict(self._inline_failures)
+
+    def probe_support(self):
+        """Optional later executions, never a waiver of an earlier failure."""
+        return list(self._probe_support.values())
 
     def _record_probe(self, scope, probe):
         self.inline_failures()  # Release only scopes whose failure was actually closed.
@@ -771,6 +875,15 @@ class MemberProgress:
                 command = ""
                 cwd = str(parameters.get("cwd") or ".")
                 reading = False
+                failure_obs = obs
+                archived = obs.meta.get("complete_failure_output")
+                if (obs.source == "run_shell" and isinstance(archived, str) and 0 < len(archived.encode()) <= 8192
+                        and type(obs.meta.get("exit_code")) is int and obs.meta["exit_code"] > 0
+                        and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
+                    # The display stays marked truncated. Only the separately
+                    # captured host evidence is complete, with the same call/exit.
+                    failure_obs = obs.model_copy(update={"content": archived, "truncated": False,
+                        "meta": {**obs.meta, "truncated": False}})
                 if obs.source == "run_shell":
                     self._shell_calls += 1
                     invocation = shell_invocation(str(parameters.get("command", "")), cwd)
@@ -781,7 +894,7 @@ class MemberProgress:
                     elif re.match(r"^(?:ls|rg|grep|find|pwd)(?:\s|$)", str(parameters.get("command", "")).strip()):
                         advances |= self._navigation_result(obs, command, search=True)
                     # A source dump is navigation even if the file is tests.txt.
-                    signal = _check(obs, "" if reading else command, reading, None)
+                    signal = _check(failure_obs, "" if reading else command, reading, None)
                 elif obs.source == "run_browser":
                     self._browser_calls += 1
                     signal = _browser_check(obs, str(parameters.get("code", "")), str(parameters.get("cwd", ".")))
@@ -939,7 +1052,7 @@ class MemberProgress:
                                     "exit_code":exit_code,
                                     "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
                         elif (obs.source == "run_shell" and invocation and invocation.complete
-                              and invocation.script in self._edited_scripts and not _output_truncated(obs)
+                              and invocation.script in self._edited_scripts and not _output_truncated(failure_obs)
                               and type(exit_code) is int and exit_code != 0
                               and self._current.get(invocation.script) == before.get(invocation.script)):
                             original = self._check_sources.get(invocation.script)
@@ -947,14 +1060,15 @@ class MemberProgress:
                             # failure output can be handed to another member. This
                             # is a review subject, never a waived failed assertion.
                             if (original and original[0] == before.get(invocation.script)
-                                    and len(obs.content.encode()) <= 8192 and obs.tool_call_id):
+                                    and len(failure_obs.content.encode()) <= 8192 and obs.tool_call_id):
                                 # Named failures use versioned case scopes, not
                                 # the aggregate suite scope. Bind the same frozen
                                 # source to each actual failure so a peer can
                                 # adjudicate it without rewriting the assertion.
                                 for scope, failure in failures.items():
                                     self._record_probe(scope, {
-                                        "kind":"edited_script", "code":original[1], "error":obs.content,
+                                        "kind":"edited_script", "code":original[1], "error":failure_obs.content,
+                                        "display_truncated": _output_truncated(obs),
                                         "path":invocation.script, "sha256":original[0], "exit_code":exit_code,
                                         "check":invocation.caption, "tool":obs.source,
                                         "tool_call_id":obs.tool_call_id, "task_id":state.task_id,
@@ -974,6 +1088,24 @@ class MemberProgress:
                             self._review_evidence["pass:" + suite_key] = {
                                 "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id,
                                 "asserted":status != "runner_exit"}
+                            code = parameters.get("code", "")
+                            if obs.source in {"run_python", "run_browser"} and status != "runner_exit":
+                                inputs = _asserted_inputs(code)
+                                if obs.source == "run_browser":
+                                    inputs.update(_browser_asserted_inputs(code, self.workspace, parameters.get("cwd", ".")))
+                                self._review_evidence["pass:" + suite_key]["asserted_inputs"] = {
+                                    p: self._current[p] for p in inputs if p in self._current}
+                            if (self._inline_failures and status != "runner_exit" and obs.tool_call_id
+                                    and obs.source in {"run_python", "run_browser"}
+                                    and type(exit_code) is int and exit_code == 0
+                                    and 0 < len(code.encode()) <= 32768 and len(obs.content.encode()) <= 8192
+                                    and not _output_truncated(obs) and not obs.meta.get("timed_out")
+                                    and not obs.meta.get("cancelled")):
+                                self._probe_support[suite_key] = {"scope": suite_key, "code": code,
+                                    "output": obs.content, "exit_code": exit_code, "tool": obs.source,
+                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id}
+                                if len(self._probe_support) > 4:
+                                    del self._probe_support[next(iter(self._probe_support))]
                             if status != "runner_exit":
                                 original_probe = self._inline_failures.get(suite_key, {})
                                 revised_script = (original_probe.get("kind") == "edited_script" and
