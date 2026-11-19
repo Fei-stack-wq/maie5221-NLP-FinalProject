@@ -35,6 +35,7 @@ from .rao import (
     StepPolicy,
     StepRecord,
     ToolCompletion,
+    WorkCheckpoint,
     policy_messages,
 )
 from .sandbox import Sandbox
@@ -330,13 +331,16 @@ class Agent:
                 def project(policy, offered):
                     schemas = [spec.to_api() for spec in offered]
                     available = budget.available_tokens(policy.token_reserve)
+                    excluded, measured = excluded_ranges, reported_assistant_tokens
+                    if not policy.compact and (checkpoint := state.scratch.get("work_checkpoint")):
+                        excluded, measured = checkpoint.rebase_indices(excluded, measured)
                     view, pruned = fit_history(
                         policy_messages(state, policy), tool_schemas=schemas,
                         window=self.settings.context_window_tokens, ceiling=output_reserve,
                         replay_target=retry_envelope[0] // 2 if retry_envelope else None,
-                        excluded_ranges=None if policy.compact else excluded_ranges,
+                        excluded_ranges=None if policy.compact else excluded,
                         usage_anchor=None if policy.compact else usage_anchor,
-                        reported_assistant_tokens=None if policy.compact else reported_assistant_tokens,
+                        reported_assistant_tokens=None if policy.compact else measured,
                         available=available, steps_left=budget.steps_left,
                     )
                     return schemas, available, view, pruned
@@ -407,10 +411,23 @@ class Agent:
                     break
                 budget.spend(steps=1)
                 step_started = time.perf_counter()
+                history_start = len(state.history)
+                checkpoint = state.scratch.get("work_checkpoint")
+                reset_work_view = policy.compact and policy.phase == "work"
+                if reset_work_view:
+                    # Every earlier tool batch is complete here. Only commit
+                    # the new boundary after the provider turn actually runs.
+                    prefix = projection.messages
+                    if state.scratch.get("tool_protocol_feedback") and policy.allowed_tools != frozenset():
+                        prefix = prefix[:-1]  # A one-turn protocol correction has no place in later requests.
+                    checkpoint = WorkCheckpoint(history_start, prefix)
                 if self.tracer:
                     self.tracer.event(
                         "step_start", **identity, step=state.step_index + 1,
                         phase=policy.phase, compact=policy.compact, tokens_reserved=policy.token_reserve,
+                        **({"work_history_start": checkpoint.history_end,
+                            "work_history_tail_messages": history_start - checkpoint.history_end}
+                           if checkpoint and policy.phase == "work" else {}),
                         seconds_reserved=policy.seconds_reserve,
                         offered_tools=[spec.name for spec in offered], requested_tool=policy.required_tool,
                         allowed_write_paths=sorted(policy.allowed_write_paths) if policy.allowed_write_paths is not None else None,
@@ -426,7 +443,6 @@ class Agent:
                         input_limit_tokens=projection.input_limit,
                         input_estimate_source=projection.estimate_source,
                     )
-                history_start = len(state.history)
                 state.scratch.pop("tool_protocol_feedback", None)
                 try:
                     record = self.unit.step(
@@ -450,6 +466,14 @@ class Agent:
                                           transport=self.provider.transport, request_attempts=exc.attempts,
                                           usage_source="unknown", recovery="shrink_and_retry")
                     continue
+                if reset_work_view:
+                    state.scratch["work_checkpoint"] = checkpoint
+                    # All earlier spans and token measurements now precede the
+                    # replay boundary. The raw transcript remains untouched.
+                    excluded_ranges.clear()
+                    reported_assistant_tokens.clear()
+                    usage_anchor = None
+                    compactor = RollingCompactor()
                 retry_envelope = None
                 usage = usage.merged(
                     Usage(prompt_tokens=record.prompt_tokens,

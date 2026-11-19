@@ -125,8 +125,10 @@ class NativeReviewTest(unittest.TestCase):
                  "assert 'old warehouse' in text\nprint('PASS destination matches the dispatch')")
         check = tool("run_python", code=scope)
         new_check = tool("run_python", code=scope.replace("'old warehouse' in text", "text.endswith('record.')"))
-        steps = self.start_review() + [check] * 7 + [
-            write("review-note.md", "Verified the warehouse. Separately check the dispatch record suffix."),
+        note = "Verified the warehouse. Separately check the dispatch record suffix."
+        record_note = {"tool_calls": [write("review-note.md", note)["tool_calls"][0],
+                                      tool("read_file", path="review-note.md")["tool_calls"][0]]}
+        steps = self.start_review() + [check] * 7 + [record_note,
             new_check, submit(label, "passed"), {"text":"Delivered."}]
         detail, provider = self.execute(steps)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
@@ -156,8 +158,21 @@ class NativeReviewTest(unittest.TestCase):
         compact = [r for r in trail if r["kind"] == "step_start" and r.get("compact")]
         self.assertTrue(compact)
         self.assertTrue(all(r["phase"] == "work" and set(r["offered_tools"]) == set(tools) for r in compact))
-        # A real write immediately restores the regular request and a different independent check succeeds.
-        self.assertTrue(any(m["role"] == "tool" for m in requests[evidence_turn + 1][0]))
+        # The next decision sees both new receipts and their actual calls,
+        # without reintroducing the seven pre-checkpoint copies of the test.
+        resumed, offered = requests[evidence_turn + 1]
+        self.assertEqual(resumed[:len(prompt)], prompt)
+        appended = resumed[len(prompt):]
+        assistant, first, second = appended[:3]
+        calls = assistant["tool_calls"]
+        self.assertEqual([call["function"]["name"] for call in calls], ["write_file", "read_file"])
+        self.assertEqual([first["tool_call_id"], second["tool_call_id"]], [call["id"] for call in calls])
+        self.assertIn(note, second["content"])
+        self.assertEqual(offered, tools)
+        self.assertNotIn(scope, str(resumed))
+        next_step = next(r for r in trail if r["kind"] == "step_start" and r["step"] == compact[-1]["step"] + 1)
+        self.assertEqual(next_step["work_history_start"], compact[-1]["work_history_start"])
+        self.assertEqual(next_step["work_history_tail_messages"], 3)
         report, = [r["handoff"] for r in detail["room_events"] if r["kind"] == "member_report"
                    and r["role"] == "inspector"]
         self.assertTrue(report["published"])

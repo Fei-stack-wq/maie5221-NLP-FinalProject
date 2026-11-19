@@ -331,6 +331,19 @@ class ToolCompletion:
 
 
 @dataclass(frozen=True)
+class WorkCheckpoint:
+    """Request prefix plus the next complete batch's index in the raw transcript."""
+    history_end: int
+    messages: list[dict[str, Any]]
+
+    def rebase_indices(self, excluded, measured):
+        shift = len(self.messages) - self.history_end
+        return ([(max(start, self.history_end) + shift, end + shift) for start, end in excluded
+                 if end > self.history_end],
+                {index + shift: cost for index, cost in measured.items() if index >= self.history_end})
+
+
+@dataclass(frozen=True)
 class StepPolicy:
     """Host-selected request mode. An empty allowlist requires a text response."""
 
@@ -356,10 +369,9 @@ class StepPolicy:
 def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]:
     """Project request-only steering without growing replay history.
 
-    In compact mode only the current objective and authenticated human replies
-    survive from the conversation. The caller supplies its current receipts
-    and dispatch state in instruction. Past tool outputs cannot masquerade as
-    human replies or delivery-gate decisions.
+    Compact work retains its assignment; later requests append whole batches
+    to that checkpoint. A compact closing request uses the current objective,
+    authenticated human replies and the caller's current receipts.
     """
     if policy.compact:
         messages = [m for m in state.history[:1] if m.get("role") == "system"]
@@ -370,6 +382,8 @@ def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]
             messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})
         if feedback := state.scratch.get("delivery_feedback"):
             messages.append({"role": "user", "content": feedback})
+    elif checkpoint := state.scratch.get("work_checkpoint"):
+        messages = [*checkpoint.messages, *state.history[checkpoint.history_end:]]
     else:
         messages = list(state.history)
     if policy.instruction:
