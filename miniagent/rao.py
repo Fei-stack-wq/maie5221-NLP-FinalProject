@@ -319,6 +319,18 @@ class RAOState(BaseModel):
 
 
 @dataclass(frozen=True)
+class ToolCompletion:
+    """Host-authorized final text derived from authenticated tool receipts."""
+
+    answer: str
+    evidence: dict[str, Any]
+
+    def __post_init__(self):
+        if not self.answer.strip() or not self.evidence:
+            raise ValueError("tool completion requires text and bound evidence")
+
+
+@dataclass(frozen=True)
 class StepPolicy:
     """Host-selected request mode. An empty allowlist requires a text response."""
 

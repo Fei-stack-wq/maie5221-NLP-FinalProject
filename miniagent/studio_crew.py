@@ -22,7 +22,7 @@ from .crew_progress import MemberProgress
 from .member_processes import managed_member_processes
 from .peer_recheck import ClosingPeerChecks
 from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_project_file, validate_project_data
-from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, policy_messages
+from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, ToolCompletion, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
 from .studio_reviews import Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
@@ -1527,6 +1527,54 @@ class RoomCrew:
                 pass
             return None
 
+        signed_handoff = None
+
+        def complete_signed_review(record):
+            nonlocal signed_handoff
+            if (private or not session or not session.assessment or session.assessment["verdict"] != "passed"
+                    or self.should_cancel() or not record.observations
+                    or any(not obs.ok for obs in record.observations)):
+                return None
+            # A signed submission closes the review contract. Later tool actions
+            # in that batch can introduce new evidence; never silently ignore it.
+            submitted = any(obs.source == "submit_review" for obs in record.observations)
+            if submitted:
+                if record.observations[-1].source != "submit_review":
+                    return None
+            elif not peer_checks.offered or any(obs.source != "run_shell" for obs in record.observations):
+                return None
+            evidence = progress.evidence()
+            if (progress.pending_paths() or progress.failed_checks() or evidence["pending_verification"]
+                    or member.sandbox.command_sessions.pending_reason() or session.snapshot_issue()
+                    or preflight_publication()):
+                return None
+            # A passing product review cannot replace the reviewer's exact peer
+            # check obligation. If it is outstanding, retain the existing narrow
+            # replay path before finishing this member.
+            for pending in self._review_requests(role):
+                if pending["task"] != review.target:
+                    continue
+                for entry in pending.get("verification", []):
+                    receipt = evidence["script_exits"].get(entry["scope"], {})
+                    if entry["scope"] not in evidence["complete_verification"] and not (
+                            receipt.get("path") == entry.get("path") and receipt.get("exit_code") == 0
+                            and receipt.get("sha256") == entry.get("current_sha256")
+                            and receipt.get("sha256") == review.files.get(entry.get("path"))):
+                        return None
+            assessment = session.assessment
+            lines = ["宿主依据已签独立评审生成交接；逐项理由与限制保留原文。",
+                     "评审者：" + assessment["evaluator"], "候选版本：" + assessment["candidate_version"]]
+            for finding in assessment["results"]:
+                lines.append("\n" + finding["criterion_id"] + " [" + finding["verdict"] + "]：" + finding["reason"])
+                lines.extend("证据 " + receipt["ref"] + "：" + (
+                    receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt["kind"])
+                    for receipt in finding["receipts"])
+            signed_handoff = {"source":"signed_review", "target":review.target,
+                              "candidate_version":review.version, "assessment":assessment,
+                              "completion_step":record.step,
+                              "trigger_calls":[obs.tool_call_id for obs in record.observations]}
+            return ToolCompletion("\n".join(lines), signed_handoff)
+
         initial = allocated.model_copy()
         started = time.monotonic()
         try:
@@ -1535,7 +1583,8 @@ class RoomCrew:
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,
                                     on_step=observe, before_answer=preflight_publication,
-                                    preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True))
+                                    preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True),
+                                    tool_completion=complete_signed_review)
         finally:
             usage = {"steps": allocated.steps_used - initial.steps_used,
                      "actions": allocated.actions_used - initial.actions_used,
@@ -1624,9 +1673,11 @@ class RoomCrew:
                                               [] if promotion else changes, native_target) if published else []
         report = {"role": role, "task_id": record.task_id, "objective": objective,
                   "acceptance_expectation": expectations, "status": status, "published": published,
-                  "summary": _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
+                  "summary": text if signed_handoff else _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
                   "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
+        if signed_handoff:
+            report["signed_handoff"] = signed_handoff
         queued_probe_review = False
         if published:
             if promotion:

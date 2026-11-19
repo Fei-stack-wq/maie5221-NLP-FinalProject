@@ -34,6 +34,7 @@ from .rao import (
     RAOUnit,
     StepPolicy,
     StepRecord,
+    ToolCompletion,
     policy_messages,
 )
 from .sandbox import Sandbox
@@ -130,6 +131,7 @@ class Agent:
         before_answer: Callable[[], str | None] | None = None,
         step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
         preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
+        tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
     ) -> RunResult:
         """跑完一个任务。
 
@@ -524,7 +526,10 @@ class Agent:
                     )
                     break
 
-                if text_only and record.decision_kind != "answer":
+                completion = tool_completion(record) if tool_completion and record.observations else None
+                if completion is not None and not isinstance(completion, ToolCompletion):
+                    raise TypeError("tool_completion must return ToolCompletion or None")
+                if text_only and record.decision_kind != "answer" and completion is None:
                     rejected_text_turns += 1
                     if rejected_text_turns > 1:
                         status, error = "error", "收尾阶段连续两次未收到有效的模型文字交接。"
@@ -533,8 +538,8 @@ class Agent:
                 rejected_text_turns = 0
 
                 # ② 模型给出最终答复 → 必须过验收
-                if record.decision_kind == "answer":
-                    if step_policy is not None and record.answer.lstrip().startswith("[BLOCKED]"):
+                if record.decision_kind == "answer" or completion is not None:
+                    if completion is None and step_policy is not None and record.answer.lstrip().startswith("[BLOCKED]"):
                         if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
                             retry = (not reviewed_close_retried and budget.has_steps(1)
                                      and budget.has_tokens(1) and budget.seconds_left > 0)
@@ -565,7 +570,10 @@ class Agent:
                         state.history.append({"role": "user", "content": reason})
                         state.scratch["delivery_feedback"] = reason
                         continue
-                    answer = record.answer
+                    answer = completion.answer if completion is not None else record.answer
+                    if completion is not None and self.tracer:
+                        self.tracer.event("tool_completion", **identity, step=record.step,
+                                          evidence=completion.evidence, answer=answer)
                     if durable_task is not None:
                         durable_task = self.task_service.transition(
                             task_id, expected_revision=durable_task.revision, status="verifying",

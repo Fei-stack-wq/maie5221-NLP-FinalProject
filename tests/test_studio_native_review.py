@@ -56,7 +56,9 @@ class NativeReviewTest(unittest.TestCase):
         # A real stale delegation error preceded the accepted review.
         script.insert(3, tool("delegate_task", assignee="inspector", objective="Verify the label.",
                               remaining_roles=[], review={"candidate": "unknown-target", "criteria": [RULE]}))
-        return script + [submit(label, "passed"), {"text": "Independent review published."}]
+        # The signed review is handed off by the host; the next scripted
+        # response belongs to the coordinator, including genuine blockers.
+        return script + [submit(label, "passed")]
 
     def close_events(self, detail):
         trace = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"

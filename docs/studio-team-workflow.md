@@ -286,3 +286,13 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 壳命令仍向模型展示原有的 1,400 字节首部与 2,200 字节尾部。若真实非零退出的完整失败输出（含 stdout、stderr 和退出码）不超过 8 KiB，宿主另存 `complete_failure_output`；模型摘要的 `truncated=true` 原样保留，冻结探针的 `display_truncated` 表明二者区别。解析命名失败和移交原错误时使用这份有相同调用身份的完整宿主记录。输出超界、超时、取消或信号中止均不获该例外；成功但截断的输出仍只说明进程完成。旧运行没有存下完整原输出时不能事后补造，因此历史 T2-04 的 `a6b1f4…` 仍应显示缺少完整证据；本修复使相同真实输出规模的新调用可以完整保留、正常移交。
 
 这一分离参考 Pi 的 `OutputAccumulator`/shell 工具：模型展示截断内容，结构化结果引用独立保存的完整输出，并区分真实退出码与后台管道超时。Studio 只保存满足既有 8 KiB 探针上限的失败原输出，不增加模型展示预算或自动执行。未复制源码。[Pi 完整输出与截断显示](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L304-L436) · [真实退出与超时回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/suite/regressions/11613-bash-timeout-after-shell-exit.test.ts) · [MIT 许可证](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/LICENSE)
+
+### 根据已签评审直接完成成员交接
+
+独立成员对已绑定的公开候选成功 `submit_review`，且候选、必需工件、指定检查及当前分工门禁全部满足时，宿主直接从已签记录生成可读交接，再执行原有成员验收与发布流程。不会再向压缩成纯文字的模型请求一次“是否完成”的判断。逐项理由、来源访问限制、URL 与读取/执行回执保持原签内容；例如入口网页返回 CAPTCHA、后来用官方 PDF 核实，交接仍逐字保留这个区别，不能改写成入口访问成功。
+
+此路径只处理成功签署所在工具批次的结尾，或已存在的精确同伴复跑结束后。签署之后同一批次新增操作、工具错误、失败检查、缺失交付、未完成命令、未满足的指定复跑、文件 SHA 变化、取消、预算或用户显式验收问题继续走原门禁。私稿及私稿晋升仍使用原成员交接、独立复跑和发布检查；本次不改变其完成方式。模型未签署时的 `[BLOCKED]` 不被关键词改判；新出现的真实问题也不会被忽略。
+
+运行轨迹的 `tool_completion` 保存候选版本、原 assessment、触发调用及宿主交接文本；`member_report.handoff.signed_handoff` 连到相同签署。原工具步骤记录不改写为模型答复，用户验收仍由原来的验收器记录，发布仍校验当前文件。没有结构化契约的普通成员分工继续使用原文字交接。
+
+实现参考 OpenAI Agents SDK 的 `check_for_final_output_from_tools` 与 `ToolsToFinalOutputResult`：受宿主管理的工具结果可以直接产生最终输出，不必再调用模型，并继续经过已有最终输出处理；无结果、错误的回调返回类型和无效策略不会被误认为成功。Studio 额外检查冻结候选、原评审和任务门禁，并保留原逐项理由，没有采用“任意第一个工具即完成”。未复制上游代码或引入依赖；上游为 MIT 许可证。[工具结果决定完成与异常分支](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L801-L834) · [复用最终输出处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L235-L272) · [无第二次模型调用与返回类型反例](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_tool_use_behavior.py#L184-L237) · [本项目普通入口回归](../tests/test_signed_review_handoff.py)

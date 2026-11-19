@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from miniagent.config import Settings
 from miniagent.crew_progress import MemberProgress, _check_key, _script_inputs, _shell_inputs, _shell_case_suite
+from miniagent.studio_crew import RoomCrew
 from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
 from miniagent.schemas import ToolResult
 from miniagent.studio_service import StudioService
@@ -362,19 +363,29 @@ sys.exit(0 if ok else 1)
     def test_concurrent_public_edit_and_checkpoint_tampering_are_rejected(self):
         for tamper in ("base","checkpoint"):
             with self.subTest(tamper=tamper):
-                previous = set((self.root/"runs").glob("*/agents/lead"))
-                def mutate(index):
-                    if index==6:
-                        pattern="*/agents/lead/records.json" if tamper=="base" else "*/assignments/*/checkpoint/agents/builder/delivery.txt"
-                        path = next(p for p in (self.root/"runs").glob(pattern)
-                                    if next(d for d in p.parents if d.parent==self.root/"runs")/"agents/lead" not in previous)
+                publish_original = RoomCrew._publish
+                mutated = []
+                def mutate(crew, assignment, role, original, *, candidate=None):
+                    if candidate:
+                        self.assertEqual(role, "inspector")
+                        # This seam runs after the signed review and before the
+                        # real publisher validates or commits either tree.
+                        # Keep this race independent of model final-turn counts.
+                        path = (crew.path/"agents"/crew.lead/"records.json" if tamper=="base" else
+                                candidate["checkpoint"]/"agents"/candidate["role"]/PATH)
                         path.write_text("Concurrent edit preserved.")
-                _,reports=self.run_steps(initial()+[submit(OLD),{"text":"Verified."},{"text":"[BLOCKED] No current version."}],mutate)
+                        mutated.append(path)
+                    return publish_original(crew, assignment, role, original, candidate=candidate)
+                with patch.object(RoomCrew, "_publish", mutate):
+                    _,reports=self.run_steps(initial()+[submit(OLD),{"text":"Verified."},
+                                                       {"text":"[BLOCKED] No current version."}])
+                self.assertEqual(len(mutated), 1)
+                self.assertEqual(reports[-1]["native_review"]["assessment"]["verdict"], "passed")
                 self.assertFalse(reports[-1]["published"],reports)
                 self.assertEqual(reports[-1]["native_review"]["state"],"blocked")
                 self.assertFalse((self.local/PATH).exists())
                 if tamper=="base":
-                    self.assertEqual(next((self.root/"runs").glob("*/agents/lead/records.json")).read_text(),"Concurrent edit preserved.")
+                    self.assertEqual(mutated[0].read_text(),"Concurrent edit preserved.")
 
     def test_selection_requires_same_room_task_current_revision_and_complete_outputs(self):
         queue=ReviewQueue()
