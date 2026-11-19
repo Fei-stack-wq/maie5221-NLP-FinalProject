@@ -298,3 +298,15 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 运行轨迹的 `tool_completion` 保存候选版本、原 assessment、触发调用及宿主交接文本；`member_report.handoff.signed_handoff` 连到相同签署。原工具步骤记录不改写为模型答复，用户验收仍由原来的验收器记录，发布仍校验当前文件。没有结构化契约的普通成员分工继续使用原文字交接。
 
 实现参考 OpenAI Agents SDK 的 `check_for_final_output_from_tools` 与 `ToolsToFinalOutputResult`：受宿主管理的工具结果可以直接产生最终输出，不必再调用模型，并继续经过已有最终输出处理；无结果、错误的回调返回类型和无效策略不会被误认为成功。Studio 额外检查冻结候选、原评审和任务门禁，并保留原逐项理由，没有采用“任意第一个工具即完成”。未复制上游代码或引入依赖；上游为 MIT 许可证。[工具结果决定完成与异常分支](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L801-L834) · [复用最终输出处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L235-L272) · [无第二次模型调用与返回类型反例](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_tool_use_behavior.py#L184-L237) · [本项目普通入口回归](../tests/test_signed_review_handoff.py)
+
+### 复用已有 Python 业务检查函数
+
+独立脚本可能通过 `ok = identity() and paging(); sys.exit(0 if ok else 1)` 汇总结果。普通退出码没有说明哪些检查实际执行，因此不会仅因这一语法或文件名自动得到 `passed_check`。这条边界保持不变：纯打印、恒真条件、没有进入检查分支、吞掉错误后正常退出都不能自动认证成业务通过。
+
+若原脚本已有清楚返回 bool 的真实业务检查函数，评审人可以先读原脚本，然后在现有 `run_python` 中用 `runpy.run_path(..., run_name='__review_probe__')` 载入它，分别顶层断言原函数返回值 `is True`，最后输出一条 PASS。不必重写长浏览器检查。`list_review_evidence` 的 `execute.existing_python_check` 给出可复制模板；仅在该成员实际拥有 `run_python` 时展示。模板捕获 `SystemExit` 并转为断言失败，避免函数提前退出 0 被当作完成。它不调用脚本的 `__main__` 汇总分支，不以子进程退出码或恒真断言代替业务核查。
+
+原脚本与工件仍需保持冻结版本，引用本次尝试、本次工具实际产生的 E 回执。脚本、工件变化或原函数真实返回 False/异常时，不能冒用先前回执提交。该方式是普通产品 execute 标准的聚合断言；`runpy` 内部函数调用没有通用的静态输入追踪，不能凭它核销另一个版本、同伴指定脚本的独立退出义务或要求输入绑定的争议 scope。找不到可复用业务函数时，仍需写较小的独立检查或使用标准测试运行器；系统不会解释任意 Python 程序来推定通过。
+
+依据 Python 标准库的实现：`run_path` 明确设置模块名并返回执行后的全局字典；其测试验证自定义 `run_name`、脚本路径与异常。`unittest` 先获得已执行测试的结果，再用 `wasSuccessful()` 决定进程退出码，并对零测试单独处理，因此单独观察 exit 0 不能反推出具体业务断言。这里只提供该标准 API 的适配指引，没有复制上游源码或改变验收判定。[CPython run_path](https://github.com/python/cpython/blob/v3.14.0/Lib/runpy.py#L262-L294) · [脚本名、路径与异常测试](https://github.com/python/cpython/blob/v3.14.0/Lib/test/test_runpy.py#L631-L683) · [unittest 结果与退出码](https://github.com/python/cpython/blob/v3.14.0/Lib/unittest/main.py#L264-L277) · [端到端回归](../tests/test_existing_python_check.py)
+
+T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双尺寸翻页函数真实完成后产生可引用 E 回执；更改 HTML 的负例真实退出 1，旧候选版本与旧 E 被拒绝。这是新离线验证，未改写历史 failed，也不代表线上任务重新执行完成。

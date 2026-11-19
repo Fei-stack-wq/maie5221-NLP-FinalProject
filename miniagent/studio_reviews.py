@@ -485,9 +485,29 @@ class ReviewSession:
     def execution_guidance(self):
         if not any(self.ordinary_execution(rule) for rule in self.item.criteria):
             return {}
-        return {"execute": {"evidence": "通过项引用本轮与该标准相符的 passed_check 的 E 短 ID。"
+        guidance = {"evidence": "通过项引用本轮与该标准相符的 passed_check 的 E 短 ID。"
                 "文件 SHA、脚本 scope、调用 ID 和正常退出记录各有不同用途；证据不足可提交 inconclusive。",
-                "actions": self.execution_actions}}
+                "actions": self.execution_actions}
+        if "run_python" in self.execution_actions:
+            guidance["existing_python_check"] = {
+                "when": "原 Python 脚本用业务函数返回 bool，再用条件决定退出码，普通退出还没有 passed_check 时，"
+                        "先读冻结脚本，确认可复用的真实、只读检查函数。无需重写长检查脚本。",
+                "tool": "run_python",
+                "code": "import runpy\ndef checked_call(fn, *args, **kwargs):\n"
+                        "    try:\n        return fn(*args, **kwargs)\n"
+                        "    except SystemExit as exc:\n"
+                        "        raise AssertionError('check exited before returning its result') from exc\n"
+                        "checks = checked_call(runpy.run_path, 'checks/verify.py', run_name='__review_probe__')\n"
+                        "assert checked_call(checks['check_identity']) is True\n"
+                        "assert checked_call(checks['check_behavior']) is True\n"
+                        "print('PASS existing identity and behavior checks')\n",
+                "binding": "将示例路径、函数名换成已读原脚本中的真实名称，分别调用该标准所需的每个业务检查；"
+                           "原脚本及工件仍须保持绑定版本。随后用 list_review_evidence 返回的本轮 E 短 ID 提交。",
+                "limits": "不要只断言子进程 exit_code == 0，不要用 assert True 或 PASS 文本替代实际检查。"
+                          "函数失败、异常或未执行都不表示通过；没有可复用函数时写较小的独立断言或使用标准测试运行器。"
+                          "此方法不会自动核销另一个版本或争议 scope。",
+            }
+        return {"execute": guidance}
 
     def evidence_needs(self):
         retained = self.retained_findings()
