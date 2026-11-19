@@ -31,6 +31,27 @@ class StepPolicyTest(unittest.TestCase):
                       Settings(), **kwargs)
         return agent, provider
 
+    def test_compact_work_keeps_assignment_and_authenticated_answer_then_can_write(self):
+        operations = frozenset({"ask_human", "run_python", "write_file"})
+        script = [
+            {"tool_calls":[{"name":"ask_human","arguments":{"question":"Which room?"}}]},
+            {"tool_calls":[{"name":"run_python","arguments":{"code":"print('transient tool text')"}}]},
+            {"tool_calls":[{"name":"write_file","arguments":{"path":"room.md","content":"A101"}}]},
+            {"text":"Done"}]
+        agent, provider = self.agent(script, human_handler=lambda _: "A101")
+        result = agent.run("Record the confirmed room", conversation_context="Own the booking document",
+                           step_policy=lambda state, _: StepPolicy("work", allowed_tools=operations,
+                                                                  compact=state.step_index == 2),
+                           acceptance=accept_files("room.md", min_bytes=1))
+        self.assertEqual(result.status, "completed", result.error)
+        prompt, tools = provider.requests[2]
+        contents = "\n".join(msg["content"] for msg in prompt)
+        for fact in ("Own the booking document", "Record the confirmed room", "[用户已答复]", "Which room?", "A101"):
+            self.assertIn(fact, contents)
+        self.assertNotIn("transient tool text", contents)
+        self.assertEqual(set(tools), operations)
+        self.assertEqual((agent.sandbox.root / "room.md").read_text(), "A101")
+
     def test_compact_handoff_has_user_reply_but_no_source_or_stale_background(self):
         script = [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "选哪间？"}}]},
