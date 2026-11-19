@@ -204,6 +204,9 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"))
 
     # Keep the native Python path on hosts without POSIX process groups.
+    timeout = command_timeout(ctx, args.get("timeout"))
+    if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
+        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
     env = project_environment(ctx)
     argv[0] = os.path.join(env["VIRTUAL_ENV"], "Scripts", "python.exe")
     timeout = command_timeout(ctx, args.get("timeout"))

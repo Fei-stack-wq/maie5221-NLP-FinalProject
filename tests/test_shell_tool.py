@@ -111,6 +111,7 @@ class ShellToolTest(unittest.TestCase):
         self.assertNotEqual(self.ctx.sandbox.command_venv(), Path(sys.prefix))
 
     def test_offline_member_pip_install_import_cli_and_published_files(self):
+        self.ctx.limits.tool_timeout_seconds = 30
         module = "studio_offline_fixture"
         self.assertIsNone(importlib.util.find_spec(module))
         host_packages = Path(sysconfig.get_path("purelib"))
@@ -133,10 +134,14 @@ class ShellToolTest(unittest.TestCase):
                     archive.writestr(name, data)
             install = f"install --no-index --no-deps {shlex.quote(str(wheel))}"
             with managed_member_processes(self.ctx.sandbox):
+                prefix = self.ctx.sandbox.command_venv()
+                self.assertNotEqual(prefix.resolve(), Path(sys.prefix).resolve())
+                identity = self.run_command("pip debug")
+                self.assertTrue(identity.ok, identity.content)
+                self.assertIn(f"sys.executable: {prefix}/bin/python", identity.content)
                 installed = self.run_command(f"pip {install} && studio-fixture")
                 self.assertTrue(installed.ok, installed.content)
                 self.assertIn("fixture runs", installed.content)
-                prefix = self.ctx.sandbox.command_venv()
                 cache = self.run_command("python3 -m pip cache dir")
                 self.assertTrue(cache.ok, cache.content)
                 self.assertIn(str(prefix.parent / "pip-cache"), cache.content)
