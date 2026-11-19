@@ -47,6 +47,15 @@ def main():
                 data["thread"].pop("saved_roles", None)
                 old_meta.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         service.add_profile(legacy)
+        onsite = {"id":"onsite","name":"值班工程师","prompt":"检查机房告警记录。"}
+        with patch("miniagent.studio_service.DeepSeekProvider",
+                   return_value=ScriptedProvider([{"text":"已经核对告警。"}])):
+            group = service.start(request("single", objective="复核机房告警", conversation={
+                "kind":"group", "members":["onsite","reviewer"], "recipient":"onsite",
+                "intent":"question", "profiles":[onsite],
+            }))
+            finished(service, group["id"])
+
         first = ScriptedProvider([
             propose("skill", "重启验证", "重启应用，确认已有预约仍然存在。"),
             propose("memory", "测试偏好", "优先运行快速测试。"),
@@ -54,7 +63,13 @@ def main():
         ])
         second = CheckIndependentChat([{"text": "已收到本轮消息。"}])
         continuation = ScriptedProvider([{"text":"旧项目已继续。"}])
-        with (patch("miniagent.studio_service.DeepSeekProvider", side_effect=[first, second, continuation]),
+        live = ScriptedProvider([
+            {"tool_calls":[{"name":"delegate_task","arguments":{
+                "assignee":"reviewer","objective":"确认维护时间范围。","remaining_roles":[]}}]},
+            {"tool_calls":[{"name":"ask_human","arguments":{"question":"维护记录的时间范围？"}}]},
+            {"text":"已确认。"}, {"error":"fixture review was interrupted"},
+        ])
+        with (patch("miniagent.studio_service.DeepSeekProvider", side_effect=[first, second, continuation, live]),
               patch("miniagent.studio_workspace.pick_directory", return_value=str(project))):
             print(f"http://127.0.0.1:{server.server_port}/", flush=True)
             try:

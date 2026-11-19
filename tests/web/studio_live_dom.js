@@ -23,7 +23,7 @@ window.fetch=async(path, options={})=>{
  let data;
  let ok=true;
  if(path==='/api/bootstrap') data={provider_ready:true,model:'offline fixture',thinking:'disabled',csrf_token:'fixture',conversation_roles:roles};
- else if(path==='/api/conversations') data={conversations:[{...completeThread,title:'测试项目',turn_count:1}]};
+ else if(path==='/api/directory/chats') data={channels:[],recent:[{...completeThread,title:'测试项目',turn_count:1}]};
  else if(path==='/api/runs' && options.method==='POST'){
   fixturePosts.push(JSON.parse(options.body));
   ok=false;data={error:'测试网络错误。',code:'fixture_error'};

@@ -4,6 +4,28 @@
 
 > 2026-11-17（America/Los_Angeles），开发分支 `jinyuwu/local-studio-gui`。本次给已有任务执行能力增加可视化入口：发起任务、任务树、运行状态、日志、文本产物和验收报告。已支持用项目私聊或群聊追问并迭代产物。侧栏「角色库」支持创建长期助手、维护跨会话记忆、编写与审核技能。操作见[个人角色库](personal-role-library.md)。
 
+
+## 用角色、最近对话和固定群聊找工作
+
+- **找人和分工**。打开**角色库**，可按名称、ID 或职责搜索个人角色、内置角色和历史会话成员。点角色先看**分配的任务**，可以筛选私聊、群聊，再点具体任务直接展开当时的任务树节点。**参与的对话**列出这位成员加入的房间，包括尚未获派任务的群。在群聊的成员栏也可以点名字回到角色页。[个人角色库](personal-role-library.md)
+- **接着上次讨论**。打开**最近对话**，按最近一轮的时间找私聊或群，也可以按群名、成员和最近消息搜索。每个房间只占一行。从目录打开时会进入最新轮。任务卡仍指向分派发生的那一轮。
+- **常驻处理一件事**。在侧栏**固定群聊**旁点 **＋**，填写群名，选成员和负责人，即可建群。工作区可选，建好后再发第一条消息。需要与统一对话共享可派工项目时，为两者选择同一个本地工作区。
+- **保留一个已有团队**。在**最近对话 → 群聊**点目标行的图钉，或在旧任务详情点**固定到侧栏**，输入易辨认的群名。日后点**管理固定群聊**可改名或取消固定。同一组成员可以有多个独立的项目群，每个群各自保留消息、文件和工作区。选择取消固定后，仍可从最近对话和成员页找到原群。
+
+例如，在预订系统的项目群点 **Software Developer**，可以看到这位开发者在该群和其他软件群实际接到的开发任务。想找某次发布时，由任务打开当时的执行记录。想让原班人马继续维护，直接打开原群，固定并命名为“会议室预订维护”即可。
+
+### 目录的数据来源与设计参考
+
+| 入口 | 数据来源及身份 |
+| --- | --- |
+| `GET /api/directory/roles` 与 `/api/directory/roles/{key}` | 个人角色和内置角色使用稳定 ID，历史成员按原 ID、名称、职责的完整快照区分。任务依据 TaskStore 的执行人字段归集。持久角色记忆的绑定由用户另行确认。 |
+| `GET /api/directory/chats` | `recent` 按会话 ID 汇总并按末轮时间排序，`channels` 取已固定的群。首条消息建的普通群可手动固定。命名频道创建时自动固定。 |
+| `POST /api/directory/channels` 与 `/api/directory/channels/{id}` | 创建空频道，或更新已有群的名称与固定状态。通过用户界面建空群时，重复提交相同请求会返回同一房间。侧栏设置独立于任务状态和消息历史。 |
+
+目录参考了 Zulip 按会话身份聚合最近消息、独立构建固定频道分区的实现。这里用 Studio 自有的房间 ID，保留同成员、不同项目的独立历史。[最近对话键](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/recent_view_util.ts) · [频道排序](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/stream_list_sort.ts) · [分区测试](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/stream_list_sort.test.cjs)
+
+侧栏分类与成员身份校验分别参考了 Mattermost 的频道分类更新和 Zulip 在归属范围内查找用户的做法。Studio 使用本机侧栏设置与历史角色快照键，相关逻辑由本项目实现。[Mattermost 频道分类](https://github.com/mattermost/mattermost/blob/v10.11.0/server/channels/app/channel_category.go) · [分类测试](https://github.com/mattermost/mattermost/blob/v10.11.0/server/channels/app/channel_category_test.go) · [Zulip 身份查找](https://github.com/zulip/zulip/blob/3c8a89e78d27cc18e91537f37cbb9c0feab54f0b/zerver/lib/users.py#L342-L360)
+
 ## 1. 启动与体验
 
 macOS 可双击仓库根目录的 [Start Studio.command](<../Start Studio.command>)。启动器定位到项目目录，使用 `.venv/bin/python` 启动 `studio --open` 并打开默认浏览器；启动服务本身不会创建模型任务。若没有虚拟环境，终端会显示创建 `.venv` 和安装 `requirements.txt` 的步骤，等待用户处理。

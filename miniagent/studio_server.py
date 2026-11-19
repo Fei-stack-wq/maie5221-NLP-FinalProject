@@ -18,6 +18,8 @@ from .studio_preview import PREVIEW_CSP, html_preview
 
 MAX_BODY_BYTES = 65536
 _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
+           "/directory.js": ("directory.js", "text/javascript; charset=utf-8"),
+           "/directory.css": ("directory.css", "text/css; charset=utf-8"),
            "/index.html": ("index.html", "text/html; charset=utf-8"),
            "/superagent.css": ("superagent.css", "text/css; charset=utf-8"),
            "/superagent.js": ("superagent.js", "text/javascript; charset=utf-8"),
@@ -144,10 +146,16 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/api/runs":
             self._json(200, service.list_runs())
             return
+        if path == "/api/directory/chats":
+            self._json(200, service.directory_chats())
+            return
         if path == "/api/conversations":
             self._json(200, service.list_conversations())
             return
         parts = path.split("/")
+        if parts[:4] == ["", "api", "directory", "roles"] and len(parts) in (4, 5):
+            self._json(200, service.role_directory(parts[4] if len(parts) == 5 else None))
+            return
         if len(parts) in (5, 7) and parts[:3] == ["", "api", "profiles"] and parts[4] == "knowledge":
             if len(parts) == 5:
                 self._json(200, service.role_library(parts[3]))
@@ -199,7 +207,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         profile_op = parts[:3] == ["", "api", "profiles"] and (
             len(parts) == 5 and parts[4] in {"edit", "knowledge", "bind"} or
             len(parts) == 7 and parts[4] == "knowledge" and parts[6] in {"status", "restore"})
-        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages") and not (cancel or reply or review or profile_op)) or url.query:
+        channel_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) in (4, 5)
+        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages")
+                and not (cancel or reply or review or profile_op or channel_op)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -236,6 +246,11 @@ class StudioHandler(BaseHTTPRequestHandler):
             except (WorkspaceError, TimeoutError) as exc:
                 raise StudioError(str(exc), "picker_unavailable", 409) from None
             self._json(200, {"path": selected})
+            return
+        if channel_op:
+            service = self.server.studio_service
+            channel = service.create_channel(payload) if len(parts) == 4 else service.update_channel(parts[4], payload)
+            self._json(200, {"channel": channel})
             return
         if profile_op:
             service = self.server.studio_service

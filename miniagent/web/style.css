@@ -562,3 +562,32 @@ main{padding:28px 18px}
 .legacy-rooms h3{font-size:13px}.legacy-rooms>p,.legacy-room small{font-size:12px;line-height:1.75;color:var(--muted)}
 .legacy-rooms>p{margin:4px 0 10px}.legacy-room{display:flex;align-items:center;flex-wrap:wrap;gap:7px;padding:10px 0}
 .legacy-room+.legacy-room{border-top:1px solid var(--line)}.legacy-room a{font-size:13px;overflow-wrap:anywhere}.legacy-room a:hover{text-decoration:underline}.legacy-room .secondary{margin-left:auto}
+
+.directory-search{display:flex;align-items:center;gap:.65rem;border:1px solid var(--line);border-radius:var(--radius);padding:0 12px;max-width:420px;background:var(--surface);color:var(--muted)}
+.directory-search svg{width:16px;height:16px;flex:none}.directory-search input{min-width:0;flex:1;padding:10px 0;background:transparent;border:0;color:var(--ink);font:inherit}
+.directory-search:focus-within{outline:2px solid var(--accent);outline-offset:2px}.directory-search input:focus{outline:0}
+.directory-section{margin-top:28px}.directory-section>h2{display:flex;align-items:baseline;gap:8px;font-size:16px;margin:0 0 12px}.directory-section>h2 small{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;font-weight:500}
+.role-card h3{font-size:16px;line-height:1.4;overflow-wrap:anywhere}.role-card code{overflow-wrap:anywhere}
+.role-card-activity{display:flex;align-items:center;gap:6px;grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px;font-size:12px;color:var(--muted)}
+.role-card-activity>svg,.role-card-activity i svg{width:14px;height:14px}.role-card-activity i{margin-left:auto;display:inline-flex;color:var(--accent-dark)}
+.role-identity{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-top:5px}
+.role-sections,.role-task-filters{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.role-sections{margin-bottom:14px;border-bottom:1px solid var(--line)}
+.role-sections button{display:flex;gap:6px;align-items:baseline;font-weight:600;color:var(--muted);border-bottom:2px solid transparent;padding:9px 2px}
+.role-sections button[aria-pressed=true]{color:var(--accent-dark);border-color:var(--accent)}.role-sections small,.role-task-filters small{font-size:11px;font-variant-numeric:tabular-nums;font-weight:500}
+.role-task-filters{padding:10px 15px;gap:4px}.role-task-filters button{padding:5px 8px;border-radius:4px}.role-task-filters button[aria-pressed=true]{background:var(--accent-soft);color:var(--accent-dark)}
+.role-task-row{display:flex;gap:12px;align-items:center;padding:14px 16px;min-width:0;border-top:1px solid var(--line)}
+.role-task-row:hover{background:var(--sidebar)}.role-task-text{display:grid;gap:5px;flex:1;min-width:0;overflow-wrap:anywhere}
+.role-task-text strong,.role-task-text small{display:-webkit-box;-webkit-box-orient:vertical;overflow:hidden}
+.role-task-text strong{-webkit-line-clamp:2;font-weight:550;line-height:1.5}.role-task-text small{-webkit-line-clamp:2;font-size:12px;color:var(--muted)}
+.role-task-row>.badge,.role-task-row>svg{flex:none}.role-task-row>svg{width:13px;height:13px;color:var(--muted)}
+/* Keep the complete directory scannable on phones while preserving role briefs. */
+.directory-section .role-card{padding:16px;gap:10px}.role-task-text small{-webkit-line-clamp:1}
+@media(max-width:650px){
+ .directory-section .role-cards{gap:8px}.directory-section .role-card{grid-template-columns:36px minmax(0,1fr) auto;column-gap:10px;row-gap:4px;padding:12px}
+ .directory-section .role-mark{width:36px;height:36px;border-radius:9px;font-size:17px}
+ .directory-section .role-card h3{font-size:14px}.directory-section .role-card code{font-size:11px}
+ .directory-section .role-card p{grid-column:2/-1;grid-row:2;min-height:0;-webkit-line-clamp:1;font-size:12px}
+ .directory-section .role-card-activity{grid-column:3;grid-row:1;align-self:start;white-space:nowrap;gap:3px;padding:0;border:0;font-size:11px}
+ .directory-section .role-card-activity i{display:none}.directory-section .role-card-activity>svg{width:12px;height:12px}
+ .role-sections{gap:8px}.role-task-row{padding:12px;gap:7px}.role-task-row>svg{display:none}
+}

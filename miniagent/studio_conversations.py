@@ -17,6 +17,13 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_SIDECARS, supported_project
 
 ROLE_LABELS = {"worker": "通用助手", "researcher": "研究员", "writer": "写作者", "reviewer": "审阅者"}
 
+ROLE_DUTIES = {
+    "worker": "通用执行、整理和一次性任务",
+    "researcher": "查找原始资料、调研并整理来源",
+    "writer": "撰写或编辑文章、说明和报告",
+    "reviewer": "独立检查交付、核实结果并提出修改意见",
+}
+
 
 _ROLE_ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,47}\Z")
 

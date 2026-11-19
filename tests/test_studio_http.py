@@ -68,6 +68,28 @@ class StudioHTTPTest(unittest.TestCase):
                          {"conversation_id": run_id, "head_run_id": run_id})
         self.assertEqual(json.loads(self.fetch("POST", endpoint, payload, headers)[2])["run"]["id"], run_id)
 
+    def test_channel_create_and_unpin_over_http_reuses_real_empty_conversation(self):
+        listing = "/api/directory/chats"
+        endpoint = "/api/directory/channels"
+        headers = {"Content-Type": "application/json", "Origin": self.origin, "X-Studio-Token": self.server.studio_token}
+        request = json.dumps({"request_id": str(uuid.uuid4()), "name": "维护组", "lead": "worker",
+                              "members": ["worker", "reviewer"]})
+        self.assertEqual(json.loads(self.fetch(path=listing)[2]), {"recent": [], "channels": []})
+        self.assertEqual(self.fetch("POST", endpoint, request, {"Content-Type": "application/json"})[0], 403)
+        status, _, body = self.fetch("POST", endpoint, request, headers)
+        self.assertEqual(status, 200, body)
+        row = json.loads(body)["channel"]
+        self.assertEqual(row["id"], row["head_run_id"])
+        self.assertEqual(json.loads(self.fetch(path=listing)[2])["channels"], [row])
+        details = json.loads(self.fetch(path="/api/runs/" + row["id"])[2])["conversation"]
+        self.assertTrue(details["can_continue"])
+        self.assertEqual(details["turns"], [])
+        status, _, body = self.fetch("POST", endpoint + "/" + row["id"], '{"pinned":false}', headers)
+        self.assertEqual(status, 200, body)
+        self.assertFalse(json.loads(body)["channel"]["pinned"])
+        self.assertEqual(len(json.loads(self.fetch(path=listing)[2])["recent"]), 1)
+        self.assertEqual(json.loads(self.fetch(path=listing)[2])["channels"], [])
+
     def test_native_folder_picker_uses_existing_origin_and_token_gate(self):
         route = "/api/workspaces/pick"
         headers = {"Origin": self.origin, "Content-Type": "application/json",

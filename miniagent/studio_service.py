@@ -470,8 +470,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 "scheduler": meta.get("request", {}).get("scheduler", "serial")}
 
     def list_conversations(self) -> dict:
+        return {"conversations": self._conversation_rows()}
 
-        conversations = {}
+    def _conversation_rows(self, *, directory=False) -> list[dict]:
+        conversations, roots = {}, {}
         with self._lock:
             for path in self._directories():
                 try:
@@ -488,13 +490,20 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 })
                 if path.name == identity:
                     item["title"] = "Superagent" if thread.get("superagent") else meta.get("title", "")
+                    if directory:
+                        roots[identity] = meta
                 if thread.get("superagent"):
                     item["superagent"] = True
                 if thread["ordinal"] > item["turn_count"]:
                     item.update(head_run_id=path.name, turn_count=thread["ordinal"],
                                 updated_at=meta.get("finished_at") or meta.get("created_at", ""))
-        ordered = sorted(conversations.values(), key=lambda item: (item["updated_at"], item["id"]), reverse=True)
-        return self._redact({"conversations": ordered})
+                    if directory:
+                        item["last_message"] = meta.get("title", "")[:200] if thread["ordinal"] else ""
+            rows = conversations.values()
+            if directory:
+                rows = [self._room_card(row, roots.get(row["id"], {})) for row in rows]
+        ordered = sorted(rows, key=lambda item: (item["updated_at"], item["id"]), reverse=True)
+        return self._redact(ordered)
 
     def list_runs(self) -> dict:
         runs = []
@@ -638,14 +647,19 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 and head.get("status") == "failed" and head["intent"] == "edit"):
             candidates = [meta for _, meta in self._room_checkpoints(
                 related[-1][1], related[-1][3], public_events, verify=True)]
+        group_title = (self.channel_label(initial["id"], anchor[2] if anchor else {})
+                       if initial["kind"] == "group" else None)
+        linked = self.linked_roles(initial["id"])
         return {"id": initial["id"], "kind": initial["kind"], "members": initial["members"],
-                **({"title": anchor[2]["title"], "lead": anchor[3]["recipient"]} if anchor else {}),
+                "role_keys": self.directory_role_keys(initial, linked),
+                **({"title": group_title} if group_title else {}),
+                **({"lead": anchor[3]["recipient"]} if anchor else {}),
                 "superagent": bool(initial.get("superagent")),
                 "recipient": anchor[3]["recipient"] if anchor else initial["recipient"],
                 "recovery_candidates": candidates,
                 "head_run_id": head.get("run_id"), "artifact_run_id": artifact_id,
                 "profiles": (related[-1][3] if related else initial).get("profiles", []),
-                "saved_roles": sorted(set(initial.get("saved_roles", [])) | set(self.linked_roles(initial["id"]))),
+                "saved_roles": sorted(set(initial.get("saved_roles", [])) | set(linked)),
                 "knowledge_project_id": project_id,
                 "workspace_path": (related[-1][2] if related else anchor[2] if anchor else {}).get("workspace_path"),
                 "can_continue": can_continue, "turns": turns}

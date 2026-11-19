@@ -6,6 +6,7 @@ import re
 
 from .role_tools import attach_role_tools
 from .studio_conversations import validate_conversation
+from .studio_role_directory import role_directory, room_role_cards
 from .studio_role_memory import RoleMemoryConflict, RoleMemoryNotFound
 
 
@@ -55,6 +56,15 @@ class RoleSession:
 
 
 class StudioRoles:
+    def role_directory(self, key=None):
+        return role_directory(self, key)
+
+    def directory_role_keys(self, thread, linked):
+        if thread.get("superagent"):
+            return {}
+        saved = {p["id"]: p for p in self.profiles()}
+        return {member: card["key"] for member, card in room_role_cards(thread, saved, linked).items()}
+
     def validate_role_refs(self, value):
         if not isinstance(value, dict) or "parent_run_id" in value:
             return validate_conversation(value)
@@ -120,9 +130,9 @@ class StudioRoles:
         return json.loads(data) if data else []
 
     def _can_link(self, root, profile):
-        # A historic inline profile can predate the persistent library. An
-        # exact snapshot and an explicit user choice are both required.
-        return ("saved_roles" not in root and profile in root.get("profiles", [])
+        # Both old and current unbound snapshots can be adopted. Reading the
+        # directory never grants access to personal knowledge; binding is explicit.
+        return (profile["id"] not in root.get("saved_roles", []) and profile in root.get("profiles", [])
                 and profile["id"] in root.get("members", []))
 
     def link_profile(self, role, payload):

@@ -12,6 +12,8 @@
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/superagent.css">
   <link rel="stylesheet" href="/activity.css">
+  <link rel="stylesheet" href="/directory.css">
+  <script src="/directory.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -20,15 +22,20 @@
     <aside class="sidebar" id="sidebar" aria-label="工作室导航">
       <a href="#assistant" class="brand" aria-label="Agent Studio 首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>Agent <strong>Studio</strong></span></a>
       <a class="assistant-nav" href="#assistant" data-nav="assistant"><span data-icon="terminal"></span>统一对话<span class="nav-arrow" aria-hidden="true">↗</span></a>
-      <div class="nav-label">工作空间</div>
-      <nav>
-        <a href="#home" class="nav-item" data-nav="home"><span data-icon="grid"></span>工作台</a>
-        <a href="#chats" class="nav-item" data-nav="chats"><span data-icon="users"></span>对话</a>
+      <nav aria-label="工作室">
+        <a href="#chats" class="nav-item" data-nav="chats"><span data-icon="messages"></span>最近对话</a>
         <a href="#roles" class="nav-item" data-nav="roles"><span data-icon="book"></span>角色库</a>
+      </nav>
+      <section class="side-channels" aria-labelledby="channel-label">
+        <div class="channel-section-head"><h2 id="channel-label">固定群聊</h2><button class="icon-button" data-channel-action="create" aria-label="新建固定群聊" title="新建固定群聊"><span data-icon="plus"></span></button></div>
+        <nav id="channel-nav" aria-label="固定群聊"><p class="side-empty">正在读取群聊…</p></nav>
+      </section>
+      <nav aria-label="任务与运行" class="runtime-nav">
+        <div class="nav-label">任务与运行</div>
+        <a href="#home" class="nav-item" data-nav="home"><span data-icon="grid"></span>工作台</a>
         <a href="#runs" class="nav-item" data-nav="runs"><span data-icon="layers"></span>全部任务<span class="nav-count" id="nav-count">0</span></a>
         <button class="nav-item new-task-link" data-action="new"><span data-icon="plus"></span>新建任务 <kbd>N</kbd></button>
       </nav>
-      <div class="sidebar-recent"><div class="nav-label">最近任务</div><div id="recent-nav"><p class="side-empty">你的任务会显示在这里</p></div></div>
       <div class="sidebar-bottom">
         <button class="connection-card" data-action="connection" aria-label="查看模型连接信息"><span class="connection-symbol" data-icon="cpu"></span><span><strong id="provider-label">正在连接</strong><small id="provider-caption">读取本地配置</small></span><span class="connection-dot" id="provider-dot"></span></button>
         <div class="local-user"><span class="avatar">L</span><span>本地工作室<small>仅在这台电脑运行</small></span><span class="version">v0.1</span></div>
@@ -44,6 +51,7 @@
   <dialog id="task-dialog" class="task-dialog" aria-labelledby="dialog-title"><div class="dialog-header"><div><span class="eyebrow">NEW TASK</span><h2 id="dialog-title">开始一个新任务</h2></div><button class="icon-button" data-action="close-dialog" aria-label="关闭新建任务"><span data-icon="x"></span></button></div><div id="dialog-form"></div></dialog>
   <dialog id="info-dialog" class="info-dialog" aria-labelledby="info-title"><div class="dialog-header"><h2 id="info-title">模型连接</h2><button class="icon-button" data-action="close-info" aria-label="关闭连接信息"><span data-icon="x"></span></button></div><div id="connection-info"></div></dialog>
   <dialog id="role-dialog" class="task-dialog role-dialog" aria-labelledby="role-dialog-title"><div class="dialog-header"><h2 id="role-dialog-title"></h2><button type="button" class="icon-button" data-role-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="role-editor"></div></dialog>
+  <dialog id="channel-dialog" class="task-dialog" aria-labelledby="channel-dialog-title"><div class="dialog-header"><h2 id="channel-dialog-title"></h2><button type="button" class="icon-button" data-channel-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="channel-editor"></div></dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript>请启用 JavaScript 使用本地工作室。</noscript>
 </body>

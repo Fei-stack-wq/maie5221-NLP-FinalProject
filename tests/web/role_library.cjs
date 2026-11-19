@@ -26,6 +26,7 @@ async function verify(page, url) {
   await roleDialog.getByLabel('角色名称').fill('项目维护');
   await roleDialog.getByRole('button',{name:'保存角色'}).click();
   await page.getByRole('heading',{name:'项目维护',exact:true}).waitFor();
+  await page.getByRole('button',{name:'记忆与技能'}).click();
   await page.getByRole('button',{name:'添加记忆'}).click();
   await roleDialog.getByLabel('标题').fill('偏好');
   await roleDialog.getByLabel('记忆内容').fill('始终保留 <本地备份>。');
@@ -59,6 +60,12 @@ async function verify(page, url) {
   assert.equal(detail.conversation.profiles.find(p=>p.id===roleID).name,'项目维护');
   await page.goto(detailURL);
   await page.getByRole('link',{name:'继续最近私聊'}).waitFor();
+  await page.locator('.role-task-row').filter({hasText:'提出重启验证的技能'}).click();
+  await page.waitForFunction(()=>document.activeElement?.matches('.task-button[aria-expanded="true"]'));
+  assert.equal(await page.locator('.task-inspector').count(),1);
+  assert.match(decodeURIComponent(page.url()),/overview\?task=/);
+  await page.goto(detailURL);
+  await page.getByRole('button',{name:'记忆与技能'}).click();
   await page.getByRole('button',{name:/待确认/}).click();
   await page.locator('.knowledge-card').filter({hasText:'测试偏好'}).getByRole('button',{name:'拒绝'}).click();
   await page.getByRole('button',{name:'已处理'}).click();
@@ -81,7 +88,7 @@ async function verify(page, url) {
   await page.locator('.knowledge-card').filter({hasText:'项目发布'}).getByText('核对发布清单。').waitFor();
 
   await page.getByRole('link',{name:'继续最近私聊'}).click();
-  assert.equal(page.url(),firstURL);
+  assert.equal(page.url(),firstURL+'?latest=1');
   await page.goto(detailURL);
   await page.getByRole('button',{name:'新建私聊',exact:true}).click();
   await dialogForm.locator('[name="objective"]').fill('另一个独立项目。');
@@ -91,6 +98,7 @@ async function verify(page, url) {
   assert.equal(submitted[1].conversation.recipient,roleID);
   assert.equal(submitted[1].conversation.parent_run_id,undefined);
   await page.goto(detailURL);
+  await page.getByRole('button',{name:/参与的对话/}).click();
   await page.locator('.role-conversations a').nth(1).waitFor();
   await page.setViewportSize({width:380,height:750});
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
@@ -99,7 +107,48 @@ async function verify(page, url) {
   await page.getByRole('link',{name:/项目维护/}).click();
   await page.getByRole('heading',{name:'项目维护',exact:true}).waitFor();
   await page.getByRole('link',{name:'返回角色库'}).click();
-  await page.getByRole('link',{name:/旧版维护助手/}).click();
+  const historical=page.getByRole('region',{name:'历史会话成员'});
+  const saved=page.getByRole('region',{name:'个人角色'});
+  const builtins=page.getByRole('region',{name:'内置角色'});
+  await historical.getByRole('link',{name:/值班工程师/}).click();
+  await page.getByRole('link',{name:'回到最近群聊'}).waitFor();
+  const groupTask=page.locator('.role-task-row').filter({hasText:'复核机房告警'});
+  await groupTask.waitFor();
+  await page.locator('[data-role-action="task-filter"][data-value="dm"]').click();
+  assert.equal(await page.locator('.role-task-row').count(),0);
+  await page.locator('[data-role-action="task-filter"][data-value="group"]').click();
+  await groupTask.click();
+  await page.waitForFunction(()=>document.activeElement?.matches('.task-button[aria-expanded="true"]'));
+  await page.goBack();
+  await page.getByRole('button',{name:'保存为个人角色'}).click();
+  assert.equal(await roleDialog.locator('input[name="id"]').inputValue(),'onsite');
+  await roleDialog.getByRole('button',{name:'取消'}).click();
+  await page.getByRole('link',{name:'返回角色库'}).click();
+  await builtins.getByRole('link',{name:/审阅者/}).click();
+  await page.getByRole('button',{name:/分配的任务 0/}).waitFor();
+  await page.getByRole('button',{name:/参与的对话/}).click();
+  await page.locator('.role-conversations a').filter({hasText:'复核机房告警'}).waitFor();
+  await page.getByRole('link',{name:'返回角色库'}).click();
+  await builtins.getByRole('link',{name:/研究员/}).click();
+  await page.getByRole('button',{name:'新建私聊',exact:true}).click();
+  assert.equal(await dialogForm.locator('[name="recipient"]').inputValue(),'researcher');
+  await page.keyboard.press('Escape');
+  await page.getByRole('link',{name:'返回角色库'}).click();
+  await page.getByRole('searchbox',{name:'搜索角色'}).fill('负责写作');
+  await historical.getByRole('link',{name:/旧版维护助手/}).click();
+  assert.equal(await page.getByRole('button',{name:'记忆与技能'}).count(),0);
+  await page.getByRole('button',{name:'保存为个人角色'}).click();
+  assert.equal(await roleDialog.getByLabel('角色名称').inputValue(),'旧版维护助手');
+  assert.equal(await roleDialog.getByLabel('角色职责').inputValue(),'负责写作。');
+  assert.equal(await roleDialog.locator('input[name="id"]').inputValue(),'');
+  await roleDialog.getByLabel('角色名称').fill('历史写作助手');
+  await roleDialog.getByRole('button',{name:'保存角色'}).click();
+  await page.getByRole('heading',{name:'历史写作助手',exact:true}).waitFor();
+  assert.equal(await page.locator('.role-task-row').count(),0);
+  await page.getByRole('link',{name:'返回角色库'}).click();
+  await page.getByRole('searchbox',{name:'搜索角色'}).fill('');
+  await saved.getByRole('link',{name:/旧版维护助手/}).click();
+  await page.getByRole('button',{name:/参与的对话/}).click();
   const legacy=page.locator('.legacy-room').filter({hasText:'旧项目交接记录'});
   await legacy.getByRole('button',{name:'关联已有会话'}).waitFor();
   assert.equal(await page.locator('.legacy-room').filter({hasText:'另一位同名成员'}).count(),0);
@@ -113,9 +162,25 @@ async function verify(page, url) {
   await page.locator('.reply-form').getByRole('button',{name:'发送'}).click();
   await page.getByText('旧项目已继续。',{exact:true}).waitFor();
   await page.goto(url+'#roles/legacy');
+  await page.getByRole('button',{name:'记忆与技能'}).click();
   await page.locator('.knowledge-card').getByText('每次修改前创建备份。',{exact:true}).waitFor();
+  // Another client assigns work while the role stays open. Exercise the real
+  // host transition rather than forcing a UI refresh or replacing its data.
+  await page.getByRole('button',{name:/分配的任务/}).click();
+  const live=await page.evaluate(()=>api('/api/runs',{method:'POST',body:JSON.stringify({
+    request_id:crypto.randomUUID(),mode:'team',objective:'维护报告范围确认',
+    conversation:{kind:'group',members:['legacy','reviewer'],recipient:'legacy',intent:'edit'}
+  })}));
+  const liveRow=page.locator('.role-task-row').filter({hasText:'维护报告范围确认'});
+  await liveRow.locator('.badge.running').waitFor();
+  await page.waitForFunction(async id=>(await api('/api/runs/'+id)).pending_questions.length>0,live.run.id);
+  await page.evaluate(async id=>{
+    const question=(await api('/api/runs/'+id)).pending_questions[0];
+    await api('/api/runs/'+id+'/questions/'+question.request_id,{method:'POST',body:JSON.stringify({answer:'过去一周。'})});
+  },live.run.id);
+  await liveRow.locator('.badge.failed').waitFor();
   assert.deepEqual(errors,[]);
-  console.log('Role creation/editing, independent and resumed DMs, candidate review, project scopes, revisions, archiving, explicit legacy binding, direct memory capture and mobile navigation passed.');
+  console.log('Role directory, per-role assignment history, exact task links, member-only group participation, historical promotion, independent DMs, knowledge revisions and mobile navigation passed.');
 }
 
 withFixture('serve_role_fixture',verify).catch(error=>{console.error(error);process.exitCode=1;});

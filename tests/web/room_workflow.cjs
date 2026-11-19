@@ -39,7 +39,7 @@ async function room(page, url) {
     }
   });
   await page.goto(url + '#chats');
-  await page.getByRole('link',{name:'管理工作室角色'}).click();
+  await page.getByRole('link',{name:'角色库',exact:true}).click();
   await page.getByRole('button',{name:'创建角色'}).click();
   const profile = page.locator('.role-editor');
   await profile.getByText('自定义角色 ID（选填）').click();
@@ -48,7 +48,7 @@ async function room(page, url) {
   await profile.locator('[name="prompt"]').fill('负责协调并委派独立评审。');
   await profile.getByText('保存角色').click();
   await page.getByRole('heading',{name:'项目负责人'}).waitFor();
-  await page.getByRole('link',{name:'对话',exact:true}).click();
+  await page.getByRole('link',{name:'最近对话',exact:true}).click();
   await page.getByText('新建群聊', {exact: true}).click();
   const form = page.locator('#dialog-form form');
   const picked = page.waitForResponse(r => r.url() === url + 'api/workspaces/pick');
