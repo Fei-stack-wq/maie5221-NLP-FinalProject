@@ -248,3 +248,17 @@ DeepSeek 官方将 HTTP 402 定义为账户额度不足。Studio 将其显示为
 API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验的成员检查点，`recoverable_drafts` 列出其任务 ID 和角色，GUI 提示可在项目文件选项中选择。未找到检查点时不声称草稿一定可恢复；旧轮详情不借用后续轮的草稿。后续同一任务获得有效响应时，先前 402 保留为 `resolved=true` 的历史警告，不覆盖新的执行或验收结果。其他任务的成功、晚到的旧尝试响应均不能据此声称恢复。额度受阻与成稿是否满足业务目标是不同结论。
 
 实现参考维护中的 DeepSeek Harness 将 402 映射到 QUOTA、默认不重试此类非瞬态错误及其“仅一次请求、无重试计时器”回归。Studio 额外按一轮共用实例保存终止原因，以避免成员失败后负责人再次请求同一服务；未复制上游代码。[官方适配器分类](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-deepseek/src/transport.ts#L34-L54) · [重试异常分支](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-retry/src/index.ts#L191-L221) · [单次请求回归](https://github.com/deepseek-ai/deepseek-harness/blob/ca33fd6843b205e279c7ccb6cb73a472c78f5760/packages/llm/llm-retry/tests/retry.spec.ts#L454-L465) · [Studio 新鲜/历史诊断及正常群入口回归](../tests/test_studio_diagnostics.py)
+
+### 产品通过后的附属检查复核
+
+产品的原生评审 `passed` 与成员修订检查脚本后留下的 `pending_check_reviews` 是两种义务。真实运行中曾出现：评审者修正自己的检查器，原稿评审通过；负责人却不断重开原稿的全套评审，而剩余义务其实是由另一成员独立运行当前检查器。当前公开状态同时显示仍匹配文件 SHA 的产品通过回执，以及待核任务、scope、命令、检查路径、原始与当前脚本 SHA、可选的独立成员和 `[CHECKED 原任务ID]` 交接标记。不会在每轮指令重复附带整个候选项目清单。
+
+自动纠偏只在用户当前预期交付全部由有效通过回执覆盖，且没有其他产品标准、来源要求、成员交接或交付门禁未决时启用。负责人误用精确任务 ID 或唯一成稿路径、按原有标准重开已通过的评审，会转给有资格的同伴核验剩余检查。作者角色别名不会被猜成某份产品；新标准、不同候选和普通、不带 `review` 的后续业务分工继续走原路径，不能把它们静默丢弃。重开请求无法成立时，错误反馈会附上具体剩余义务与合法派工方式。多项检查由各自的作者及最后编辑者决定资格，一位成员只收到自己可独立核验的项目；没有独立成员时如实报告阻塞。同伴这次检查使用当前公共快照，不会接回该角色自己的旧私有草稿。
+
+纠偏不运行命令，也不核销任何责任。成员仍须自行读取原要求、完整执行相同 scope 的当前版本检查、取得真实回执并明确交接。现有同版本、同 scope、非作者/最后编辑者且本轮未改待核文件的条件继续生效。产品通过回执不会被改回待审，也不会替代任何真实失败。`peer_check_routed` 群事件记录请求成员、实际接收者、待核任务和对应产品回执。
+
+参考 OpenAI Agents SDK 的 `execute_handoffs`：可恢复派工错误返回原调用者，成功转移前保留错误并允许纠正；取消和不可恢复异常不会被当作成功。本项目将错误说明具体化为剩余义务与合法角色。另参考 LangGraph 的剩余计划测试，保存未完成步骤并只路由下一项；Studio 沿用自己的双队列和已有核销机制，没有引入上游框架或复制源码。两个项目均为 MIT 许可证。
+
+- [Agents SDK 交接与异常处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L545-L633) · [纠错和异常边界测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_handoff_failure_error_function.py#L31-L217) · [许可证](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/LICENSE)
+- [LangGraph 剩余计划路由测试](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_pregel.py#L5230-L5284) · [Command 目标校验](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/langgraph/pregel/_io.py#L56-L78) · [许可证](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/LICENSE)
+- [正常群入口和误路由反例](../tests/test_studio_peer_checks.py) · [同版本独立回执与反例](../tests/test_handoff_review.py)。这些是无付费模型请求的平台回归，不代表真实模型运行或原题交付已经通过。

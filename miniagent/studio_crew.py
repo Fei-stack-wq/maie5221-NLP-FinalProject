@@ -24,7 +24,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
-from .studio_reviews import ReviewQueue, ReviewSession, digest, manifest_issue
+from .studio_reviews import ReviewQueue, ReviewRequest, ReviewSession, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
@@ -270,6 +270,8 @@ class RoomCrew:
                  "\n已计划成员：" + _json(sorted(self.planned) if self.planned is not None else None) +
                  "\n可接手返工的已选成员：" + _json(self._eligible_repairs(None)) +
                  "\n本轮用户决定：" + _clip(decisions, 1800) + "\n公开交接：" + receipts)
+        if self.pending_check_reviews:
+            state += "\n已通过且仍匹配当前文件的产品评审：" + _json(self._passed_review_receipts())
         diagnostics = self._diagnostic_context()
         state += _clip(diagnostics, 800) if final else diagnostics
         if not final:
@@ -486,6 +488,49 @@ class RoomCrew:
                                  "required_criteria": [rule.id for rule in item.criteria if rule.required]})
         return tuple(receipts) if covered == expected else ()
 
+    def _passed_review_receipts(self):
+        """Product approval stays visible while a peer checks an edited test."""
+        expected = set(self.delivery.get("files", [])) | set(self.native_reviews.required_source_paths)
+        expected.update(c["path"] for c in self.delivery.get("checks", []))
+        return [{"target": r.target, "author": r.author, "reviewer": r.reviewer,
+                 "candidate_version": r.version, "files": {p: sha for p, sha in r.files.items() if p in expected},
+                 "candidate_file_count": len(r.files),
+                 "required_criteria": [c.id for c in r.criteria if c.required], "state": "passed"}
+                for r in self.native_reviews.items.values()
+                if r.state == "passed" and r.latest.get("candidate_version") == r.version
+                and all(self.native_reviews.public_versions.get(p) == sha for p, sha in r.files.items())]
+
+    def _pending_check_briefing(self):
+        rows = []
+        for item in self.pending_check_reviews.values():
+            excluded = {self.lead, item["author"], item.get("last_editor")}
+            roles = sorted(set(self.profiles) - excluded)
+            rows.append({"task": item["task"], "author": item["author"], "last_editor": item.get("last_editor"),
+                         "verification": item.get("verification", []), "changes": item.get("changes", []),
+                         "eligible_roles": roles,
+                         "completion_marker": "[CHECKED " + item["task"] + "]"})
+        return rows
+
+    def _only_peer_checks_remaining(self):
+        # Never substitute test review for a pending product criterion, member
+        # assignment, source review or delivery gate.
+        return (bool(self.pending_check_reviews) and bool(self._reviewed_delivery()) and not self.delivery_issue
+                and self.native_reviews.next(self._review_answers()) is None
+                and not self.native_reviews.missing_source_reviews()
+                and any(r["published"] for r in self.reports)
+                and not (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
+                         | (set(self.child_checks) - self.approved_roles)))
+
+    def _peer_check_instruction(self, requests=None, *, for_member=False):
+        dispatch = ("你的本次分工是按原需求独立复核以下检查；已通过的产品标准保持原结论。" if for_member else
+                    "这是附属检查的独立复核，已通过的产品评审不需要重开。"
+                    "请用 delegate_task 委派 eligible_roles 中的另一成员，省略 review 和 recover_from，"
+                    "deliverable_paths 填 []。")
+        return (dispatch + "对照原需求阅读当前脚本，按下列同一 scope 的命令完整运行，"
+                "保留真实退出码和当前文件 SHA；不得改待复核脚本或候选来核销。"
+                "确认后在交接写 completion_marker；未通过则如实交接缺口。待复核记录："
+                + _json(self._pending_check_briefing() if requests is None else requests))
+
     def coordinator_policy(self, state, budget):
         pending = self.before_answer() or self.delivery_issue or self.dispatch_ended
         authenticated = () if pending else self._reviewed_delivery()
@@ -514,6 +559,9 @@ class RoomCrew:
             return StepPolicy("coordinate", "独立验收遇到需要用户决定的业务歧义。请使用 ask_human 询问这一项：" +
                               _clip(_json(native.latest.get("results", [])), 2500),
                               frozenset({"ask_human"}), required_tool="ask_human")
+        if self._only_peer_checks_remaining() and not any(r["eligible_roles"] for r in self._pending_check_briefing()):
+            return StepPolicy("finalize", "以 [BLOCKED] 说明：待复核检查没有可独立核销的其他成员。"
+                              + self._peer_check_instruction(), frozenset(), compact=True)
         personal = self.role_session.context(self.lead, state.goal) if self.role_session else ""
         instruction = self.instructions() + self._prior_context()
         if personal:
@@ -521,6 +569,8 @@ class RoomCrew:
         if self.private_read:
             instruction += "\n负责人自己的角色知识工具回执：\n" + self.private_read
         instruction += self._public_state(final=False)
+        if self._only_peer_checks_remaining():
+            instruction += "\n" + self._peer_check_instruction()
         self.navigation_version = self.project_version
         if self.navigation:
             # Latest request first so the most recent result survives clipping.
@@ -644,8 +694,7 @@ class RoomCrew:
         if pending:
             return "这些成员的交接尚未完成或未通过用户验收：" + "、".join(sorted(pending)) + "。请安排其解决缺口。"
         if self.pending_check_reviews:
-            return ("成员的测试修订或未完成检查仍需另一位成员独立复核。请委派他人按用户需求检查并报告："
-                    + "、".join(self.pending_check_reviews))
+            return self._peer_check_instruction()
         if queue and queue.required_source_paths:
             missing = queue.missing_source_reviews()
             if missing:
@@ -822,7 +871,42 @@ class RoomCrew:
         if action in self.handoffs:
             return self.handoffs[action]
         review = self.native_reviews.next(self._review_answers())
-        if review is None and payload.get("review") is None:
+        peer_check = False
+        if self._only_peer_checks_remaining():
+            selection = payload.get("review")
+            # A rejected reopening of an already-passed product may be routed
+            # to its remaining test obligation. A different candidate keeps its
+            # own review request and criteria; never silently consume it here.
+            candidate = selection.get("candidate") if isinstance(selection, dict) else None
+            passed = self._passed_review_receipts()
+            matches = [r for r in passed if isinstance(candidate, str)
+                       and (candidate == r["target"] or candidate in r["files"])]
+            try:
+                requested = ReviewRequest.model_validate(selection)
+                same_rules = len(matches) == 1 and sorted(
+                    (c.model_dump() for c in requested.criteria), key=lambda c: c["id"]) == sorted(
+                    (c.model_dump() for c in self.native_reviews.items[matches[0]["target"]].criteria), key=lambda c: c["id"])
+            except ValueError:
+                same_rules = False
+            # Ordinary assignments remain ordinary. An author alias can refer
+            # to another product. New criteria must not be silently discarded.
+            if same_rules:
+                requests = self._pending_check_briefing()
+                actionable = [r for r in requests if r["eligible_roles"]]
+                item = next((r for r in actionable if role in r["eligible_roles"]), actionable[0] if actionable else requests[0])
+                peers = item["eligible_roles"]
+                if not peers:
+                    return self._observation(False, "待复核检查没有可独立核销的其他成员。" + self._peer_check_instruction())
+                recipient = role if role in peers else next((p for p in self.plan_order if p in peers), peers[0])
+                selected = [r for r in requests if recipient in r["eligible_roles"]]
+                objective = self._peer_check_instruction(selected, for_member=True)
+                payload = {k: v for k, v in payload.items() if k not in {"review", "recover_from"}}
+                payload.update(assignee=recipient, objective=objective, deliverable_paths=[], acceptance="")
+                self.record_event(self.run_id, "studio", "peer_check_routed", "产品评审已通过，转交剩余检查供另一成员独立复核。",
+                                  task_id=self.run_id, requested=role, recipient=recipient,
+                                  pending_tasks=[r["task"] for r in selected], product_reviews=matches)
+                routed_from, role, peer_check = role, recipient, True
+        if not peer_check and review is None and payload.get("review") is None:
             donor = payload.get("recover_from", role)
             draft = self.private_drafts.get(donor) if isinstance(donor, str) else None
             if draft and draft.get("review_after_repair") and draft["version"] == self.project_version:
@@ -851,7 +935,8 @@ class RoomCrew:
                 requested_review = self.native_reviews.open(payload["review"], role, self.reports,
                     drafts=self.private_drafts, project_version=self.project_version, inherited=self.inherited_review)
             except (ValueError, OSError) as exc:
-                return self._observation(False, "无法发起独立验收：" + str(exc))
+                remaining = "\n" + self._peer_check_instruction() if self._only_peer_checks_remaining() else ""
+                return self._observation(False, "无法发起独立验收：" + str(exc) + remaining)
             if review and review is not requested_review:
                 return self._observation(False, "请先完成已在进行的独立验收。")
             review = requested_review
@@ -902,6 +987,10 @@ class RoomCrew:
         if not isinstance(donor, str) or donor not in self.profiles or donor == self.lead:
             return self._observation(False, "recover_from 只能选择本群已有受阻交接的成员。")
         draft = self.private_drafts.get(donor)
+        if peer_check:
+            # This is a review of the current published snapshot, never a
+            # continuation of the recipient's older private implementation.
+            draft = None
         if review and not review.draft_task and review.state == "review":
             draft = None
         if review and review.draft_task and (not draft or draft["task_id"] != review.draft_task
