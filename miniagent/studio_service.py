@@ -1009,9 +1009,9 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                                                  or role != thread["recipient"] or role in addresses]
                     if request["mode"] == "single":
                         thread["recipient"] = selected[0]
-                if request["mode"] == "single" and thread["intent"] == "edit":
+                if request["mode"] == "single":
                     thread["direct_execution"] = True
-                if request["mode"] == "team" and thread["intent"] == "question":
+                if thread["intent"] == "question":
                     thread["team_question"] = True
             if request.get("required_source_review_paths") and len(thread["members"]) < 2:
                 raise StudioError("来源核查需要两位不同成员，分别负责成稿和独立评审。")
@@ -1560,8 +1560,6 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     context += "\n" + (crew.direct_instructions() if crew.direct else crew.instructions())
                     if thread.get("addressed_roles") and not crew.direct:
                         context += "\n本轮需实际参与的点名成员：" + "、".join(thread["addressed_roles"])
-                    if question:
-                        context += "\n本轮为只读讨论，请委派点名成员阅读项目并给出意见，保留现有文件。"
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
                 registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
                 prompt = COORDINATOR_PROMPT if crew and not crew.direct else None

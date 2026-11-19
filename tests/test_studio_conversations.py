@@ -79,7 +79,10 @@ class ConversationTest(unittest.TestCase):
         self.assertEqual(question["tasks"][0]["objective"], "现在有多快？")
         self.assertEqual(question["tasks"][0]["assignee_profile_id"], "reviewer")
         self.assertFalse(list((self.runs / second).rglob("unexpected.txt")))
-        self.assertTrue(all(tools == ["find_files", "list_dir", "read_file", "read_lines", "read_source", "search_files"] for _, tools in provider.requests))
+        for _, tools in provider.requests:
+            self.assertTrue({"find_files", "list_dir", "read_file", "read_lines", "read_source",
+                             "search_files", "delegate_task"}.issubset(tools))
+            self.assertFalse({"write_file", "edit_file", "run_shell"}.intersection(tools))
         self.assertIn("初版使用速度 2。", json.dumps(provider.requests[0][0], ensure_ascii=False))
         self.assertEqual(question["conversation"]["artifact_run_id"], first)
         third, _ = self.run_turn(msg("改为速度 1", reply(second, "writer")), [

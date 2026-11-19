@@ -140,3 +140,22 @@ class GroupAddressingTest(unittest.TestCase):
         self.assertTrue(all("write_file" not in names and "run_shell" not in names for _,names in calls))
         self.assertEqual(result["artifacts"], [])
         self.assertEqual((self.workspace / "data.md").read_text(), "Initial inventory")
+
+    def test_one_addressed_reader_can_optionally_consult_another_reader_in_the_same_room(self):
+        note = "Inventory version 12 lists 80 parts."
+        (self.workspace / "data.md").write_text(note)
+        result, calls = self.execute("@writer 请判断库存；需要时请同事看一眼。", [
+            tool("read_file", path="data.md"),
+            tool("delegate_task", assignee="reviewer", objective="Check the version and count in data.md.",
+                 remaining_roles=[]),
+            tool("read_file", path="data.md"), {"text": "已读到第 12 版的 80 件库存。"},
+            {"text": "我与审阅者都看到第 12 版有 80 件。"}], intent="question")
+        self.assertEqual(result["run"]["status"], "unverified", result["diagnostics"])
+        root, child = sorted(result["tasks"], key=lambda task: task["parent_id"] is not None)
+        self.assertEqual((root["assignee_profile_id"], child["assignee_profile_id"], child["parent_id"]),
+                         ("writer", "reviewer", root["task_id"]))
+        self.assertTrue(all(not {"write_file", "edit_file", "run_shell"}.intersection(names) for _, names in calls))
+        self.assertEqual([e["role"] for e in result["room_events"] if e["kind"] == "member_report"], ["reviewer"])
+        self.assertFalse(any(e["kind"] == "direct_delivery" for e in result["room_events"]))
+        self.assertEqual(result["artifacts"], [])
+        self.assertEqual((self.workspace / "data.md").read_text(), note)

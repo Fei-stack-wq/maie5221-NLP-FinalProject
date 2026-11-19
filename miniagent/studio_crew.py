@@ -152,12 +152,16 @@ class RoomCrew:
         self.direct_start = {}
         self.direct_candidate = None
         if self.direct:
-            copy_project(path, self.lead, None, extensions, secret=settings.api_key, manifest=self.direct_start)
+            if not self.read_only:
+                copy_project(path, self.lead, None, extensions, secret=settings.api_key, manifest=self.direct_start)
             required = set(self.delivery.get("files", []))
             required.update(check["path"] for check in self.delivery.get("checks", []))
             self.direct_progress = MemberProgress(path / "agents" / self.lead, required)
 
     def direct_instructions(self):
+        if self.read_only:
+            return ("你是本轮问题的收件人。请查阅项目后直接在群里回答；需要其他专业意见时可以用 "
+                    "delegate_task 邀请一位成员查阅资料，取得其回答后汇总。可邀请角色：" + _json(self.delegate_recipients))
         return ("你是用户点名的执行者。请自己使用工作工具完成本轮并直接回复用户；无须先委派给自己。"
                 "确实需要其他专业能力或独立复核时，用 delegate_task 邀请对应成员并说明具体目标。"
                 "已有成稿可用 review.candidate 填项目路径，附 criteria，由另一成员核对实际版本。"
@@ -165,7 +169,7 @@ class RoomCrew:
 
     def snapshot_direct_changes(self):
         """Freeze the addressed author's bytes before handing them to a peer or ending the turn."""
-        if self.assigned:
+        if self.read_only or self.assigned:
             return
         current = {}
         copy_project(self.path, self.lead, None, self.extensions, secret=self.settings.api_key, manifest=current)
@@ -227,6 +231,10 @@ class RoomCrew:
 
     def instructions(self):
         roster = [{**v, "prompt": _clip(v["prompt"], 1200)} for v in self.profiles.values()]
+        if self.read_only:
+            return ("这是只读群聊。根据用户问题和成员专长，用 delegate_task 邀请成员查阅资料并给出意见。"
+                    "把需要的后续成员填入 remaining_roles；收齐实际答复后直接在群内汇总。群成员与职责："
+                    + _json(roster) + "。用户本轮点名的成员：" + _json(self.thread.get("addressed_roles", [])))
         return ("你是群负责人 " + self.lead + "。群成员和职责：" + _json(roster) +
                 "。本轮可选 assignee ID：" + _json(self.delegate_recipients) + "。"
                 "\n负责人也可以执行具体分工。用户或任务给你本人安排了调研、撰写或修订文件时，"
@@ -435,8 +443,13 @@ class RoomCrew:
                                   "enum": self.delegate_recipients}
         remaining = properties["remaining_roles"]
         properties["remaining_roles"] = {**remaining, "items": {"type": "string", "enum": self.delegate_recipients}}
+        description = "将明确的子任务交给指定群成员。负责人承担文件交付时，用自己的 ID 和具体交付路径认领。"
+        if self.read_only:
+            description = "邀请群成员只读查阅项目并给出意见。"
+            for edit_parameter in ("deliverable_paths", "review", "recover_from"):
+                properties.pop(edit_parameter, None)
         return original.model_copy(update={
-            "description": "将明确的子任务交给指定群成员。负责人承担文件交付时，用自己的 ID 和具体交付路径认领。",
+            "description": description,
             "parameters": {**original.parameters, "properties": properties,
                            "required": [*original.parameters["required"], "assignee"]},
         })
@@ -1453,6 +1466,8 @@ class RoomCrew:
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context)
+        if self.read_only:
+            member_context += "\n本次是群内只读咨询。请用查询工具核对资料后在消息里说明意见和依据。"
         if review_notes:
             member_context += "\n本轮单独交接的评审附件（委派名称对应写入路径），保留旧版及产品原件：" + _json(review_notes)
         if session:
