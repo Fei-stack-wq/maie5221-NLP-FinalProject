@@ -24,7 +24,43 @@ _KEY_PATTERN = re.compile(rb"(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}|github_
 # Studio writes task-<UUID hex> into citations and handoff reports. Only
 # exclude a complete canonical identifier from generic text pattern matching.
 _STUDIO_TASK_ID = re.compile(rb"(?<![A-Za-z0-9_])task-[0-9a-f]{32}(?![A-Za-z0-9_-])")
+# A Markdown section link can reproduce the label's words after "#", with
+# an optional section number. Keep this grammar narrower than URL syntax.
+_SECTION_LINK = re.compile(rb"\[([A-Za-z]{1,24}(?:[ -][A-Za-z]{1,24}){2,15})\]\("
+                           rb"#(?:[0-9]{1,8}-)?([a-z]{1,24}(?:-[a-z]{1,24}){2,15})\)")
 _TASKSTORE_SCHEMA = (b"CREATE TABLE creation_keys", b"CREATE INDEX records_task", b"CREATE INDEX outbox_pending")
+
+
+def _is_task_section_word(data: bytes, start: int) -> bool:
+    """Only the 'sk-' starting inside a corroborated Markdown section word."""
+    if start < 2 or data[start-2:start+1] != b"tas":
+        return False
+    opening = data.rfind(b"[", max(0, start-820), start-2)
+    if opening < 0:
+        return False
+    link = _SECTION_LINK.match(data, opening)
+    if not link or not link.start(2) <= start-2 < link.end(2):
+        return False
+    words = link[1].lower().replace(b" ", b"-")
+    if words != link[2]:
+        return False
+    offset = start - 2 - link.start(2)
+    return ((not offset or words[offset-1:offset] == b"-") and
+            words[offset:].startswith(b"task-") and words[offset:].count(b"-") >= 2)
+
+
+def _has_text_credential(data: bytes) -> bool:
+    if not _KEY_PATTERN.search(data):
+        return False
+    text = _STUDIO_TASK_ID.sub(b"[task]", data)
+    offset = 0
+    while match := _KEY_PATTERN.search(text, offset):
+        if not _is_task_section_word(text, match.start()):
+            return True
+        # The generic pattern is greedy. A separate token may begin inside
+        # its match, even elsewhere in the same anchor. Rescan that suffix.
+        offset = match.start() + 3
+    return False
 
 
 def is_database(name: str) -> bool:
@@ -89,8 +125,7 @@ def validate_project_data(name: str, data: bytes, *, secret: str = "", reject_cr
         return
     if reject_credentials:
         configured_key = secret and secret.encode() in data
-        generic_key = _KEY_PATTERN.search(data) and _KEY_PATTERN.search(_STUDIO_TASK_ID.sub(b"[task]", data))
-        if configured_key or generic_key:
+        if configured_key or _has_text_credential(data):
             raise ValueError("项目文件含可识别的服务凭据。")
     if b"\x00" in data:
         raise ValueError("项目文本包含二进制数据。")

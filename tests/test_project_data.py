@@ -1,5 +1,7 @@
 """Use real booking records across a version handoff and a downloaded ZIP."""
 import io
+import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -133,3 +135,29 @@ class ProjectDataTest(unittest.TestCase):
                 self.copy()
             self.assertNotIn(fake, str(rejected.exception))
             self.assertFalse((self.root / "next" / project_file.name).exists())
+
+    def test_protocol_source_anchor_can_be_copied_but_embedded_credentials_still_block(self):
+        from miniagent.project_data import validate_project_data
+        title = "Re Task Configuration Fields Representation"
+        slug = title.lower().replace(" ", "-")
+        link = f"[{title}](#312-{slug})"
+        body = json.dumps({"kind":"fetched_source", "text":f"### 3.1.2 {title}\n\nSee {link}."}).encode()
+        sources = self.agent / "sources"
+        sources.mkdir()
+        source = sources / (hashlib.sha256(body).hexdigest() + ".json")
+        source.write_bytes(body)
+        self.assertEqual((self.copy() / "sources" / source.name).read_bytes(), body)
+
+        key = "sk-" + "a" * 40
+        nested = "Task Overview SK Detailed Configuration Transport Requirements"
+        opaque_task = "task-" + "abc123" * 6
+        unsafe = [key, "api_key=ta" + key, f"[details](https://example.invalid/{key})",
+                  f"[{title}](https://example.invalid/#{slug})", f"[unrelated](#312-{slug})",
+                  "api_key=" + slug, opaque_task, f"[{nested}](#{nested.lower().replace(' ', '-')})"]
+        for extra in unsafe:
+            source.write_bytes(json.dumps({"kind":"fetched_source", "text":link + "\n" + extra}).encode())
+            with self.subTest(), self.assertRaisesRegex(SnapshotError, "服务凭据") as caught:
+                self.copy()
+            self.assertNotIn(key, str(caught.exception))
+        with self.assertRaisesRegex(ValueError, "服务凭据"):
+            validate_project_data("source.json", body, secret=slug[slug.index("task-")+2:], reject_credentials=True)
