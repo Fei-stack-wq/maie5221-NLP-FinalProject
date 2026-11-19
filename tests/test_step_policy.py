@@ -52,6 +52,63 @@ class StepPolicyTest(unittest.TestCase):
         self.assertEqual(set(tools), operations)
         self.assertEqual((agent.sandbox.root / "room.md").read_text(), "A101")
 
+    def test_rebased_work_tail_omits_failed_batches_and_can_take_another_checkpoint(self):
+        def write(path):
+            return {"tool_calls":[{"name":"write_file","arguments":{"path":path, "content":"persisted"}}]}
+
+        pseudo = "<｜tool▁calls▁begin｜> never-executed-marker"
+        agent, provider = self.agent([write("old.md"), write("first-tail.md"), {"text":pseudo},
+                                      write("second-tail.md"), write("latest.md"), {"text":"Done"}])
+        tools = frozenset({"write_file"})
+        def policy(state, _):
+            recovery = state.step_index in {1, 4}
+            return StepPolicy("work", f"Checkpoint {state.step_index}" if recovery else "",
+                              tools, compact=recovery)
+
+        result = agent.run("Write the project notes", step_policy=policy,
+                           acceptance=accept_files("latest.md", min_bytes=1))
+        self.assertEqual(result.status, "completed", result.error)
+        corrected = str(provider.requests[3][0])
+        self.assertIn("Checkpoint 1", corrected)
+        self.assertIn("first-tail.md", corrected)
+        self.assertIn("工具协议纠正", corrected)
+        self.assertNotIn("old.md", corrected)
+        self.assertNotIn("never-executed-marker", corrected)
+        final = str(provider.requests[-1][0])
+        self.assertIn("Checkpoint 4", final)
+        self.assertIn("latest.md", final)
+        for old in ("Checkpoint 1", "old.md", "first-tail.md", "second-tail.md", "never-executed-marker"):
+            self.assertNotIn(old, final)
+        self.assertTrue(all(names == ["write_file"] for _, names in provider.requests))
+        self.assertEqual(len(list(agent.sandbox.root.glob("*.md"))), 4)
+
+    def test_semantic_compaction_after_work_recovery_summarizes_only_new_batches(self):
+        from tests.test_semantic_compaction import summary
+        old = [f"old-section-{i}.md" for i in range(8)]
+        new = [f"new-section-{i}.md" for i in range(8)]
+        script = [{"tool_calls":[{"name":"read_file", "arguments":{"path":name}}]} for name in old + new]
+        agent, provider = self.agent([*script, {"text":"Reviewed"}])
+        agent.settings.context_window_tokens = 18000
+        for name in old + new:
+            (agent.sandbox.root / name).write_text(name + "\n" + "x" * 4000)
+        summaries = []
+        def summarize(messages, **_):
+            summaries.append((provider.cursor, str(messages)))
+            return summary("old-summary-marker" if provider.cursor < len(old) else "new-summary-marker")
+        provider.summarize_context = summarize
+        result = agent.run("Review the project", step_policy=lambda state, _: StepPolicy(
+            "work", "Active checkpoint", frozenset({"read_file"}), compact=state.step_index == len(old)))
+        self.assertEqual(result.status, "unverified", result.error)
+        self.assertTrue(any(turn < len(old) for turn, _ in summaries))
+        current = [payload for turn, payload in summaries if turn >= len(old)]
+        self.assertTrue(current)
+        self.assertTrue(any("new-section-" in payload for payload in current))
+        self.assertTrue(all("old-section-" not in payload and "old-summary-marker" not in payload for payload in current))
+        for prompt, _ in provider.requests[len(old):]:
+            self.assertNotIn("old-section-", str(prompt))
+            self.assertNotIn("old-summary-marker", str(prompt))
+        self.assertTrue(any("new-summary-marker" in str(messages) for messages, _ in provider.requests[len(old):]))
+
     def test_compact_handoff_has_user_reply_but_no_source_or_stale_background(self):
         script = [
             {"tool_calls": [{"name": "ask_human", "arguments": {"question": "选哪间？"}}]},
