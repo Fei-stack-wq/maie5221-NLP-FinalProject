@@ -25,7 +25,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, ToolCompletion, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
-from .studio_reviews import InheritedCriteriaConflict, Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
+from .studio_reviews import CandidateLookupError, InheritedCriteriaConflict, Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
@@ -113,6 +113,7 @@ class RoomCrew:
         self.refused_retry = set()
         self.dispatch_ended = ""
         self.routing_denied = False
+        self.invalid_route = None
         self.child_checks = child_checks
         self.delivery = delivery or {}
         self.check_delivery = build_checks(self.delivery.get("files", []), self.delivery.get("checks", []))
@@ -169,20 +170,25 @@ class RoomCrew:
 
     def instructions(self):
         roster = [{**v, "prompt": _clip(v["prompt"], 1200)} for v in self.profiles.values()]
+        responsibilities = ("本群两人。若用户要求你撰写或汇总成文件，可调用 delegate_task，assignee 填你自己的 ID，"
+                            "deliverable_paths 列出你负责的具体文件。宿主提供独立工作副本完成撰写并交接。"
+                            "另一位成员仍需实际参与，独立审阅须由不同角色完成。"
+                            if len(self.profiles) == 2 else "你负责协调、转交缺陷或汇总。具体文件由其他成员处理。")
         return ("你是群负责人 " + self.lead + "。群成员和职责：" + _json(roster) +
+                "\n" + responsibilities + " 本轮可选 assignee ID：" + _json(self.delegate_recipients) + "。" +
                 "\n" + self.capabilities + " 这份清单来自执行成员的工具注册表。成员可检索并读取公开来源时，请委派调查；来源能否访问以实际回执为准。" +
                 "\n依据用户目标和角色职责选人。首次 delegate_task 须用 remaining_roles 列出这次后续需要的角色 ID，"
                 "简单任务可以填 []。完整产品交付如群内有相应分工，应安排实现、独立验收和发布交付。"
                 "复核继承的成稿时可以直接用 delegate_task.review.candidate 填成稿路径、原作者任务 ID 或唯一作者角色，"
                 "由另一成员独立检查现版。无需先让作者改写原件或重复交接。"
                 "独立评估已交付的候选或带 reviewable_candidate 的完整私有草稿时，使用 delegate_task.review 引用原任务或作者角色，填写逐项标准；"
-                "需观察行为用 execute，审阅文件用 inspect，核查事实用 source。要求独立调查时，评审者可打开其他原始资料；检索未命中只说明已查范围。宿主会将返工转回适当成员。"
+                "检查运行行为用 execute；审阅文件用 inspect。按本地原始记录核对成稿时用 inspect，并把原记录工作区路径写入每项相应标准的 reference_path。只有核实外部网页事实才用 source，需要评审员亲自打开网页。要求独立调查时，评审者可打开其他原始资料；检索未命中只说明已查范围。宿主会将返工转回适当成员。"
                 "每次只委派给一人。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
                 "验收只列该成员负责的工作。其他成员的独立验证、交付说明和打包工作请留给其实际负责人，"
                 "不要把整个项目的全部最终验收原样转给执行第一阶段的人。下一人的分工基于实际交接。"
                 "分派分析、审阅或测试报告时，用 deliverable_paths 指定报告。即使交接受阻，也可读其诊断并按实证分工。"
                 "同一人可以续修未发布的草稿。若同一人原地踏步，可点名另一位成员，用 recover_from 显式接手缺文件的有效草稿。"
-                "你负责协调、转交缺陷或汇总。具体文件由成员处理。成员完成且用户要求得到满足时立即交付。"
+                "成员完成且用户要求得到满足时立即交付。"
                 "团队内选谁、补交、返工、是否由负责人读源码，均由你自主决定。"
                 "开始委派前可核实公开项目中影响选人和分工的必要细节。收到成功交接后根据公开报告安排后续工作。"
                 "工具回执中的调用次数只表示已经执行的次数。查询平台工具配置属于 runtime_capability。"
@@ -357,13 +363,28 @@ class RoomCrew:
         self.navigation_repeats = 0 if advanced else self.navigation_repeats + 1
 
     @cached_property
+    def delegate_recipients(self):
+        return [name for name in self.profiles if name != self.lead or len(self.profiles) == 2]
+
+    @cached_property
+    def delegate_spec(self):
+        original = CONTROL_TOOLS["delegate_task"]
+        properties = dict(original.parameters["properties"])
+        properties["assignee"] = {"type": "string", "description": "本次分工的角色 ID，须取枚举中的一个。",
+                                  "enum": self.delegate_recipients}
+        remaining = properties["remaining_roles"]
+        properties["remaining_roles"] = {**remaining, "items": {"type": "string", "enum": self.delegate_recipients}}
+        return original.model_copy(update={"parameters": {**original.parameters, "properties": properties,
+                                                        "required": [*original.parameters["required"], "assignee"]}})
+
+    @cached_property
     def coordinator_schemas(self):
         registry = build_default_registry(read_only=True)
         registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(self.lead, registry, read_only=True)
         specs = [*registry.specs(), *CONTROL_TOOLS.values()]
-        return {s.name:s.to_api() for s in specs}
+        return {s.name:(self.delegate_spec if s.name == "delegate_task" else s).to_api() for s in specs}
 
     @staticmethod
     def _decisions(events):
@@ -552,7 +573,7 @@ class RoomCrew:
                   "source" if any(r.method == "source" for r in original_rules) else "inspect")
         rules = [Rule(id="probe_" + scope, method=method, description=(
             "独立裁决原评审明确引用的失败检查 " + scope + "，说明原断言/真实错误为何与以下原业务标准冲突或一致：" +
-            _clip(_json([rule.model_dump() for rule in original_rules]), 950))) for scope in probes]
+            _clip(_json([rule.model_dump(exclude_none=True) for rule in original_rules]), 950))) for scope in probes]
         # Keep the original inspection/source semantics as well as the exact
         # executable counterexample. A passing assertion alone cannot establish
         # an externally sourced product claim.
@@ -578,7 +599,7 @@ class RoomCrew:
             return False
         child = Review(report["task_id"], parent.reviewer, peers[0],
                        "复核评审者自建检查的争议；真实产品缺陷回原作者。原产品标准：" +
-                       _clip(_json([r.model_dump() for r in parent.criteria]), 5000),
+                       _clip(_json([r.model_dump(exclude_none=True) for r in parent.criteria]), 5000),
                        rules, dict(draft["manifest"]), draft_task=report["task_id"], probes=dict(probes),
                        kind="reviewer_probe", probe_parent=parent.target, probe_support=extra,
                        probe_product_files=product_files,
@@ -825,6 +846,8 @@ class RoomCrew:
         return _json(replies)
 
     def before_answer(self):
+        if getattr(self, "invalid_route", None) and self.dispatch_ended:
+            return self.dispatch_ended
         queue = getattr(self, "native_reviews", None)
         if queue and queue.items:
             pending_review = self._next_review()
@@ -832,8 +855,13 @@ class RoomCrew:
                 return ("独立验收尚未通过，需要 " + pending_review.owner + " 处理 " + pending_review.state +
                         ("。用 delegate_task 委派原验收者，省略 review 以沿用原标准；有新的可复核来源时告诉验收者。"
                          if pending_review.verification_gaps() else "。") + "当前目标与缺口：" + _clip(_json(pending_review.briefing()), 1900))
-        if not any(r["published"] for r in self.reports):
+        published = [r for r in self.reports if r["published"]]
+        if not published:
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
+        if len(self.profiles) == 2:
+            peer = next(name for name in self.profiles if name != self.lead)
+            if not any(r.get("role") == peer for r in published):
+                return "还缺另一位成员的实际交接。请按用户要求把独立工作交给：" + peer + "。"
         pending = (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
                    | (set(self.child_checks) - self.approved_roles))
         if pending:
@@ -857,6 +885,13 @@ class RoomCrew:
             self.last_dispatch_error = _clip(text, 1200)
         return Observation(step_id=self.run_id + ":delegate", source="delegate", ok=ok,
                            content=text, error_class=None if ok else ErrorClass.A_TOOL_ERROR)
+
+    def _reject_destination(self, destination, message):
+        decision = (destination, self.project_version, len(self.reports))
+        if self.invalid_route == decision:
+            self.dispatch_ended = "相同项目状态下重复提交了不可执行的派工。" + message
+        self.invalid_route = decision
+        return self._observation(False, message)
 
     def _allocation(self, role, planned, *, record_shares=True):
         # Hold the final report and the remaining dispatches. If each elected
@@ -1011,8 +1046,13 @@ class RoomCrew:
         role = payload.get("assignee")
         objective = payload.get("objective")
         action = payload.get("__runtime_action_id")
-        if not isinstance(role, str) or role not in self.profiles or role == self.lead:
-            return self._observation(False, "请明确指定本组另一位成员的 ID。")
+        if (not isinstance(role, str) or role not in self.delegate_recipients
+                or role == self.lead and (not payload.get("deliverable_paths") or payload.get("review"))):
+            peers = [name for name in self.profiles if name != self.lead]
+            hint = "请明确指定本组可执行成员。assignee 可填：" + _json(peers) + "。"
+            if role == self.lead and len(self.profiles) == 2:
+                hint += "如由负责人撰写文件，列出 deliverable_paths；独立验收交给另一位成员。"
+            return self._reject_destination(("recipient", role), hint)
         if not isinstance(objective, str) or not objective.strip() or len(objective) > 10000 or not action:
             return self._observation(False, "委派需要具体目标和运行时动作身份。")
         if action in self.handoffs:
@@ -1033,8 +1073,8 @@ class RoomCrew:
             try:
                 requested = ReviewRequest.model_validate(selection)
                 same_rules = len(matches) == 1 and sorted(
-                    (c.model_dump() for c in requested.criteria), key=lambda c: c["id"]) == sorted(
-                    (c.model_dump() for c in self.native_reviews.items[matches[0]["target"]].criteria), key=lambda c: c["id"])
+                    (c.model_dump(exclude_none=True) for c in requested.criteria), key=lambda c: c["id"]) == sorted(
+                    (c.model_dump(exclude_none=True) for c in self.native_reviews.items[matches[0]["target"]].criteria), key=lambda c: c["id"])
             except ValueError:
                 same_rules = False
             # Ordinary assignments remain ordinary. An author alias can refer
@@ -1083,6 +1123,11 @@ class RoomCrew:
             try:
                 requested_review = self.native_reviews.open(payload["review"], role, self.reports,
                     drafts=self.private_drafts, project_version=self.project_version, inherited=self.inherited_review)
+            except CandidateLookupError as exc:
+                known = list(self.native_reviews.path_candidates)[:8]
+                message = ("无法发起独立验收：" + str(exc) + " 本轮已发布的候选路径：" + _json(known)
+                           + "。如果材料只是尚无本群发布记录的输入，省略 review，给独立成员分配读取原文并记录意见的任务。")
+                return self._reject_destination(("candidate", role, payload["review"]["candidate"]), message)
             except (ValueError, OSError) as exc:
                 remaining = "\n" + self._peer_check_instruction() if self._only_peer_checks_remaining() else ""
                 return self._observation(False, "无法发起独立验收：" + str(exc) + remaining,
@@ -1109,7 +1154,7 @@ class RoomCrew:
         if "remaining_roles" in payload:
             rest = payload["remaining_roles"]
             if (not isinstance(rest, list) or len(rest) > len(self.profiles)
-                    or any(not isinstance(r, str) or r not in self.profiles or r == self.lead for r in rest)):
+                    or any(not isinstance(r, str) or r not in self.delegate_recipients for r in rest)):
                 return self._observation(False, "remaining_roles 应只列出本群后续需要的成员 ID。")
             plan = (plan or set()) | {role, *rest}
             for named in [role, *rest]:
@@ -1134,7 +1179,7 @@ class RoomCrew:
         expectations = str(payload.get("acceptance") or "")[:2000]
         user_state = self._clarifications(self.room_events(self.run_id))
         donor = (review.author if review.draft_task else role) if review else payload.get("recover_from", role)
-        if not isinstance(donor, str) or donor not in self.profiles or donor == self.lead:
+        if not isinstance(donor, str) or donor not in self.delegate_recipients:
             return self._observation(False, "recover_from 只能选择本群已有受阻交接的成员。")
         draft = self.private_drafts.get(donor)
         if peer_check:
@@ -1179,6 +1224,7 @@ class RoomCrew:
             self.dispatch_ended = "已无委派预算，或本轮已被取消。"
             return self._observation(False, self.dispatch_ended)
         self.routing_denied = False
+        self.invalid_route = None
         self.started_roles.add(role)
         self.untapped_shares.pop(role, None)
         dispatch_started = time.monotonic()
@@ -1186,14 +1232,14 @@ class RoomCrew:
             if review.publication and review.target not in self.native_reviews.items:
                 self.record_event(self.run_id, "studio", "published_review_bound", "已绑定同群先前发布的原件，开始本轮独立复核。",
                                   task_id=self.run_id, reviewer=role, publication=review.publication,
-                                  candidate_version=review.version, criteria=[r.model_dump() for r in review.criteria])
+                                  candidate_version=review.version, criteria=[r.model_dump(exclude_none=True) for r in review.criteria])
             if review.kind != "reviewer_probe":
                 self.native_reviews.items[review.target] = review
         if retry_gaps:
             self.record_event(self.run_id, "studio", "review_resumed", "原标准继续生效，已将未决项交给原验收者。",
                               task_id=self.run_id, requested=original_recipient, recipient=role, candidate_task=review.target,
                               candidate_version=review.version, pending_criteria=[g["criterion_id"] for g in retry_gaps],
-                              bound_criteria=[r.model_dump() for r in review.criteria])
+                              bound_criteria=[r.model_dump(exclude_none=True) for r in review.criteria])
         try:
             outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review)
         finally:

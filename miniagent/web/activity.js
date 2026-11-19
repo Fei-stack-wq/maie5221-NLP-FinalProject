@@ -10,6 +10,8 @@
     http_get:'打开来源', search_sources:'搜索来源', submit_review:'提交评审',
     list_review_evidence:'查询评审证据', delegate_task:'委派任务', delegate:'委派任务',
     ask_human:'请求用户答复', human:'请求用户答复', list_studio_roles:'查看角色',
+    list_studio_targets:'查找协作者', dispatch_studio_task:'委派任务',
+    list_studio_deliveries:'查找已交付文件', read_studio_delivery:'读取已交付文件',
     create_studio_role:'创建角色', create_studio_group:'创建群聊'
   };
   const states = {running:'执行中', succeeded:'完成', failed:'失败', interrupted:'已中断'};

@@ -8,8 +8,9 @@ from functools import partial
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .acceptance import _relative_name
 from .contracts.acceptance import CheckResult, Criterion
 from .contracts.base import EvidenceRef
 from .schemas import ToolResult
@@ -27,12 +28,27 @@ class Rule(Criterion):
     description: str = Field(min_length=1, max_length=1200)
     required: bool = True
     method: Literal["inspect", "execute", "source"]
+    reference_path: str | None = Field(default=None, min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def check_local_reference(self):
+        if self.reference_path is not None:
+            if self.method != "inspect":
+                raise ValueError("本地原件对照请使用 method=inspect 并保留 reference_path。"
+                                 "source 专用于需要亲自打开外部网页的事实核查。")
+            if _relative_name(self.reference_path) != self.reference_path or "\x00" in self.reference_path:
+                raise ValueError("reference_path 须为工作区中原始记录的规范相对路径。")
+        return self
 
 
 class ReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     candidate: str = Field(min_length=1, max_length=160)
     criteria: list[Rule] = Field(default_factory=list, max_length=24)
+
+
+class CandidateLookupError(ValueError):
+    """The requested artifact or independent reviewer is not a valid destination."""
 
 
 class InheritedCriteriaConflict(ValueError):
@@ -61,7 +77,10 @@ REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候
         "description": "新增标准。复核上轮同一已发布原件时，宿主原样加入未通过的必需项；可省略 criteria 以只沿用这些项。首次验收须给出必需标准。",
         "items": {
         "type": "object", "properties": {"id":{"type":"string"}, "description":{"type":"string"},
-            "method":{"type":"string","enum":["inspect","execute","source"]}, "required":{"type":"boolean"}},
+            "method":{"type":"string","enum":["inspect","execute","source"],
+                      "description":"inspect 检查文件，对照本地原件时填写 reference_path；execute 验证实际运行行为；source 须独立打开外部网页核实事实。"},
+            "reference_path":{"type":"string","description":"仅用于 inspect：须对照的本地原始记录的工作区相对路径，应与被审成稿不同。"},
+            "required":{"type":"boolean"}},
         "required":["id","description","method"], "additionalProperties":False}}},
     "required": ["candidate"], "additionalProperties":False}
 SUBMIT_SCHEMA = {"type":"object","properties":{"candidate_version":{"type":"string"},
@@ -128,7 +147,7 @@ class Review:
         return {"target":self.target, "author":self.author, "reviewer":self.reviewer,
                 "kind":self.kind, "probe_parent":self.probe_parent,
                 "state":self.state, "candidate_version":self.version, "files":dict(self.files),
-                "objective":self.objective, "criteria":[c.model_dump() for c in self.criteria],
+                "objective":self.objective, "criteria":[c.model_dump(exclude_none=True) for c in self.criteria],
                 "findings":self.latest.get("results", []), "private_candidate_task":self.draft_task,
                 "host_issue":self.host_issue, **({"publication":self.publication} if self.publication else {})}
 
@@ -210,6 +229,7 @@ class ReviewQueue:
     def __init__(self, required_source_paths=()):
         self.items = {}
         self.candidates = {}
+        self.path_candidates = {}
         self.public_versions = {}
         self.required_source_paths = set(required_source_paths)
         self.source_authors = {}
@@ -242,8 +262,20 @@ class ReviewQueue:
         self.record_author(report["role"], changes)
         paths = set(report["deliverable_paths"]) | {c["path"] for c in changes}
         self.candidates[report["task_id"]] = {p:manifest.get(p) for p in sorted(paths)}
+        # An unchanged file mentioned in somebody else's deliverables must not
+        # reassign its authorship. Track the task that actually published these bytes.
+        for change in changes:
+            path, sha = change["path"], change.get("sha256")
+            if sha and manifest.get(path) == sha:
+                self.path_candidates[path] = (report["task_id"], sha)
+            else:
+                self.path_candidates.pop(path, None)
         for item in self.items.values():
-            if item.state == "passed" and any(manifest.get(p) != v for p,v in item.files.items()):
+            if item.state != "passed":
+                continue
+            references = {e["path"]: e["sha256"] for finding in item.latest.get("results", [])
+                          for e in finding["receipts"] if e["kind"] == "reference"}
+            if any(manifest.get(p) != v for p,v in (item.files | references).items()):
                 item.files = {p:manifest.get(p) for p in item.files}
                 # A reviewer who edits previously approved product bytes cannot
                 # independently sign off their own new version.
@@ -263,15 +295,19 @@ class ReviewQueue:
             return active
         author = next((r for r in reversed(reports) if spec.candidate in {r["task_id"], r["role"]}
                        and not r.get("promoted_candidate")), None)
+        if author is None:
+            binding = self.path_candidates.get(spec.candidate)
+            if binding and self.public_versions.get(spec.candidate) == binding[1]:
+                author = next((r for r in reversed(reports) if r["task_id"] == binding[0]), None)
         publication = None
         if author is None and inherited:
             publication = inherited(spec.candidate)
             if publication:
                 author = publication
         if not author:
-            raise ValueError("请选择本群其他成员产生的候选。找不到与当前文件匹配的同群发布回执，请核对成稿路径或原任务 ID。")
+            raise CandidateLookupError("请选择本群其他成员产生的候选。找不到与当前文件匹配的同群发布回执，请核对成稿路径或原任务 ID。")
         if author["role"] == reviewer:
-            raise ValueError("请选择本群其他成员产生的候选。")
+            raise CandidateLookupError("请选择本群其他成员产生的候选。原作者不能独立验收自己的文件。")
         draft_task = None
         objective = author["objective"]
         probes = {}
@@ -286,7 +322,7 @@ class ReviewQueue:
             if len(inherited_rules) > 24:
                 raise ValueError("该原件的未决必需项超过单次可绑定的 24 项，无法完整重开复核。")
             if conflicts:
-                canonical = [rule.model_dump() for rule in inherited_rules.values()]
+                canonical = [rule.model_dump(exclude_none=True) for rule in inherited_rules.values()]
                 source_hint = ""
                 if self.required_source_paths.intersection(publication["files"]) and not any(
                         r.required and r.method == "source" for r in inherited_rules.values()):
@@ -327,6 +363,12 @@ class ReviewQueue:
                     probes[scope] = probe
         if not files:
             raise ValueError("该交接没有可绑定版本的工件。")
+        for rule in spec.criteria:
+            if rule.reference_path:
+                if not any(path != rule.reference_path and sha for path, sha in files.items()):
+                    raise ValueError("reference_path 须指向成稿以外的本地原始记录；review.candidate 应指定待审成稿。")
+                if self.public_versions and self.public_versions.get(rule.reference_path) is None:
+                    raise ValueError(f"公共工作区找不到本地原始记录 {rule.reference_path}，请核对 reference_path 后重试。")
         existing = self.items.get(author["task_id"])
         required_sources = self.required_source_paths.intersection(p for p, sha in files.items() if sha)
         bound_reviewer = existing.reviewer if existing else reviewer
@@ -374,6 +416,7 @@ class ReviewSession:
             "run_shell": "运行含相关断言的现有测试套件，保留测试框架的逐项结果和真实退出码。",
         }.items() if name in available_tools}
         self.review_notes = set(review_notes)
+        self.reference_paths = {r.reference_path for r in item.criteria if r.reference_path}
         self.private_snapshot_issue = private_snapshot_issue
         self.promotion_issue = promotion_issue
         self.promotion_issue_seen = False
@@ -407,7 +450,7 @@ class ReviewSession:
         receipts = {}
         if self.assessment:
             receipts = {r["path"]: r["sha256"] for finding in self.assessment["results"] for r in finding["receipts"]
-                        if r["kind"] in {"review_note", "source"} and manifest.get(r["path"]) != r["sha256"]}
+                        if r["kind"] in {"review_note", "source", "reference"} and manifest.get(r["path"]) != r["sha256"]}
         issue = manifest_issue(receipts, manifest)
         if not issue:
             if self.private_snapshot_issue:
@@ -449,19 +492,21 @@ class ReviewSession:
             if (obs.ok and obs.source in {"read_file","read_lines"} and path in self.review_notes
                     and meta.get("sha256") and self.progress.project_versions().get(path) == meta["sha256"]):
                 self._add("note:" + path, {"kind":"review_note", "path":path, "sha256":meta["sha256"]}, obs.tool_call_id)
-            if (obs.ok and obs.source in {"read_file", "read_lines"} and path in self.item.files
-                    and meta.get("sha256") and self.item.files[path] == meta["sha256"]):
-                row = {"kind":"read", "path":path, "sha256":meta["sha256"],
+            if obs.ok and obs.source in {"read_file", "read_lines"} and meta.get("sha256"):
+                row = {"path":path, "sha256":meta["sha256"],
                        "position":meta.get("offset",meta.get("start_line",0)),
                        "extent":meta.get("returned_chars",meta.get("returned_lines",0))}
-                self._add("file:" + path, row, obs.tool_call_id)
+                if self.item.files.get(path) == row["sha256"]:
+                    self._add("file:" + path, {"kind":"read", **row}, obs.tool_call_id)
+                if path in self.reference_paths and self.original.get(path) == row["sha256"] and row["extent"] > 0:
+                    self._add("reference:" + path, {"kind":"reference", **row}, obs.tool_call_id)
 
         evidence = self.progress.evidence()
         # Positive and negative test events come from the host's provenance
         # policy. A member printing an opinion cannot mint a check receipt.
         current = self.progress.review_evidence()
         for ref in list(self.receipts):
-            if self.receipts[ref]["kind"] in {"review_note", "source"}:
+            if self.receipts[ref]["kind"] in {"review_note", "source", "reference"}:
                 note = self.receipts[ref]
                 if self.progress.project_versions().get(note["path"]) != note["sha256"]:
                     del self.receipts[ref]
@@ -493,7 +538,7 @@ class ReviewSession:
         # Older clients used literal URLs and paths. A URL that returned two
         # different records must now be disambiguated by its exact receipt.
         matches = [r for r in self.receipts.values() if r["legacy_ref"] == ref]
-        if matches and (len({r["fingerprint"] for r in matches}) == 1 or matches[-1]["kind"] == "read"):
+        if matches and (len({r["fingerprint"] for r in matches}) == 1 or matches[-1]["kind"] in {"read", "reference"}):
             return matches[-1]
         return None
 
@@ -538,6 +583,7 @@ class ReviewSession:
         retained = self.retained_findings()
         kinds = {r["kind"] for r in self.receipts.values()}
         reads = {r["path"] for r in self.receipts.values() if r["kind"] == "read" and r.get("extent", 0) > 0}
+        references = {r["path"] for r in self.receipts.values() if r["kind"] == "reference"}
         required_paths = self.item.required_source_paths - self.item.sourced_files(retained.values()).keys()
         needs = {}
         for rule in self.item.criteria:
@@ -555,6 +601,12 @@ class ReviewSession:
                 missing.extend({"tool": tool} for tool in self.execution_actions)
             elif rule.method == "execute" and not kinds & {"passed_check", "failed_check"}:
                 missing.append({"tool":"run_shell"})
+            elif rule.reference_path:
+                if not reads - {rule.reference_path}:
+                    missing.append({"tool":"read_lines", "paths":sorted(p for p, sha in self.item.files.items()
+                                                                        if sha and p != rule.reference_path)})
+                if rule.reference_path not in references:
+                    missing.append({"tool":"read_lines", "paths":[rule.reference_path]})
             elif rule.method == "inspect" and not kinds & {"read", "passed_check", "review_note"}:
                 missing.append({"tool":"read_lines"})
             if missing:
@@ -619,13 +671,13 @@ class ReviewSession:
         # source report or review note that disappeared requires a fresh check.
         return {g["criterion_id"]: g for g in self.item.latest["results"]
                 if g["verdict"] == "passed" and all(manifest.get(e["path"]) == e["sha256"]
-                    for e in g["receipts"] if e["kind"] in {"read", "source", "review_note"})}
+                    for e in g["receipts"] if e["kind"] in {"read", "source", "review_note", "reference"})}
 
     def context(self):
         retained = list(self.retained_findings())
         return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
                  + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
-                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件，execute 须执行检查。source 核对稿件中的具体论断和亲自打开的原始来源，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
+                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件；标准包含 reference_path 时用 read_lines 或 read_file 分别读成稿和指定本地原始记录，逐项对照实际内容，并在该项同时引用 read 和 reference 短 ID。execute 须执行检查。source 核对稿件中的具体论断和亲自打开的外部网页，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
                 "评审期间候选及工作副本中全部继承文件都须保持原字节，包括旧检查脚本。将临时脚本放入系统临时目录，另写评审附件。"
                 "用 submit_review 提交结构化结果；每项引用宿主回执 ID。变更请求写明责任分类与可执行修改。"
                 "业务标准本身不明确时选择 inconclusive/business。材料：" +
@@ -661,11 +713,17 @@ class ReviewSession:
             raise ValueError("引用了未观察到或不唯一的证据：" + "、".join(r[:160] for r in unknown)
                              + "。从 list_review_evidence 选择相符的短 ID。")
         kinds = {e["kind"] for e in receipts}
+        if rule.reference_path and (result.verdict == "passed" or result.cause == "product"):
+            if not (any(e["kind"] == "reference" and e["path"] == rule.reference_path for e in receipts)
+                    and any(e["kind"] == "read" and e["path"] != rule.reference_path and e.get("extent", 0) > 0
+                            for e in receipts)):
+                raise ValueError(f"本地对照须读取并同时引用候选成稿的 read 回执和 {rule.reference_path} 的 reference 回执。")
         if self.item.kind == "reviewer_probe" and result.cause == "product" and result.verdict == "inconclusive":
             raise ValueError("争议尚未查实时请用 inconclusive/verification；确认产品缺陷才用 changes_requested/product。")
         if rule.method == "source" and (result.verdict == "passed" or result.cause == "product"):
             if not {"read", "source"} <= kinds:
-                raise ValueError("核实事实需要引用所读候选及本次亲自打开的来源。资料不足时标记 inconclusive。")
+                raise ValueError("核实外部事实需要引用所读候选及本次亲自打开的来源（http_get 网页回执）。"
+                                 "仅有本地材料时可标记 inconclusive 并向负责人说明所需取证方法。")
             if (self.item.kind == "reviewer_probe" and not any(r["kind"] == "read"
                     and r.get("extent", 0) > 0 and self.item.probe_product_files.get(r["path"]) == r["sha256"]
                     for r in receipts)):

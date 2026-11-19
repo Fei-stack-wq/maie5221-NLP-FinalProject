@@ -260,6 +260,75 @@ sys.exit(bool(errors))
         self.assertEqual(evidence["url"], url)
         self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(article.encode()).hexdigest())
 
+    def test_a_local_reference_receipt_cannot_vouch_for_an_external_claim(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        url = "https://issuer.example/dispatch"
+        project = self.root / "project"
+        project.mkdir()
+        (project / "dispatch.txt").write_text(label)
+        local = {**RULE, "reference_path":"dispatch.txt"}
+        external = {**RULE, "id":"external", "method":"source"}
+        script = self.start_review()
+        script[3] = tool("delegate_task", assignee="inspector", objective="Compare the local order and verify the issuer.",
+                         review={"candidate":"builder", "criteria":[local, external]})
+        locally_checked = {"criterion_id":"content", "verdict":"passed", "reason":"Local order matches.",
+                           "evidence":["file:" + PATH, "reference:dispatch.txt"]}
+        external_claim = {**locally_checked, "criterion_id":"external"}
+        def decide(claim):
+            return tool("submit_review", candidate_version=version(label), results=[locally_checked, claim])
+        steps = script + [tool("read_file", path="dispatch.txt"), decide(external_claim),
+                          tool("http_get", url=url), decide({**external_claim, "evidence":["file:" + PATH, "source:" + url]}),
+                          {"text":"Checked both records."}, {"text":"Delivered."}]
+        with patch("miniagent.research.fetch", return_value=Page(url, "text/plain", label.encode(), False)):
+            detail, provider = self.execute(steps, workspace_path=str(project))
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertTrue(any("本次亲自打开的来源" in str(messages) for messages, _ in provider.requests))
+        report = next(e["handoff"] for e in detail["room_events"]
+                      if e["kind"] == "member_report" and e["handoff"]["role"] == "inspector")
+        rows = report["native_review"]["assessment"]["results"]
+        self.assertEqual([[e["kind"] for e in r["receipts"]] for r in rows], [["read","reference"], ["read","source"]])
+
+    def test_local_comparison_requires_independent_reads_of_candidate_and_named_reference(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        project = self.root / "project"
+        project.mkdir()
+        record = project / "dispatch.txt"
+        record.write_text("Confirmed destination: old warehouse.\n")
+        (project / "other.txt").write_text("A different record.\n")
+        script = self.start_review()
+        def inspect(method, path):
+            return tool("delegate_task", assignee="inspector", objective="Check the label against the dispatch record.",
+                        review={"candidate":"builder", "criteria":[{**RULE, "method":method, "reference_path":path}]})
+        script[3:4] = [inspect("source", record.name), inspect("inspect", "missing.txt"), inspect("inspect", record.name)]
+        both = submit(label, "passed")
+        both["tool_calls"][0]["arguments"]["results"][0]["evidence"].append("reference:" + record.name)
+        detail, provider = self.execute(script + [
+            tool("read_file", path="other.txt"), submit(label, "passed"),
+            tool("read_lines", path=record.name, start_line=1), both,
+            {"text":"Checked the original record."}, {"text":"Delivered."}], workspace_path=str(project))
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        results = [str(messages) for messages, _ in provider.requests]
+        self.assertTrue(any("本地原件对照请使用 method=inspect" in result for result in results))
+        self.assertTrue(any("找不到本地原始记录 missing.txt" in result for result in results))
+        self.assertTrue(any("须读取并同时引用" in result for result in results))
+        report = next(e["handoff"] for e in detail["room_events"]
+                      if e["kind"] == "member_report" and e["handoff"]["role"] == "inspector")
+        assessment = report["native_review"]["assessment"]
+        receipts = assessment["results"][0]["receipts"]
+        self.assertEqual([(r["kind"], r["path"]) for r in receipts], [("read", PATH), ("reference", record.name)])
+        self.assertEqual(receipts[1]["sha256"], hashlib.sha256(record.read_bytes()).hexdigest())
+
+        # The approved candidate remains byte-identical while another member
+        # publishes an amended original record. Its old comparison must reopen.
+        queue = ReviewQueue()
+        item = Review("build", "builder", "inspector", "Verify the label against its record.",
+                      [Rule.model_validate({**RULE, "reference_path":record.name})], {PATH:receipts[0]["sha256"]})
+        item.apply(assessment, "")
+        queue.items[item.target] = item
+        queue.published({"task_id":"update", "role":"lead", "deliverable_paths":[record.name]},
+                        {**item.files, record.name:"new-original-sha"}, [{"path":record.name, "sha256":"new-original-sha"}])
+        self.assertEqual(item.state, "review")
+
     def test_identical_test_method_failure_does_not_loop_or_ask_user(self):
         finding = submit("Shipment destination: old warehouse. Verified dispatch record.","inconclusive",cause="verification",action="Obtain independent destination evidence.")
         script = self.start_review()+[finding,{"text":"Method inconclusive."},

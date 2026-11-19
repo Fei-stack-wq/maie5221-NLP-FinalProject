@@ -523,6 +523,7 @@ class RAOUnit:
         self.loop_warn = loop_warn
         self.loop_stop = loop_stop
         self.enable_control_tools = enable_control_tools
+        self.delegate_spec = DELEGATE_TOOL
         self.tool_started: Callable[[int, Action], None] | None = None
         self.tool_observed: Callable[[int, Action, Observation], None] | None = None
         self.action_recorder = action_recorder
@@ -533,7 +534,7 @@ class RAOUnit:
                    allowed_write_paths: frozenset[str] | None = None) -> list[ToolSpec]:
         specs = self.registry.specs()
         if self.enable_control_tools:
-            specs += list(CONTROL_TOOLS.values())
+            specs += [self.delegate_spec if name == "delegate_task" else spec for name, spec in CONTROL_TOOLS.items()]
         if allowed_tools is not None:
             specs = [spec for spec in specs if spec.name in allowed_tools]
         if allowed_write_paths is None:

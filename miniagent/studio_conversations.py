@@ -92,13 +92,16 @@ def member_profiles(thread: dict) -> dict[str, dict]:
 
 
 def project_context(thread: dict, history: list[dict]) -> str:
-    role = thread["recipient"]
-    profile = member_profiles(thread)[role]
-    lines = [f"项目会话。你的角色是{profile['name']}（{role}）。", profile["prompt"],
-             "以下是历史公开消息，供理解项目与既有决定。当前用户要求在下一条消息中。",
-             "本轮是只读问答，可用 find_files、search_files、list_dir、read_lines 和 read_file 核实项目，再直接回答。"
-             if thread["intent"] == "question" else
-             "请检查项目工作区并按当前用户要求完成交付。"]
+    if thread.get("superagent"):
+        lines = ["统一工作室对话。下面是历史消息、当前项目的派工回执和可用角色。当前用户要求在下一条消息中。"]
+    else:
+        role = thread["recipient"]
+        profile = member_profiles(thread)[role]
+        lines = [f"项目会话。你的角色是{profile['name']}（{role}）。", profile["prompt"],
+                 "以下是历史公开消息，供理解项目与既有决定。当前用户要求在下一条消息中。",
+                 "本轮是只读问答，可用 find_files、search_files、list_dir、read_lines 和 read_file 核实项目，再直接回答。"
+                 if thread["intent"] == "question" else
+                 "请检查项目工作区并按当前用户要求完成交付。"]
     if thread.get("recovery_source"):
         source = thread["recovery_source"]
         lines.append(f"本轮从上一轮受阻成员 {source['role']} 的项目检查点恢复。已有文件和数据可以核验，上一轮验收仍为失败。")
@@ -122,6 +125,11 @@ def project_context(thread: dict, history: list[dict]) -> str:
         if thread.get("superagent"):
             decisions.extend({"已创建": e["entity"]} for e in turn.get("events", [])
                              if e["kind"] == "studio_entity" and isinstance(e.get("entity"), dict))
+            for dispatch in turn.get("dispatches", [])[-8:]:
+                decisions.append({"派工": dispatch["objective"][:600], "收件人": dispatch["target_name"],
+                                  "目标 ID": dispatch["target_id"], "状态": dispatch["status"],
+                                  "答复节选": dispatch["answer"][:1600], "错误": dispatch.get("error", ""),
+                                  "交付引用": [file["ref"] for file in dispatch["artifacts"][:24]]})
         if decisions:
             entry += "\n" + json.dumps(decisions[-12:], ensure_ascii=False)
         cost = len(entry.encode("utf-8")) + 1

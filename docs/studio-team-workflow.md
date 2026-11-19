@@ -155,6 +155,8 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 负责人把已交付的候选交给群内另一位成员时，可在 `delegate_task` 中提交 `review`。候选可用作者的任务 ID 或该角色最近一次公开交付定位。每条标准包含稳定 ID、描述、是否必需以及取证方式。检查文字内容、合同或版面可选 `inspect`；核对程序行为或可计算结果选 `execute`。宿主绑定原作者任务、完整候选文件的 SHA-256 清单及其版本摘要。普通讨论和仅需交付的委派维持原有流程。
 
+如果要核对通知中的日期是否符合工作区的原始记录，负责人可给这项标准设置 `"method": "inspect", "reference_path": "change.txt"`。评审员亲自读取成稿和指定原件，在该项同时引用两次读取的回执，并说明日期是否相符。两份文件各自绑定路径和 SHA-256，其中一份更新后需要复核。外部事实核查使用 `source`，评审员须亲自打开原始网页，同时引用成稿与网页回执。文件版本匹配借鉴了 in-toto 对指定路径和摘要的检查。[in-toto MATCH 实现](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L645-L751) · [规则测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549-L743)
+
 ```json
 {
   "assignee": "qa",
@@ -315,10 +317,26 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 ### Superagent 的统一对话与工作室工具
 
-统一助手沿用单聊的模型、工具注册表、文件工作区、运行轨迹和任务状态。只有从统一入口创建的对话会获得 `list_studio_roles`、`create_studio_role` 和 `create_studio_group`。已保存的角色可立即用于私聊，或作为群聊成员与负责人。普通群成员使用其原有权限。
+统一助手沿用单聊的模型、工具注册表、文件工作区、运行轨迹和任务状态。首页获得查询角色、创建角色或群、向目标派工及读取已交付文件的工作室工具。已保存的角色可立即用于私聊，或作为群聊成员与负责人。群内成员使用各自的执行工具和已授权的上下文。
 
 `GET /api/superagent` 返回固定会话的 `conversation_id` 和当前 `head_run_id`，首条消息之前两者为 null。`POST /api/superagent/messages` 接受 UUID `request_id`、文本 `message`、当前 `parent_run_id` 及可选的 `workspace_path`。首次发送可省略父轮或传 null。刷新后可以按返回的运行 ID 读取原有详情接口。发送方复用相同请求 ID 可以找回已有运行。来自多个页面的不同消息争用同一父轮时，后到的页面取得 `stale_head`，应先同步对话。工作进程异常退出会释放该轮的 SQLite 写锁。用户随后可以发起新一轮，已执行过的工具不会自动重放。
 
 每次成功创建会写入 `studio_entity` 事件，内含类型、名称和实体 ID。原生空群的 `mode` 为 `room`，状态为 `ready`，轮数为零。在首次发送消息前，用户可以打开、刷新和检查成员。第一次消息会使用这个群实际保存的角色与负责人。用户明确切换本地目录时，统一助手保留聊天历史，重新取所选目录的文件。新群默认使用创建时的项目目录，第一条真实消息再从磁盘读取工作副本。
 
 工具定义参考 OpenAI Agents SDK 将工具名、参数 schema 和当前运行的执行上下文绑定，在参数不匹配或执行失败时给模型返回可修正的错误。Studio 使用现有 ToolRegistry 和服务端角色、群聊存储完成这些操作。参考了接口设计，未复制上游源码。上游采用 MIT 许可证。[函数工具调用实现](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tool.py#L2809-L2851) · [错误输入和执行异常测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_function_tool.py#L642-L665) · [统一对话端到端测试](../tests/test_studio_superagent.py)
+
+### 跨会话派工
+
+`list_studio_targets` 列出工作室可接单的角色和当前项目的命名群。角色目录只含公开职责，群目录列出成员、负责人和稳定 ID。模型用 `dispatch_studio_task` 提交目标类型、ID、整项任务需要的参与者、工作说明和可选的输入与验收文件。宿主检验成员与项目归属。单人私聊只能承接该角色能够独立完成的工作。命名群使用已保存的负责人和真实成员。
+
+每个派工有持久的 `dispatch_id` 和预留的子运行 ID。来源轮成功收尾并释放工作位置后，调度器创建原生私聊或群任务。相同来源轮对同一目标重复提交同一工作会返回同一回执。目标会话忙时保留队列项。进程重启后按已发布运行的来源身份重新关联。来源轮失败或取消时，尚未发出的派工会记录原因。角色接单沿用该助手在本项目的派工私聊，个人另开的私聊独立保存。
+
+两人群里，如果负责人也负责撰稿或汇总，可以认领具体文件，在单独的执行任务中写入并交接。另一位成员须实际参与，作者和独立验收人分开记录。按文件名发起正式复核时，宿主核对当前版本的生产者和 SHA。本轮显式转入的角色私聊原件也可按文件路径定位原作者；发生变更后，须依据新版本重新核对。
+
+来源回合的 `dispatches` 列出收件者、工作说明、状态、子运行与会话 ID、待答问题、答复和交付文件。每次派工都有独立的原生运行和验收记录，预算亦按运行计量。要求文件存在的验收只证明该项文件检查通过，判断其内容可采用独立成员复核和已有的验收规则。主页可继续接收新消息，并刷新较早回合的待办。
+
+选了本机目录时，接单方从该项目目录签出工作副本。显式转交的工作区文件或历史交付按项目相对路径放入子工作区，同名冲突会报告。成功或未配置独立验收的子运行收尾时，只发布负责人的公开工作区里新增、修改或明确指定验收的文件。交付封存到原生 handoff 快照。后续工作看得到相对路径、SHA-256 和 `dispatch:<UUID>/<项目路径>` 引用。打开或转交时核对内容哈希。模型可通过 `list_studio_deliveries` 查找本项目记录，通过 `read_studio_delivery` 阅读实际文本。
+
+作者修订后，可以把新版本再交给原评审员。宿主会查出评审员上次收到的版本，仅当当前私有副本仍与该版本逐字节相同、新版来自同一上游会话且轮次更晚，才替换本轮输入。评审员另行编辑过的文件、异源同名文件、用户本地修改都会触发冲突。版本覆盖规则参考 Git 的双树合并，并增加了派工身份核对。[Git 版本选择](https://github.com/git/git/blob/v2.47.0/unpack-trees.c#L2935-L2941) · [工作副本保留测试](https://github.com/git/git/blob/v2.47.0/t/t1001-read-tree-m-2way.sh#L282-L303) · [工作室四轮回归](../tests/test_studio_route_revisions.py)
+
+开源参照采用 OpenAI Agents SDK 的管理者调用专家并提取本次结果的模式，以及按实际能力向模型开放工具的做法。Studio 将专家执行落到原生持久会话，使单执行位置也能完成交接。Temporal SDK 的稳定运行身份与重复启动处理用于核对本地崩溃恢复语义。当前实现沿用项目原有运行时与 SQLite。[专家调用实现](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L646-L692) · [当前调用结果测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L896-L938) · [工具可见性](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_preparation.py#L98-L141) · [Temporal 重复运行处理](https://github.com/temporalio/sdk-python/blob/e64f9dd3b3b513da6676caf5c1a6cbbb36119503/temporalio/client/_impl.py#L201-L221) · [重复运行测试](https://github.com/temporalio/sdk-python/blob/e64f9dd3b3b513da6676caf5c1a6cbbb36119503/tests/test_client.py#L111-L145)

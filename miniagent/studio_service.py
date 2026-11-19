@@ -37,6 +37,7 @@ from .contracts.tasks import AttemptRecord, TaskRecord
 from .metrics import Tracer, render_report, summarize
 from .orchestrator import Orchestrator
 from .providers import DeepSeekProvider, ScriptedProvider
+from .rao import StepPolicy
 from .sandbox import Sandbox
 from .task_service import TaskService
 from .task_store import StoreTransaction, TaskStore, _schema
@@ -44,9 +45,11 @@ from .tools import build_default_registry
 from .project_data import (PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, SQLITE_SIDECARS, is_database, is_png,
                            supported_project_file, validate_project_data)
 from .studio_superagent import ASSISTANT_INSTRUCTIONS, StudioAssistant
+from .studio_dispatch import StudioDispatch
 from .studio_roles import RoleSession, StudioRoles, knowledge_project
 from .studio_role_memory import RoleMemoryStore
 from . import studio_workspace
+from . import studio_route_results
 from .studio_discussion import RoomDiscussion
 from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
@@ -155,7 +158,7 @@ def _write_json(directory: Path, name: str, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
-class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
+class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch):
     def __init__(self, runs_dir: Path | str, settings: Settings, *, max_workers: int = 2):
         if type(max_workers) is not int or not 1 <= max_workers <= 8:
             raise ValueError("max_workers must be between 1 and 8")
@@ -176,6 +179,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
         self._answers = threading.Condition(self._lock)
         self._questions = {}
         self._closed = False
+        self._drain_studio_dispatches()
 
     def profiles(self):
         data, truncated = _read_file(self.runs_dir, "studio-profiles.json", 2 * 1024**2, missing=True)
@@ -409,7 +413,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
         with self._lock:
             owned = path.name in self._active
         states = {task["status"] for task in roots}
-        if not owned and meta.get("state") in {"running", "queued"} and meta.get("thread", {}).get("superagent"):
+        if (not owned and meta.get("state") in {"running", "queued"}
+                and (meta.get("thread", {}).get("superagent") or meta.get("studio_dispatch"))):
             owned = self._assistant_elsewhere(path)
         if meta.get("mode") == "room":
             status = "ready"
@@ -584,7 +589,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                 answer_text = answer.decode("utf-8", errors="ignore")
             state = meta.get("state", "interrupted")
             if state in {"running", "queued"} and directory.name not in self._active:
-                if not (thread.get("superagent") and self._assistant_elsewhere(directory)):
+                if not ((thread.get("superagent") or meta.get("studio_dispatch")) and self._assistant_elsewhere(directory)):
                     state = "interrupted"
             if thread.get("inherit_files") is False:
                 artifact_id = None
@@ -611,7 +616,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                     changed = set(delivered.get("files", []))
                     prefix = "agents/" + thread["recipient"] + "/"
                     attachments = [f for f in attachments if f["path"].removeprefix(prefix) in changed]
-            turns.append({"artifacts": attachments, "workspace_delivery": meta.get("workspace_delivery"),
+            dispatches = (studio_route_results.project_dispatches(self, directory.name)
+                          if with_answers and thread.get("superagent") else [])
+            turns.append({**({"dispatches": dispatches} if thread.get("superagent") and with_answers else {}),
+                          "artifacts": attachments, "workspace_delivery": meta.get("workspace_delivery"),
                           "workspace_member_delivery": meta.get("workspace_member_delivery"),
                           "recovery_source": thread.get("recovery_source"),
                           "run_id": directory.name, "user": meta.get("title", ""),
@@ -908,10 +916,12 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
             connection.close()
 
 
-    def start(self, payload: Any, *, superagent: bool = False) -> dict:
+    def start(self, payload: Any, *, superagent: bool = False, routed: dict | None = None) -> dict:
         request = self._request(payload)
         if superagent:
             request["superagent"] = True
+        if routed:
+            request["studio_dispatch"] = routed
         fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         with self._lock, self._admission():
             if self._closed:
@@ -929,7 +939,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                 raise StudioError("统一对话已更新，请读取最新消息后再发送。", "stale_head", 409)
             if request["mode"] in {"single", "team"} and not self.settings.api_key.strip():
                 raise StudioError("本机尚未配置 DeepSeek API key，请先配置后启动工作室。", "provider_unavailable", 409)
-            run_id = "studio-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
+            run_id = routed["child_run_id"] if routed else "studio-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
             thread = self._next_turn(run_id, request["conversation"], mode=request["mode"]) if "conversation" in request else None
             if superagent:
                 thread["superagent"] = True
@@ -1004,13 +1014,18 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                                 copy_project(source, author, target, _EXTENSIONS, secret=self.settings.api_key)
                         except SnapshotError as exc:
                             raise StudioError(str(exc), "unsupported_snapshot", 409) from None
+                if routed:
+                    meta["studio_dispatch"] = {key: routed[key] for key in ("dispatch_id", "source_run_id")}
+                    studio_route_results.prepare_inputs(self, routed["source_run_id"], staged,
+                                                        self._workspace(staged, thread), routed["input_files"],
+                                                        inherited_from=thread.get("base_run_id") if local is None else None)
                 _write_json(staged, "studio.json", meta)
                 service = TaskService(TaskStore(staged / "tasks.sqlite3"))
                 service.create(task_id=run_id, creation_key=("orchestration:" if request["mode"] in {"team", "team-demo"} and not thread else "root:") + run_id,
                                objective=request["objective"], owner=assignee, assignee=assignee)
                 staged.rename(path)
                 published = True
-                if thread and thread.get("superagent"):
+                if routed or (thread and thread.get("superagent")):
                     self._assistant_turns[run_id] = self._claim_assistant_turn(path)
                 self._active.add(run_id)
                 self._cancellations[run_id] = threading.Event()
@@ -1199,7 +1214,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                 if product:
                     raise ValueError("指定版本已有独立验收确认的产品缺陷。请安排作者修订并发布新版本。")
                 candidate["unresolved"].extend(r for r in findings if r not in candidate["unresolved"])
-        return candidate
+        return candidate or studio_route_results.imported_review_candidate(self, crew, reference, manifest, seen)
 
     def _load_prior_diagnostics(self, crew, thread):
         parent = thread.get("parent_run_id")
@@ -1355,6 +1370,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                     msg = str(exc) if isinstance(exc, ValueError) else "写入本地工作区失败，本轮产物保存在聊天中。"
                     outcome = {"state": "failed", "error_code": "workspace_delivery", "error": msg,
                                "workspace_delivery": {"status": "failed", "message": msg}}
+            if meta.get("studio_dispatch") and outcome["state"] in {"completed", "unverified"}:
+                studio_route_results.capture_delivery(self, path, meta)
         except Exception as exc:
             # Only an exception category is exposed; messages may contain URLs,
             # credentials or arbitrary tool output.
@@ -1378,6 +1395,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                     self._active.discard(run_id)
                     self._cancellations.pop(run_id, None)
                     self._slots.release()
+            self._drain_studio_dispatches()
 
     def _execute(self, run_id: str, request: dict) -> dict:
         # Import the host-owned demo fixtures lazily to avoid the CLI entrypoint's
@@ -1468,9 +1486,24 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                     context += "\n" + crew.instructions()
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
                 registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
+                prompt = COORDINATOR_PROMPT if crew else None
+                step_policy = crew.coordinator_policy if crew else None
                 if thread.get("superagent") and not question:
                     self.add_superagent_tools(registry, run_id)
-                    context = ASSISTANT_INSTRUCTIONS + "\n" + context
+                    prompt = ASSISTANT_INSTRUCTIONS
+                    targets = self.studio_routing_targets(run_id)
+                    context += "\n本项目可派工的公开目录（有后续页时可搜索或翻页）\n" + json.dumps(targets, ensure_ascii=False)
+                    deliveries = studio_route_results.delivery_catalog(self, metadata)
+                    if deliveries["files"]:
+                        context += ("\n以下是本项目实际收到的交付原件，保存在各收件方的运行目录，"
+                                    "当前目录为空也能访问。用户要求使用或复核原文件时，把匹配的 ref 原样放入派工"
+                                    " input_files。需要读正文用 read_studio_delivery，找其他文件用 list_studio_deliveries。"
+                                    "请保持原件，不要重建或凭摘要转述。\n" + json.dumps(deliveries, ensure_ascii=False))
+                    # The workspace assistant dispatches durable jobs. Only a room
+                    # coordinator can service the low-level delegate_task control.
+                    assistant_policy = StepPolicy("work", allowed_tools=frozenset(registry.names()) | {"ask_human", "abort_task"})
+                    def step_policy(_state, _budget):
+                        return assistant_policy
                 if crew:
                     registry.add(crew.diagnostics.tool())
                 agent = Agent(name=recipient, provider=provider, registry=registry,
@@ -1480,13 +1513,15 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant):
                                              if "conversation" in request else None),
                               delegate_handler=crew.delegate if crew else None,
                               human_request_gate=crew.human_request_gate if crew else None, should_cancel=should_cancel)
+                if crew:
+                    agent.unit.delegate_spec = crew.delegate_spec
                 if question:
                     agent.unit.enable_control_tools = False
                 result = agent.run(request["objective"], task_id=run_id, acceptance=acceptance,
                                    budget=crew.budget if crew else None, conversation_context=context,
-                                   system_prompt=COORDINATOR_PROMPT if crew else None,
+                                   system_prompt=prompt,
                                    before_answer=crew.before_answer if crew else None,
-                                   step_policy=crew.coordinator_policy if crew else None,
+                                   step_policy=step_policy,
                                    on_step=crew.observe_coordinator if crew else None)
                 if result.answer:
                     # Write the public final answer only. Keep reasoning, raw

@@ -99,6 +99,25 @@ button.assistant-folder:hover {color:#8f4b35;text-decoration:underline}
 .studio-entity strong {font-size:14px;font-weight:550}
 .entity-open {display:inline-flex;align-items:center;gap:4px;font-size:12px;margin-left:9px;color:#5b634e}
 .entity-open svg {width:13px;height:13px}
+.dispatch-card {margin:14px 0;padding:12px 14px;border:1px solid var(--line);border-inline-start:3px solid #b0ac96;border-radius:7px;background:var(--surface);min-width:0}
+.dispatch-heading,.dispatch-recipient,.dispatch-heading a,.dispatch-status {display:flex;align-items:center}
+.dispatch-heading {gap:8px 12px;flex-wrap:wrap}
+.dispatch-recipient {gap:7px;min-width:0;color:#45483b}
+.dispatch-recipient strong {font-size:14px;font-weight:600}
+.dispatch-recipient svg {width:15px;height:15px;flex:none}
+.dispatch-status {gap:5px;color:#65665c;font-size:12px}
+.dispatch-status::before {content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.dispatch-status[data-status=running],.dispatch-status[data-status=waiting_user] {color:#865038}
+.dispatch-status[data-status=completed] {color:#4c6749}
+.dispatch-status[data-status=failed],.dispatch-error {color:#963f34}
+.dispatch-heading a {margin-inline-start:auto;gap:3px;color:#6c553e;font-size:12px}
+.dispatch-heading a:hover {text-decoration:underline}
+.dispatch-heading a svg {width:12px;height:12px}
+.dispatch-objective,.dispatch-error {margin:6px 0 0;font-size:13px;line-height:1.65;white-space:pre-wrap}
+.dispatch-objective {color:var(--muted)}
+.dispatch-answer {border-top:1px solid var(--line);margin-top:10px;padding-top:8px;font-size:14px;line-height:1.65}
+.dispatch-answer pre {max-width:100%;overflow:auto}
+.dispatch-card .turn-files,.dispatch-card .human-form {margin-bottom:0}
 @media(max-width:900px) {
  .assistant-examples {gap:4px}.assistant-examples button {padding-inline:6px}.example-go {display:none}
 }
