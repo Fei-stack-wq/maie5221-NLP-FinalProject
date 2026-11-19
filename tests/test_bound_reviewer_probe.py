@@ -236,6 +236,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
         steps = self.start_bound_review()
         finding = steps[-2]["tool_calls"][0]["arguments"]["results"][0]
         finding.update(verdict="inconclusive", cause="verification",
+                       evidence=["file:" + PATH, "fail:" + BAD_SCOPE],
                        action="Continue independent verification with the corrected computation.")
         steps[-1] = {"text": "The earlier computation was mistaken; the product criterion remains under review."}
         final_finding = bound_submission()
@@ -254,6 +255,80 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.assertTrue(reports[1]["evidence"]["failed_check_details"], "Historical diagnostics remain visible.")
         self.assertFalse(provider.probe_contexts)
         self.assertFalse(any(r.get("native_review", {}).get("kind") == "reviewer_probe" for r in reports))
+
+    def test_inconclusive_comparison_returns_peer_evidence_to_original_reviewer_for_new_signature(self):
+        reference = "reference.txt"
+        rule = {"id":"C1", "method":"inspect", "reference_path":reference,
+                "description":"The quantity on the shipment must equal the original dispatch."}
+        reference_body = "10"
+        compare = ("from pathlib import Path\nqty = int(Path('delivery.txt').read_text().split('quantity: ')[1].split()[0])\n"
+                   "expected = int(Path('reference.txt').read_text())\nassert qty == expected\nprint('PASS shipment matches dispatch')\n")
+        original = self.start_bound_review(bad_probe=BAD_PROBE, fixed_probe=compare)
+        original[3]["tool_calls"][0]["arguments"]["review"] = {"candidate":PATH, "criteria":[rule]}
+        original.insert(-4, tool("read_file", path=reference))
+        findings = original[-2]["tool_calls"][0]["arguments"]["results"]
+        findings[0].update(criterion_id="C1", verdict="inconclusive", cause="verification", reason="The original probe added ten.",
+                           action="Independently check the disputed calculation against the original dispatch.")
+        findings[0]["evidence"].append("reference:" + reference)
+        original[-1] = {"text":"[BLOCKED] The conflicting executed checks need an independent measurement."}
+        steps = [tool("delegate_task", assignee="lead", objective="Record the initial dispatch.", deliverable_paths=[reference]),
+                 write(reference, reference_body), {"text":"Recorded."}] + original
+        peer = self.peer_steps()
+        original_finding = {"criterion_id":"original_C1", "verdict":"passed", "reason":"Read the label and original ten-unit dispatch.",
+                            "evidence":["file:" + PATH, "reference:" + reference]}
+        peer[-1]["_extra_findings"] = [original_finding]
+        # Reading the report, then a good assertion on the label alone, cannot
+        # replace the explicitly bound original comparison.
+        dual = {**peer[-1], "_probe_finding":{**peer[-1]["_probe_finding"], "evidence":["pass:" + scope(compare)]}}
+        steps += peer + [tool("read_file", path=reference), peer[-1], tool("run_python", code=compare), dual,
+                         {"text":"I independently adjudicated the competing checks."}]
+        final = {"criterion_id":"C1", "verdict":"passed", "reason":"The remeasured shipment matches the frozen dispatch.",
+                 "evidence":["file:" + PATH,"reference:" + reference,"pass:" + scope(compare)]}
+        steps += [tool("delegate_task", assignee="inspector", objective="Re-sign C1 against its original reference."),
+                  tool("read_file", path=PATH), tool("read_file", path=reference), tool("run_python", code=compare),
+                  tool("submit_review", candidate_version=product_version(), results=[final]), {"text":"Delivered."}]
+        detail, reports, provider = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        original, peer, final = [r for r in reports if r.get("native_review")]
+        self.assertEqual([r["role"] for r in (original, peer, final)], ["inspector","arbiter","inspector"])
+        self.assertEqual([r["native_review"]["assessment"]["verdict"] for r in (original, peer, final)],
+                         ["inconclusive","passed","passed"])
+        self.assertEqual(original["native_review"]["candidate_version"], final["native_review"]["candidate_version"])
+        result = next(x for x in peer["native_review"]["assessment"]["results"] if x["criterion_id"] == "original_C1")
+        self.assertEqual([(r["kind"], r["path"]) for r in result["receipts"]], [("read", PATH), ("reference", reference)])
+        evidence = final["native_review"]["peer_recheck"]
+        self.assertEqual((evidence["review_task"], evidence["evaluator"]), (peer["task_id"], "arbiter"))
+        self.assertEqual(evidence["reference_files"], {reference:hashlib.sha256(reference_body.encode()).hexdigest()})
+        self.assertEqual([e["text"] for e in detail["room_events"] if e["kind"] == "reviewer_probe_resolved"],
+                         ["probe_corrected_pending_product_review"])
+        self.assertIn("同时取值于绑定的对照原件 " + reference, str(provider.requests))
+
+    def test_unrelated_passing_probe_cannot_escalate_an_inconclusive_product_finding(self):
+        unrelated = "assert 4 == 2 + 2\nprint('PASS arithmetic')\n"
+        steps = self.start_bound_review(fixed_probe=unrelated)
+        finding = steps[-2]["tool_calls"][0]["arguments"]["results"][0]
+        finding.update(verdict="inconclusive", cause="verification", action="Have another person check the label.")
+        steps += [{"text":"[BLOCKED] The positive arithmetic result does not validate the actual label."}]
+        detail, reports, _ = self.run_steps(steps)
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        signed = reports[-1]["native_review"]["assessment"]
+        self.assertEqual(signed["verdict"], "inconclusive")
+        receipts = signed["results"][0]["receipts"]
+        self.assertEqual({r["kind"] for r in receipts}, {"read", "passed_check", "failed_check"})
+        self.assertFalse(next(r for r in receipts if r["kind"] == "passed_check").get("asserted_inputs"))
+        self.assertFalse(any(e["kind"] == "reviewer_probe_pending" for e in detail["room_events"]))
+
+    def test_inconclusive_source_without_a_fetched_source_stays_with_original_reviewer(self):
+        steps = self.start_bound_review()
+        steps[3]["tool_calls"][0]["arguments"]["review"]["criteria"] = [SOURCE_RULE]
+        finding = steps[-2]["tool_calls"][0]["arguments"]["results"][0]
+        finding.update(verdict="inconclusive", cause="verification", action="Acquire the missing external dispatch.")
+        steps += [{"text":"[BLOCKED] The issuer has not been inspected."}]
+        detail, reports, _ = self.run_steps(steps, required_source_review_paths=[PATH])
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        signed = reports[-1]["native_review"]["assessment"]
+        self.assertEqual(signed["verdict"], "inconclusive")
+        self.assertFalse(any(e["kind"] == "reviewer_probe_pending" for e in detail["room_events"]))
 
     def test_original_reviewer_cannot_be_selected_to_sign_its_own_probe(self):
         steps = self.start_bound_review() + self.peer_steps(assignee="inspector") + [

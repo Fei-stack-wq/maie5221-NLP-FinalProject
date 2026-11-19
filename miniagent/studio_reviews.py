@@ -115,7 +115,9 @@ class Review:
     probe_parent: str | None = None
     probe_support: list = field(default_factory=list)
     probe_product_files: dict = field(default_factory=dict)
+    probe_reference_inputs: dict = field(default_factory=dict)
     comparison_targets: set[str] = field(default_factory=set)
+    peer_recheck: dict = field(default_factory=dict)
 
     def compare_with(self, reference):
         return (self.comparison_targets or {p for p, sha in self.files.items() if sha}) - {reference}
@@ -154,7 +156,8 @@ class Review:
                 "state":self.state, "candidate_version":self.version, "files":dict(self.files),
                 "objective":self.objective, "criteria":[c.model_dump(exclude_none=True) for c in self.criteria],
                 "findings":self.latest.get("results", []), "private_candidate_task":self.draft_task,
-                "host_issue":self.host_issue, **({"publication":self.publication} if self.publication else {})}
+                "host_issue":self.host_issue, **({"publication":self.publication} if self.publication else {}),
+                **({"peer_recheck":self.peer_recheck} if self.peer_recheck.get("candidate_version") == self.version else {})}
 
     def briefing(self):
         # Prompts need actionable gaps and an immutable version. The complete
@@ -167,6 +170,8 @@ class Review:
                  "pending_criteria": [r["criterion_id"] for r in pending],
                  "findings": [{k: r.get(k) for k in ("criterion_id", "verdict", "cause", "action", "reason")}
                               for r in pending]}
+        if recheck := facts.pop("peer_recheck", None):
+            brief["peer_recheck"] = recheck
         facts["files"] = dict(list(self.files.items())[:32])
         facts["files_total"] = len(self.files)
         if any(rule.reference_path for rule in self.criteria):
@@ -482,6 +487,8 @@ class ReviewSession:
             receipts = {r["path"]: r["sha256"] for finding in self.assessment["results"] for r in finding["receipts"]
                         if r["kind"] in {"review_note", "source", "reference"} and manifest.get(r["path"]) != r["sha256"]}
         issue = manifest_issue(receipts, manifest)
+        if not issue and self.item.peer_recheck.get("candidate_version") == self.item.version:
+            issue = manifest_issue(self.item.peer_recheck["reference_files"], manifest)
         if not issue:
             if self.private_snapshot_issue:
                 issue = self.private_snapshot_issue()
@@ -571,12 +578,47 @@ class ReviewSession:
                     return
             self.progress.require_handoff("结构化验收结果已记录")
 
-    def reviewer_failures(self, results):
+    def disputed_verification(self, results):
+        """Every unresolved required finding must present a checkable conflict on these exact inputs."""
+        rules = {r.id:r for r in self.item.criteria if r.required}
+        covered_sources = set(self.item.sourced_files(results))
+        for finding in results:
+            rule = rules.get(finding["criterion_id"])
+            if not rule or finding["verdict"] == "passed":
+                continue
+            if (finding["verdict"], finding["cause"]) != ("inconclusive", "verification"):
+                return False
+            receipts = finding["receipts"]
+            reads = {r["path"]: r["sha256"] for r in receipts if r["kind"] == "read" and r.get("extent", 0) > 0
+                     and self.item.files.get(r["path"]) == r["sha256"]}
+            if rule.reference_path:
+                if not reads.keys() & self.item.compare_with(rule.reference_path) or not any(
+                        r["kind"] == "reference" and r["path"] == rule.reference_path
+                        and self.original.get(r["path"]) == r["sha256"] for r in receipts):
+                    return False
+            if rule.method == "source":
+                if not reads or not any(r["kind"] == "source" for r in receipts):
+                    return False
+                covered_sources.update(reads)
+            if (rule.method == "inspect" and not reads) or not any(r["kind"] == "failed_check" for r in receipts):
+                return False
+            targets = self.item.compare_with(rule.reference_path)
+            if not any(r["kind"] == "passed_check" and r.get("asserted")
+                       and any(path in targets and self.item.files.get(path) == sha
+                               for path, sha in r.get("asserted_inputs", {}).items())
+                       and (not rule.reference_path or
+                            r.get("asserted_inputs", {}).get(rule.reference_path) == self.original[rule.reference_path])
+                       for r in receipts):
+                return False
+        return self.item.required_source_paths <= covered_sources
+
+    def reviewer_failures(self, results, *, include_verification=False):
         """A public product judgment may dispute only explicitly cited, transferable failures."""
         if not self.reviewer_task or not (failed := self.progress.failed_checks()):
             return {}, ""
         probes = self.progress.inline_failures()
-        cited = {e["receipt_id"] for finding in results if finding["verdict"] == "passed"
+        cited = {e["receipt_id"] for finding in results if finding["verdict"] == "passed" or
+                 (include_verification and finding["verdict"] == "inconclusive" and finding["cause"] == "verification")
                  for e in finding["receipts"] if e["kind"] == "failed_check"}
         details = {r["scope_id"]: r for r in self.progress.evidence()["failed_check_details"]}
         disputes, outstanding = {}, []
@@ -705,15 +747,18 @@ class ReviewSession:
             if missing:
                 needs[rule.id] = missing
             if self.item.kind == "reviewer_probe" and rule.id.startswith("probe_") and rule.method == "execute":
-                if not any(self._product_assertion(r) for r in self.receipts.values()):
-                    needs[rule.id] = [{"tool":"run_python", "paths":sorted(self.item.probe_product_files),
+                if not any(self._product_assertion(r, rule) for r in self.receipts.values()):
+                    references = self.item.probe_reference_inputs.get(rule.id, {})
+                    needs[rule.id] = [{"tool":"run_python", "paths":sorted(self.item.probe_product_files.keys() | references.keys()),
                         "reason":"断言须检查冻结产品实际数据；也可用 run_browser 打开冻结本地 file URL 后对该 page 执行 expect/assert。无关 PASS 不裁决原失败。"},
                         {"tool":"run_browser"}]
         return needs
 
-    def _product_assertion(self, receipt):
+    def _product_assertion(self, receipt, rule):
+        references = self.item.probe_reference_inputs.get(rule.id, {})
         return (receipt.get("kind") == "passed_check" and receipt.get("asserted")
-                and any(self.item.probe_product_files.get(path) == sha
+                and references.items() <= receipt.get("asserted_inputs", {}).items()
+                and any(path not in references and self.item.probe_product_files.get(path) == sha
                         for path, sha in receipt.get("asserted_inputs", {}).items()))
 
     def guidance(self, *, show_examples=True):
@@ -832,8 +877,10 @@ class ReviewSession:
                     not any(r["kind"] == "passed_check" and r.get("asserted") for r in receipts)):
                 raise ValueError("原临时探针的独立复核需要实际断言结果，进程正常退出只能证明运行完成。")
             if (self.item.kind == "reviewer_probe" and rule.id.startswith("probe_") and rule.method == "execute"
-                    and not any(self._product_assertion(r) for r in receipts)):
-                raise ValueError("原失败的裁决必须执行依赖冻结产品实际内容的断言；空断言或其他检查的 PASS 不足以核销该 scope。")
+                    and not any(self._product_assertion(r, rule) for r in receipts)):
+                references = self.item.probe_reference_inputs.get(rule.id, {})
+                hint = "，同时取值于绑定的对照原件 " + "、".join(references) if references else ""
+                raise ValueError("原失败的裁决必须执行依赖冻结产品实际内容的断言" + hint + "；空断言或其他检查的 PASS 不足以核销该 scope。")
             if result.cause or result.action:
                 raise ValueError("通过项不应分派修复。")
             if rule.method == "execute" and "passed_check" not in kinds or not kinds & {"read","passed_check","review_note"}:
