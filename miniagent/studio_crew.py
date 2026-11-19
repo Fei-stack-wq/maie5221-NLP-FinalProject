@@ -625,8 +625,10 @@ class RoomCrew:
         if (not draft["checkpoint"] or not draft["manifest"]
                 or set(probes) != set(draft["failed_checks"]) or len(probes) > 24):
             return False
-        peers = [p for p in dict.fromkeys([*self.plan_order, *self.profiles])
-                 if p not in {self.lead, parent.reviewer, parent.author}]
+        # The coordinator may adjudicate in an isolated member task when
+        # someone else authored the product and someone else signed the probe.
+        candidates = [*self.plan_order, *(p for p in self.profiles if p != self.lead), self.lead]
+        peers = [p for p in dict.fromkeys(candidates) if p not in {parent.reviewer, parent.author}]
         if not peers:
             parent.host_issue = "原评审引用的失败检查需要独立于产品作者和检查作者的裁决者，当前没有合格成员；保留原失败证据，不能自审通过。"
             return False
@@ -1144,9 +1146,10 @@ class RoomCrew:
                 return self._observation(False, "向协作者提供项目版本失败：" + str(exc))
         review = self._next_review()
         if role == self.lead:
-            # A returned candidate already carries the author's exact file contract.
-            bound_repair = review and review.state == "repair" and review.owner == role and review.files
-            if not (payload.get("review") or bound_repair or payload.get("deliverable_paths") or self.read_only
+            # A bound repair or review already supplies the exact input files
+            # and standards; an adjudicator can sign without inventing a file.
+            bound_work = review and review.state in {"repair", "review"} and review.owner == role and review.files
+            if not (payload.get("review") or bound_work or payload.get("deliverable_paths") or self.read_only
                     or role in self.thread.get("addressed_roles", [])):
                 peers = [name for name in self.profiles if name != self.lead]
                 hint = ("请在 deliverable_paths 列出负责人承担的具体文件；独立验收可交给其他成员："

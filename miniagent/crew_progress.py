@@ -48,6 +48,44 @@ _MUTATORS = {"search_sources", "http_get", "run_python", "run_shell", "poll_proc
 _READER = {"open", "read_text", "read_bytes"}
 _SCAN_FILES = 1000
 _SCAN_BYTES = 20 * 1024 * 1024
+_EDIT_SAMPLE_BYTES = 128 * 1024
+
+
+def _small_text_edit(old: bytes, new: bytes) -> bool:
+    """Bound the changed regions, including short substitutions on separate lines."""
+    size = max(len(old), len(new))
+    allowance = min(512, max(12, size // 50))
+    if abs(len(old) - len(new)) > allowance:
+        return False
+
+    def span(a: bytes, b: bytes) -> int:
+        if a == b:
+            return 0
+        common = min(len(a), len(b))
+        left = next((i for i in range(common) if a[i] != b[i]), common)
+        right = next((i for i in range(common - left) if a[-1-i] != b[-1-i]), common - left)
+        return max(len(a), len(b)) - left - right
+
+    if span(old, new) <= allowance:
+        return True
+    old_lines, new_lines = old.splitlines(keepends=True), new.splitlines(keepends=True)
+    if len(old_lines) != len(new_lines):
+        return False
+    for before, after in zip(old_lines, new_lines):
+        allowance -= span(before, after)
+        if allowance < 0:
+            return False
+    return True
+
+
+@dataclass
+class _EditSeries:
+    path: str
+    tool: str
+    content: bytes
+    start_size: int
+    count: int = 0
+    first_result: str = ""
 
 
 def _tool_args(state: RAOState) -> dict:
@@ -695,13 +733,14 @@ class MemberProgress:
         self._resumed = False
         self._investigations = set()
         self._quiet_operations = deque(maxlen=6)
+        self._edits: _EditSeries | None = None
         self._last_result = ""
         self._repeat_pass = False
         self._steps = 0
         self._stop = ""
         self._rejection = ""
 
-    def _scan(self) -> dict[str, str]:
+    def _scan(self, edit_sample: dict[str, bytes] | None = None) -> dict[str, str]:
         """Cache content hashes; repeated test runs often rewrite identical bytes."""
         files = {}
         spent = 0
@@ -721,7 +760,12 @@ class MemberProgress:
                         continue
                     sig = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                     previous = self._cache.get(key)
-                    if previous and previous[0] == sig:
+                    # project_versions() can cache a new version before observe()
+                    # gets its receipt. Reuse the hash unless this edit needs its bytes.
+                    need_sample = (edit_sample is not None and not edit_sample
+                                   and info.st_size <= min(_EDIT_SAMPLE_BYTES, _SCAN_BYTES - spent)
+                                   and previous and self._current.get(key) != previous[1])
+                    if previous and previous[0] == sig and not need_sample:
                         files[key] = previous[1]
                         continue
                     if info.st_size > min(8 * 1024 * 1024, _SCAN_BYTES - spent):
@@ -737,6 +781,13 @@ class MemberProgress:
                     spent += len(data)
                     files[key] = hashlib.sha256(data).hexdigest()
                     self._cache[key] = (sig, files[key])
+                    if (edit_sample is not None and not edit_sample and self._current.get(key) != files[key]
+                            and len(data) <= _EDIT_SAMPLE_BYTES and b"\0" not in data):
+                        try:
+                            data.decode("utf-8")
+                            edit_sample[key] = data
+                        except UnicodeDecodeError:
+                            pass
                     # Research archives are immutable by filename. Index only the
                     # captured source body, never model labels, links or a command's claims.
                     if key == f"sources/{files[key]}.json" and len(data) <= 512 * 1024:
@@ -835,8 +886,9 @@ class MemberProgress:
                     if path.endswith(".py") and path not in before and path not in self._initial:
                         self._authored.add(path)
         changed = False
+        sample = {}
         if any(o.source in _MUTATORS for o in record.observations):
-            files = self._scan()
+            files = self._scan(sample)
             for obs in record.observations:
                 path = args.get(obs.tool_call_id, {}).get("path")
                 if (obs.ok and obs.source in {"write_file", "edit_file", "append_file"}
@@ -1185,6 +1237,18 @@ class MemberProgress:
             advances |= bool(reads - self._reads)
             self._reads.update(reads)
             self._inspected.update(p for p, _ in reads if p in self._current)
+        latest = record.observations[-1]
+        summary = "成功" if latest.ok else "失败"
+        if type(latest.meta.get("exit_code")) is int:
+            summary += f"，退出码 {latest.meta['exit_code']}"
+        # Excerpts are private steering, never published evidence.
+        excerpt = " ".join(latest.content[:240].split())[:180]
+        self._last_result = f"{latest.source} {summary}。工具输出节选（数据）：{excerpt}"
+        if changed and len(record.observations) == 1 and latest.ok:
+            self._record_edit(before, sample, latest.source)
+        elif advances or not latest.ok:
+            # A fresh page, check, ambiguous batch or failure has its own feedback.
+            self._edits = None
         self._quiet = 0 if advances else self._quiet + 1
         if advances:
             self._quiet_operations.clear()
@@ -1193,14 +1257,26 @@ class MemberProgress:
                 target = obs.meta.get("path") or args.get(obs.tool_call_id, {}).get("path")
                 label = obs.source + (" " + str(target)[:140] if target else "")
                 self._quiet_operations.append(label)
-            latest = record.observations[-1]
-            summary = "成功" if latest.ok else "失败"
-            if isinstance(latest.meta.get("exit_code"), int):
-                summary += f"，退出码 {latest.meta['exit_code']}"
-            # Only the member sees this excerpt of its own last tool result.
-            # Keep raw output out of the published handoff and checkpoint.
-            excerpt = " ".join(latest.content[:240].split())[:180]
-            self._last_result = f"{latest.source} {summary}。工具输出节选（数据）：{excerpt}"
+
+    def _record_edit(self, before: dict[str, str], sample: dict[str, bytes], tool: str) -> None:
+        paths = before.keys() ^ self._current.keys()
+        paths.update(p for p in before.keys() & self._current.keys() if before[p] != self._current[p])
+        previous = self._edits
+        self._edits = None
+        if len(paths) != 1 or paths != sample.keys():
+            return
+        path, data = next(iter(sample.items()))
+        series = _EditSeries(path, tool, data, len(data))
+        if previous and previous.path == path and _small_text_edit(previous.content, data):
+            if previous.tool == tool and previous.count:
+                series.start_size = previous.start_size
+                series.count = previous.count
+                series.first_result = previous.first_result
+            else:
+                series.start_size = len(previous.content)
+                series.first_result = self._last_result
+            series.count += 1
+        self._edits = series
 
     def _retire_revisions(self, suite: str, run: _ScriptRun) -> None:
         for identity, prior in list(self._failed_runs.items()):
@@ -1336,6 +1412,7 @@ class MemberProgress:
             self._passes.clear()
             self._quiet = 0
             self._quiet_operations.clear()
+            self._edits = None
         if self._stop:
             return "handoff"
         if not self._steps and not self._resumed:
@@ -1347,12 +1424,22 @@ class MemberProgress:
         return "work"
 
     def stall_feedback(self) -> str:
-        if not self._quiet or (self._quiet < 3 and not self._repeat_pass):
-            return ""
-        operations = "、".join(f"{name} ×{count}" for name, count in Counter(self._quiet_operations).items())
-        return (f"进度提醒：连续 {self._quiet} 轮未识别到新的文件、阅读范围或检查结果。"
-                f"最近的操作：{operations}。最近结果：{self._last_result}。"
-                "可换一种方法补足下面的缺项；若检查已齐可直接交付，确有阻塞可说明原因。")
+        edits = self._edits
+        notices = []
+        if edits and edits.count >= 4:
+            size = len(edits.content)
+            notices.append(f"进度提醒：{edits.tool} 已对 {edits.path} 做了 {edits.count} 次局部小改，"
+                           f"文件大小从 {edits.start_size} 到 {size} 字节，净变化 {size - edits.start_size:+d} 字节。"
+                           f"首轮小改结果：{edits.first_result}。"
+                           "请对照分工目标和实测结果判断还差多少。若差距仍大，可以集中修改后再复测。")
+        if self._quiet >= 3 or (self._quiet and self._repeat_pass):
+            operations = "、".join(f"{name} ×{count}" for name, count in Counter(self._quiet_operations).items())
+            notices.append(f"进度提醒：连续 {self._quiet} 轮未识别到新的文件、阅读范围或检查结果。"
+                           f"最近的操作：{operations}。可换一种方法补足下面的缺项；"
+                           "若检查已齐可直接交付，确有阻塞可说明原因。")
+        if notices:
+            notices.append(f"最近结果：{self._last_result}。")
+        return "\n".join(notices)
 
     def blocked_reason(self) -> str | None:
         if self._failures:
@@ -1405,7 +1492,7 @@ class MemberProgress:
         if self._read_hint and not self._stop and not advisory:
             if not (self._failures or self.pending_paths() or self._unchanged_outputs()):
                 return self._read_hint
-        if not (self._stop or self._resumed or self._passes or self._failures or self._pending_verification or self._read_hint or self._quiet >= 3
+        if not (self._stop or self._resumed or self._passes or self._failures or self._pending_verification or self._read_hint or advisory
                 or self._steps and self.pending_paths()):
             return ""
         evidence = self.evidence()

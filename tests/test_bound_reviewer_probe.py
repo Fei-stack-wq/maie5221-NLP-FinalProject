@@ -115,12 +115,12 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def run_steps(self, steps, *, arbiter=True, human_answer=None,
+    def run_steps(self, steps, *, arbiter=True, lead="lead", human_answer=None,
                   objective="Deliver a shipment label recording exactly ten units, independently checked.", **options):
         provider = ProbeProvider(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
             run = self.service.start(request(
-                "team", conversation=roster("lead", "builder", "inspector", *(["arbiter"] if arbiter else [])),
+                "team", conversation=roster(*dict.fromkeys([lead, "builder", "inspector", *(["arbiter"] if arbiter else [])])),
                 objective=objective,
                 acceptance_files=[PATH], limits={"max_steps": 90}, **options,
             ))
@@ -240,16 +240,37 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.assertEqual(child["role"], "arbiter")
         self.assertNotIn(child["native_review"]["reviewer"], {"lead", "builder", "inspector"})
 
+    def test_three_person_room_lead_can_adjudicate_the_reviewers_failed_probe_after_contributing_separate_notes(self):
+        steps = [
+            tool("delegate_task", assignee="lead", objective="Research the unit convention for the builder.",
+                 deliverable_paths=["notes.md"], remaining_roles=["builder", "inspector"]),
+            write("notes.md", "The warehouse counts physical units."), {"text": "Research notes published."},
+            *self.start_bound_review(), *self.peer_steps(assignee="lead"),
+            {"text": "Independently checked the mistaken probe."}, {"text": "Delivered the verified label."}]
+        detail, reports, provider = self.run_steps(steps, arbiter=False)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual([r["role"] for r in reports], ["lead", "builder", "inspector", "lead"])
+        _, product, inspection, adjudication = reports
+        dispute = adjudication["native_review"]
+        self.assertTrue(provider.probe_contexts)
+        self.assertEqual((dispute["reviewer"], dispute["target"], dispute["probe_parent"]),
+                         ("lead", inspection["task_id"], product["task_id"]))
+        self.assertTrue(adjudication["published"])
+        self.assertEqual(dispute["files"][PATH], inspection["native_review"]["files"][PATH])
+        self.assertEqual(dispute["assessment"]["candidate_version"], dispute["candidate_version"])
+        self.assertNotEqual(adjudication["task_id"], detail["run"]["id"])
+
     def test_without_a_third_member_the_product_author_cannot_self_certify(self):
         steps = self.start_bound_review() + [
             tool("delegate_task", assignee="builder", objective="Resolve the outstanding bound probe."),
             {"text": "[BLOCKED] No third member can independently adjudicate the bound product facts."},
         ]
-        detail, reports, provider = self.run_steps(steps, arbiter=False)
+        detail, reports, provider = self.run_steps(steps, arbiter=False, lead="builder")
         self.assertNotEqual(detail["run"]["status"], "completed")
         self.assertFalse(provider.probe_contexts)
         self.assertFalse(any(r.get("native_review", {}).get("kind") == "reviewer_probe" for r in reports))
         self.assertEqual([r["role"] for r in reports], ["builder", "inspector"])
+        self.assertIn("没有合格成员", reports[-1]["native_review"]["host_issue"])
 
     def test_plain_assert_true_cannot_use_a_separate_product_read_as_its_input(self):
         unrelated = "assert True\nprint('PASS unrelated constant')\n"

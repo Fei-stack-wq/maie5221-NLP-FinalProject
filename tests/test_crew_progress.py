@@ -222,6 +222,56 @@ class MemberProgressTest(unittest.TestCase):
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["inspected"], ["module.py"])
 
+    def test_genuine_small_python_edits_report_versions_outputs_and_missing_paths(self):
+        self.p = MemberProgress(self.root, ["guide.md", "review.md"])
+        guide = self.root / "guide.md"
+        lines = ["保留正文。" * 80 + "可压缩" * 6 for _ in range(3)]
+        guide.write_text("\n".join(lines))
+        self.observe(text="first draft", meta={"exit_code": 0})
+        before = guide.stat().st_size
+        for i in range(1, 6):
+            # One command replaces words on distant lines. Line-aligned changes
+            # remain small even when they span nearly the whole document.
+            lines = [line.replace("可压缩", "略", 1) for line in lines]
+            guide.write_text("\n".join(lines))
+            self.p.project_versions()  # A publisher may have primed the hash cache.
+            self.observe(text=f"exit_code=0\nstdout:\nunits left {6000 - i}", meta={"exit_code": 0})
+            self.assertEqual(self.p.phase(self.budget), "work")
+        note = self.p.steering()
+        for fact in ("run_python", "guide.md", "5 次局部小改", "units left 5999", "units left 5995",
+                     f"{before} 到 {guide.stat().st_size} 字节", "review.md"):
+            self.assertIn(fact, note)
+        evidence = self.p.evidence()
+        self.assertEqual(evidence["files"], ["guide.md"])
+        self.assertEqual(evidence["missing_required_files"], ["review.md"])
+        self.assertEqual(evidence["check_signals"], [])
+        self.assertEqual(evidence["stop_reason"], "")
+        self.assertNotIn("units left", json.dumps(evidence))
+
+    def test_edit_advisory_clears_on_material_change_new_file_and_fresh_page(self):
+        guide = self.root / "guide.md"
+        for activity in ("rewrite", "new_file", "read_page"):
+            with self.subTest(activity=activity):
+                self.p = MemberProgress(self.root, ["guide.md"])
+                guide.write_text("a" * 4000)
+                self.observe("write_file", meta={"path":"guide.md"})
+                for i in range(1, 6):
+                    guide.write_text("b" * i + "a" * (4000 - i))
+                    self.observe(text=f"revision {i}", meta={"exit_code": 0})
+                self.assertIn("局部小改", self.p.steering())
+                if activity == "rewrite":
+                    guide.write_text("k" * 4000)  # Equal size, different throughout.
+                    self.observe(text="rewritten", meta={"exit_code": 0})
+                elif activity == "new_file":
+                    (self.root / "other.txt").write_text("additional output")
+                    self.observe(text="written", meta={"exit_code": 0})
+                else:
+                    for offset in range(0, 100, 20):
+                        self.observe("read_file", meta={"path":"guide.md", "offset":offset})
+                        self.assertNotIn("局部小改", self.p.steering())
+                self.assertEqual(self.p.phase(self.budget), "work")
+                self.assertEqual(self.p.stall_feedback(), "")
+
     def test_round_robin_pages_record_versioned_union_and_soft_hint(self):
         data = "".join(f"{n:04d} 测试-" + "x" * 30 + "\r\n" for n in range(600))
         self.src.write_bytes(data.encode())
