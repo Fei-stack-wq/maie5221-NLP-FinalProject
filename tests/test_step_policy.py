@@ -157,6 +157,13 @@ class StepPolicyTest(unittest.TestCase):
         self.assertIn("验收未通过", str(provider.requests[2][0]))
         self.assertEqual(result.acceptance_report.verdict, "failed")
 
+    def test_pure_text_handoff_cannot_retry_forever_without_tools_for_a_rejected_gate(self):
+        agent, provider = self.agent([{"text": "complete"}, {"text": "still complete"}])
+        final = lambda *_: StepPolicy("finalize", allowed_tools=frozenset(), compact=True)
+        result = agent.run("deliver", step_policy=final, before_answer=lambda: "missing signed review")
+        self.assertEqual((result.status, result.error), ("error", "missing signed review"))
+        self.assertEqual([tools for _, tools in provider.requests], [[], []])
+
     def test_blocked_report_is_not_success_even_when_no_checks_configured(self):
         agent, _ = self.agent([{"text": "[BLOCKED] missing input DB"}])
         result = agent.run("review", step_policy=lambda *_: StepPolicy("work"))
