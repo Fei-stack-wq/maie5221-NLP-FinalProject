@@ -1,7 +1,9 @@
 """A real local browser can resolve an executable dispute on frozen input."""
 import ast
 import hashlib
+import json
 import unittest
+from unittest.mock import patch
 
 from miniagent.crew_progress import _check_key
 from tests import test_bound_reviewer_probe as fixture
@@ -48,6 +50,36 @@ class BoundBrowserProbeTest(unittest.TestCase):
         self.assertNotEqual(detail["run"]["status"], "completed")
         self.assertFalse(reports[-1]["published"])
         self.assertIsNone(reports[-1]["native_review"]["assessment"])
+
+    def test_external_link_invalidates_attribution_until_explicit_return_to_original(self):
+        label = '<html><body>Shipment quantity: 10 units.<a href="about:blank">External</a></body></html>'
+        for reanchor in (False, True):
+            with self.subTest(reanchor=reanchor):
+                code = ("from pathlib import Path\n"
+                        "page.goto(Path('index.html').resolve().as_uri())\n"
+                        "page.locator('a').click()\n")
+                code += ("page.goto(Path('index.html').resolve().as_uri())\n"
+                         "expect(page.locator('body')).to_contain_text('quantity: 10 units.')\n" if reanchor else
+                         "expect(page).to_have_url('about:blank')\n")
+                steps = json.loads(json.dumps(fixture.BoundReviewerProbeTest.start_bound_review(label=label))
+                                   .replace("delivery.txt", "index.html"))
+                steps[-2]["tool_calls"][0]["arguments"]["candidate_version"] = fixture.digest({
+                    "index.html": hashlib.sha256(label.encode()).hexdigest()})
+                steps += [tool("delegate_task", assignee="arbiter", objective="Resolve the original product dispute."),
+                    tool("read_file", path="index.html"), tool("run_browser", code=code),
+                    {"_probe_finding":{"criterion_id":"probe_" + fixture.BAD_SCOPE, "verdict":"passed",
+                        "reason":"Independently checking the frozen product's actual quantity, not the destination of its external link.",
+                        "evidence":["file:index.html", "pass:" + browser_scope(code)]}},
+                    {"text":"Independent check complete." if reanchor else "[BLOCKED] The assertion ran on an external page."},
+                    {"text":"Delivered." if reanchor else "[BLOCKED] Missing a product execution receipt."}]
+                provider = fixture.ProbeProvider(steps)
+                with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+                    run = self.service.start(fixture.request("team",
+                        conversation=fixture.roster("lead", "builder", "inspector", "arbiter"),
+                        objective="Deliver an independently checked ten-unit label.", acceptance_files=["index.html"],
+                        limits={"max_steps":90}))
+                    detail = fixture.finished(self.service, run["id"])
+                self.assertEqual(detail["run"]["status"] == "completed", reanchor, detail["diagnostics"])
 
 
 if __name__ == "__main__":

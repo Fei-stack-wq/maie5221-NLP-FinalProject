@@ -180,6 +180,10 @@ def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
     except (SyntaxError, ValueError, RecursionError):
         return set()
     entry, checked = None, set()
+    navigation = {"goto", "set_content", "click", "dblclick", "tap", "press", "type", "fill",
+                  "check", "uncheck", "set_checked", "select_option", "set_input_files", "dispatch_event",
+                  "hover", "drag_to", "evaluate", "evaluate_handle", "add_script_tag", "go_back",
+                  "go_forward", "reload", "on", "once", "wait_for_timeout", "wait_for_url"}
 
     def local_entry(node):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -196,13 +200,23 @@ def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
     for statement in tree.body:
         expr = statement.value if isinstance(statement, ast.Expr) else None
         call = expr if isinstance(expr, ast.Call) else None
+        anchored = False
         if call and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
             if call.func.value.id == "page" and call.func.attr in {"goto", "set_content"}:
                 path = local_entry(call.args[0]) if call.func.attr == "goto" and call.args else None
                 try:
                     entry = path.resolve().relative_to(root.resolve()).as_posix() if path else None
+                    anchored = entry is not None
                 except (OSError, ValueError):
                     entry = None
+        # A successful click/JS action may already be on an external document.
+        # Without host URL telemetry we cannot carry the old file attribution
+        # across it. An explicit direct goto is the only way to re-anchor.
+        if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr in navigation for node in ast.walk(statement)):
+            checked.clear()
+            if not anchored:
+                entry = None
         assertion = statement.test if isinstance(statement, ast.Assert) else None
         if (call and isinstance(call.func, ast.Attribute) and call.func.attr.startswith(("to_", "not_to_"))
                 and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)

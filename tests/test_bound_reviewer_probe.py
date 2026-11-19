@@ -115,7 +115,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def run_steps(self, steps, *, arbiter=True,
+    def run_steps(self, steps, *, arbiter=True, human_answer=None,
                   objective="Deliver a shipment label recording exactly ten units, independently checked.", **options):
         provider = ProbeProvider(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
@@ -125,6 +125,11 @@ class BoundReviewerProbeTest(unittest.TestCase):
                 acceptance_files=[PATH], limits={"max_steps": 90}, **options,
             ))
             detail = finished(self.service, run["id"])
+            if human_answer is not None:
+                self.assertEqual(detail["run"]["status"], "waiting_user")
+                question, = detail["pending_questions"]
+                self.service.reply_human(run["id"], question["request_id"], human_answer)
+                detail = finished(self.service, run["id"])
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
         return detail, reports, provider
 
@@ -427,11 +432,43 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.assertIsNone(child["native_review"]["assessment"])
         self.assertEqual([c["id"] for c in child["native_review"]["criteria"]], ["probe_" + BAD_SCOPE])
 
+    def test_verification_change_request_remains_with_the_independent_probe_reviewer(self):
+        first = self.peer_steps(verdict="changes_requested", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="verification", reason="I need to recheck my calculation.",
+                                           action="Rerun the quantity check on the frozen label.")
+        steps = self.start_bound_review() + first + [{"text": "My verification needs correction."}]
+        steps += self.peer_steps() + [{"text": "Confirmed the frozen quantity."}, {"text": "Delivered the reviewed label."}]
+        detail, reports, _ = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([r["role"] for r in children], ["arbiter", "arbiter"])
+        self.assertEqual([r["native_review"]["state"] for r in children], ["review", "passed"])
+        decisions = [e["text"] for e in detail["room_events"] if e["kind"] == "reviewer_probe_resolved"]
+        self.assertEqual(decisions, ["probe_corrected"])
+
+    def test_business_answer_resumes_the_same_frozen_probe_without_a_second_question(self):
+        first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="business", reason="The unit label has two plausible meanings.",
+                                           action="Ask whether quantity means individual units.")
+        steps = self.start_bound_review() + first + [
+            {"text": "The owner must specify the unit."},
+            tool("ask_human", question="Does quantity refer to individual units?")]
+        steps += self.peer_steps() + [{"text": "Confirmed ten individual units."}, {"text": "Delivered the reviewed label."}]
+        detail, reports, _ = self.run_steps(steps, human_answer="Use individual units.")
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        children = [r["native_review"] for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([item["state"] for item in children], ["awaiting_user", "passed"])
+        self.assertEqual(children[0]["candidate_version"], children[1]["candidate_version"])
+        self.assertEqual(len([e for e in detail["room_events"] if e["kind"] == "human_question"]), 1)
+
     def test_real_product_failure_returns_to_original_product_author(self):
         wrong_label = LABEL.replace("10 units", "9 units")
         weak_correction = FIXED_PROBE.replace("assert actual == 10", "assert actual == 9")
         steps = self.start_bound_review(label=wrong_label, fixed_probe=weak_correction)
-        steps += self.peer_steps(evidence=["fail:" + PEER_SCOPE], verdict="changes_requested")
+        # A real failed assertion can support further investigation; a tentative
+        # conclusion must not be published as a confirmed product defect.
+        peer = self.peer_steps(evidence=["fail:" + PEER_SCOPE], verdict="inconclusive")
+        steps += peer + [self.peer_steps(evidence=["fail:" + PEER_SCOPE], verdict="changes_requested")[-1]]
         steps += [
             {"text": "The label actually contains nine units. The product author must correct it."},
             tool("delegate_task", assignee="inspector", objective="Resolve the confirmed product discrepancy."),
@@ -442,6 +479,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
         detail, reports, provider = self.run_steps(steps)
         self.assertTrue(provider.probe_contexts)
         self.assertNotEqual(detail["run"]["status"], "completed")
+        self.assertTrue(any("争议尚未查实" in str(messages) for messages, _ in provider.requests))
         child, = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
         self.assertEqual(child["native_review"]["assessment"]["verdict"], "changes_requested")
         self.assertEqual(reports[-1]["role"], "builder")

@@ -143,6 +143,12 @@ class Review:
             facts["required_source_paths"] = sorted(self.required_source_paths)
         return {**brief, **facts}
 
+    def resume_after_answer(self, human_state):
+        if self.state == "awaiting_user" and human_state != self.answer_at:
+            self.answered_issues.update((self.version, finding["criterion_id"]) for finding in self.latest["results"]
+                                        if finding["cause"] == "business")
+            self.state = "review"
+
     def apply(self, assessment, human_state):
         previous = {g["criterion_id"] for g in self.verification_gaps()}
         self.latest = assessment
@@ -220,10 +226,7 @@ class ReviewQueue:
 
     def next(self, human_state):
         for item in self.items.values():
-            if item.state == "awaiting_user" and human_state != item.answer_at:
-                item.answered_issues.update((item.version, g["criterion_id"]) for g in item.latest["results"]
-                                            if g["cause"] == "business")
-                item.state = "review"
+            item.resume_after_answer(human_state)
             if item.state != "passed":
                 return item
         return None
@@ -342,6 +345,7 @@ class ReviewSession:
         self.review_notes = set(review_notes)
         self.private_snapshot_issue = private_snapshot_issue
         self.promotion_issue = promotion_issue
+        self.promotion_issue_seen = False
         self.original = original
         self.progress = progress
         self.attempt_id = attempt_id
@@ -573,7 +577,7 @@ class ReviewSession:
                  "page.goto(Path('候选路径').resolve().as_uri()) 后对该 page 执行 expect/assert。"
                  "只读文件再 assert True、无关页面 PASS 或另一版本不能代替执行核查。"
                  "原检查错误且业务行为满足原要求才判 passed；真实产品错误判 changes_requested/product；"
-                 "证据不足判 inconclusive。其他脚本的 PASS 不能代替对该失败的逐项解释。"
+                 "证据不足判 inconclusive/verification。其他脚本的 PASS 不能代替对该失败的逐项解释。"
                  "原评审后来取得的实际回执（仅供对照，不能代替你的独立断言）：" +
                  json.dumps(self.item.probe_support, ensure_ascii=False)
                  if self.item.kind == "reviewer_probe" else "") +
@@ -594,6 +598,8 @@ class ReviewSession:
             raise ValueError("引用了未观察到或不唯一的证据：" + "、".join(r[:160] for r in unknown)
                              + "。从 list_review_evidence 选择相符的短 ID。")
         kinds = {e["kind"] for e in receipts}
+        if self.item.kind == "reviewer_probe" and result.cause == "product" and result.verdict == "inconclusive":
+            raise ValueError("争议尚未查实时请用 inconclusive/verification；确认产品缺陷才用 changes_requested/product。")
         if rule.method == "source" and (result.verdict == "passed" or result.cause == "product"):
             if not {"read", "source"} <= kinds:
                 raise ValueError("核实事实需要引用所读候选及本次亲自打开的来源。资料不足时标记 inconclusive。")
@@ -672,6 +678,7 @@ class ReviewSession:
                     raise ValueError("通过候选需要对作者原件的独立检查，评审者的报告是单独的附件。")
                 problem = self.promotion_issue()
                 if problem:
+                    self.promotion_issue_seen = True
                     raise ValueError(problem)
             self.assessment = {"target":self.item.target,"candidate_version":self.item.version,
                                "evaluator":self.item.reviewer,"attempt_id":self.attempt_id,

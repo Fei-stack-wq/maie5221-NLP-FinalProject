@@ -275,6 +275,8 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 
 裁决通过后仍先走原私稿发布、成员验收、最终用户检查及文件 SHA 校验，再恢复原产品评审人签署的结果；第三人不会代签其他产品标准。确认产品确有问题时回原产品作者修订，并保留原产品评审人及完整标准。无法核实、修改冻结 HTML/脚本、来源不足或新失败保持阻塞。`reviewer_probe_resolved` 记录具体 scope、裁决者、候选版本和结论；修复后的脚本 PASS 不覆盖历史失败回执。
 
+独立裁决逐项按必需标准和原因分流。`verification` 保留候选版本并交给同一裁决者补证，`product` 的返工结论才会回到原产品作者。`business` 通过本群原人工请求等待答复，用户的 `reply_human` 恢复同一版本、同一项独立裁决，评审人仍须提交带证据的结果。下面的 Studio 入口测试分别经过了补证和一次真实的请求/答复，再核对最终公开版本。
+
 机制参考 LangGraph 按检查点/任务身份恢复未决项，并拒绝无法定位的恢复值；Studio 另以原产品版本和失败 scope 绑定子义务，不自动重放节点。也参考 OpenAI Agents SDK 在可恢复交接错误后保留调用状态、向调用者返回具体验证错误；这里的业务裁决仍使用 Studio 原来的独立评审和硬性验收。两项目均为 MIT 许可证，未复制源码或添加依赖。
 
 - [LangGraph 恢复及错误处理](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/langgraph/pregel/_loop.py#L1029-L1075) · [按未决身份恢复的测试](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_interrupt_state.py#L100-L143) · [歧义恢复反例](https://github.com/langchain-ai/langgraph/blob/bbd52757e72d8611b07ae2831b9529a6ba03f2a1/libs/langgraph/tests/test_interrupt_state.py#L352-L367)

@@ -493,7 +493,9 @@ class RoomCrew:
     def _next_review(self):
         for item in getattr(self, "reviewer_probe_reviews", {}).values():
             if not item.get("resolved"):
-                return item["review"]
+                child = item["review"]
+                child.resume_after_answer(self._review_answers())
+                return child
         return self.native_reviews.next(self._review_answers())
 
     @staticmethod
@@ -617,8 +619,9 @@ class RoomCrew:
                                       ledger, item["base"], changes, parent.target)
             item["resolved"] = True
             resolution = "probe_corrected"
-        elif assessment and assessment["verdict"] == "changes_requested" and not issue:
-            # The probe's author is not necessarily the product's author.
+        elif assessment and child.state == "repair" and not issue:
+            # Review.apply routes required findings by cause. A verification
+            # gap stays with this reviewer even when changes were requested.
             # Return the real defect to the original product repair/review path.
             parent.state = "repair"
             parent.host_issue = "独立复核确认产品缺陷：" + _clip(_json(assessment["results"]), 2500)
@@ -1416,6 +1419,25 @@ class RoomCrew:
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
+            private_probe_closing = bool(private and session and review.kind == "reviewer_probe"
+                                         and session.promotion_issue_seen and not session.assessment)
+            if (private_probe_closing and "run_shell" in work_tools and not progress.pending_paths()
+                    and spendable.has_steps(3) and spendable.has_actions(2) and not spendable.exhausted):
+                # This unpublished reviewer draft has no public peer-check
+                # request. Its already-bound pending script is nevertheless a
+                # real promotion gate, separate from the source judgment.
+                scoped = [{"task": review.target, "candidate": dict(review.files),
+                           "verification": [{**entry, "current_sha256": review.files.get(entry.get("path"))}
+                                            for entry in evidence["pending_verification"]]}]
+                instruction = peer_checks.offer(scoped, review.target, review.files, evidence)
+                if instruction:
+                    # One newly exposed exact execution obligation may finish
+                    # before resubmission. This does not reset a repeated source
+                    # gap, and offer() cannot repeat it for the same candidate.
+                    session.closing_needs = None
+                    session.closing_attempts = 0
+                    return StepPolicy("work", instruction, frozenset({"run_shell"}),
+                                      token_reserve=reserve, seconds_reserve=handoff_seconds)
             if ("run_shell" in work_tools and session and session.assessment and session.assessment["verdict"] == "passed"
                     and not progress.pending_paths() and spendable.has_steps(2)
                     and spendable.has_actions(1) and not spendable.exhausted):
@@ -1432,7 +1454,12 @@ class RoomCrew:
                                   + pending_call + "。若该断言有误，交接具体阻塞及独立复验需要。",
                                   frozenset({"rerun_browser_check"}), token_reserve=reserve, seconds_reserve=handoff_seconds)
             if peer_checks.offered:
-                return closing
+                if not private_probe_closing:
+                    return closing
+                # The private promotion rejection happened before a signed
+                # assessment. Keep the existing bounded submission flow after
+                # the exact replay; never reopen general member tools.
+                phase = "handoff"
             if phase == "handoff" and session and not session.assessment:
                 allowed = session.closing_options() & work_tools
                 if not allowed or spendable.exhausted:
