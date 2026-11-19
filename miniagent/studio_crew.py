@@ -149,11 +149,11 @@ class RoomCrew:
         self.nested_seconds = 0.0
         self.read_only = thread.get("intent") == "question"
         self.direct = bool(thread.get("direct_execution"))
-        self.direct_start = {}
+        self.direct_baseline = {}
         self.direct_candidate = None
         if self.direct:
             if not self.read_only:
-                copy_project(path, self.lead, None, extensions, secret=settings.api_key, manifest=self.direct_start)
+                copy_project(path, self.lead, None, extensions, secret=settings.api_key, manifest=self.direct_baseline)
             required = set(self.delivery.get("files", []))
             required.update(check["path"] for check in self.delivery.get("checks", []))
             self.direct_progress = MemberProgress(path / "agents" / self.lead, required)
@@ -169,30 +169,21 @@ class RoomCrew:
 
     def snapshot_direct_changes(self):
         """Freeze the addressed author's bytes before handing them to a peer or ending the turn."""
-        if self.read_only or self.assigned:
+        if self.read_only:
             return
         current = {}
         copy_project(self.path, self.lead, None, self.extensions, secret=self.settings.api_key, manifest=current)
-        if self.direct_candidate and current == self.native_reviews.public_versions:
-            return
-        # Before a peer accepts, the actor may revise or undo a rejected
-        # candidate. Only the files still changed belong to this turn.
-        if self.direct_candidate:
-            self.native_reviews.candidates.pop(self.run_id, None)
-            self.native_reviews.path_candidates = {
-                path: binding for path, binding in self.native_reviews.path_candidates.items() if binding[0] != self.run_id}
-            self.direct_candidate = None
-        if current == self.direct_start:
-            self.native_reviews.public_versions = current
+        if current == self.direct_baseline:
             return
         with tempfile.TemporaryDirectory(dir=self.path) as staging:
             stage = Path(staging) / "receipt"
             stage.mkdir()
             frozen = {}
             copy_project(self.path, self.lead, stage / "project", self.extensions, secret=self.settings.api_key, manifest=frozen)
-            changes = [{"path": p, "change": "modified" if p in self.direct_start else "added", "sha256": frozen[p]}
+            baseline = self.direct_baseline
+            changes = [{"path": p, "change": "modified" if p in baseline else "added", "sha256": frozen[p]}
                        if p in frozen else {"path": p, "change": "deleted"}
-                       for p in sorted(self.direct_start.keys() | frozen.keys()) if self.direct_start.get(p) != frozen.get(p)]
+                       for p in sorted(baseline.keys() | frozen.keys()) if baseline.get(p) != frozen.get(p)]
             if not changes:
                 return
             (stage / "manifest.json").write_text(_json(frozen), encoding="utf-8")
@@ -202,10 +193,21 @@ class RoomCrew:
                          for c in changes if c["change"] != "deleted"]
             (self.path / "handoffs").mkdir(exist_ok=True)
             stage.rename(self.path / "handoffs" / key)
+        owned = {p for p, (task, sha) in self.native_reviews.path_candidates.items()
+                 if task == self.run_id and frozen.get(p) == sha}
+        owned.update(a["project_path"] for a in artifacts)
         report = {"role": self.lead, "task_id": self.run_id, "objective": self.service.store.get(self.run_id).objective,
-                  "published": True, "deliverable_paths": [a["project_path"] for a in artifacts], "changed_files": changes}
+                  "published": True, "deliverable_paths": sorted(owned), "changed_files": changes}
         self.direct_candidate = report
         self.native_reviews.published(report, frozen, changes)
+        for review in self.native_reviews.items.values():
+            if review.state == "repair" and review.author == self.lead and not review.draft_task:
+                edited = set(review.files).intersection(c["path"] for c in changes)
+                if edited:
+                    review.repaired(frozen, edited)
+        self.direct_baseline = frozen
+        self.project_version += 1
+        self.inventory = self._inventory()
         self.record_event(self.run_id, self.lead, "direct_delivery", "定向执行者已保存本轮改动的版本。",
                           published=True, task_id=self.run_id, handoff=report, artifacts=artifacts)
 
@@ -374,9 +376,7 @@ class RoomCrew:
 
     def observe_coordinator(self, record, state):
         """Keep attributable public tool receipts in the next compact request."""
-        if self.direct and self.inspection_revision is None:
-            # The first delegation may complete inside this same tool batch.
-            # Coordinator inspection starts on the following model request.
+        if self.direct:
             self.direct_progress.observe(record, state)
             return
         if any(o.source == "delegate" for o in record.observations):
@@ -776,7 +776,9 @@ class RoomCrew:
                 + _json(self._pending_check_briefing() if requests is None else requests))
 
     def coordinator_policy(self, state, budget):
-        if self.direct and not self.assigned:
+        bare_close = StepPolicy("finalize", allowed_tools=frozenset(), compact=True)
+        self.close_tokens = estimate_tokens(policy_messages(state, bare_close)) + self.close_state_bytes + 2304
+        if self.direct:
             return StepPolicy("work", self.direct_instructions() + "\n" + self.direct_progress.steering())
         pending = self.before_answer() or self.delivery_issue or self.dispatch_ended
         authenticated = () if pending else self._reviewed_delivery()
@@ -791,8 +793,6 @@ class RoomCrew:
                              frozenset(), compact=True, reviewed_delivery=authenticated)
         # Fixed upper bound for the final receipt plus the root's actual goal,
         # system message and authenticated human replies, with framing/output.
-        bare_close = StepPolicy("finalize", allowed_tools=frozenset(), compact=True)
-        self.close_tokens = estimate_tokens(policy_messages(state, bare_close)) + self.close_state_bytes + 2304
         self._prepare_inspection(budget)
         plan_finished = self.planned is not None or set(self.profiles) - {self.lead} <= self.approved_roles
         if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
@@ -921,6 +921,11 @@ class RoomCrew:
         return _json(replies)
 
     def before_answer(self):
+        if self.direct and self.native_reviews.items:
+            try:
+                self.snapshot_direct_changes()
+            except (SnapshotError, OSError) as exc:
+                return "提交独立验收前无法核对候选当前版本：" + str(exc)
         if getattr(self, "invalid_route", None) and self.dispatch_ended:
             return self.dispatch_ended
         queue = getattr(self, "native_reviews", None)
@@ -1132,6 +1137,11 @@ class RoomCrew:
             return self._observation(False, "委派需要具体目标和运行时动作身份。")
         if action in self.handoffs:
             return self.handoffs[action]
+        if self.direct:
+            try:
+                self.snapshot_direct_changes()
+            except (SnapshotError, OSError) as exc:
+                return self._observation(False, "向协作者提供项目版本失败：" + str(exc))
         review = self._next_review()
         if role == self.lead:
             # A returned candidate already carries the author's exact file contract.
@@ -1205,8 +1215,6 @@ class RoomCrew:
                 routed_from, role = donor, recipient
         if payload.get("review") is not None:
             try:
-                if self.direct and not self.assigned:
-                    self.snapshot_direct_changes()
                 candidates = ([self.direct_candidate] if self.direct_candidate else []) + self.reports
                 requested_review = self.native_reviews.open(payload["review"], role, candidates,
                     drafts=self.private_drafts, project_version=self.project_version, inherited=self.inherited_review)
@@ -1292,11 +1300,6 @@ class RoomCrew:
             paths = sorted(set(paths) | set(draft["required"]))
         identity = (role, objective.strip(), expectations.strip(), tuple(paths), user_state, donor,
                     (review.target, review.version, review.state, len(review.visited)) if review else None)
-        if self.direct and not self.assigned:
-            try:
-                self.snapshot_direct_changes()
-            except (SnapshotError, OSError) as exc:
-                return self._observation(False, "向协作者提供项目版本失败：" + str(exc))
         self.planned = plan
         self.assigned.add(role)
         prior = self.assignment_results.get(identity)
@@ -1828,6 +1831,10 @@ class RoomCrew:
                 review.draft_task = None
             else:
                 self.native_reviews.published(report, public_versions, changes)
+            if self.direct:
+                # The next root edit must be compared to the bytes the peer
+                # handed back, preserving ownership of its output.
+                self.direct_baseline = public_versions.copy()
         if not published or review_notes:
             documents = sorted(review_notes.values()) if private and session else required
             if review_notes:

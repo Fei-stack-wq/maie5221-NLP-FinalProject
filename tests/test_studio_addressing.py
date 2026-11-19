@@ -124,6 +124,44 @@ class GroupAddressingTest(unittest.TestCase):
         check = reports[0]["handoff"]["native_review"]
         self.assertEqual((check["author"], check["reviewer"], check["candidate_version"]), ("writer","reviewer",candidate))
 
+    def test_direct_writer_retains_tools_and_authorship_after_a_peer_publishes_notes(self):
+        result, calls = self.execute("@writer 请研究员查好件数后自己写说明。", [
+            tool("delegate_task", assignee="researcher", objective="Record the counted inventory.",
+                 deliverable_paths=["counts.md"], remaining_roles=[]),
+            tool("write_file", path="counts.md", content="Inventory: 80 components."), {"text": "已核实件数。"},
+            tool("read_file", path="counts.md"),
+            tool("write_file", path="summary.md", content="The researcher counted 80 components today."),
+            {"text": "我已根据研究员的记录写好说明。"}], acceptance_files=["counts.md", "summary.md"])
+        self.assertEqual(result["run"]["status"], "completed", result["diagnostics"])
+        self.assertIn("write_file", calls[-1][1])
+        publications = [(e["role"], [c["path"] for c in e["handoff"]["changed_files"]])
+                        for e in result["room_events"] if e["kind"] in {"direct_delivery", "member_report"}]
+        self.assertEqual(publications, [("researcher", ["counts.md"]), ("writer", ["summary.md"])])
+        self.assertIn("80", (self.workspace / "summary.md").read_text())
+
+    def test_edit_after_peer_approval_requires_the_peer_to_check_the_new_bytes(self):
+        one, two = "Inventory confirmed: four desks.", "Inventory confirmed: six desks."
+        def sign(note):
+            version = digest({"guide.md": hashlib.sha256(note.encode()).hexdigest()})
+            return tool("submit_review", candidate_version=version, results=[{"criterion_id": "count",
+                        "verdict": "passed", "evidence": ["file:guide.md"], "reason": "Read the stated desk count."}])
+        initial = tool("delegate_task", assignee="reviewer", objective="Inspect the count in the guide.", remaining_roles=[],
+                       review={"candidate": "guide.md", "criteria": [
+                           {"id": "count", "method": "inspect", "description": "Read and verify the stated count."}]})
+        result, calls = self.execute("@writer 写好指南请人核对。", [
+            tool("write_file", path="guide.md", content=one),
+            initial, tool("read_file", path="guide.md"), sign(one),
+            tool("edit_file", path="guide.md", old_text=one, new_text=two), {"text": "数量已更新。"},
+            tool("delegate_task", assignee="reviewer", objective="Recheck the corrected count."),
+            tool("read_file", path="guide.md"), sign(two), {"text": "修订版核对完成。"}],
+            acceptance_files=["guide.md"])
+        self.assertEqual(result["run"]["status"], "completed", result["diagnostics"])
+        approvals = [e["handoff"]["native_review"]["candidate_version"] for e in result["room_events"]
+                     if e["kind"] == "member_report"]
+        self.assertEqual(approvals, [digest({"guide.md": hashlib.sha256(note.encode()).hexdigest()}) for note in (one, two)])
+        self.assertIn("独立验收尚未通过", str(calls))
+        self.assertEqual((self.workspace / "guide.md").read_text(), two)
+
     def test_multiple_read_only_addressees_both_give_evidence_and_cannot_edit(self):
         (self.workspace / "data.md").write_text("Initial inventory")
         def ask(role):
@@ -149,6 +187,7 @@ class GroupAddressingTest(unittest.TestCase):
             tool("delegate_task", assignee="reviewer", objective="Check the version and count in data.md.",
                  remaining_roles=[]),
             tool("read_file", path="data.md"), {"text": "已读到第 12 版的 80 件库存。"},
+            tool("read_lines", path="data.md"),
             {"text": "我与审阅者都看到第 12 版有 80 件。"}], intent="question")
         self.assertEqual(result["run"]["status"], "unverified", result["diagnostics"])
         root, child = sorted(result["tasks"], key=lambda task: task["parent_id"] is not None)

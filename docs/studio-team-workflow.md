@@ -367,6 +367,8 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 用「@writer @reviewer」可要求两人实际参与，收尾检查当次交接记录。未点名时，负责人根据任务选择实际执行成员；一个人完成即可结束。需要独立复核时，作者先产生候选，另一位成员通过 `delegate_task.review` 明确候选和标准，再读取原件并提交证据。系统以文件 SHA-256 和实际作者核对独立性。两位不同成员即可承担作者和评审者。成功提交的定向修改也能在原群后续轮次按文件路径发起独立复核。选了本机目录时，只有实际发布到该目录且内容仍相符的版本可沿用这份作者回执。
 
+协作者交回工作后，本轮收件人可以继续执行。例如写作者让研究员保存 `counts.md`，随后自行读取它并写出 `summary.md`。两个文件分别归属研究员和写作者。若写作者修改了评审者刚签过的成稿，提交前会重新比对内容哈希，并将当前版本交还评审者核对。只读提问也允许收件人在同伴答复后继续查资料。
+
 这里借鉴 OpenAI Agents SDK 的按需调用专家模式。Studio 自行实现了群内收件人、工作区版本及独立验收。定向消息仅在调用成员工具时创建子任务。上游采用 MIT 许可。[上游嵌套运行](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L1085-L1107) · [上游当次调用结果测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L855-L938) · [Studio 收件人与复核回归](../tests/test_studio_addressing.py)
 
 ### 群成员侧栏与最新消息

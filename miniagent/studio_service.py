@@ -1208,6 +1208,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         # govern review, including changes that restore older bytes.
         seen = {change["path"] for report in crew.reports if report.get("published")
                 for change in report.get("changed_files", [])}
+        seen.update(crew.native_reviews.path_candidates)
         choices, prior_findings = {}, {}
         task_scope = set()
         while parent and parent in ancestors:
