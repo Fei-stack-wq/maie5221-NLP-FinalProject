@@ -541,19 +541,22 @@ class StudioCrewTest(unittest.TestCase):
 
     def test_blocked_or_rejected_member_publication_prevents_success_after_good_draft(self):
         for last, reason in [([{"text": "[BLOCKED] missing proof"}], "missing proof"),
-                             ([write("bad.xyz", "unsupported format"), {"text": "Ready to publish."}], "项目快照发布失败")]:
+                             ([write("bad.xyz", "unsupported format"), {"text": "Ready to publish."},
+                               {"text": "[BLOCKED] Cannot publish the required bad.xyz file."}], "bad.xyz")]:
             with self.subTest(reason=reason):
                 script = [tool("delegate_task", assignee="writer", objective="Create a draft", remaining_roles=["check"]),
                           write("draft.md", "Good enough for review."), {"text": "Published draft."},
                           assign("check", "Inspect delivery"), *last,
-                          {"text": "Everything passed."}, {"text": "Everything passed."}]
-                detail, _ = self.execute(script, roster("lead", "writer", "check"), objective="Deliver a checked draft",
+                          {"text": "Everything passed."}, {"text": "[BLOCKED] Independent handoff remains unavailable."}]
+                detail, provider = self.execute(script, roster("lead", "writer", "check"), objective="Deliver a checked draft",
                                          acceptance_files=["draft.md"])
                 self.assertEqual(detail["run"]["status"], "failed", detail["diagnostics"])
                 reports = [e for e in detail["room_events"] if e["kind"] == "member_report"]
                 self.assertTrue(reports[0]["published"])
                 self.assertEqual(reports[1]["disposition"], "blocked")
                 self.assertIn(reason, reports[1]["handoff"]["remaining_issue"])
+                if reason == "bad.xyz":
+                    self.assertIn("项目快照发布失败", str(provider.requests))
                 self.assertFalse((self.root / "runs" / detail["run"]["id"] / "agents/lead/bad.xyz").exists())
 
     def test_blocked_draft_is_recoverable_only_by_its_owner_on_the_same_public_revision(self):
