@@ -239,6 +239,8 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 绑定后，群事件 `published_review_bound` 记录原运行、作者任务、文件摘要、本轮评审者和标准。评审者独立取证并提交本轮结论。原件上的未决标准会带入复核；同一版本已有明确产品缺陷时，应由作者修订再发布。缺失原始来源或本轮硬性验收不通过时，复核不能授权交付。实际作者只有在需要修订产品时才需再次交接。
 
+同一已发布原件已有未决必需标准时，负责人可只写 `review.candidate`，宿主从该原件的签署记录恢复完整定义。`review.criteria` 可只列本轮追加的条款，额外要求使用新 ID。若复用了旧 ID 却改变方法、描述或必需性，宿主返回完整原定义和修正方式。当前用户绑定的来源核查和最终交付检查仍须满足。首次评审必须显式提出至少一个必需标准。按具体字段回传可纠正错误的做法参考 Pydantic AI，Studio 在同群发布及版本核对后选择原定义。[Pydantic AI 验证反馈](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/pydantic_ai_slim/pydantic_ai/messages.py#L2938-L2958) · [工具纠错测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L4792-L4818)
+
 路径和版本匹配参考 in-toto 逐项核对上一步产物和下一步材料的做法。Studio 使用本机群发布回执、不可变交接归档与即时工作区摘要来确认来源。[in-toto 的材料匹配](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/in_toto/verifylib.py#L727-L765) · [上游匹配测试](https://github.com/in-toto/in-toto/blob/e352b43ad7cb8915d84c36d791aa61346152a0a3/tests/test_verifylib.py#L549) · [Studio 跨轮复核回归](../tests/test_studio_inherited_review.py)
 
 ### DeepSeek 额度不足时的诊断与接续

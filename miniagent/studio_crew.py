@@ -25,7 +25,7 @@ from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_proje
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, ToolCompletion, policy_messages
 from .sandbox import Sandbox
 from .studio_acceptance import build_checks
-from .studio_reviews import Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
+from .studio_reviews import InheritedCriteriaConflict, Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
 from .tools import build_default_registry
 
@@ -851,8 +851,10 @@ class RoomCrew:
                         "没有本轮候选时，先以成稿路径引用同群可验证的原发布；本轮新增或修订的成稿由作者交接。")
         return None
 
-    def _observation(self, ok, text):
-        self.last_dispatch_error = "" if ok else _clip(text, 1200)
+    def _observation(self, ok, text, *, bound_definitions=False):
+        self.last_dispatch_error = "" if ok else text
+        if not ok and not bound_definitions:
+            self.last_dispatch_error = _clip(text, 1200)
         return Observation(step_id=self.run_id + ":delegate", source="delegate", ok=ok,
                            content=text, error_class=None if ok else ErrorClass.A_TOOL_ERROR)
 
@@ -1083,7 +1085,8 @@ class RoomCrew:
                     drafts=self.private_drafts, project_version=self.project_version, inherited=self.inherited_review)
             except (ValueError, OSError) as exc:
                 remaining = "\n" + self._peer_check_instruction() if self._only_peer_checks_remaining() else ""
-                return self._observation(False, "无法发起独立验收：" + str(exc) + remaining)
+                return self._observation(False, "无法发起独立验收：" + str(exc) + remaining,
+                                         bound_definitions=isinstance(exc, InheritedCriteriaConflict))
             if review and review is not requested_review:
                 return self._observation(False, "请先完成已在进行的独立验收。")
             review = requested_review

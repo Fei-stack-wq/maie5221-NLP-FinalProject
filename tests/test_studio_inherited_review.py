@@ -1,9 +1,11 @@
 """A review-only continuation binds the previous author's real public bytes."""
 import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
 from miniagent.config import Settings
+from miniagent.crew_progress import _check_key, _script_inputs
 from miniagent.research import Page
 from miniagent.studio_reviews import digest
 from miniagent.studio_service import StudioService
@@ -108,6 +110,70 @@ class InheritedReviewTest(unittest.TestCase):
                             reply(reset["run"]["id"], "lead"), required_source_review_paths=[FILE])
         self.assertNotEqual(last["run"]["status"], "completed")
         self.assertNotIn("published_review_bound", [e["kind"] for e in last["room_events"]])
+
+    def test_unresolved_definitions_can_be_reused_verbatim_and_extended_without_retyping(self):
+        identity = {"id":"identity", "method":"execute",
+                    "description":"Verify the original dispatch hash and byte length. " + "Frozen shipment record. " * 44 + "END."}
+        original = [identity, RULE]
+        extra = {"id":"weekday", "method":"inspect", "description":"Check that the dispatch states the weekday.",
+                 "required":False}
+
+        def delegate(criteria=None):
+            review = {"candidate":task}
+            if criteria is not None:
+                review["criteria"] = criteria
+            return tool("delegate_task", assignee="checker", objective="Check the published dispatch.",
+                        review=review, remaining_roles=[])
+
+        def sign(results):
+            return tool("submit_review", candidate_version=digest({FILE:SHA}), results=results)
+
+        probe = (f"import hashlib\nfrom pathlib import Path\nraw = Path({FILE!r}).read_bytes()\n"
+                 f"assert len(raw) == {len(BODY.encode())} and hashlib.sha256(raw).hexdigest() == {SHA!r}\n"
+                 "print('PASS document identity')\n")
+        passed = [{"criterion_id":"identity", "verdict":"passed", "reason":"Verified the exact bytes and digest.",
+                   "evidence":["pass:"+_check_key(_script_inputs(probe)[1])]},
+                  {"criterion_id":"issued", "verdict":"passed", "reason":"Compared the dispatch with the issuer.",
+                   "evidence":["file:"+FILE,"source:"+URL]}]
+        for additions in ([], [extra]):
+            with self.subTest(additions=additions):
+                self.local = self.root / ("extra" if additions else "inherit")
+                self.local.mkdir()
+                parent, task = self.seed()
+                pending, _ = self.turn([delegate(original), tool("read_file", path=FILE), sign([
+                    {"criterion_id":r["id"], "verdict":"inconclusive", "cause":"verification", "action":"Acquire independent evidence.",
+                     "reason":"Only the original file has been read.", "evidence":["file:"+FILE]} for r in original]),
+                    {"text":"[BLOCKED] Missing executed check and independent issuer source."},
+                    {"text":"[BLOCKED] The original criteria remain open."}], reply(parent, "lead"), required_source_review_paths=[FILE])
+                report = next(e["handoff"] for e in pending["room_events"] if e["kind"] == "member_report")
+                self.assertEqual(report["native_review"]["assessment"]["verdict"], "inconclusive")
+                prior = pending["run"]["id"]
+                rewritten = [{**identity, "method":"inspect", "description":"Read the file name only."}, *additions]
+                results = passed + ([{"criterion_id":"weekday", "verdict":"passed", "reason":"The file specifies Tuesday.",
+                                      "evidence":["file:"+FILE]}] if additions else [])
+                steps = [delegate(rewritten), delegate(additions or None), tool("read_file", path=FILE),
+                         tool("http_get", url=URL), tool("run_python", code=probe), sign(results),
+                         {"text":"Verified the published dispatch."}, {"text":"Delivered the independently checked dispatch."}]
+                detail, provider = self.turn(steps, reply(prior, "lead"), required_source_review_paths=[FILE])
+                self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+                feedback = next(m["content"] for m in provider.requests[1][0]
+                                if "宿主会原样补齐" in str(m.get("content")) and "END." in str(m.get("content")))
+                canonical, _ = json.JSONDecoder().raw_decode("[" + feedback.split("原定义：[", 1)[1])
+                self.assertEqual(canonical, [{**r,"required":True} for r in original])
+                bound, = [e for e in detail["room_events"] if e["kind"] == "published_review_bound"]
+                self.assertEqual(bound["publication"]["task_id"], task)
+                self.assertEqual(bound["criteria"], [*additions, *canonical])
+                signed = next(e["handoff"]["native_review"]["assessment"] for e in detail["room_events"]
+                              if e["kind"] == "member_report")
+                self.assertEqual({f["criterion_id"] for f in signed["results"]}, {r["id"] for r in bound["criteria"]})
+
+    def test_no_prior_criteria_cannot_create_an_empty_review(self):
+        parent, task = self.seed()
+        detail, provider = self.turn([tool("delegate_task", assignee="checker", objective="Check the original.",
+                                      review={"candidate":task}), {"text":"[BLOCKED] No criteria supplied."}],
+                                     reply(parent, "lead"), required_source_review_paths=[FILE])
+        self.assertIn("请在 review.criteria 提供至少一项必需标准", str(provider.requests))
+        self.assertNotIn("published_review_bound", [e["kind"] for e in detail["room_events"]])
 
     def test_current_writer_cannot_review_older_publication_after_restoring_identical_bytes(self):
         parent, task = self.seed()

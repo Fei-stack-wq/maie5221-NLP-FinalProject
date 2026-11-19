@@ -32,7 +32,11 @@ class Rule(Criterion):
 class ReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     candidate: str = Field(min_length=1, max_length=160)
-    criteria: list[Rule] = Field(min_length=1, max_length=24)
+    criteria: list[Rule] = Field(default_factory=list, max_length=24)
+
+
+class InheritedCriteriaConflict(ValueError):
+    """A coordinator needs the complete bound definitions to correct its request."""
 
 
 class Finding(BaseModel):
@@ -53,11 +57,13 @@ class Submission(BaseModel):
 
 # Explicit wire schemas are also consumed by OpenAI-compatible providers.
 REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候选作者任务 ID（或当前角色 ID；可用同群已发布的成稿路径、原任务 ID 或唯一的原作者引用继承的原件）引用候选。",
-    "properties": {"candidate": {"type": "string"}, "criteria": {"type": "array", "items": {
+    "properties": {"candidate": {"type": "string"}, "criteria": {"type": "array",
+        "description": "新增标准。复核上轮同一已发布原件时，宿主原样加入未通过的必需项；可省略 criteria 以只沿用这些项。首次验收须给出必需标准。",
+        "items": {
         "type": "object", "properties": {"id":{"type":"string"}, "description":{"type":"string"},
             "method":{"type":"string","enum":["inspect","execute","source"]}, "required":{"type":"boolean"}},
         "required":["id","description","method"], "additionalProperties":False}}},
-    "required": ["candidate", "criteria"], "additionalProperties":False}
+    "required": ["candidate"], "additionalProperties":False}
 SUBMIT_SCHEMA = {"type":"object","properties":{"candidate_version":{"type":"string"},
     "results":{"type":"array","items":{"type":"object","properties":{
         "criterion_id":{"type":"string"}, "verdict":{"type":"string","enum":["passed","changes_requested","inconclusive"]},
@@ -246,12 +252,13 @@ class ReviewQueue:
     def open(self, raw, reviewer, reports, *, drafts=None, project_version=None, inherited=None):
         spec = ReviewRequest.model_validate(raw)
         ids = [rule.id for rule in spec.criteria]
-        if len(set(ids)) != len(ids) or not any(r.required for r in spec.criteria):
-            raise ValueError("标准 ID 需要唯一，且至少一项为必需。")
+        if len(set(ids)) != len(ids):
+            raise ValueError("每项标准须使用唯一 ID。")
         if active := next((r for r in self.items.values() if r.draft_task and
                            spec.candidate in {r.target,r.author,r.draft_task}), None):
             original_rules = active.criteria[:len(active.criteria) - len(active.probes)]
-            if (active.reviewer != reviewer or original_rules != spec.criteria) and not active.verification_gaps():
+            if not any(r.required for r in spec.criteria) or (
+                    (active.reviewer != reviewer or original_rules != spec.criteria) and not active.verification_gaps()):
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return active
         author = next((r for r in reversed(reports) if spec.candidate in {r["task_id"], r["role"]}
@@ -269,17 +276,33 @@ class ReviewQueue:
         objective = author["objective"]
         probes = {}
         if publication:
+            inherited_rules = {}
+            for raw_rule in publication["unresolved"]:
+                rule = Rule.model_validate(raw_rule)
+                if rule.id in inherited_rules and inherited_rules[rule.id] != rule:
+                    raise ValueError("同一原件已有互相冲突的历史标准定义，无法确定应沿用哪一条：" + rule.id)
+                inherited_rules[rule.id] = rule
+            conflicts = [r.id for r in spec.criteria if r.id in inherited_rules and r != inherited_rules[r.id]]
+            if len(inherited_rules) > 24:
+                raise ValueError("该原件的未决必需项超过单次可绑定的 24 项，无法完整重开复核。")
+            if conflicts:
+                canonical = [rule.model_dump() for rule in inherited_rules.values()]
+                source_hint = ""
+                if self.required_source_paths.intersection(publication["files"]) and not any(
+                        r.required and r.method == "source" for r in inherited_rules.values()):
+                    source_hint = "本轮用户还指定了来源核查，请在新增项中保留必需的 source 标准。"
+                raise InheritedCriteriaConflict(
+                    "原件已有未通过的标准，同一 ID 须保留原定义：" + "、".join(conflicts) +
+                    "。保持 review.candidate，移除 criteria 中的冲突项，宿主会原样补齐；保留其余新增项。"
+                    "若改写内容是额外要求，请用新 ID 追加。只沿用旧项可省略 criteria。" +
+                    source_hint + "原定义：" + json.dumps(canonical, ensure_ascii=False))
+            spec.criteria.extend(rule for key, rule in inherited_rules.items() if key not in ids)
+            if len(spec.criteria) > 24:
+                raise ValueError("必需旧项与新增标准合计超过 24 项。请减少新增项，保留全部旧项。")
+        if not any(rule.required for rule in spec.criteria):
+            raise ValueError("请在 review.criteria 提供至少一项必需标准。省略 criteria 只适用于有未决必需项的同群已发布原件。")
+        if publication:
             files = publication["files"]
-            # A new turn must recheck unresolved public criteria on these exact bytes.
-            for old in publication["unresolved"]:
-                required_rule = Rule.model_validate(old)
-                if required_rule.id in ids and required_rule not in spec.criteria:
-                    raise ValueError("原件已有未通过的标准，请保留其原定义：" + required_rule.id)
-                if required_rule.id not in ids:
-                    if len(spec.criteria) >= 24:
-                        raise ValueError("请减少新增标准，并保留原件未通过的必需项。")
-                    ids.append(required_rule.id)
-                    spec.criteria.append(required_rule)
         elif author["task_id"] in self.candidates:
             files = self.candidates[author["task_id"]]
             if any(self.public_versions.get(p) != sha for p,sha in files.items()):
@@ -312,6 +335,8 @@ class ReviewQueue:
         if existing:
             if publication and existing.files != files:
                 raise ValueError("这次复核已绑定其他文件范围，请沿用原目标。")
+            if publication and any(rule not in existing.criteria for rule in spec.criteria):
+                raise ValueError("当前复核已开始，新增或改写的标准尚未登记。请先完成已绑定的复核，再另行验收新增要求。")
             if (existing.reviewer != reviewer or existing.criteria != spec.criteria) and not existing.verification_gaps():
                 raise ValueError("这个目标已绑定独立验收标准和验收者。")
             return existing
