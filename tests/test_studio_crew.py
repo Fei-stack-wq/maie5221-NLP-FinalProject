@@ -404,6 +404,27 @@ class StudioCrewTest(unittest.TestCase):
         self.assertFalse(reports[0]["published"])
         self.assertEqual(reports[0]["status"], "limit_exceeded")
 
+    def test_stalled_member_can_write_declared_file_then_verify_before_handoff(self):
+        path = "notes/research.md"
+        content = "Checked content from the captured evidence. Remaining claims are explicitly unconfirmed."
+        exploration = [tool("run_python", code=f"print('inspecting section {i}')") for i in range(7)]
+        script = [tool("delegate_task", assignee="writer", objective="Write the verified note",
+                       deliverable_paths=[path], remaining_roles=[]),
+                  *exploration, write(path, content),
+                  tool("run_python", code=f"from pathlib import Path\nassert Path({path!r}).read_text() == {content!r}"),
+                  {"text":"Ready"}, {"text":"Delivered"}]
+        detail, provider = self.execute(script, roster("lead","writer","observer"), objective="Create a research note",
+                                       acceptance_files=[path], limits={"max_seconds":120,"max_total_tokens":0,"max_steps":0})
+        self.assertEqual(detail["run"]["status"], "completed", detail["report"])
+        calls = [row for row in detail["events"] if row["kind"] == "step_start" and row["level"] == "subtask"]
+        delivery, = [row for row in calls if row["phase"] == "deliver"]
+        self.assertEqual(delivery["offered_tools"], ["write_file"])
+        self.assertEqual(delivery["allowed_write_paths"], [path])
+        self.assertIn("run_python", calls[delivery["step"]]["offered_tools"])
+        report, = [row["handoff"] for row in detail["room_events"] if row["kind"] == "member_report"]
+        self.assertTrue(report["published"])
+        self.assertEqual([f["path"] for f in report["changed_files"]], [path])
+
     def test_repeated_green_suite_transitions_to_member_handoff_and_lead_final(self):
         code = ("import subprocess, sys\n"
                 "p = subprocess.run([sys.executable, '-m', 'unittest', 'test_delivery'], capture_output=True, text=True)\n"

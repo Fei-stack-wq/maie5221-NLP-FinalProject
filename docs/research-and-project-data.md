@@ -6,6 +6,8 @@
 
 检索结果自动保存为 `sources/<内容哈希>.json`。研究员依据候选条目选取原始来源，再用 `http_get(url)` 获取可读取的公开网页或文本接口。工具会保存请求网址、最终网址、UTC 获取时间、截断标记、所读原始字节的 SHA-256 和提取出的文本。网页和文本接口最多读取 200,000 字节。带文本的 PDF 可读取最多 8 MiB 原始文件并提取最多 200,000 字节正文。可用 `pdf_page` 读取特定页，页码从 1 开始。来源记录标明页码、提取器、截断及原文件摘要。原始 PDF 仅在临时文件内解析，工作区只保存可交接的文本记录。解析超时、扫描版无正文、文件超限或本机缺少 Poppler 时，工具报告原因，可继续查同一出版方的 HTML 正文。PDF 解析使用已安装的 Poppler 命令，项目只负责限时、有界读取和来源归档。[Poppler 对输入、页码和失败的处理](https://skia.googlesource.com/third_party/poppler/+/7eb91c754431a87c35fc461e31cbd5bafb2f0ddc/utils/pdftotext.cc#259)
 
+成员可以用 `read_source(path, query, offset, limit)` 阅读已保存的资料。只需提供来源路径，其余参数可省略。比如在已抓取的协议文档中查找 `task`，提供 `query="task"` 即可从首个匹配处阅读。随后省略搜索词，用回执的 `next_offset` 继续翻页。起点和长度按正文字符计算，默认每次 4,000 字符，单次最多 12,000 字符。`eof` 表示已读到存档末尾，原抓取自身的截断会另行标出。工具从磁盘核对快照摘要，同伴可以在交接后阅读相同的版本。分页与结束提示参考 MCP Fetch 的字符游标实现，Studio 将其应用于本地归档。[MCP Fetch 分页](https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/fetch/src/mcp_server_fetch/server.py#L1093-L1105) · [完整翻页与越界测试](https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/fetch/tests/test_protocol.py#L820-L895) · [Studio 来源读取回归](../tests/test_research.py)
+
 交接消息应指明「要核查的论断、来源文件、支持或反驳该论断的具体段落」。接手人可以打开资料文件，与当时的草稿逐项比对。搜索命中、聚合链接和 GDELT 收录日期均只能用于发现线索。发表日期和关键结论应回到原始来源核实。
 
 搜索服务使用固定 HTTPS 接口。来源抓取会逐次校验跳转，连接到已验证的公网 IP，并以原始域名校验 TLS。当本机 HTTP 代理为域名返回 `198.18.0.0/15` 合成地址时，工具会用 Google Public DNS 查询公开 A 记录，通过系统代理连接到经校验的数字地址。普通公网 DNS 无需这一查询。[Google Public DNS 查询协议](https://developers.google.com/speed/public-dns/docs/doh/json)

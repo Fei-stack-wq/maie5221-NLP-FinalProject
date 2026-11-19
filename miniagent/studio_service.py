@@ -552,10 +552,12 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         conversation = data["conversation"] or {}
         recoverable = (conversation.get("recovery_candidates", [])
                        if conversation.get("head_run_id") == run_id else [])
+        data["room_events"] = self.room_events(run_id)
         data["diagnostics"] = diagnose(tasks, events, acceptance,
                                        active=run_id in self._active, incomplete=log_truncated,
-                                       recovery_candidates=recoverable)
-        data["room_events"] = self.room_events(run_id)
+                                       recovery_candidates=recoverable,
+                                       room_events=data["room_events"] if data["run"]["status"] == "failed"
+                                       and not data["run"].get("error_code") else None)
         data["pending_questions"] = [{key: row[key] for key in ("request_id", "role", "text")}
                                      for (rid, _), row in self._questions.items()
                                      if rid == run_id and row["answer"] is None]

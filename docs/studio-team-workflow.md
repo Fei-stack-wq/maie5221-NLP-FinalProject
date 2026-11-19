@@ -97,6 +97,18 @@ print("PASS: submitted the booking through the visible form")
 
 浏览器操作和断言直接使用 Microsoft 的开源 Playwright for Python（Apache-2.0）。[同步 API 文档](https://playwright.dev/python/docs/library) · [源代码与许可证](https://github.com/microsoft/playwright-python)
 
+### 成员调研与文件交付
+
+成员第一次执行命令时，工作室会在项目目录外建立临时 Python 虚拟环境。该成员的 shell、Python 和浏览器脚本共用解释器，普通 `pip install` 安装的依赖与命令行工具在后续步骤可用。pip 缓存也位于项目目录外。成员结束后释放临时环境；项目要长期使用的依赖仍应写入项目自己的依赖清单。实现复用 CPython 的 `venv.EnvBuilder` 和独立安装前缀，并向成员提供平台预装的运行库。[CPython venv 创建过程](https://github.com/python/cpython/blob/v3.14.0/Lib/venv/__init__.py#L64-L95) · [环境前缀测试](https://github.com/python/cpython/blob/v3.14.0/Lib/test/test_venv.py#L268-L283) · [Studio 命令工具回归](../tests/test_shell_tool.py)
+
+群成员可以调用 `read_source` 对 `http_get` 或 `search_sources` 已归档的正文或结果分页。在同一份归档上读取原始 JSON 和读取正文分别记录字符范围。用 Python 从归档抽出正文时，宿主也能识别先前未见的原文节选。阅读进度只用于决定下一步是否继续工作，独立评审需要自己的来源和检查回执。
+
+连续七轮工具调用没有产生新文件、新的阅读范围或检查结果时，成员如有预算且尚缺指定文本文件，会得到一次 `deliver` 回合。该回合保留已读材料，仅对缺失的目标路径开放 `write_file`。实际写入会使成员回到 `work`，可继续编辑、补来源和验证。如果同一批缺失文件仍未产生，成员进入文字交接，负责人能看到具体缺项。独立评审沿用各自的签署与取证流程。
+
+这里参考 OpenAI Agents SDK 按当前运行上下文计算工具可用性，并在执行前处理已失效工具的做法。Studio 将 `deliver` 的写入范围绑定到本次委派声明的文件，并核对工作目录里实际产生的版本。[上游工具筛选](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L302-L320) · [上游执行前拒绝测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_run_step_execution.py#L1604-L1639) · [成员进度回归](../tests/test_crew_progress.py) · [群聊交付回归](../tests/test_studio_crew.py)
+
+失败详情会把同一次成员尝试的工具清单、实际调用和交接回执对齐。若写工具曾经开放、成员一次也没调用、宿主因停滞收起工具，且最终确实缺文件，界面会说明在哪一步转入文字交接，并列出这次分工缺少的路径。真正的工具错误、预算耗尽、发布到本地目录失败都有各自的诊断。这里参考 OpenAI Agents SDK 通过所属运行和 span 身份关联工具与结束事件的做法，Studio 另外核对持久任务尝试与群聊交接记录。[轨迹导出](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tracing/spans.py#L373-L405) · [工具轨迹测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_tracing.py#L452-L481) · [Studio 失败诊断回归](../tests/test_studio_diagnostics.py)
+
 ## 已有草稿的返工
 
 负责人可以在同一次委派中声明成员负责的 `deliverable_paths`。分工已有测试证据但还缺指定的文本产物时，成员会看到缺失路径、最近的检查结果，并保留编辑源码和复测的工具。系统保存上一次未发布的草稿及其公共版本，恢复时会把实际检查、缺失路径和工作目录一并交还。对同一组缺口反复改写任务描述，仍计入同一次返工；为其他已选成员保留的执行额度会单独计算。日志可区分成员间发布、草稿续修、向本机工作区写回和最后一次独立验收。
@@ -331,11 +343,13 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 每个派工有持久的 `dispatch_id` 和预留的子运行 ID。来源轮成功收尾并释放工作位置后，调度器创建原生私聊或群任务。相同来源轮对同一目标重复提交同一工作会返回同一回执。目标会话忙时保留队列项。进程重启后按已发布运行的来源身份重新关联。来源轮失败或取消时，尚未发出的派工会记录原因。角色接单沿用该助手在本项目的派工私聊，个人另开的私聊独立保存。
 
-两人群里，如果负责人也负责撰稿或汇总，可以认领具体文件，在单独的执行任务中写入并交接。另一位成员须实际参与，作者和独立验收人分开记录。按文件名发起正式复核时，宿主核对当前版本的生产者和 SHA。本轮显式转入的角色私聊原件也可按文件路径定位原作者；发生变更后，须依据新版本重新核对。
+在任意规模的群里，负责人都可以用自己的角色 ID 认领具体文件。比如在研究、写作、复核三人群，研究员兼任负责人时，先用自己的成员执行任务写入笔记，再把笔记交给写作者，最后由复核者检查成稿。负责人协调时使用只读工具，认领的子任务使用独立可写工作副本；两者分别计量。至少一位其他成员应有实际交接，独立评审仍由另一位角色完成。按文件名发起正式复核时，宿主核对当前版本的生产者和 SHA。本轮显式转入的角色私聊原件也可按文件路径定位原作者；发生变更后，须依据新版本重新核对。
 
 来源回合的 `dispatches` 列出收件者、工作说明、状态、子运行与会话 ID、待答问题、答复和交付文件。每次派工都有独立的原生运行和验收记录，预算亦按运行计量。要求文件存在的验收只证明该项文件检查通过，判断其内容可采用独立成员复核和已有的验收规则。主页可继续接收新消息，并刷新较早回合的待办。
 
 选了本机目录时，接单方从该项目目录签出工作副本。显式转交的工作区文件或历史交付按项目相对路径放入子工作区，同名冲突会报告。成功或未配置独立验收的子运行收尾时，只发布负责人的公开工作区里新增、修改或明确指定验收的文件。交付封存到原生 handoff 快照。后续工作看得到相对路径、SHA-256 和 `dispatch:<UUID>/<项目路径>` 引用。打开或转交时核对内容哈希。模型可通过 `list_studio_deliveries` 查找本项目记录，通过 `read_studio_delivery` 阅读实际文本。
+
+这里参考了 OpenAI Agents SDK 将专家作为工具调用时建立单独运行上下文、完成后把结果交还调用者的实现。Studio 把协调和生成工件分成两个任务，可复用同一角色身份，并单独校验发布文件、群成员的实际交接与审阅者身份。三阶段端到端回归核对每份文件的实际发布人和后续读取回执，也覆盖角色 ID 无效、负责人缺少具体文件和只有负责人交接。[嵌套运行](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L1085-L1107) · [读取本次结果的测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L855-L938) · [输入错误处理回归](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L1509-L1532) · [Studio 分派测试](../tests/test_studio_duo.py)
 
 作者修订后，可以把新版本再交给原评审员。宿主会查出评审员上次收到的版本，仅当当前私有副本仍与该版本逐字节相同、新版来自同一上游会话且轮次更晚，才替换本轮输入。评审员另行编辑过的文件、异源同名文件、用户本地修改都会触发冲突。版本覆盖规则参考 Git 的双树合并，并增加了派工身份核对。[Git 版本选择](https://github.com/git/git/blob/v2.47.0/unpack-trees.c#L2935-L2941) · [工作副本保留测试](https://github.com/git/git/blob/v2.47.0/t/t1001-read-tree-m-2way.sh#L282-L303) · [工作室四轮回归](../tests/test_studio_route_revisions.py)
 

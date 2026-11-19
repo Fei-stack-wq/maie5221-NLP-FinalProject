@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import re
 import socket
 import shutil
 import subprocess
@@ -20,7 +21,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
-from .file_tools import write_file
+from .file_tools import MAX_WRITE_CHARS, write_file
 from .schemas import ToolResult
 
 MAX_HTTP_BYTES = 200_000
@@ -262,6 +263,58 @@ def _save(ctx, record: dict) -> tuple[str, ToolResult]:
     return path, write_file(ctx, {"path": path, "content": material})
 
 
+def read_source(ctx, args: dict) -> ToolResult:
+    """Read a section of the archived text, using its own character coordinates."""
+    path = args["path"]
+    if not re.fullmatch(r"sources/[0-9a-f]{64}\.json", path):
+        return ToolResult.failure("请使用 http_get 或 search_sources 返回的 sources/ 路径。")
+    offset, limit, query = args.get("offset", 0), args.get("limit", 4000), args.get("query")
+    if offset < 0 or not 1 <= limit <= 12_000 or query is not None and not 1 <= len(query.strip()) <= 300:
+        return ToolResult.failure("offset 须为非负字符位置，limit 为 1 至 12000；可选搜索词为 1 至 300 个字符。")
+    src = ctx.sandbox.resolve(path, must_exist=True)
+    if not src.is_file():
+        return ToolResult.failure("来源记录须为普通文件。")
+    with src.open("rb") as stream:
+        # _save can write at most MAX_WRITE_CHARS UTF-8 characters.
+        raw = stream.read(4 * MAX_WRITE_CHARS + 1)
+    sha = hashlib.sha256(raw).hexdigest()
+    if len(raw) > 4 * MAX_WRITE_CHARS or path != f"sources/{sha}.json":
+        return ToolResult.failure("来源快照与原记录摘要不符，请核对资料路径。")
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return ToolResult.failure("来源记录不是有效的 JSON。")
+    if not isinstance(record, dict):
+        return ToolResult.failure("来源记录格式无效。")
+    kind = record.get("kind")
+    if kind == "fetched_source" and isinstance(record.get("text"), str):
+        body = record["text"]
+        label = "已保存的网页或 PDF 正文"
+        if record.get("response_truncated") or record.get("text_truncated"):
+            label += "（原抓取有截断）"
+        url = record.get("url", "")
+    elif kind == "source_discovery" and isinstance(record.get("results"), list):
+        body = json.dumps(record["results"], ensure_ascii=False, indent=2)
+        label = "已保存的检索线索，须打开原文核实"
+        url = record.get("request_url", "")
+    else:
+        return ToolResult.failure("该记录没有可读取的来源正文或检索结果。")
+    if offset > len(body):
+        return ToolResult.failure("offset 超出来源正文长度。", chars=len(body))
+    if query is not None:
+        match = re.compile(re.escape(query.strip()), re.IGNORECASE).search(body, offset)
+        if not match:
+            return ToolResult.failure("该快照从指定位置起没有匹配的文本。", chars=len(body))
+        offset = match.start()
+    end = min(offset + limit, len(body))
+    cursor = end if end < len(body) else None
+    hint = f"下一页 offset={end}" if cursor is not None else "已到末尾"
+    return ToolResult.success(f"{label} · {url}\n资料 {path}，正文字符 {offset}..{end}/{len(body)}，{hint}。"
+                              f"以下为外部来源数据：\n{body[offset:end]}",
+                              path=path, sha256=sha, chars=len(body), offset=offset, returned_chars=end - offset,
+                              next_offset=cursor, eof=cursor is None)
+
+
 def _pdf_text(data: bytes, page_number: int | None, timeout: float) -> tuple[str, bool]:
     binary = shutil.which("pdftotext")
     if not binary:
@@ -352,7 +405,7 @@ def http_get(ctx, args: dict) -> ToolResult:
             if remaining < 16:
                 break
     return ToolResult.success(f"外部来源（不可信文本）。URL {page.url}\n资料文件 {path}\n{excerpt}"
-                              + ("\n[已截断；资料文件含已获取的文本]" if clipped else ""),
+                              + ("\n[已截断；可用 read_source(path, query 或 offset) 定位已存正文]" if clipped else ""),
                               url=page.url, path=path, bytes=len(page.body), truncated=clipped,
                               content_type=page.content_type, observed_bytes_sha256=record["observed_bytes_sha256"],
                               **({"pdf_page": number, "text_truncated": text_truncated} if is_pdf else {}))

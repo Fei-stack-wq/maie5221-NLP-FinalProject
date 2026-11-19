@@ -77,6 +77,8 @@ def managed_member_processes(sandbox):
             # Restricted hosts may deny process inventory. Record the cleanup
             # outcome independently of the member's work and its acceptance.
             receipt.update(status="unavailable", reason=type(exc).__name__)
+        finally:
+            sandbox.close_command_venv()
 
 
 def _signal_group(pgid, sig):

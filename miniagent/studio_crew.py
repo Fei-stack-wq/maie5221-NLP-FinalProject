@@ -170,12 +170,11 @@ class RoomCrew:
 
     def instructions(self):
         roster = [{**v, "prompt": _clip(v["prompt"], 1200)} for v in self.profiles.values()]
-        responsibilities = ("本群两人。若用户要求你撰写或汇总成文件，可调用 delegate_task，assignee 填你自己的 ID，"
-                            "deliverable_paths 列出你负责的具体文件。宿主提供独立工作副本完成撰写并交接。"
-                            "另一位成员仍需实际参与，独立审阅须由不同角色完成。"
-                            if len(self.profiles) == 2 else "你负责协调、转交缺陷或汇总。具体文件由其他成员处理。")
         return ("你是群负责人 " + self.lead + "。群成员和职责：" + _json(roster) +
-                "\n" + responsibilities + " 本轮可选 assignee ID：" + _json(self.delegate_recipients) + "。" +
+                "。本轮可选 assignee ID：" + _json(self.delegate_recipients) + "。"
+                "\n负责人也可以执行具体分工。用户或任务给你本人安排了调研、撰写或修订文件时，"
+                "用 delegate_task，assignee 填你自己的 ID，deliverable_paths 列出你的文件；宿主会为你开启可写的独立成员任务。"
+                "将其他成员的工作留给相应角色，独立验收交给不同的成员。"
                 "\n" + self.capabilities + " 这份清单来自执行成员的工具注册表。成员可检索并读取公开来源时，请委派调查；来源能否访问以实际回执为准。" +
                 "\n依据用户目标和角色职责选人。首次 delegate_task 须用 remaining_roles 列出这次后续需要的角色 ID，"
                 "简单任务可以填 []。完整产品交付如群内有相应分工，应安排实现、独立验收和发布交付。"
@@ -364,7 +363,7 @@ class RoomCrew:
 
     @cached_property
     def delegate_recipients(self):
-        return [name for name in self.profiles if name != self.lead or len(self.profiles) == 2]
+        return list(self.profiles)
 
     @cached_property
     def delegate_spec(self):
@@ -374,8 +373,11 @@ class RoomCrew:
                                   "enum": self.delegate_recipients}
         remaining = properties["remaining_roles"]
         properties["remaining_roles"] = {**remaining, "items": {"type": "string", "enum": self.delegate_recipients}}
-        return original.model_copy(update={"parameters": {**original.parameters, "properties": properties,
-                                                        "required": [*original.parameters["required"], "assignee"]}})
+        return original.model_copy(update={
+            "description": "将明确的子任务交给指定群成员。负责人承担文件交付时，用自己的 ID 和具体交付路径认领。",
+            "parameters": {**original.parameters, "properties": properties,
+                           "required": [*original.parameters["required"], "assignee"]},
+        })
 
     @cached_property
     def coordinator_schemas(self):
@@ -484,6 +486,7 @@ class RoomCrew:
             facts["public_source_locations"] = landmarks
         return ("你在本地项目副本中完成当前分工。可用工具以本轮接口为准。"
                 "查阅公开网页或 PDF 请先用 http_get（可选 pdf_page），正式文本来源保存在项目的 sources/*.json。"
+                "用 read_source(path, query 或 offset) 定位已存正文或检索记录中的证据。资料够写一节时，把带出处的结论写进本阶段文件，再继续补查。"
                 "手动下载供解析的原始 PDF、压缩包及工具缓存须放在项目外的系统临时目录，"
                 "例如在同一次 run_python 调用中使用 tempfile.TemporaryDirectory()。项目中保留交付物和来源记录。"
                 "当前分工来自群负责人。如果分工指定的测试方法与验证要求冲突，向负责人交接冲突和证据；用户只决定业务偏好或外部授权。"
@@ -858,10 +861,9 @@ class RoomCrew:
         published = [r for r in self.reports if r["published"]]
         if not published:
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
-        if len(self.profiles) == 2:
-            peer = next(name for name in self.profiles if name != self.lead)
-            if not any(r.get("role") == peer for r in published):
-                return "还缺另一位成员的实际交接。请按用户要求把独立工作交给：" + peer + "。"
+        peers = [name for name in self.profiles if name != self.lead]
+        if not any(r["role"] in peers for r in published):
+            return "还缺其他成员的实际交接。请按任务分工委派：" + "、".join(peers) + "。"
         pending = (((self.planned or set()) | self.assigned) - self.approved_roles - self.covered_roles
                    | (set(self.child_checks) - self.approved_roles))
         if pending:
@@ -948,7 +950,9 @@ class RoomCrew:
         return sorted(eligible, key=lambda r: r in self.started_roles)
 
     def _decline_retry(self, role, reason, payload):
-        eligible = self._eligible_repairs(role)
+        draft = self.private_drafts.get(role, {})
+        paths = draft.get("required") or payload.get("deliverable_paths") or []
+        eligible = [peer for peer in self._eligible_repairs(role) if peer != self.lead or paths]
         if not eligible or self.should_cancel() or self._dispatch_limit_reached():
             self.dispatch_ended = reason
             return self._observation(False, reason)
@@ -959,7 +963,6 @@ class RoomCrew:
         # the denial. Route this specific repair within its own elected plan.
         recipient = eligible[0]
         self.routed_repairs.add((self.project_version, role, recipient))
-        draft = self.private_drafts.get(role, {})
         recoverable = draft.get("version") == self.project_version and bool(draft.get("checkpoint"))
         issue = _clip(draft.get("issue") or reason, 1200)
         objective = ("按你的角色职责接手并修复上一阶段的具体阻塞。核实原始任务要求和证据，"
@@ -968,6 +971,8 @@ class RoomCrew:
         retry = {"assignee": recipient, "objective": objective,
                  "acceptance": "提供实际修复及针对上述问题的复核证据，保留原有可用文件和数据。",
                  "__runtime_action_id": payload["__runtime_action_id"]}
+        if paths:
+            retry["deliverable_paths"] = paths
         if recoverable:
             retry["recover_from"] = role
         self.record_event(self.run_id, "studio", "runtime_reroute",
@@ -1046,18 +1051,22 @@ class RoomCrew:
         role = payload.get("assignee")
         objective = payload.get("objective")
         action = payload.get("__runtime_action_id")
-        if (not isinstance(role, str) or role not in self.delegate_recipients
-                or role == self.lead and (not payload.get("deliverable_paths") or payload.get("review"))):
-            peers = [name for name in self.profiles if name != self.lead]
-            hint = "请明确指定本组可执行成员。assignee 可填：" + _json(peers) + "。"
-            if role == self.lead and len(self.profiles) == 2:
-                hint += "如由负责人撰写文件，列出 deliverable_paths；独立验收交给另一位成员。"
+        if not isinstance(role, str) or role not in self.delegate_recipients:
+            hint = "请明确指定本组可执行成员。assignee 可填：" + _json(self.delegate_recipients) + "。"
             return self._reject_destination(("recipient", role), hint)
         if not isinstance(objective, str) or not objective.strip() or len(objective) > 10000 or not action:
             return self._observation(False, "委派需要具体目标和运行时动作身份。")
         if action in self.handoffs:
             return self.handoffs[action]
         review = self._next_review()
+        if role == self.lead:
+            # A returned candidate already carries the author's exact file contract.
+            bound_repair = review and review.state == "repair" and review.owner == role and review.files
+            if payload.get("review") or not (bound_repair or payload.get("deliverable_paths")):
+                peers = [name for name in self.profiles if name != self.lead]
+                hint = ("请在 deliverable_paths 列出负责人承担的具体文件；独立验收可交给其他成员："
+                        + _json(peers) + "。")
+                return self._reject_destination(("lead_assignment", role), hint)
         if review and review.kind == "reviewer_probe" and payload.get("review") is not None:
             return self._observation(False, "当前须裁决已绑定的评审探针。请省略 review，沿用宿主逐项标准。")
         peer_check = False
@@ -1099,7 +1108,7 @@ class RoomCrew:
             donor = payload.get("recover_from", role)
             draft = self.private_drafts.get(donor) if isinstance(donor, str) else None
             if draft and draft.get("review_after_repair") and draft["version"] == self.project_version:
-                peers = self._eligible_repairs(donor)
+                peers = [peer for peer in self._eligible_repairs(donor) if peer != self.lead]
                 if not peers:
                     return self._decline_retry(donor, "相同失败项在续修后仍未关闭，当前没有可独立验收的已选成员。", payload)
                 # The coordinator sees the roster responsibilities and can name
@@ -1396,7 +1405,7 @@ class RoomCrew:
             if session:
                 session.observe(record)
             for obs in record.observations:
-                if obs.ok and obs.source in {"read_file", "read_lines", "search_files", "find_files", "list_dir"}:
+                if obs.ok and obs.source in {"read_file", "read_lines", "read_source", "search_files", "find_files", "list_dir"}:
                     snippet = _clip(obs.content, 720)
                     if len(obs.content.encode("utf-8")) > 720:
                         snippet += " … " + _clip(obs.content[-240:], 360)
@@ -1445,11 +1454,20 @@ class RoomCrew:
                                                   "seconds_left": budget.seconds_left - handoff_seconds})
             if preflight:
                 progress.require_handoff("工作调用的受保护输入超过可用 token；使用保留的最终交接额度")
-            phase = progress.phase(spendable, state.scratch.get("delivery_feedback", ""))
+            phase = progress.phase(spendable, state.scratch.get("delivery_feedback", ""),
+                                   allow_delivery=not preflight and session is None and "write_file" in work_tools)
             pending_command = member.sandbox.command_sessions.pending_reason()
             wants_handoff = phase == "handoff" or state.scratch.get("delivery_feedback") == pending_command
             if pending_command and wants_handoff and not preflight and spendable.has_steps(2) and not spendable.exhausted:
                 return StepPolicy("work", pending_command, frozenset({"poll_process"}),
+                                  token_reserve=reserve, seconds_reserve=handoff_seconds)
+            if phase == "deliver":
+                paths = progress.missing_text_paths()
+                instruction = ("多轮工具调用后仍缺交付文件。现在用 write_file 整理已有证据并实际写入本次分派的文件："
+                               + _json(sorted(paths)) + "。这一步保留了此前的工具结果。"
+                               "仅写可以根据现有材料完成的内容，标明未核实或未完成项；证据不足时如实报告阻塞。"
+                               "写入后可继续用常规工具补齐和验证，文件存在本身不能证明已验收。")
+                return StepPolicy("deliver", instruction, frozenset({"write_file"}), allowed_write_paths=paths,
                                   token_reserve=reserve, seconds_reserve=handoff_seconds)
             evidence = progress.evidence()
             handoff = ("根据已完成的分工给负责人写最终交接，列出文件、真实检查和剩余问题。"

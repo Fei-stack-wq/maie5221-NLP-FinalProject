@@ -34,6 +34,47 @@ def event(kind, identity="root", **fields):
 
 
 class StudioDiagnosticsTest(unittest.TestCase):
+    def test_diagnoses_only_host_confirmed_blocked_handoff_before_writing(self):
+        tasks = [task(status="failed"), task("child", "failed", "root")]
+        identity = {"root_id": "root", "attempt_id": "a", "run_id": "r"}
+        work = event("step_start", "child", **identity, phase="work", step=1, offered_tools=["write_file"])
+        closing = event("step_start", "child", **identity, phase="handoff", step=9, offered_tools=[])
+        child_end = event("task_end", "child", **identity, status="error")
+        root_end = event("task_end", status="error", error="[BLOCKED] 写文件时被系统拒绝")
+        evidence = {"stop_reason": "连续七轮没有新的文件、来源或检查结果", "missing_required_files": ["notes/a.md"]}
+        receipt = {"kind": "member_report", "task_id": "child", "role": "writer", "status": "error",
+                   "published": False, "handoff": {"evidence": evidence}, "text": "我是没有工具的角色"}
+        events = [work, closing, {**closing, "step": 10}, child_end, root_end]
+        drafts = [{"task_id": "child", "role": "writer"}]
+        result = diagnose(tasks, events, [], room_events=[receipt], recovery_candidates=drafts)
+        issue = result["issues"][0]
+        self.assertEqual(issue["code"], "member_handoff_before_write")
+        self.assertEqual(issue["missing_required_files"], ["notes/a.md"])
+        self.assertEqual((issue["task_id"], issue["attempt_id"], issue["step"]), ("child", "a", 9))
+        self.assertIn("工作阶段提供过", issue["message"])
+        self.assertIn("选择这个成员的草稿", issue["suggestion"])
+        self.assertEqual(result["execution_status"], "failed")
+        result = diagnose(tasks, [work, {**work, "phase": "deliver", "step": 8}, closing, child_end, root_end],
+                          [], room_events=[receipt])
+        self.assertEqual(result["issues"][0]["code"], issue["code"])
+        self.assertIn("专门写入", result["issues"][0]["message"])
+        self.assertNotIn("选择这个成员的草稿", result["issues"][0]["suggestion"])
+
+        write_failure = event("tool_result", "child", **identity, operation="write_file", ok=False)
+        for trace, journal, incomplete in [
+            ([work, write_failure, closing, child_end, root_end], [receipt], False),
+            ([work, {**closing, "attempt_id": "old"}, child_end, root_end], [receipt], False),
+            (events, [dict(receipt, handoff={})], False),
+            (events, [receipt, dict(receipt, status="completed", published=True)], False),
+            (events, [receipt], True),
+            ([*events[:-1], event("task_end",status="completed")], [receipt], False),
+            ([*events, event("studio_error", error_code="OSError")], [receipt], False),
+        ]:
+            with self.subTest(trace=trace, journal=journal, incomplete=incomplete):
+                codes = [issue["code"] for issue in diagnose(tasks, trace, [], room_events=journal,
+                                                              incomplete=incomplete)["issues"]]
+                self.assertNotIn("member_handoff_before_write", codes)
+
     def test_historical_402_receipts_explain_balance_and_verified_recoverable_drafts(self):
         rows = [task(status="failed"), task("risk", "failed", "root")]
         events = []

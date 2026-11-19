@@ -4,7 +4,7 @@
   const escape = value => String(value ?? '').replace(/[&<>"']/g, char =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[char]);
   const labels = {
-    list_dir:'列出目录', read_file:'读取文件', read_lines:'读取指定行', find_files:'查找文件',
+    list_dir:'列出目录', read_file:'读取文件', read_lines:'读取指定行', read_source:'读取已存来源', find_files:'查找文件',
     search_files:'搜索文件', write_file:'写入文件', edit_file:'编辑文件', append_file:'追加文件',
     delete_file:'删除文件', run_shell:'执行命令', run_python:'运行 Python', run_browser:'检查网页',
     http_get:'打开来源', search_sources:'搜索来源', submit_review:'提交评审',

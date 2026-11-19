@@ -12,13 +12,14 @@ import os
 import re
 import shlex
 import stat
-from dataclasses import dataclass, field
+import sys
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import unquote, urlsplit
 
 from .check_provenance import python_check_source, python_invocation, shell_invocation
-from .project_data import PROJECT_CACHE_DIRS
+from .project_data import PROJECT_CACHE_DIRS, is_database, is_png
 from .rao import Budget, Observation, RAOState, StepRecord
 from .schemas import ToolResult
 from .tools import Tool
@@ -662,13 +663,16 @@ class MemberProgress:
         self._failed_runs = {}
         self._retired = []
         self._active_retirements = {}
+        self._source_text = {}
+        self._excerpt_ranges = {}
+        self._delivery_offer = None
         self._current = self._scan()
         self._starting = self._current.copy()
         # A recovered member starts from its private checkpoint, while work
         # credited to the assignment is always relative to the public project.
         self._initial = self._current.copy() if public_baseline is None else dict(public_baseline)
         self._reads = set()
-        self._read_coverage: dict[str, _ReadCoverage] = {}
+        self._read_coverage: dict[tuple[str, str], _ReadCoverage] = {}
         self._read_hint = ""
         self._inspected = set()
         self._passes = {}
@@ -732,6 +736,20 @@ class MemberProgress:
                     spent += len(data)
                     files[key] = hashlib.sha256(data).hexdigest()
                     self._cache[key] = (sig, files[key])
+                    # Research archives are immutable by filename. Index only the
+                    # captured source body, never model labels, links or a command's claims.
+                    if key == f"sources/{files[key]}.json" and len(data) <= 512 * 1024:
+                        try:
+                            record = json.loads(data)
+                        except (ValueError, UnicodeError, RecursionError):
+                            record = None
+                        if (isinstance(record, dict) and record.get("kind") == "fetched_source"
+                                and isinstance(record.get("text"), str)):
+                            if key not in self._source_text and len(self._source_text) >= 32:
+                                oldest = next(iter(self._source_text))
+                                del self._source_text[oldest]
+                                self._excerpt_ranges.pop(oldest, None)
+                            self._source_text[key] = record["text"]
                     if key.endswith(".py") and len(data) <= 32768:
                         try:
                             self._check_sources[key] = (files[key], data.decode("utf-8"))
@@ -840,9 +858,13 @@ class MemberProgress:
             self._after_pass = 0
             self._reads.clear()
             self._investigations.clear()
-            for path, coverage in list(self._read_coverage.items()):
-                if self._current.get(path) != coverage.sha256:
-                    del self._read_coverage[path]
+            for key, coverage in list(self._read_coverage.items()):
+                if self._current.get(key[0]) != coverage.sha256:
+                    del self._read_coverage[key]
+            for path in list(self._source_text):
+                if self._current.get(path) != Path(path).stem:
+                    del self._source_text[path]
+                    self._excerpt_ranges.pop(path, None)
         seen_before = bool(self._passes)
         advances = changed
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
@@ -864,10 +886,10 @@ class MemberProgress:
             if obs.source == "run_shell" and obs.meta.get("process_state") == "running":
                 continue
             reads = set()
-            if obs.source in {"read_file", "read_lines"} and obs.ok:
+            if obs.source in {"read_file", "read_lines", "read_source"} and obs.ok:
                 path = obs.meta.get("path") or parameters.get("path")
                 if path:
-                    offset = (obs.meta.get("offset", parameters.get("offset", 0)) if obs.source == "read_file"
+                    offset = (obs.meta.get("offset", parameters.get("offset", 0)) if obs.source in {"read_file", "read_source"}
                               else ("line", obs.meta.get("start_line", parameters.get("start_line", 1))))
                     path = str(Path(path))
                     if changed and self._current.get(path) != obs.meta.get("sha256") and obs.meta.get("sha256"):
@@ -918,6 +940,10 @@ class MemberProgress:
                     paths, command, exit_position, reading = _script_inputs(str(parameters.get("code", "")))
                     reads.update((p, 0) for p in paths if obs.ok and p in self._current)
                     signal = _check(obs, command, reading, exit_position)
+                    if reading and obs.ok and obs.meta.get("exit_code") == 0:
+                        advances |= self._new_source_excerpt(obs.content)
+                if invocation and invocation.legacy_default_scope in self._pending_verification:
+                    invocation = replace(invocation, scope=invocation.legacy_default_scope)
                 exit_code = obs.meta.get("exit_code")
                 missing_exit = False
                 if invocation and invocation.exit_footer and exit_code == 0:
@@ -1152,6 +1178,9 @@ class MemberProgress:
             elif obs.source in {"search_sources", "http_get"} and obs.ok:
                 if path := obs.meta.get("path"):
                     reads.add((path, 0))
+                    if obs.source == "search_sources":
+                        self._searches.add((obs.source, parameters.get("collection", "news"),
+                                            parameters.get("query", "").casefold().strip()))
             elif obs.source == "human" and obs.ok:
                 advances = True
             advances |= bool(reads - self._reads)
@@ -1200,20 +1229,36 @@ class MemberProgress:
             self._searches.add(key)
         return fresh
 
+    def _new_source_excerpt(self, output: str) -> bool:
+        # Python can select JSON records using a glob or computed path. Treat a
+        # new matching passage as scheduling progress, never verification.
+        stdout = output.partition("stdout:\n")[2].partition("\nstderr:\n")[0]
+        excerpts = [line.strip()[:512] for line in stdout[:8192].splitlines() if len(line.strip()) >= 48][:6]
+        fresh = False
+        for excerpt in excerpts:
+            for path, body in self._source_text.items():
+                start = body.find(excerpt)
+                if start >= 0:
+                    ranges = self._excerpt_ranges.setdefault(path, [])
+                    fresh |= _cover(ranges, start, start + len(excerpt))
+                    break
+        return fresh
+
     def _record_page(self, path: str, obs: Observation) -> bool | None:
         meta = obs.meta
         digest, total = meta.get("sha256"), meta.get("chars")
-        if obs.source == "read_file":
+        if obs.source in {"read_file", "read_source"}:
             start, size = meta.get("offset"), meta.get("returned_chars")
             end = start + size if type(start) is int and type(size) is int else None
         else:
             start, end = meta.get("char_start"), meta.get("char_end")
         if not digest or not all(type(n) is int and n >= 0 for n in (start, end, total)):
             return None
-        previous = self._read_coverage.pop(path, None)
+        key = (path, "source_body" if obs.source == "read_source" else "file")
+        previous = self._read_coverage.pop(key, None)
         new_version = previous is None or previous.sha256 != digest
         page = _ReadCoverage(digest, total) if new_version else previous
-        self._read_coverage[path] = page
+        self._read_coverage[key] = page
         fresh = _cover(page.ranges, min(start, total), min(end, total))
         if obs.source == "read_lines" and meta.get("returned_lines"):
             first = meta["start_line"]
@@ -1227,7 +1272,14 @@ class MemberProgress:
         return fresh or new_version
 
     def read_checkpoint(self) -> dict:
-        return {path: page.receipt() for path, page in list(self._read_coverage.items())[-6:]}
+        result = {}
+        for (path, coordinates), page in list(self._read_coverage.items())[-6:]:
+            receipt = result.setdefault(path, {})
+            if coordinates == "source_body":
+                receipt["source_body"] = page.receipt()
+            else:
+                receipt.update(page.receipt())
+        return result
 
     def failed_checks(self) -> dict[str, str]:
         # Never put an invocation's raw command into a recoverable checklist.
@@ -1248,7 +1300,11 @@ class MemberProgress:
     def restore_pending_verification(self, previous):
         for entry in previous:
             if isinstance(entry, dict) and re.fullmatch(r"[0-9a-f]{64}", str(entry.get("scope", ""))):
-                self._pending_verification[entry["scope"]] = {k: entry.get(k) for k in ("scope", "selection", "check", "path", "at_sha256")}
+                restored = {k: entry.get(k) for k in ("scope", "selection", "check", "path", "at_sha256")}
+                prefix = shlex.quote(sys.executable) + " "
+                if isinstance(restored["check"], str) and restored["check"].startswith(prefix):
+                    restored["check"] = "python " + restored["check"][len(prefix):]
+                self._pending_verification[entry["scope"]] = restored
 
     def require_handoff(self, reason: str) -> None:
         self._stop = reason
@@ -1263,7 +1319,10 @@ class MemberProgress:
     def _unchanged_outputs(self) -> list[str]:
         return sorted(p for p in self.required & self._current.keys() if self._initial.get(p) == self._current[p])
 
-    def phase(self, budget: Budget, feedback: str = "") -> str:
+    def missing_text_paths(self) -> frozenset[str]:
+        return frozenset(path for path in self.pending_paths() if not is_database(path) and not is_png(path))
+
+    def phase(self, budget: Budget, feedback: str = "", *, allow_delivery: bool = False) -> str:
         if self._stop and feedback.startswith("[验收未通过]") and feedback != self._rejection:
             self._rejection = feedback
             self._stop = ""
@@ -1278,6 +1337,12 @@ class MemberProgress:
                 or not budget.has_tokens(1) or budget.seconds_left <= 0):
             self._stop = "为最终交接保留本次分工的剩余额度"
         elif self._quiet >= 7:
+            missing = self.missing_text_paths()
+            if allow_delivery and missing and self._delivery_offer != missing:
+                # Stop unproductive exploration but leave one opportunity to
+                # materialize the outstanding deliverables with current evidence.
+                self._delivery_offer = missing
+                return "deliver"
             self._stop = "连续七轮没有新的文件、来源或检查结果"
         elif (self._failures and not self.pending_paths() and not self._unchanged_outputs()
               and self._initial != self._current and self._repeat_pass):
@@ -1358,8 +1423,10 @@ class MemberProgress:
         if evidence["missing_required_files"] or evidence["unchanged_required_files"]:
             missing = "、".join(evidence["missing_required_files"]) or "无"
             unchanged = "、".join(evidence["unchanged_required_files"]) or "无"
+            research = ("已有调研材料可先将有出处的要点写入目标文件，再补其余来源。"
+                        "查归档正文请用 read_source 按需分页。" if self._source_text else "")
             return (f"本次分工还需交付 {missing}。与分工起点一致的文件：{unchanged}。"
-                    "请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。"
+                    f"请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。{research}"
                     "已有文件可作输入，只有实际修改和检查才构成本轮交付证据。已观察记录：" + facts)
         if self.browser_replays():
             return ("原浏览器断言曾失败。修复后用 rerun_browser_check 引用 replayable_browser_call_ids 中的原调用 ID。"

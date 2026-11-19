@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from .project_data import validate_project_data
 
 MAX_ACTIVITY = 100
-_FILE_TOOLS = {"list_dir", "read_file", "read_lines", "write_file", "edit_file", "append_file",
+_FILE_TOOLS = {"list_dir", "read_file", "read_lines", "read_source", "write_file", "edit_file", "append_file",
                "delete_file", "find_files", "search_files"}
 _ERRORS = {"A_INVALID_ARGS": "工具参数无效", "A_UNKNOWN_TOOL": "工具不存在",
            "A_SANDBOX_DENY": "工作区拒绝访问", "A_HUMAN_DENIED": "未获执行许可",
@@ -100,7 +100,7 @@ def _scalar(event):
 def _result(event, tool):
     """Human-readable results derived strictly from typed host metrics."""
     parts = []
-    if _natural(event.get("returned_chars")) and tool == "read_file":
+    if _natural(event.get("returned_chars")) and tool in {"read_file", "read_source"}:
         parts.append(f"已读取 {event['returned_chars']} 字符")
     if _natural(event.get("bytes")) and tool in {"write_file", "edit_file", "append_file", "http_get"}:
         parts.append(f"{event['bytes']} 字节")

@@ -120,6 +120,9 @@ class ResearchTest(unittest.TestCase):
         self.assertIn("query=HKUST+AI", http.call_args.args[0])
         record = json.loads((self.root / search.meta["path"]).read_text())
         self.assertEqual(record["results"][0]["indexed_at"], "20261110T120000Z")
+        discovery_page = self.registry.dispatch("read_source", {"path": search.meta["path"], "query": "campus"}, self.ctx)
+        self.assertTrue(discovery_page.ok, discovery_page.content)
+        self.assertIn("检索线索", discovery_page.content)
         body = b"<html><head><title>Hidden</title></head><body>Evidence <script>hidden()</script> supported.</body></html>"
         with patch("miniagent.research.fetch", return_value=Page(article + "/final", "text/html", body, False)):
             fetched = self.registry.dispatch("http_get", {"url": article}, self.ctx)
@@ -130,6 +133,33 @@ class ResearchTest(unittest.TestCase):
         self.assertEqual(record["observed_bytes_sha256"], hashlib.sha256(body).hexdigest())
         self.assertEqual(record["text"], "Evidence\nsupported.")
         self.assertIn(fetched.meta["path"], fetched.content)
+
+    def test_read_saved_source_uses_text_offsets_and_finds_exact_passages_offline(self):
+        body = "第一段🌿 Economics。第二段 Economic growth。".encode()
+        with patch("miniagent.research.fetch", return_value=Page("https://example.org/text", "text/plain", body, False)) as fetch:
+            source = self.registry.dispatch("http_get", {"url": "https://example.org/text"}, self.ctx)
+            path = source.meta["path"]
+            def read(**args):
+                return self.registry.dispatch("read_source", {"path": path, **args}, self.ctx)
+
+            page = read(query="ECONOMIC", limit=8)
+            self.assertTrue(page.ok, page.content)
+            self.assertEqual(page.meta["offset"], body.decode().index("Economic"))
+            self.assertTrue(page.content.endswith("Economic"))
+            rest = read(offset=page.meta["next_offset"])
+            self.assertTrue(rest.content.endswith("s。第二段 Economic growth。"))
+            self.assertTrue(rest.meta["eof"])
+            self.assertFalse(read(query="缺失").ok)
+            self.assertFalse(read(offset=12000).ok)
+            self.assertFalse(read(limit=0).ok)
+            self.assertFalse(read(path="../other.json").ok)
+            (self.root / path).write_bytes(b'{}')
+            self.assertFalse(read().ok)
+            malformed = b'invalid-json'
+            damaged = f"sources/{hashlib.sha256(malformed).hexdigest()}.json"
+            (self.root / damaged).write_bytes(malformed)
+            self.assertIn("JSON", read(path=damaged).content)
+            fetch.assert_called_once()
 
     def test_paper_metadata_and_bad_input(self):
         item = {"title":["Detector limitations"], "URL":"https://doi.org/10.1111/test", "published":{"date-parts":[[2025,6]]}}

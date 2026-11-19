@@ -4,9 +4,58 @@ from __future__ import annotations
 from typing import Any
 
 
+def _blocked_before_writing(room_events, events, ends, roots, recovery_candidates):
+    """Only attribute the latest blocked handoff, using host receipts for the same attempt."""
+    report = next((row for row in reversed(room_events) if row.get("kind") == "member_report"), {})
+    handoff = report.get("handoff") or {}
+    evidence = handoff.get("evidence") or {}
+    missing = evidence.get("missing_required_files")
+    terminal = ends.get(report.get("task_id"), {})
+    root = ends.get(terminal.get("root_id"), {})
+    if (report.get("published") is not False or report.get("status") != "error"
+            or evidence.get("stop_reason") != "连续七轮没有新的文件、来源或检查结果"
+            or evidence.get("observed_failure") or not isinstance(missing, list) or not missing
+            or not all(isinstance(path, str) and path for path in missing)
+            or terminal.get("status") != "error" or terminal.get("root_id") not in roots
+            or root.get("status") != "error" or not (root.get("error") or "").startswith("[BLOCKED]")):
+        return None
+    identity = (terminal["task_id"], terminal.get("attempt_id"), terminal.get("run_id"))
+    if not all(identity):
+        return None
+    rows = [row for row in events if (row.get("task_id"), row.get("attempt_id"), row.get("run_id")) == identity]
+    stages = [row for row in rows if row.get("kind") == "step_start"]
+    writers = {"write_file", "edit_file", "append_file"}
+    if (not stages or stages[-1].get("phase") != "handoff" or stages[-1].get("offered_tools") != []
+            or not any(row.get("phase") in {"work", "deliver"} and "write_file" in (row.get("offered_tools") or [])
+                       for row in stages[:-1])
+            or any(row.get("kind") in {"tool_start", "tool_result"} and
+                   (row.get("operation") in writers or row.get("tool") in writers) for row in rows)):
+        return None
+    # A tool-protocol correction may add a second tool-free handoff turn.
+    step = stages[-1].get("step")
+    for stage in reversed(stages[:-1]):
+        if stage.get("phase") != "handoff" or stage.get("offered_tools") != []:
+            break
+        step = stage.get("step")
+    writing_offer = next((row for row in reversed(stages) if row.get("phase") == "deliver"
+                          and "write_file" in (row.get("offered_tools") or [])), None)
+    transition = ("平台连续七轮未识别到新的进展。宿主随后提供了一轮专门写入所缺文件的工具，"
+                  if writing_offer else "平台连续七轮未识别到新的进展，")
+    suggestion = "在原群继续，先请成员把已核实的材料写入约定文件，再交给下一位成员。"
+    if any(row.get("task_id") == identity[0] for row in recovery_candidates):
+        suggestion = "在原群的「本轮选项与预算」选择这个成员的草稿，先写入缺少的文件，再继续后续分工。"
+    return {"code": "member_handoff_before_write", "severity": "error", "task_id": identity[0],
+            "attempt_id": identity[1], "run_id": identity[2], "step": step,
+            "title": "成员在生成交付文件前转入了文字交接",
+            "message": (transition + "之后收起工具并要求成员提交文字交接。"
+                        "工作阶段提供过写文件工具，本次分工没有调用文件写入工具。交接时仍缺少 "
+                        + "、".join(missing) + "。"),
+            "missing_required_files": missing, "stop_reason": evidence["stop_reason"], "suggestion": suggestion}
+
+
 def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
              *, active: bool = False, incomplete: bool = False,
-             recovery_candidates: list[dict] | None = None) -> dict[str, Any]:
+             recovery_candidates: list[dict] | None = None, room_events: list[dict] | None = None) -> dict[str, Any]:
     def scope(event):
         return (event.get("task_id") or event.get("root_id"),
                 event.get("attempt_id") or event.get("root_attempt_id"),
@@ -196,6 +245,11 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
         elif kind in {"task_end", "subtask_end", "orchestration_end"}:
             starts = {key: value for key, value in starts.items() if scope(value) != scope(event)}
     current = list(starts.values()) if active else []
+    if (room_events and not active and not incomplete and failed & roots
+            and all(item["code"] == "execution_failed" or item["severity"] != "error" for item in issues)):
+        member_issue = _blocked_before_writing(room_events, events, ends, roots, recovery_candidates or [])
+        if member_issue:
+            issues = [member_issue, *(issue for issue in issues if issue.get("task_id") != member_issue["task_id"])]
     delivered = (bool(roots) and verification == "passed"
                  and all(t.get("status") == "completed" for t in tasks if t["task_id"] in roots))
     if delivered:

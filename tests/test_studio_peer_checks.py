@@ -38,7 +38,7 @@ class PeerChecksTest(unittest.TestCase):
         room._allocation = lambda *_: (Budget.from_limits(room.settings.limits), Budget.from_limits(room.settings.limits))
         room._dispatch = Mock(return_value=Observation(step_id="step", source="delegate", ok=True, content="delegated"))
         room.record_event = Mock()
-        room.reports = [{"published": True}]
+        room.reports = [{"published": True, "role": "author"}]
         room.native_reviews = ReviewQueue()
         review = Review("product-task", "author", "qa", "Deliver the label", [
             Rule(id="label", description="Confirm shipment", method="inspect")], {"label.txt": "sha"})

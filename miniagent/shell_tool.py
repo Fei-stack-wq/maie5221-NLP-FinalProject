@@ -64,9 +64,11 @@ def project_environment(ctx):
     # servers started by this member when it hands off.
     env = {key: os.environ[key] for key in ("LANG", "LC_ALL", "LC_CTYPE", "SystemRoot", "WINDIR",
                                             "PATHEXT", "TMP", "TEMP", "TMPDIR") if key in os.environ}
-    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", os.defpath)])
-    if sys.prefix != sys.base_prefix:
-        env["VIRTUAL_ENV"] = sys.prefix
+    prefix = ctx.sandbox.command_venv()
+    binaries = prefix / ("Scripts" if os.name == "nt" else "bin")
+    env["PATH"] = os.pathsep.join([str(binaries), str(Path(sys.executable).parent), os.environ.get("PATH", os.defpath)])
+    env.update(VIRTUAL_ENV=str(prefix), PIP_CACHE_DIR=str(prefix.parent / "pip-cache"),
+               PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
     env.update(HOME=str(ctx.sandbox.root), CI="true", GIT_TERMINAL_PROMPT="0", PAGER="cat", NO_COLOR="1",
                NO_PROXY="localhost,127.0.0.1,::1")
     if os.name == "nt":
@@ -166,12 +168,18 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
         return ToolResult.failure(str(exc))
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
         return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
+    env = project_environment(ctx)
+    # First use may bootstrap pip from Python's offline wheel. Recheck the
+    # overall task deadline before starting the requested command.
+    timeout = command_timeout(ctx, requested_timeout)
+    if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
+        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
     started = time.monotonic()
     stdout, stderr = _Output(), _Output()
     timed_out = False
     cancelled = False
     with subprocess.Popen(
-        argv, cwd=cwd, env=project_environment(ctx), stdin=subprocess.DEVNULL,
+        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
     ) as process:
         try:

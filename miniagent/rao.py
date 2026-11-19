@@ -908,7 +908,7 @@ class RAOUnit:
     # --------------------------------------------------------------- Observe
     def _observe(self, result: ToolResult, action: Action, step_id: str) -> Observation:
         artifacts = list(result.meta.get("artifacts") or [])
-        if (not artifacts and action.tool not in {"read_file", "read_lines", "list_dir", "find_files", "search_files"}
+        if (not artifacts and action.tool not in {"read_file", "read_lines", "read_source", "list_dir", "find_files", "search_files"}
                 and isinstance(result.meta.get("path"), str)):
             artifacts = [result.meta["path"]]
         error_class = None if result.ok else classify_failure(result.content)

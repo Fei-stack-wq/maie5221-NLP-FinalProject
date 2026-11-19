@@ -33,5 +33,5 @@ def run_browser(ctx, args: dict) -> ToolResult:
         return ToolResult.failure("浏览器测试目录必须是项目中的目录。")
     runner = Path(__file__).with_name("playwright_runner.py").resolve()
     with tempfile.TemporaryDirectory(prefix="miniagent-browser-") as temp_home:
-        argv = [sys.executable, "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, code]
+        argv = ["python", "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, code]
         return run_posix_argv(ctx, argv, cwd, args.get("timeout"))

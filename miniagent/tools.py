@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from .browser_tool import run_browser
 from .config import Limits
 from .project_navigation import find_files, read_lines, search_files
-from .research import http_get as _http_get, search_sources
+from .research import http_get as _http_get, read_source, search_sources
 from .sandbox import Sandbox, SandboxError
 from .shell_tool import command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell
 from .schemas import ToolResult, ToolSpec
@@ -200,11 +199,13 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     if len(code) > 20_000:
         return ToolResult.failure("代码过长（上限 20000 字符）。")
 
-    argv = [sys.executable, "-I", "-c", code]
+    argv = ["python", "-I", "-B", "-c", code]
     if os.name == "posix":
         return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"))
 
     # Keep the native Python path on hosts without POSIX process groups.
+    env = project_environment(ctx)
+    argv[0] = os.path.join(env["VIRTUAL_ENV"], "Scripts", "python.exe")
     timeout = command_timeout(ctx, args.get("timeout"))
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
         return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
@@ -214,7 +215,7 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     completed = subprocess.run(
         argv,
         cwd=str(ctx.sandbox.root),
-        env=project_environment(ctx),
+        env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -291,6 +292,18 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                        "start_line": {"type": "integer", "description": "首行从 1 开始"},
                        "limit": {"type": "integer", "description": "1..400 行，默认 120"}},
                        "required": ["path"]}, read_lines))
+    registry.add(
+        Tool(
+            name="read_source",
+            description="从已存来源的正文或检索结果按字符分页，可用关键词直接定位。无需重新下载或运行脚本。",
+            parameters={"type": "object", "properties": {
+                "path": {"type": "string", "description": "http_get 或 search_sources 返回的 sources/ 路径"},
+                "query": {"type": "string", "description": "选填。从 offset 起匹配的字面词组，忽略大小写"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 12000}}, "required": ["path"]},
+            fn=read_source,
+        )
+    )
     if read_only:
         return registry
 

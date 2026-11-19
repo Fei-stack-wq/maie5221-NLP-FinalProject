@@ -1,4 +1,4 @@
-"""Two-person rooms may attribute a concrete deliverable to their lead."""
+"""Room leads can take file-producing assignments while peers retain separate identities."""
 import unittest
 import hashlib
 from unittest.mock import patch
@@ -65,13 +65,76 @@ class TeamRecipientsTest(unittest.TestCase):
         self.assertTrue(any('reviewer' in e.get('preview','') and e.get('ok') is False for e in detail['events']))
 
     def test_invalid_larger_room_recipient_gets_real_choices_then_bounded_failure(self):
-        invalid = tool('delegate_task', assignee='chief', objective='写报告', deliverable_paths=['report.md'])
+        invalid = tool('delegate_task', assignee='outsider', objective='写报告', deliverable_paths=['report.md'])
         detail, schemas = self.execute(('chief','writer','reviewer'),[invalid,invalid,{'text':'[BLOCKED] 无法分配'}])
         self.assertEqual(detail['run']['status'], 'failed')
-        self.assertTrue(schemas and all(set(s)=={'writer','reviewer'} for s in schemas))
+        self.assertTrue(schemas and all(set(s)=={'chief','writer','reviewer'} for s in schemas))
         rows = [e for e in detail['events'] if e['kind']=='tool_result' and e.get('operation')=='delegate_task']
         self.assertEqual(len(rows), 2)
         self.assertTrue(all('writer' in e['preview'] and 'reviewer' in e['preview'] for e in rows))
+
+    def test_research_lead_of_three_writes_then_hands_off_to_writer_and_independent_reviewer(self):
+        roles = ('researcher', 'writer', 'reviewer')
+        notes, guide, review = 'notes/research.md', 'docs/guide.md', 'docs/review.md'
+        detail, schemas = self.execute(roles, [
+            tool('delegate_task', assignee='researcher', objective='先调研，保存笔记',
+                 remaining_roles=['writer','reviewer'], deliverable_paths=[notes]),
+            write(notes, 'A queue and a schema are different parts of a protocol.'), {'text':'调研笔记就绪。'},
+            tool('delegate_task', assignee='writer', objective='基于调研笔记撰写教程', deliverable_paths=[guide]),
+            tool('read_file', path=notes), write(guide, 'Define the message schema, then choose the queue.'),
+            {'text':'已交付成稿。'},
+            tool('delegate_task', assignee='reviewer', objective='对照笔记独立复核成稿', deliverable_paths=[review]),
+            tool('read_file', path=guide), tool('read_file', path=notes),
+            write(review, 'Reviewed: the schema and queue are distinguished consistently.'), {'text':'已复核。'},
+            {'text':'三份文件已交付。'},
+        ], acceptance_files=[notes,guide,review])
+        self.assertEqual(detail['run']['status'], 'completed', detail['diagnostics'])
+        self.assertTrue(schemas and all(set(s) == set(roles) for s in schemas))
+        published = [event for event in detail['room_events'] if event['kind'] == 'member_report']
+        self.assertEqual([row['role'] for row in published], list(roles))
+        for row, path in zip(published, [notes,guide,review], strict=True):
+            self.assertTrue(row['handoff']['published'])
+            self.assertEqual([change['path'] for change in row['handoff']['changed_files']], [path])
+        self.assertIn(notes, published[1]['handoff']['evidence']['inspected'])
+        self.assertIn(guide, published[2]['handoff']['evidence']['inspected'])
+
+    def test_reviewer_can_return_a_concrete_file_to_the_lead_for_repair(self):
+        from tests.test_studio_native_review import PATH, RULE, submit
+        old = 'Shipment destination: old warehouse. Verified dispatch record.'
+        updated = 'Shipment destination: new warehouse. Verified dispatch record.'
+        steps = [
+            tool('delegate_task', assignee='lead', objective='Write the label.', deliverable_paths=[PATH],
+                 remaining_roles=['inspector']),
+            write(PATH, old), {'text':'First label ready.'},
+            tool('delegate_task', assignee='inspector', objective='Check the label.',
+                 review={'candidate':PATH, 'criteria':[RULE]}),
+            tool('read_file', path=PATH),
+            submit(old, 'changes_requested', cause='product', action='Print the confirmed new warehouse.'),
+            {'text':'Returned to author.'},
+            tool('delegate_task', assignee='lead', objective='Correct the returned label.'),
+            write(PATH, updated), {'text':'Label updated.'},
+            tool('delegate_task', assignee='inspector', objective='Independently verify the revised label.'),
+            tool('read_file', path=PATH), submit(updated, 'passed'), {'text':'The new label passes.'},
+            {'text':'Delivered the reviewed revision.'},
+        ]
+        detail, _ = self.execute(('lead','inspector','publisher'), steps, acceptance_files=[PATH], limits={'max_steps':90})
+        self.assertEqual(detail['run']['status'], 'completed', detail['diagnostics'])
+        reports = [event['handoff'] for event in detail['room_events'] if event['kind'] == 'member_report']
+        self.assertEqual([row['role'] for row in reports], ['lead', 'inspector', 'lead', 'inspector'])
+        self.assertEqual([row['native_review']['state'] for row in reports[1:]], ['repair','review','passed'])
+
+    def test_three_person_lead_requires_concrete_file_and_cannot_finish_alone(self):
+        missing_path = tool('delegate_task', assignee='lead', objective='再分配整组工作')
+        create = tool('delegate_task', assignee='lead', objective='整理笔记', remaining_roles=[],
+                      deliverable_paths=['notes.md'])
+        detail, _ = self.execute(('lead','writer','reviewer'), [
+            missing_path, create, write('notes.md','First stage completed.'), {'text':'已交接。'},
+            {'text':'[BLOCKED] 尚缺其他成员的交接。'},
+        ], acceptance_files=['notes.md'])
+        self.assertEqual(detail['run']['status'], 'failed')
+        self.assertEqual([e['recipient'] for e in detail['room_events'] if e['kind']=='assignment'], ['lead'])
+        self.assertTrue(any(e.get('ok') is False and 'deliverable_paths' in e.get('preview','')
+                            for e in detail['events']))
 
     def test_review_path_binds_current_publisher_even_when_lead_and_disallows_self_review(self):
         reviews = ReviewQueue()

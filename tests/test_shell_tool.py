@@ -1,9 +1,14 @@
-import os
+import gc
+import importlib.util
 import json
+import os
+import shlex
 import sys
+import sysconfig
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +20,7 @@ from miniagent.member_processes import managed_member_processes
 from miniagent.metrics import Tracer
 from miniagent.providers import ScriptedProvider
 from miniagent.sandbox import Sandbox
+from miniagent.studio_conversations import copy_project
 from miniagent.tools import ToolContext, build_default_registry
 
 
@@ -99,8 +105,79 @@ class ShellToolTest(unittest.TestCase):
                 "print(os.environ['MINIAGENT_MEMBER_PROCESS_SCOPE'])\nassert sys.stdin.read()==''")}, self.ctx)
         self.assertTrue(probe.ok, probe.content)
         self.assertIn("fixture-scope", probe.content)
-        python = self.run_command("""python -c 'import sys; print(sys.executable)'""")
-        self.assertIn(str(Path(sys.executable).parent), python.content)
+        python = self.run_command("""python -c 'import os,sys; assert sys.prefix == os.environ["VIRTUAL_ENV"]; print(sys.prefix)'""")
+        self.assertTrue(python.ok, python.content)
+        self.assertIn(str(self.ctx.sandbox.command_venv()), python.content)
+        self.assertNotEqual(self.ctx.sandbox.command_venv(), Path(sys.prefix))
+
+    def test_offline_member_pip_install_import_cli_and_published_files(self):
+        module = "studio_offline_fixture"
+        self.assertIsNone(importlib.util.find_spec(module))
+        host_packages = Path(sysconfig.get_path("purelib"))
+        host_bin = Path(sysconfig.get_path("scripts"))
+        workspace = self.root / "agents/writer"
+        self.ctx.sandbox = Sandbox(workspace)
+        note = workspace / "Library/Caches/pip/notes.md"
+        note.parent.mkdir(parents=True)
+        note.write_text("user-owned guide")
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel = Path(tmp) / f"{module}-1.0-py3-none-any.whl"
+            info = f"{module}-1.0.dist-info"
+            files = {f"{module}.py": "def main():\n    print('fixture runs')\n",
+                     f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {module}\nVersion: 1.0\n",
+                     f"{info}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                     f"{info}/entry_points.txt": f"[console_scripts]\nstudio-fixture = {module}:main\n"}
+            files[f"{info}/RECORD"] = "".join(f"{name},,\n" for name in [*files, f"{info}/RECORD"])
+            with zipfile.ZipFile(wheel, "w") as archive:
+                for name, data in files.items():
+                    archive.writestr(name, data)
+            install = f"install --no-index --no-deps {shlex.quote(str(wheel))}"
+            with managed_member_processes(self.ctx.sandbox):
+                installed = self.run_command(f"pip {install} && studio-fixture")
+                self.assertTrue(installed.ok, installed.content)
+                self.assertIn("fixture runs", installed.content)
+                prefix = self.ctx.sandbox.command_venv()
+                cache = self.run_command("python3 -m pip cache dir")
+                self.assertTrue(cache.ok, cache.content)
+                self.assertIn(str(prefix.parent / "pip-cache"), cache.content)
+                # Explicitly populate that cache offline; only user-owned files should publish.
+                probe = self.registry.dispatch("run_python", {"code": (
+                    f"import {module} as pkg, os, sys, psutil\n"
+                    "from pathlib import Path\n"
+                    "assert sys.flags.isolated and Path(pkg.__file__).is_relative_to(sys.prefix)\n"
+                    "cache = Path(os.environ['PIP_CACHE_DIR']) / 'http-v2' / 'sample.body'\n"
+                    "cache.parent.mkdir(parents=True, exist_ok=True); cache.write_bytes(b'cache')\n"
+                    "pkg.main()")}, self.ctx)
+                self.assertTrue(probe.ok, probe.content)
+                self.assertIn("fixture runs", probe.content)
+                stage = Path(tmp) / "published"
+                copy_project(self.root, "writer", stage, {".md"})
+                self.assertEqual([p.relative_to(stage) for p in stage.rglob("*") if p.is_file()],
+                                 [note.relative_to(workspace)])
+                self.assertEqual((stage / note.relative_to(workspace)).read_text(), "user-owned guide")
+                # Both explicit destinations retain ordinary pip semantics.
+                explicit = self.run_command(
+                    f"python -m pip {install} --target vendor && "
+                    "python -m venv .venv && . .venv/bin/activate && "
+                    f"pip {install} && python -c 'import {module}, sys; from pathlib import Path; "
+                    f"assert Path({module}.__file__).is_relative_to(Path.cwd()/\".venv\")'", timeout=15)
+                self.assertTrue(explicit.ok, explicit.content)
+                self.assertTrue((workspace / "vendor" / f"{module}.py").is_file())
+            self.assertFalse(prefix.parent.exists())
+            self.assertFalse((host_packages / f"{module}.py").exists())
+            self.assertFalse((host_bin / "studio-fixture").exists())
+            with managed_member_processes(self.ctx.sandbox):
+                fresh = self.registry.dispatch("run_python", {"code":
+                    f"import importlib.util; assert importlib.util.find_spec('{module}') is None"}, self.ctx)
+                self.assertTrue(fresh.ok, fresh.content)
+
+    def test_direct_sandbox_disposes_its_command_environment(self):
+        sandbox = Sandbox(self.root / "solo")
+        prefix = sandbox.command_venv()
+        self.assertTrue(prefix.is_dir())
+        del sandbox
+        gc.collect()
+        self.assertFalse(prefix.parent.exists())
 
     def test_managed_background_process_available_between_tools_until_handoff(self):
         child = None

@@ -18,6 +18,7 @@ class Invocation:
     script: str
     complete: bool
     exit_footer: bool = False
+    legacy_default_scope: str = ""
 
 
 def _invocation(argv, cwd, complete):
@@ -49,8 +50,14 @@ def _invocation(argv, cwd, complete):
     else:
         caption = script or name + (" " + args[1] if args[:1] == ["-m"] else "")
     selection = "\0".join((str(Path(cwd)), *args))
+    legacy_scope = ""
+    if argv[0] == "python":
+        # Older native wrappers recorded the platform's absolute interpreter.
+        # Match only that exact executable, directory, flags and case selection.
+        old_key = "\0".join((str(Path(cwd)), sys.executable, *args))
+        legacy_scope = hashlib.sha256(old_key.encode()).hexdigest()
     return Invocation(hashlib.sha256(key.encode()).hexdigest(), hashlib.sha256(selection.encode()).hexdigest(),
-                      caption[:160], script, complete)
+                      caption[:160], script, complete, legacy_default_scope=legacy_scope)
 
 
 def shell_invocation(command, cwd):
@@ -91,7 +98,9 @@ def python_invocation(code, cwd):
         if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
             argv.append(arg.value)
         elif isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name) and arg.value.id == "sys" and arg.attr == "executable":
-            argv.append(sys.executable)
+            # Each member has its own absolute interpreter path. Record the
+            # replayable shell name for the same default member interpreter.
+            argv.append("python")
         else:
             return None
     # A snippet that analyzes, synthesizes, reads back, or filters output has

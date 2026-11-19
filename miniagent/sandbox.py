@@ -21,6 +21,13 @@
 from __future__ import annotations
 
 import os
+import shlex
+import sys
+import sysconfig
+import tempfile
+import threading
+import venv
+import weakref
 from pathlib import Path
 from typing import Callable
 
@@ -35,8 +42,50 @@ class Sandbox:
         self.process_env: dict[str, str] = {}
         self.command_sessions = None
         self.track_shell_group: Callable[[int], None] | None = None
+        self._venv: Path | None = None
+        self._venv_lock = threading.Lock()
+        self._venv_cleanup: weakref.finalize | None = None
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def command_venv(self) -> Path:
+        """Share an external, disposable Python environment between this member's commands."""
+        with self._venv_lock:
+            if self._venv is None:
+                storage = tempfile.TemporaryDirectory(prefix="miniagent-python-")
+                path = Path(storage.name).resolve() / "venv"
+                try:
+                    inherited = dict.fromkeys(sysconfig.get_path(name) for name in ("purelib", "platlib"))
+                    share_pip = os.name == "posix" and any((Path(p) / "pip/__main__.py").is_file() for p in inherited)
+                    venv.EnvBuilder(with_pip=not share_pip, symlinks=os.name != "nt").create(path)
+                    # Keep installed Studio libraries importable while pip installs into
+                    # the member prefix. A .pth works with run_python's isolated mode.
+                    schemes = sysconfig.get_scheme_names()
+                    scheme = "venv" if "venv" in schemes else ("nt" if os.name == "nt" else "posix_prefix")
+                    packages = Path(sysconfig.get_path("purelib", scheme, {"base": str(path), "platbase": str(path)}))
+                    (packages / "_studio_libraries.pth").write_text("\n".join(inherited) + "\n", encoding="utf-8")
+                    if share_pip:
+                        # Reuse pip's library without running the host's pip shebang.
+                        # This avoids extracting ensurepip for every short-lived member.
+                        binaries = path / "bin"
+                        command = f'#!/bin/sh\nexec {shlex.quote(str(binaries / "python"))} -B -m pip "$@"\n'
+                        for name in ("pip", "pip3", f"pip{sys.version_info.major}.{sys.version_info.minor}"):
+                            launcher = binaries / name
+                            launcher.write_text(command, encoding="utf-8")
+                            launcher.chmod(0o755)
+                except BaseException:
+                    storage.cleanup()
+                    raise
+                self._venv_cleanup = weakref.finalize(self, storage.cleanup)
+                self._venv = path
+            return self._venv
+
+    def close_command_venv(self) -> None:
+        with self._venv_lock:
+            if self._venv_cleanup is not None:
+                self._venv_cleanup()
+                self._venv_cleanup = None
+                self._venv = None
 
     # ------------------------------------------------------------------ 路径
     def resolve(self, rel_path: str, *, must_exist: bool = False) -> Path:

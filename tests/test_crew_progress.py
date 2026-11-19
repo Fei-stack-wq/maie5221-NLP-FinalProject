@@ -1,5 +1,8 @@
 """Crew scheduling receipts control reinspection and never certify acceptance."""
+import hashlib
 import json
+import shlex
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -399,6 +402,65 @@ class MemberProgressTest(unittest.TestCase):
         (self.root / "checks.md").write_text("One check covered")
         self.observe("write_file")
         self.assertIsNone(self.p.blocked_reason())
+
+    def test_dynamic_research_extracts_advance_only_on_new_archived_text(self):
+        paragraphs = [f"Section {i}. Durable, identifiable research content extracted from the original page."
+                      for i in range(10)]
+        archive = json.dumps({"kind": "fetched_source", "text": "\n".join(paragraphs)})
+        path = "sources/" + hashlib.sha256(archive.encode()).hexdigest() + ".json"
+        (self.root/"sources").mkdir()
+        (self.root/path).write_text(archive)
+        self.p = MemberProgress(self.root, ["notes/research.md"])
+        args = {"code": "path = next(Path('sources').glob('*.json')); print(json.loads(path.read_text())['text'])"}
+        for line in paragraphs:
+            self.observe("run_python", "exit_code=0\nstdout:\n" + line, args=args, meta={"exit_code":0})
+            self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "work")
+        for i in range(7):
+            self.observe("run_python", f"exit_code=0\nstdout:\nvariant-{i}\n" + paragraphs[-1],
+                         args=args, meta={"exit_code":0})
+        self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "deliver")
+        self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "handoff")
+        self.assertTrue(self.p.blocked_reason())
+        self.assertEqual(self.p.evidence()["check_signals"], [])
+
+    def test_read_source_uses_body_coordinates_independent_of_raw_archive_pages(self):
+        archive = json.dumps({"kind":"fetched_source","text":"a source with several pages"})
+        path = "sources/" + hashlib.sha256(archive.encode()).hexdigest() + ".json"
+        (self.root/"sources").mkdir()
+        (self.root/path).write_text(archive)
+        self.p = MemberProgress(self.root)
+        ctx = ToolContext(Sandbox(self.root), Limits())
+        tools = build_default_registry()
+        def read(tool, **params):
+            args = {"path":path, **params}
+            result = tools.dispatch(tool, args, ctx)
+            self.assertTrue(result.ok, result.content)
+            self.observe(tool, result.content, args=args, meta=result.meta)
+        read("read_file")
+        read("read_source", limit=3)
+        receipt = self.p.read_checkpoint()[path]
+        self.assertTrue(receipt["complete"])
+        self.assertEqual(receipt["source_body"]["char_ranges"], [(0,3)])
+        self.assertFalse(receipt["source_body"]["complete"])
+        self.assertNotIn("已返回过", self.p.steering())
+        read("read_source", offset=1, limit=2)
+        self.assertIn("已返回过", self.p.steering())
+        self.assertEqual(self.p.evidence()["inspected"], [path])
+        self.assertEqual(self.p.evidence()["check_signals"], [])
+
+    def test_source_discovery_counts_queries_instead_of_retrieval_timestamps(self):
+        for query, path in [("multiagent", "a"), ("multiagent", "b"), ("interoperability", "c")]:
+            self.observe("search_sources", args={"query":query,"collection":"papers"}, meta={"path":path})
+        self.assertEqual(self.p.evidence()["distinct_searches"], 2)
+
+    def test_stalled_writes_never_override_reserves_or_binary_work(self):
+        for paths, steps in [(["data.sqlite3","screen.png"], 30), (["doc.md"], 1)]:
+            with self.subTest(paths=paths):
+                self.p = MemberProgress(self.root, paths)
+                for _ in range(7):
+                    self.observe("list_dir")
+                self.assertEqual(self.p.phase(self.budget.model_copy(update={"steps_left":steps}),
+                                              allow_delivery=True), "handoff")
 
     def test_recovered_draft_can_write_before_any_new_inspection(self):
         self.p = MemberProgress(self.root, ["report.md", "data.db"])
@@ -928,6 +990,22 @@ print("FAIL lines:", [line for line in lines if "FAIL" in line] or "none")
         self.assertFalse(self.p.failed_checks())
         self.assertFalse(self.p.evidence()["check_signals"])
         self.assertTrue(self.p.evidence()["diagnostic_checks"])
+
+    def test_default_member_python_can_recheck_a_stored_host_interpreter_scope(self):
+        target = self.root / "test_cases.py"
+        target.write_text("assert 2 + 2 == 4\nprint('PASS addition')\n")
+        self.observe("write_file", args={"path": target.name})
+        old_scope = hashlib.sha256("\0".join((".", sys.executable, target.name)).encode()).hexdigest()
+        self.p.restore_pending_verification([{
+            "scope": old_scope, "check": shlex.join([sys.executable, target.name]), "path": target.name,
+            "at_sha256": hashlib.sha256(target.read_bytes()).hexdigest()}])
+        self.assertEqual(self.p.evidence()["pending_verification"][0]["check"], "python test_cases.py")
+        self.observe("run_shell", "PASS addition", args={"command":"python test_cases.py subset"},
+                     meta={"exit_code": 0})
+        self.assertTrue(self.p.evidence()["pending_verification"])
+        self.observe("run_shell", "PASS addition", args={"command":"python test_cases.py"}, meta={"exit_code": 0})
+        self.assertFalse(self.p.evidence()["pending_verification"])
+        self.assertIn(old_scope, self.p.evidence()["complete_verification"])
 
     def test_poll_only_uses_terminal_host_receipt_for_its_original_command(self):
         command = "python3 test_inventory.py"

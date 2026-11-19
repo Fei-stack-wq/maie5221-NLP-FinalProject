@@ -106,7 +106,7 @@ def project_context(thread: dict, history: list[dict]) -> str:
         profile = member_profiles(thread)[role]
         lines = [f"项目会话。你的角色是{profile['name']}（{role}）。", profile["prompt"],
                  "以下是历史公开消息，供理解项目与既有决定。当前用户要求在下一条消息中。",
-                 "本轮是只读问答，可用 find_files、search_files、list_dir、read_lines 和 read_file 核实项目，再直接回答。"
+                 "本轮是只读问答，可用 find_files、search_files、list_dir、read_lines、read_source 和 read_file 核实项目，再直接回答。"
                  if thread["intent"] == "question" else
                  "请检查项目工作区并按当前用户要求完成交付。"]
     if thread.get("recovery_source"):

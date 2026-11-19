@@ -177,7 +177,7 @@ def project_history(
             continue
         for call in calls:
             function = call["function"]
-            if function["name"] in {"read_file", "read_lines", "search_files", "write_file", "edit_file", "append_file", "delete_file"}:
+            if function["name"] in {"read_file", "read_lines", "read_source", "search_files", "write_file", "edit_file", "append_file", "delete_file"}:
                 try:
                     path = json.loads(function["arguments"]).get("path")
                 except (AttributeError, ValueError, TypeError):
