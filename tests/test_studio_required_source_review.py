@@ -310,6 +310,48 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.assertEqual(reports[-1]["native_review"]["reviewer"], "lead")
         self.assertEqual(reports[-1]["native_review"]["author"], "writer")
 
+    def test_candidate_alias_and_task_id_do_not_make_an_incidental_snapshot_the_comparison_target(self):
+        queue = ReviewQueue([FINAL])
+        archive = "sources/archive.json"
+        files = {FINAL: hashed(ARTICLE), archive: hashed("{}")}
+        author = {"task_id": "published", "role": "writer", "objective": "Compile article and archive.",
+                  "deliverable_paths": list(files)}
+        queue.published(author, files, [{"path": p, "sha256": sha} for p, sha in files.items()])
+        comparison = {"id":"structure", "description":"Inspect the final article's structure.", "method":"inspect"}
+        for selector in (FINAL, "writer", "published"):
+            with self.subTest(selector=selector):
+                with self.assertRaisesRegex(ValueError, "请省略 reference_path"):
+                    queue.open({"candidate": selector, "criteria": [RULE, {**comparison, "reference_path": FINAL}]},
+                               "checker", [author])
+                revised = queue.open({"candidate": selector, "criteria": [RULE, comparison]}, "checker", [author])
+                self.assertEqual(revised.files, files)
+                self.assertEqual(revised.comparison_targets, {FINAL})
+
+    def test_distinct_reference_and_actual_manuscript_must_both_be_in_the_comparison_receipts(self):
+        archive = "sources/dispatch.json"
+        files = {FINAL: hashed(ARTICLE), NOTES: hashed(NOTE), archive: hashed("{}")}
+        rule = {"id": "destination", "description": "Compare the manuscript with the original notes.", "method": "inspect"}
+        def review(reference):
+            return tool("delegate_task", assignee="checker", objective="Inspect the manuscript.",
+                        review={"candidate": FINAL, "criteria": [RULE, {**rule, "reference_path": reference}]})
+        def decision(read):
+            call = submit(files, FINAL)
+            call["tool_calls"][0]["arguments"]["results"].append({"criterion_id":"destination", "verdict":"passed",
+                 "reason":"Checked the manuscript against the dispatch notes.", "evidence":["file:"+read, "reference:"+NOTES]})
+            return call
+        detail, provider = self.execute([
+            tool("delegate_task", assignee="writer", objective="Write the manuscript and preserve the source and notes.",
+                 deliverable_paths=list(files), remaining_roles=["checker"]),
+            write(FINAL, ARTICLE), write(NOTES, NOTE), write(archive, "{}"), {"text":"Documents ready."},
+            review(FINAL), review(NOTES), tool("read_file", path=archive), tool("read_file", path=NOTES),
+            tool("read_file", path=FINAL), tool("http_get", url=URL), decision(archive), decision(FINAL), {"text":"Delivered."}])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertIn("请省略 reference_path", str(provider.requests))
+        self.assertIn("本地对照须读取并同时引用候选成稿", str(provider.requests))
+        event, = [e for e in detail["room_events"] if e["kind"] == "member_report" and e["role"] == "checker"]
+        receipts = event["handoff"]["native_review"]["assessment"]["results"][1]["receipts"]
+        self.assertEqual([(r["kind"], r["path"]) for r in receipts], [("read", FINAL), ("reference", NOTES)])
+
     def test_addressed_worker_gets_work_tools_and_must_obtain_fresh_independent_source_approval(self):
         review = {"candidate": FINAL, "criteria": [RULE]}
         class CurrentVersion(RecordingProvider):

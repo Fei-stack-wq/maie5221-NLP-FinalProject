@@ -117,7 +117,7 @@ print("PASS: submitted the booking through the visible form")
 
 这一行为参考 Pi 的 Agent 主循环。在当前工具批次所有回执到齐后，Pi 注入下一轮指导并继续处理请求，取消和模型错误各有明确的退出路径。Studio 在这一步提供本次成员分工的工作区证据，并对照用户要求执行独立验收。[Pi 工具批次和后续指导](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/src/agent-loop.ts#L233-L305) · [Pi 批次后注入消息测试](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/test/agent-loop.test.ts#L815-L870) · [Pi 中途取消测试](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/test/agent-loop.test.ts#L1003-L1033) · [成员进度回归](../tests/test_crew_progress.py) · [普通群聊入口回归](../tests/test_studio_crew.py)
 
-失败详情会把同一次成员尝试的工具清单、实际调用和交接回执对齐。若写工具曾经开放、成员一次也没调用、宿主因停滞收起工具，且最终确实缺文件，界面会说明在哪一步转入文字交接，并列出这次分工缺少的路径。真正的工具错误、预算耗尽、发布到本地目录失败都有各自的诊断。这里参考 OpenAI Agents SDK 通过所属运行和 span 身份关联工具与结束事件的做法，Studio 另外核对持久任务尝试与群聊交接记录。[轨迹导出](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tracing/spans.py#L373-L405) · [工具轨迹测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_tracing.py#L452-L481) · [Studio 失败诊断回归](../tests/test_studio_diagnostics.py)
+失败详情会把同一次成员尝试的工具清单、实际调用和交接回执对齐。查看旧版执行记录时，如果写工具曾经开放、成员一次也没调用、旧版宿主因停滞收起工具，且最终确实缺文件，界面会说明当时在哪一步转入了文字交接，并列出缺少的路径。当前版本把重复操作和缺少的文件告诉成员，成员保有本次分工的工具并选择后续动作。真正的工具错误、预算耗尽、发布到本地目录失败都有各自的诊断。这里参考 OpenAI Agents SDK 通过所属运行和 span 身份关联工具与结束事件的做法，Studio 另外核对持久任务尝试与群聊交接记录。[轨迹导出](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tracing/spans.py#L373-L405) · [工具轨迹测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_tracing.py#L452-L481) · [Studio 失败诊断回归](../tests/test_studio_diagnostics.py)
 
 ## 已有草稿的返工
 
@@ -174,6 +174,8 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 自定义检查可以静默结束，也可以自行选择语言与汇总格式。对于使用明确命令直接执行的脚本，宿主记录所运行的范围、脚本摘要、实际工具回执 ID 和退出码。相同范围在当前候选版本上退出 0，可让成员交接给独立验收者。该执行本身不会产生逐项通过结论，原来的待复验项仍随交接保留。验收者需要在相同工件版本上亲自重跑该命令，另行取得正面的断言证据并提交明确结论。候选文件变化会清除此前的执行回执。已观察的断言失败和用户配置的验收仍按各自规则处理。此处沿用 Pi 的进程回执接口，额外把脚本退出与独立验收分开记录。[Pi 执行与错误处理](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/bash.ts#L388-L437)
 
 ### 同群独立成员的结构化验收与返工
+
+旧版可能允许把待审文件本身也填作第二份对照原件。续聊明确选择同一路径时，宿主用历史委派参数、评审任务及当前文件摘要核实当初确实选中了同一文件，在本轮重新取证时移除重复的 `reference_path`。新复核的 `publication.criteria_corrections` 留存原始标准、运行和评审任务；历史签署仍按原样展示。标准的文字、取证方法和必需性继续生效。历史委派只指定任务或角色时，系统无法由附带文件推断原对照目标。
 
 负责人把已交付的候选交给群内另一位成员时，可在 `delegate_task` 中提交 `review`。候选可用作者的任务 ID 或该角色最近一次公开交付定位。每条标准包含稳定 ID、描述、是否必需以及取证方式。检查文字内容、合同或版面可选 `inspect`；核对程序行为或可计算结果选 `execute`。宿主绑定原作者任务、完整候选文件的 SHA-256 清单及其版本摘要。普通讨论和仅需交付的委派维持原有流程。
 
@@ -330,6 +332,10 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 ### 复用已有 Python 业务检查函数
 
 独立脚本可能通过 `ok = identity() and paging(); sys.exit(0 if ok else 1)` 汇总结果。普通退出码没有说明哪些检查实际执行，因此不会仅因这一语法或文件名自动得到 `passed_check`。这条边界保持不变：纯打印、恒真条件、没有进入检查分支、吞掉错误后正常退出都不能自动认证成业务通过。
+
+评审文字和结构化签署的落盘顺序会影响执行证据。先在 Markdown 报告中写好观察、方法和局限，再按最终工作区执行检查，用 `list_review_evidence` 获取当前 `passed_check`，直接提交 `submit_review`。短 ID 随签署保存。修改报告、测试脚本或其他工作区文件后，旧的执行结果进入 `historical_checks`，可以查看它当时的调用、失效原因和变更路径。相同检查真正重跑通过后，历史项的 `current_ref` 会指向新观测。签署可以使用新 E 或唯一有效的 `pass:<scope>`，最终回执记录实际使用的调用 ID。历史条目可用 `history_offset` 翻页，成员交接的 `native_review.historical_execution_receipts` 保留当次记录。这一区分参考 pytest 用稳定 node ID 找回同一检查、由新一轮实际执行更新状态的做法。[pytest 的状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [不同调用与子集复验回归](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [Studio 旧回执与重跑签署回归](../tests/test_studio_native_review.py)
+
+检查成稿自身的字数、摘要或章节结构时，使用 `inspect` 并省略 `reference_path`。比较两份材料时，把原始对照文件填入 `reference_path`。指定候选文件路径后，本项证据应包含那份候选的 `read` 和另一份文件的 `reference`。用原作者或任务 ID 选择整包工件时，宿主优先以用户明确指定要核查的成稿作为阅读目标。把同一成稿既填作唯一候选又填作对照，会在派工前收到更正说明。[成稿和附带来源快照的对照回归](../tests/test_studio_required_source_review.py)
 
 若原脚本已有清楚返回 bool 的真实业务检查函数，评审人可以先读原脚本，然后在现有 `run_python` 中用 `runpy.run_path(..., run_name='__review_probe__')` 载入它，分别顶层断言原函数返回值 `is True`，最后输出一条 PASS。不必重写长浏览器检查。`list_review_evidence` 的 `execute.existing_python_check` 给出可复制模板；仅在该成员实际拥有 `run_python` 时展示。模板捕获 `SystemExit` 并转为断言失败，避免函数提前退出 0 被当作完成。它不调用脚本的 `__main__` 汇总分支，不以子进程退出码或恒真断言代替业务核查。
 

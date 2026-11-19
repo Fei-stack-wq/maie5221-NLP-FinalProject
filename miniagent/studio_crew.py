@@ -1558,7 +1558,9 @@ class RoomCrew:
                 return None
 
             editable_reports = set() if private else self._editable_review_reports(role, required, original, review)
+            fresh_reports = {p for p in required if p not in original and Path(p).suffix.lower() in {".md", ".txt", ".rst"}}
             session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id, editable_reports=editable_reports,
+                                    report_outputs=fresh_reports if not private else (),
                                     available_tools={spec.name for spec in registry.specs()},
                                     private_snapshot_issue=private_snapshot_issue if private else None,
                                     promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())
@@ -1982,6 +1984,8 @@ class RoomCrew:
             if review.kind == "reviewer_probe":
                 self._finish_reviewer_probes(review, assessment, published, issue, changes)
             report["native_review"] = {**review.describe(), "assessment": assessment}
+            if session and session.execution_history:
+                report["native_review"]["historical_execution_receipts"] = list(session.execution_history.values())
         self.reports.append(report)
         private_outcome = queued_probe_review or private and not issue and (assessment is not None or private_repair and review.state == "review")
         disposition = "published" if published else "assessed" if private_outcome and session else (

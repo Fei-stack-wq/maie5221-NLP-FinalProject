@@ -7,7 +7,7 @@ from unittest.mock import patch
 from miniagent.config import Settings
 from miniagent.crew_progress import _check_key, _script_inputs
 from miniagent.research import Page
-from miniagent.studio_reviews import digest
+from miniagent.studio_reviews import ReviewQueue, Rule, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, reply, tool
@@ -32,9 +32,10 @@ class InheritedReviewTest(unittest.TestCase):
 
     def turn(self, script, conversation, **options):
         provider = RecordingProvider(script)
+        objective = options.pop("objective", "Verify the current dispatch.")
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider), \
              patch("miniagent.research.fetch", return_value=Page(URL, "text/plain", BODY.encode(), False)):
-            run = self.service.start(request("team", conversation=conversation, objective=options.pop("objective", "Verify the current dispatch."),
+            run = self.service.start(request("team", conversation=conversation, objective=objective,
                 acceptance_files=[FILE], limits={"max_steps":80}, **options))
             return finished(self.service, run["id"]), provider
 
@@ -93,6 +94,15 @@ class InheritedReviewTest(unittest.TestCase):
         direct = [e for e in reports if e["kind"] == "direct_delivery"]
         self.assertEqual(len(direct), 2)
         self.assertNotEqual(direct[-1]["artifacts"][0]["sha256"], SHA)
+        def witnessed(events):
+            return self.service._direct_member_projections(self.service._directory(parent), events, str(self.local))
+
+        self.assertEqual(witnessed([direct[0], member, direct[1]]), {0: {FILE}})
+        self.assertFalse(witnessed([member, direct[0]]))  # a later freeze proves no earlier delivery
+        self.assertFalse(witnessed([direct[0], direct[1], member]))  # changed before the projection
+        for receipt in ({}, {**member["workspace_delivery"], "status":"failed"},
+                        {**member["workspace_delivery"], "files":["check.md"]}):
+            self.assertFalse(witnessed([direct[0], {**member, "workspace_delivery":receipt}]))
         detail, _ = self.turn([self.review(FILE), tool("read_file", path=FILE), tool("http_get", url=URL),
                                self.submit(), {"text":"Verified."}, {"text":"Reviewed."}],
                               reply(parent, "lead"), required_source_review_paths=[FILE])
@@ -237,6 +247,62 @@ class InheritedReviewTest(unittest.TestCase):
                                      reply(parent, "lead"), required_source_review_paths=[FILE])
         self.assertIn("请在 review.criteria 提供至少一项必需标准", str(provider.requests))
         self.assertNotIn("published_review_bound", [e["kind"] for e in detail["room_events"]])
+
+    def test_legacy_inspect_self_reference_can_be_corrected_only_for_the_original_file_selector(self):
+        clean = {"id":"structure", "method":"inspect", "description":"Confirm the weekday is stated."}
+        legacy = {**clean, "reference_path":FILE}
+        original_open = ReviewQueue.open
+
+        def pre_validation_open(queue, raw, *args, **kwargs):
+            # The old host accepted a reference equal to the selected file. Persist its
+            # real tool arguments, review task, assessment and public receipt on disk.
+            item = original_open(queue, {**raw, "criteria":[clean]}, *args, **kwargs)
+            item.criteria = [Rule.model_validate(legacy)]
+            return item
+
+        def delegate(candidate, rule):
+            return tool("delegate_task", assignee="checker", objective="Check the frozen dispatch.",
+                        review={"candidate":candidate, "criteria":[rule]}, remaining_roles=[])
+
+        for file_selected in (True, False):
+            with self.subTest(file_selected=file_selected):
+                self.local = self.root / ("file-selector" if file_selected else "task-selector")
+                self.local.mkdir()
+                parent, task = self.seed()
+                pending = {"criterion_id":"structure", "verdict":"inconclusive", "cause":"verification",
+                           "reason":"The requested comparison was not established.", "action":"Independently check the document.",
+                           "evidence":["file:"+FILE]}
+                with patch.object(ReviewQueue, "open", pre_validation_open):
+                    previous, _ = self.turn([delegate(FILE if file_selected else task, legacy), tool("read_file", path=FILE),
+                        tool("submit_review", candidate_version=digest({FILE:SHA}), results=[pending]),
+                        {"text":"[BLOCKED] Comparison pending."}, {"text":"[BLOCKED] Independent verification is pending."}],
+                        reply(parent, "lead"))
+                prior = previous["run"]["id"]
+                original = next(e for e in previous["room_events"] if e["kind"] == "member_report")
+                self.assertEqual(original["handoff"]["native_review"]["assessment"]["verdict"], "inconclusive")
+                review = original["handoff"]["native_review"]
+                mismatched = self.service._original_self_comparisons(prior, [{**original, "task_id":"task-missing"}],
+                    (review["target"], review["candidate_version"]), FILE, review["criteria"])
+                self.assertEqual(mismatched, {})
+                if not file_selected:
+                    detail, provider = self.turn([delegate(FILE, clean), {"text":"[BLOCKED] Preserve prior standards."}],
+                                                 reply(prior, "lead"))
+                    self.assertIn("同一 ID 须保留原定义", str(provider.requests))
+                    self.assertNotIn("published_review_bound", [e["kind"] for e in detail["room_events"]])
+                    continue
+                signed = {**pending, "verdict":"passed", "reason":"The dispatch explicitly states Tuesday."}
+                del signed["cause"], signed["action"]
+                result, provider = self.turn([delegate(task, clean), delegate(FILE, {**clean, "description":"Read title."}),
+                    delegate(FILE, clean), tool("read_file", path=FILE),
+                    tool("submit_review", candidate_version=digest({FILE:SHA}), results=[signed]),
+                    {"text":"Verified Tuesday in the dispatch."}, {"text":"The independent review passed."}], reply(prior, "lead"))
+                self.assertEqual(result["run"]["status"], "completed", result["diagnostics"])
+                self.assertIn("同一 ID 须保留原定义", str(provider.requests))
+                bound, = [e for e in result["room_events"] if e["kind"] == "published_review_bound"]
+                self.assertEqual(bound["criteria"], [{**clean, "required":True}])
+                self.assertEqual(bound["publication"]["criteria_corrections"],
+                    [{"run_id":prior, "review_task":original["task_id"], "original":{**legacy, "required":True}}])
+                self.assertEqual(original, next(e for e in self.service.room_events(prior) if e["kind"] == "member_report"))
 
     def test_current_writer_cannot_review_older_publication_after_restoring_identical_bytes(self):
         parent, task = self.seed()

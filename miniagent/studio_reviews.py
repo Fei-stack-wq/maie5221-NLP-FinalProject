@@ -79,7 +79,7 @@ REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候
         "type": "object", "properties": {"id":{"type":"string"}, "description":{"type":"string"},
             "method":{"type":"string","enum":["inspect","execute","source"],
                       "description":"inspect 检查文件，对照本地原件时填写 reference_path；execute 验证实际运行行为；source 须独立打开外部网页核实事实。"},
-            "reference_path":{"type":"string","description":"仅用于 inspect：须对照的本地原始记录的工作区相对路径，应与被审成稿不同。"},
+            "reference_path":{"type":"string","description":"仅在 inspect 需对照第二份原始记录时填写。核对成稿自身的字数、哈希、结构请省略。"},
             "required":{"type":"boolean"}},
         "required":["id","description","method"], "additionalProperties":False}}},
     "required": ["candidate"], "additionalProperties":False}
@@ -114,6 +114,10 @@ class Review:
     probe_parent: str | None = None
     probe_support: list = field(default_factory=list)
     probe_product_files: dict = field(default_factory=dict)
+    comparison_targets: set[str] = field(default_factory=set)
+
+    def compare_with(self, reference):
+        return (self.comparison_targets or {p for p, sha in self.files.items() if sha}) - {reference}
 
     def sourced_files(self, results):
         """Candidate bytes cited with a freshly retrieved source on a required passing finding."""
@@ -164,6 +168,8 @@ class Review:
                               for r in pending]}
         facts["files"] = dict(list(self.files.items())[:32])
         facts["files_total"] = len(self.files)
+        if any(rule.reference_path for rule in self.criteria):
+            facts["comparison_targets"] = sorted(self.comparison_targets or {p for p, sha in self.files.items() if sha})
         if self.required_source_paths:
             facts["required_source_paths"] = sorted(self.required_source_paths)
         return {**brief, **facts}
@@ -363,14 +369,18 @@ class ReviewQueue:
                     probes[scope] = probe
         if not files:
             raise ValueError("该交接没有可绑定版本的工件。")
+        published_paths = {p for p, sha in files.items() if sha}
+        required_sources = self.required_source_paths & published_paths
+        comparison_targets = {spec.candidate} if spec.candidate in published_paths else required_sources or published_paths
         for rule in spec.criteria:
             if rule.reference_path:
-                if not any(path != rule.reference_path and sha for path, sha in files.items()):
-                    raise ValueError("reference_path 须指向成稿以外的本地原始记录；review.candidate 应指定待审成稿。")
+                if not comparison_targets - {rule.reference_path}:
+                    raise ValueError(f"标准 {rule.id} 的 reference_path 须指向成稿以外的本地原始记录。"
+                                     "检查成稿字数、哈希或结构时请省略 reference_path；确需对照时，用 review.candidate "
+                                     "指定待审文件，并将另一份原始记录填入 reference_path。")
                 if self.public_versions and self.public_versions.get(rule.reference_path) is None:
                     raise ValueError(f"公共工作区找不到本地原始记录 {rule.reference_path}，请核对 reference_path 后重试。")
         existing = self.items.get(author["task_id"])
-        required_sources = self.required_source_paths.intersection(p for p, sha in files.items() if sha)
         bound_reviewer = existing.reviewer if existing else reviewer
         if any(self.source_authors.get((p, files[p])) == bound_reviewer for p in required_sources):
             raise ValueError("请另选评审人。指定文件的当前版本由这名成员写入。")
@@ -385,9 +395,11 @@ class ReviewQueue:
         if required_sources and not any(rule.method == "source" and rule.required for rule in spec.criteria):
             raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes,
-                        required_source_paths=required_sources)
+                        required_source_paths=required_sources, comparison_targets=comparison_targets)
         if publication:
             review.publication = {k:publication[k] for k in ("run_id", "task_id", "role", "files")}
+            if publication.get("criteria_corrections"):
+                review.publication["criteria_corrections"] = publication["criteria_corrections"]
         return review
 
 
@@ -408,7 +420,7 @@ def manifest_issue(expected, actual, *, exact=False, secret=""):
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
     def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None,
-                 review_notes=(), available_tools=(), editable_reports=()):
+                 review_notes=(), available_tools=(), editable_reports=(), report_outputs=()):
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
@@ -432,6 +444,9 @@ class ReviewSession:
             protected.update(r["path"] for r in finding["receipts"] if r.get("path"))
         self.editable_reports = set(editable_reports) - protected
         self.frozen = {path: sha for path, sha in (original | item.files).items() if path not in self.editable_reports}
+        self.report_outputs = (self.editable_reports | set(report_outputs)) - protected
+        self.execution_history = {}
+        self.last_execution_manifest = dict(original)
 
     def guard_file_tools(self, registry):
         for name in ("write_file", "edit_file", "append_file", "delete_file"):
@@ -469,6 +484,25 @@ class ReviewSession:
         return self.last_snapshot_issue is None
 
     def observe(self, record):
+        current = self.progress.review_evidence()
+        checks = [r for r in self.receipts.values() if r["kind"] in {"passed_check", "failed_check"}]
+        if current or checks:
+            manifest = self.progress.project_versions()
+            changed = sorted(p for p in manifest.keys() | self.last_execution_manifest.keys()
+                             if manifest.get(p) != self.last_execution_manifest.get(p))
+            self.last_execution_manifest = manifest
+            for old in checks:
+                active = current.get(old["legacy_ref"])
+                if active and active["tool_call_id"] == old["tool_call_id"]:
+                    continue
+                if old["kind"] == "passed_check":
+                    reason = ("报告已更新" if changed and set(changed) <= self.report_outputs else
+                              "工作区输入已变化" if changed else "同一检查已有后续执行")
+                    self.execution_history[old["ref"]] = {
+                        "ref": old["ref"], "scope": old["scope"], "alias": old["legacy_ref"], "label": old["label"],
+                        "tool_call_id": old["tool_call_id"], "receipt_id": old["receipt_id"],
+                        "reason": reason, "paths": changed[:16], "changed_count": len(changed)}
+                del self.receipts[old["ref"]]
         retrieved = [obs for obs in record.observations if obs.ok and obs.source in {"search_sources", "http_get"}]
         if retrieved:
             versions = self.progress.project_versions()
@@ -504,16 +538,10 @@ class ReviewSession:
         evidence = self.progress.evidence()
         # Positive and negative test events come from the host's provenance
         # policy. A member printing an opinion cannot mint a check receipt.
-        current = self.progress.review_evidence()
         for ref in list(self.receipts):
             if self.receipts[ref]["kind"] in {"review_note", "source", "reference"}:
                 note = self.receipts[ref]
                 if self.progress.project_versions().get(note["path"]) != note["sha256"]:
-                    del self.receipts[ref]
-            elif self.receipts[ref]["kind"] in {"passed_check", "failed_check"}:
-                old = self.receipts[ref]
-                active = current.get(old["legacy_ref"])
-                if not active or active["tool_call_id"] != old["tool_call_id"]:
                     del self.receipts[ref]
         for ref, event in current.items():
             self._add(ref, {k:v for k,v in event.items() if k != "tool_call_id"}, event["tool_call_id"])
@@ -542,12 +570,23 @@ class ReviewSession:
             return matches[-1]
         return None
 
-    def catalog(self, offset=0, limit=12):
+    def _historical_execution(self, ref):
+        old = self.execution_history[ref]
+        current = self._resolve(old["alias"])
+        return {**old, "current_ref": current["ref"] if current else None}
+
+    def catalog(self, offset=0, limit=12, history_offset=0):
         rows = list(self.receipts.values())
         evidence = [{k:r[k] for k in ("ref", "kind", "path", "url", "label", "check", "sha256",
                                       "position", "extent") if k in r} for r in rows[offset:offset + limit]]
+        for row in evidence:
+            if row["kind"] == "passed_check":
+                row["alias"] = self.receipts[row["ref"]]["legacy_ref"]
+        history = list(reversed(self.execution_history))
         return {"candidate_version":self.item.version, "offset":offset, "total":len(rows),
-                "evidence":evidence, "needs":self.evidence_needs(), **self.execution_guidance()}
+                "evidence":evidence, "needs":self.evidence_needs(), **self.execution_guidance(),
+                **({"historical_checks":[self._historical_execution(ref) for ref in history[history_offset:history_offset + limit]],
+                    "historical_total": len(history), "history_offset": history_offset} if history else {})}
 
     def ordinary_execution(self, rule):
         return rule.method == "execute" and rule.id.removeprefix("probe_") not in self.item.probes
@@ -558,6 +597,11 @@ class ReviewSession:
         guidance = {"evidence": "通过项引用本轮与该标准相符的 passed_check 的 E 短 ID。"
                 "文件 SHA、脚本 scope、调用 ID 和正常退出记录各有不同用途；证据不足可提交 inconclusive。",
                 "actions": self.execution_actions}
+        if self.report_outputs:
+            guidance["report_then_verify"] = ("先完成评审报告，写业务观察、检查方法和局限。随后对冻结候选运行最后一轮断言，"
+                "用 list_review_evidence 取当前 passed_check 的 E 短 ID，直接 submit_review。E 短 ID 记录在结构化签署中，无需回写报告。")
+        if self.execution_history:
+            guidance["latest_superseded_check"] = self._historical_execution(next(reversed(self.execution_history)))
         if "run_python" in self.execution_actions:
             guidance["existing_python_check"] = {
                 "when": "原 Python 脚本用业务函数返回 bool，再用条件决定退出码，普通退出还没有 passed_check 时，"
@@ -602,9 +646,9 @@ class ReviewSession:
             elif rule.method == "execute" and not kinds & {"passed_check", "failed_check"}:
                 missing.append({"tool":"run_shell"})
             elif rule.reference_path:
-                if not reads - {rule.reference_path}:
-                    missing.append({"tool":"read_lines", "paths":sorted(p for p, sha in self.item.files.items()
-                                                                        if sha and p != rule.reference_path)})
+                targets = self.item.compare_with(rule.reference_path)
+                if not reads & targets:
+                    missing.append({"tool":"read_lines", "paths":sorted(targets)})
                 if rule.reference_path not in references:
                     missing.append({"tool":"read_lines", "paths":[rule.reference_path]})
             elif rule.method == "inspect" and not kinds & {"read", "passed_check", "review_note"}:
@@ -650,11 +694,12 @@ class ReviewSession:
     def catalog_tool(self):
         def list_evidence(ctx, args):
             offset = args.get("offset", 0)
-            if type(offset) is not int or offset < 0:
-                return ToolResult.failure("offset 须为非负整数。")
-            return ToolResult.success(json.dumps(self.catalog(offset), ensure_ascii=False))
+            history_offset = args.get("history_offset", 0)
+            if any(type(n) is not int or n < 0 for n in (offset, history_offset)):
+                return ToolResult.failure("offset 和 history_offset 须为非负整数。")
+            return ToolResult.success(json.dumps(self.catalog(offset, history_offset=history_offset), ensure_ascii=False))
         return Tool("list_review_evidence", "分页列出本次独立评审实际观察到的短回执及其原始路径、URL、SHA 和缺失的取证步骤。",
-                    {"type":"object","properties":{"offset":{"type":"integer","minimum":0}},
+                    {"type":"object","properties":{"offset":{"type":"integer","minimum":0}, "history_offset":{"type":"integer","minimum":0}},
                      "additionalProperties":False}, list_evidence)
 
     def retained_findings(self):
@@ -706,12 +751,17 @@ class ReviewSession:
         receipts = [self._resolve(ref) for ref in result.evidence]
         unknown = [ref for ref, row in zip(result.evidence, receipts) if row is None]
         if unknown:
+            expired = [self._historical_execution(ref) for ref in unknown if ref in self.execution_history]
+            if expired:
+                raise ValueError("这些 E 引用是历史执行回执：" + json.dumps(expired, ensure_ascii=False)
+                    + "。先定稿报告；若已有 current_ref，请核对后引用它或当前唯一 alias。否则在当前版本复跑原检查，"
+                      "用 list_review_evidence 获取新 E 后直接签署，无需把 E 写回报告。")
             raise ValueError("引用了未观察到或不唯一的证据：" + "、".join(r[:160] for r in unknown)
                              + "。从 list_review_evidence 选择相符的短 ID。")
         kinds = {e["kind"] for e in receipts}
         if rule.reference_path and (result.verdict == "passed" or result.cause == "product"):
             if not (any(e["kind"] == "reference" and e["path"] == rule.reference_path for e in receipts)
-                    and any(e["kind"] == "read" and e["path"] != rule.reference_path and e.get("extent", 0) > 0
+                    and any(e["kind"] == "read" and e["path"] in self.item.compare_with(rule.reference_path) and e.get("extent", 0) > 0
                             for e in receipts)):
                 raise ValueError(f"本地对照须读取并同时引用候选成稿的 read 回执和 {rule.reference_path} 的 reference 回执。")
         if self.item.kind == "reviewer_probe" and result.cause == "product" and result.verdict == "inconclusive":

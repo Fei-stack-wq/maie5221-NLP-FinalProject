@@ -76,6 +76,70 @@ class NativeReviewTest(unittest.TestCase):
         self.assertEqual((project / report_path).read_text(), final)
         self.assertIn("独立评审的冻结文件不可修改", str(provider.requests))
 
+    def test_historical_checks_cannot_sign_until_rerun_on_current_workspace(self):
+        report_path = "docs/review.md"
+        manuscript = "Shipment destination: old warehouse. Verified dispatch record."
+        for case, input_path, mutation, preserved in (
+                ("read only", PATH, None, True),
+                ("frozen input", PATH, report_path, False),
+                ("report input", report_path, report_path, False),
+                ("dynamic probe", PATH, report_path, False),
+                ("fresh external material", PATH, "sources/new.md", False),
+                ("changed assertion script", PATH, "check.py", False)):
+            with self.subTest(case=case):
+                code = (f"from pathlib import Path\ntext = Path({input_path!r}).read_text()\n"
+                        + ("result = text.lower()\n" if case == "dynamic probe" else "")
+                        + "assert 'warehouse' in text\nprint('PASS verifies warehouse')")
+                steps = self.start_review()
+                assignment = steps[3]["tool_calls"][0]["arguments"]
+                assignment["deliverable_paths"] = [report_path]
+                assignment["review"]["criteria"] = [{**RULE, "method": "execute"}]
+                change = write(mutation, "The warehouse details have been checked.") if mutation else tool("read_file", path=PATH)
+                steps += [write(report_path, "The warehouse is under review."), tool("run_python", code=code),
+                          tool("list_review_evidence"), change,
+                          tool("list_review_evidence"), {"sign": "first"}]
+                if not preserved:
+                    steps += [tool("run_python", code=code), tool("list_review_evidence"), {"sign": "first"},
+                              {"sign": "alias" if case == "dynamic probe" else "latest"}]
+                steps += [{"text": "Delivered the independently verified report."}]
+
+                class SignedRef(RecordingProvider):
+                    def chat(self, messages, tools=None, temperature=0):
+                        next_step = self.script[self.cursor] if self.cursor < len(self.script) else {}
+                        if "sign" in next_step:
+                            catalogs = [json.loads(m["content"]) for m in messages if m["role"] == "tool"
+                                        and m["content"].startswith('{"candidate_version"') and '"evidence": [' in m["content"]]
+                            catalog = catalogs[0] if next_step["sign"] == "first" else catalogs[-1]
+                            key = "alias" if next_step["sign"] == "alias" else "ref"
+                            ref = next(r[key] for r in catalog["evidence"] if r["kind"] == "passed_check")
+                            self.script[self.cursor] = tool("submit_review", candidate_version=version(manuscript),
+                                results=[{"criterion_id":"content", "verdict":"passed",
+                                          "reason":"Checked the warehouse with an executed assertion.", "evidence":[ref]}])
+                        return super().chat(messages, tools, temperature)
+
+                provider = SignedRef(steps)
+                with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+                    run = self.service.start(request("team", conversation=roster("lead","builder","inspector"),
+                        objective="Check the delivered records.", acceptance_files=[PATH], limits={"max_steps": 90}))
+                    detail = finished(self.service, run["id"])
+                self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+                trace = [json.loads(line) for line in (self.root/"runs"/run["id"]/"trace.jsonl").read_text().splitlines()]
+                results = [e["ok"] for e in trace if e["kind"] == "tool_result" and e["tool"] == "submit_review"]
+                self.assertEqual(results, [True] if preserved else [False, False, True])
+                if not preserved:
+                    report, = [e["handoff"] for e in detail["room_events"] if e.get("role") == "inspector"
+                               and e["kind"] == "member_report"]
+                    history, = report["native_review"]["historical_execution_receipts"]
+                    signed, = report["native_review"]["assessment"]["results"][0]["receipts"]
+                    self.assertEqual(history["scope"], signed["scope"])
+                    self.assertEqual(history["paths"], [mutation])
+                    self.assertNotEqual(history["ref"], signed["ref"])
+                    self.assertNotEqual(history["tool_call_id"], signed["tool_call_id"])
+                    self.assertIn(signed["ref"], str(provider.requests[-1]))
+                if mutation == report_path and not preserved:
+                    self.assertIn("报告已更新", str(provider.requests))
+                    self.assertIn("无需回写报告", str(provider.requests))
+
     def test_reviewer_cannot_rewrite_its_own_earlier_report_when_bound_as_original_reference(self):
         ref = "original-dispatch.txt"
         manuscript = "Shipment destination: old warehouse. Verified dispatch record."

@@ -39,8 +39,8 @@ from .orchestrator import Orchestrator
 from .providers import DeepSeekProvider, ScriptedProvider
 from .rao import StepPolicy
 from .sandbox import Sandbox
-from .task_service import TaskService
-from .task_store import StoreTransaction, TaskStore, _schema
+from .task_service import TaskService, _digest
+from .task_store import StoreError, StoreTransaction, TaskStore, _schema
 from .tools import build_default_registry
 from .project_data import (PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, SQLITE_SIDECARS, is_database, is_png,
                            supported_project_file, validate_project_data)
@@ -55,6 +55,7 @@ from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
 from .studio_acceptance import build_checks
 from .studio_crew import RoomCrew
+from .studio_reviews import Rule
 from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, copy_project, member_profiles, project_context,
                                    thread_info, validate_conversation)
 
@@ -1227,6 +1228,35 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     witnessed.setdefault(index, set()).add(rel)
         return witnessed
 
+    def _original_self_comparisons(self, run_id, events, target, reference, pending):
+        """Recover only the original, accepted file selector from a legacy delegation."""
+        first = next((e for e in events if e.get("kind") == "member_report" and
+                      (r := (e.get("handoff") or {}).get("native_review") or {}) and
+                      (r.get("target"), r.get("candidate_version")) == target and r.get("reviewer") == e.get("role")), None)
+        if first is None or not first.get("task_id"):
+            return {}
+        with self._record_snapshot(self._directory(run_id)) as records:
+            if not records:
+                return {}
+            db, tx = records
+            try:
+                task = tx.get("TaskRecord", first["task_id"])
+            except StoreError as exc:
+                if exc.code == "not_found":
+                    return {}
+                raise
+            calls = db.execute("""SELECT json_extract(payload, '$.action_id'), json_extract(payload, '$.arguments.review.criteria')
+                FROM blobs WHERE kind='action_identity' AND json_extract(payload, '$.operation')='delegate_task'
+                AND json_extract(payload, '$.task_id')=? AND json_extract(payload, '$.arguments.review.candidate')=?""",
+                (run_id, reference))
+            for action, criteria in calls:
+                key = "task-create:" + _digest([task.project_id, f"delegation:{run_id}:{action}"])
+                if task.creation_key == key:
+                    original = [Rule.model_validate(r).model_dump(exclude_none=True) for r in json.loads(criteria or "[]")]
+                    return {r["id"]: {"run_id": run_id, "review_task": task.task_id, "original": r}
+                            for r in pending if r in original and r.get("reference_path") == reference}
+        return {}
+
     def _inherited_review_publication(self, crew, local, reference):
         """Resolve a published original from this conversation's actual file ancestry."""
         thread = crew.thread
@@ -1272,9 +1302,12 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                             failed = {r["criterion_id"]:r for r in assessment["results"] if r["verdict"] != "passed"}
                             pending = [r for r in old["criteria"] if r["id"] in failed and r["required"]]
                             product = any(failed[r["id"]].get("cause") == "product" for r in pending)
-                            prior_findings[target] = (old["files"], pending, product)
+                            corrections = {}
+                            if reference in old["files"] and any(r.get("reference_path") == reference for r in pending):
+                                corrections = self._original_self_comparisons(parent, events, target, reference, pending)
+                            prior_findings[target] = (old["files"], pending, product, corrections)
                         elif e.get("published") and old.get("state") == "passed":
-                            prior_findings[target] = (old["files"], [], False)
+                            prior_findings[target] = (old["files"], [], False, {})
                 if not (e.get("published") and h.get("published") and e.get("task_id")
                         and e["task_id"] == h.get("task_id")):
                     continue
@@ -1328,12 +1361,17 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         if candidate:
             if task_scope - candidate["files"].keys():
                 raise ValueError("原任务的完整交付范围已改变或缺少发布凭证。请指定仍匹配的单份成稿。")
-            for files, findings, product in prior_findings.values():
+            for files, findings, product, corrections in prior_findings.values():
                 if not candidate["files"].items() & files.items():
                     continue
                 if product:
                     raise ValueError("指定版本已有独立验收确认的产品缺陷。请安排作者修订并发布新版本。")
-                candidate["unresolved"].extend(r for r in findings if r not in candidate["unresolved"])
+                for rule in findings:
+                    if rule["id"] in corrections and candidate["files"].get(reference) == files[reference]:
+                        candidate.setdefault("criteria_corrections", []).append(corrections[rule["id"]])
+                        rule = {k: v for k, v in rule.items() if k != "reference_path"}
+                    if rule not in candidate["unresolved"]:
+                        candidate["unresolved"].append(rule)
         return candidate or studio_route_results.imported_review_candidate(self, crew, reference, manifest, seen)
 
     def _load_prior_diagnostics(self, crew, thread):
