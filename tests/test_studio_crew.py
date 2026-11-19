@@ -443,6 +443,29 @@ class StudioCrewTest(unittest.TestCase):
         self.assertTrue(report["published"])
         self.assertEqual([f["path"] for f in report["changed_files"]], [path])
 
+    def test_writer_receives_edit_trend_and_can_rewrite_the_whole_draft(self):
+        path = "guide.md"
+        edit = ("from pathlib import Path\np = Path('guide.md')\n"
+                "body = p.read_text().replace('Draft', 'Done', 1)\np.write_text(body)\n"
+                "print('remaining:', body.count('Draft'))")
+        substantial_revision = "A revised guide covering the requested material."
+        script = [tool("delegate_task", assignee="writer", objective="Revise the draft until it is ready",
+                       deliverable_paths=[path], remaining_roles=[]),
+                  write(path, "Draft paragraph.\n" * 100),
+                  *[tool("run_python", code=edit) for _ in range(5)],
+                  write(path, substantial_revision), {"text":"Ready"}, {"text":"Delivered"}]
+        detail, provider = self.execute(script, roster("lead", "writer", "observer"),
+                                        objective="Prepare the guide", acceptance_files=[path])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        request, tools = provider.requests[7]
+        self.assertEqual(tools, provider.requests[1][1])
+        for fact in (path, "5 次局部小改", "remaining: 99", "remaining: 95"):
+            self.assertIn(fact, request[-1]["content"])
+        self.assertNotIn("局部小改", provider.requests[8][0][-1]["content"])
+        report, = [row["handoff"] for row in detail["room_events"] if row["kind"] == "member_report"]
+        self.assertTrue(report["published"])
+        self.assertEqual(report["changed_files"][0]["sha256"], hashlib.sha256(substantial_revision.encode()).hexdigest())
+
     def test_repeated_green_suite_allows_member_to_decide_on_handoff(self):
         code = ("import subprocess, sys\n"
                 "p = subprocess.run([sys.executable, '-m', 'unittest', 'test_delivery'], capture_output=True, text=True)\n"
