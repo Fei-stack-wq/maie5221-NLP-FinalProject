@@ -229,6 +229,8 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 例如，评审人已执行网页测试并从发行方取得公告，但只用 shell 查看成稿时，收尾仍允许用 `read_lines` 读取指定成稿。拿到文件回执后，以它和对应的来源回执提交事实判断。若满足剩余取证条件的集合持续缩小，可在本次分配的时间和预算内继续。相同缺口连续三个收尾工具回合仍未缩小时，系统收回工具并要求明确交接未验证项。独立验收与最终发布仍分别检查绑定版本和用户标准。
 
+普通 `execute` 评审的提交错误列出该标准可选的最新 `passed_check` 短 ID 和用例名称，评审人须选择实际支持该项判断的回执。只有读取、文件摘要或自定义脚本退出记录时，目录会按本角色获准的工具说明如何对冻结输入执行断言。达到收尾条件时仍沿用本轮取证次数和预算。测试以完整退出 0 的自建脚本和一个真实文件哈希重现错误，再经实际断言及短 ID 完成签署。[普通入口与权限回归](../tests/test_execute_review_guidance.py) · [Pydantic AI 工具验证纠错测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L4792-L4818)
+
 这一实现借鉴 Pydantic AI 按字段返回验证错误、对同一次工具纠错限制重试的处理。Studio 自行实现按标准整理多个错误、真实工件回执与尚缺取证操作的关联。[Pydantic AI 的错误回执](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/pydantic_ai_slim/pydantic_ai/messages.py#L2938-L2958) · [工具级重试测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L1765-L1803) · [Studio 普通入口回归](../tests/test_studio_required_source_review.py)
 
 ### 在后续群聊中直接复核原件

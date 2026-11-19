@@ -340,8 +340,14 @@ def manifest_issue(expected, actual, *, exact=False, secret=""):
 
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
-    def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None, review_notes=()):
+    def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None,
+                 review_notes=(), available_tools=()):
         self.item = item
+        self.execution_actions = {name: instruction for name, instruction in {
+            "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
+            "run_browser": "操作冻结页面，在脚本顶层用 assert 或 expect(locator).to_have_text(expected) 核对实际行为。",
+            "run_shell": "运行含相关断言的现有测试套件，保留测试框架的逐项结果和真实退出码。",
+        }.items() if name in available_tools}
         self.review_notes = set(review_notes)
         self.private_snapshot_issue = private_snapshot_issue
         self.promotion_issue = promotion_issue
@@ -471,7 +477,17 @@ class ReviewSession:
         evidence = [{k:r[k] for k in ("ref", "kind", "path", "url", "label", "check", "sha256",
                                       "position", "extent") if k in r} for r in rows[offset:offset + limit]]
         return {"candidate_version":self.item.version, "offset":offset, "total":len(rows),
-                "evidence":evidence, "needs":self.evidence_needs()}
+                "evidence":evidence, "needs":self.evidence_needs(), **self.execution_guidance()}
+
+    def ordinary_execution(self, rule):
+        return rule.method == "execute" and rule.id.removeprefix("probe_") not in self.item.probes
+
+    def execution_guidance(self):
+        if not any(self.ordinary_execution(rule) for rule in self.item.criteria):
+            return {}
+        return {"execute": {"evidence": "通过项引用本轮与该标准相符的 passed_check 的 E 短 ID。"
+                "文件 SHA、脚本 scope、调用 ID 和正常退出记录各有不同用途；证据不足可提交 inconclusive。",
+                "actions": self.execution_actions}}
 
     def evidence_needs(self):
         retained = self.retained_findings()
@@ -490,6 +506,8 @@ class ReviewSession:
                     missing.append({"tool":"read_lines"})
                 if "source" not in kinds:
                     missing.append({"tool":"http_get"})
+            elif self.ordinary_execution(rule) and "passed_check" not in kinds:
+                missing.extend({"tool": tool} for tool in self.execution_actions)
             elif rule.method == "execute" and not kinds & {"passed_check", "failed_check"}:
                 missing.append({"tool":"run_shell"})
             elif rule.method == "inspect" and not kinds & {"read", "passed_check", "review_note"}:
@@ -516,7 +534,7 @@ class ReviewSession:
             label = receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt.get("check") or ""
             by_kind.setdefault(receipt["kind"], []).append([receipt["ref"], label[:110]])
         summary = {"recent_evidence":{k:v[-6:] for k,v in by_kind.items()},
-                   "needs":self.evidence_needs(), "catalog":"list_review_evidence"}
+                   "needs":self.evidence_needs(), "catalog":"list_review_evidence", **self.execution_guidance()}
         if self.last_snapshot_issue:
             summary["snapshot_issue"] = self.last_snapshot_issue
         return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
@@ -656,7 +674,14 @@ class ReviewSession:
                 try:
                     results.append(self._finding(rule, result))
                 except ValueError as exc:
-                    issues.append({"criterion_id":rule.id, "method":rule.method, "message":str(exc)})
+                    issue = {"criterion_id":rule.id, "method":rule.method, "message":str(exc)}
+                    if result.verdict == "passed" and self.ordinary_execution(rule):
+                        issue["passed_checks"] = [{"ref":r["ref"], "label":r["label"]} for r in self.receipts.values()
+                                                  if r["kind"] == "passed_check"][-6:]
+                        if not issue["passed_checks"]:
+                            issue["missing"] = "尚无可引用的 passed_check。脚本退出 0 或打印布尔值不能单独证明该项通过。"
+                            issue["available_tools"] = list(self.execution_actions)
+                    issues.append(issue)
             if issues:
                 return self._rejection(issues)
             by_id = {r["criterion_id"]: r for r in results}

@@ -1303,6 +1303,7 @@ class RoomCrew:
                 return None
 
             session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id,
+                                    available_tools={spec.name for spec in registry.specs()},
                                     private_snapshot_issue=private_snapshot_issue if private else None,
                                     promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())
             session.guard_file_tools(registry)
