@@ -505,6 +505,40 @@ class BoundReviewerProbeTest(unittest.TestCase):
         decisions = [e["text"] for e in detail["room_events"] if e["kind"] == "reviewer_probe_resolved"]
         self.assertEqual(decisions, ["probe_corrected"])
 
+    def test_adjudicator_can_report_its_own_probe_error_and_remeasure_from_same_frozen_input(self):
+        bad = BAD_PROBE.replace(" + 10", " + 2").replace("observed == 10", "(observed, 'units') == (10, 'units')")
+        self.assertNotEqual(scope(bad), BAD_SCOPE)
+        first = self.peer_steps()
+        first[0]["tool_calls"][0]["arguments"]["deliverable_paths"] = ["arbiter-notes.md"]
+        first[-2:-2] = [write("notes/unrequested.md", "An unrequested public file would invalidate the snapshot."),
+                        write("arbiter-notes.md", "A separately assigned note."),
+                        tool("run_python", code=bad)]
+        first.append({"_probe_finding":{
+            "criterion_id":"probe_" + BAD_SCOPE, "verdict":"inconclusive", "cause":"verification",
+            "evidence":["fail:" + scope(bad), "pass:" + PEER_SCOPE],
+            "reason":"My own probe added two to the observed quantity.",
+            "action":"Read and remeasure the same frozen label in a fresh review assignment."}})
+        steps = self.start_bound_review() + first + [{"text":"The quantity needs remeasurement."}]
+        steps += self.peer_steps() + [{"text":"Confirmed the unchanged shipment quantity."}, {"text":"Delivered."}]
+        detail, reports, provider = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        pending, completed = children
+        self.assertEqual([r["role"] for r in children], ["arbiter", "arbiter"])
+        self.assertEqual([r["native_review"]["assessment"]["verdict"] for r in children], ["inconclusive", "passed"])
+        self.assertEqual(pending["native_review"]["candidate_version"], completed["native_review"]["candidate_version"])
+        failed, = pending["evidence"]["failed_check_details"]
+        evidence = pending["native_review"]["assessment"]["results"][0]["receipts"]
+        cited = next(r for r in evidence if r["kind"] == "failed_check")
+        self.assertEqual((cited["scope"], cited["tool_call_id"]), (scope(bad), failed["tool_call_id"]))
+        self.assertFalse(completed["evidence"]["failed_check_details"])
+        feedback = [m["content"] for messages, _ in provider.requests for m in messages if m.get("role") == "tool"]
+        self.assertTrue(any("会改变私有裁决的冻结快照" in m and "arbiter-notes.md" in m for m in feedback))
+        self.assertTrue(any("已写入 arbiter-notes.md" in m for m in feedback))
+        self.assertTrue(any("同一位裁决者" in m and cited["ref"] in m for m in feedback))
+        checks = [e for e in detail["room_events"] if e["kind"] == "reviewer_probe_pending"]
+        self.assertEqual(len(checks), 1, "The adjudicator's local probe must not recursively open a new review.")
+
     def test_business_answer_resumes_the_same_frozen_probe_without_a_second_question(self):
         first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
         first[-1]["_probe_finding"].update(cause="business", reason="The unit label has two plausible meanings.",

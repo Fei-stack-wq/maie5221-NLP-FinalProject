@@ -1546,8 +1546,20 @@ class RoomCrew:
                             and (evidence["check_signals"] or self.delivery.get("checks")
                                  or self.child_checks.get(review.author, {}).get("checks"))):
                         return "私有候选的指定检查尚未在当前版本独立完成：" + entry["check"]
-                if progress.failed_checks():
-                    return "当前版本仍有失败检查：" + "、".join(progress.failed_checks().values())
+                if failed := progress.failed_checks():
+                    message = "当前版本仍有失败检查：" + "、".join(failed.values())
+                    if review.kind == "reviewer_probe":
+                        receipts = {r["scope"]: r["ref"] for r in session.receipts.values() if r["kind"] == "failed_check"}
+                        local = [{"scope": scope, "ref": receipts.get(scope), "tool": p["tool"],
+                                  "tool_call_id": p["tool_call_id"]} for scope, p in progress.inline_failures().items()
+                                 if p["task_id"] == record.task_id and p["tool"] in {"run_python", "run_browser"}
+                                 and scope not in draft["failed_checks"]]
+                        if local:
+                            message += ("。本次裁决者自己的临时检查：" + _json(local) +
+                                "。若检查方法有误，请将受影响的现有标准签为 inconclusive，cause=verification，"
+                                "引用实际失败及纠正证据，在 reason 和 action 写明误差与复验方法，其余项照实提交。"
+                                "负责人可让同一位裁决者从原冻结版本重新取证；本次失败会留在历史交接中。")
+                    return message
                 if draft["evidence"].get("superseded_member_checks") and not evidence["check_signals"]:
                     return "作者修订过失败检查，请独立执行实际断言以确认改动。"
                 return None
