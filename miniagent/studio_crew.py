@@ -479,13 +479,18 @@ class RoomCrew:
                 continue
         for obs in observations:
             parameters = args.get(obs.tool_call_id, {})
+            if not isinstance(parameters, dict):
+                parameters = {}
             body = obs.content
             if obs.source in _KNOWLEDGE_READS:
                 # Only the lead's next compact prompt may see this receipt.
                 self.private_read = body if len(body.encode()) <= 12000 else _clip(body, 8500) + " … " + body[-800:]
                 continue
-            path = os.path.normpath(obs.meta.get("path") or parameters.get("path") or ".")
+            path = obs.meta.get("path") or parameters.get("path")
+            path = os.path.normpath(path) if isinstance(path, str) and path else "."
             task = parameters.get("task_id") if obs.source == "read_handoff_report" else None
+            if not isinstance(task, str):
+                task = None
             outcome = self._navigation_outcome(obs, path, task)
             self.navigation_recent.append(((obs.source, path, task), outcome))
             excerpt = _clip(body, 1800)

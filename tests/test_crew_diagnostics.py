@@ -15,6 +15,59 @@ from tests.test_studio_service import finished, request
 
 
 class DiagnosticReportTest(unittest.TestCase):
+    def test_alternating_public_queries_report_covered_pages_gaps_and_real_dispatch(self):
+        class Reader(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0):
+                if self.cursor < len(self.script) and "report_offset" in self.script[self.cursor]:
+                    offset = self.script[self.cursor]["report_offset"]
+                    task = re.search(r'"task_id":"(task-[a-f0-9]+)","path":"findings.md"',
+                                     '\n'.join(m.get('content') or '' for m in messages)).group(1)
+                    self.script[self.cursor] = tool("read_handoff_report", task_id=task, path="findings.md", offset=offset)
+                return super().chat(messages, tools, temperature)
+
+        root_page = tool("read_file", path="z-notes.md", offset=0, limit=80)
+        listing = tool("list_dir", path=".")
+        provider = Reader([
+            tool("delegate_task", assignee="analyst", objective="Examine the issue",
+                 deliverable_paths=["findings.md"], remaining_roles=["writer"]),
+            tool("run_python", code="assert False, 'red probe'"), write("findings.md", "sample " * 1000),
+            {"text":"[BLOCKED] Documented a failed check."},
+            root_page, {"report_offset":0}, listing, root_page, {"report_offset":0}, listing,
+            tool("read_lines", path="z-notes.md", start_line=1, limit=1),
+            {"report_offset":1100}, tool("read_file", path="z-notes.md", offset=70, limit=50),
+            tool("delegate_task", assignee="writer", objective="Deliver the correction", remaining_roles=[]),
+            write("delivery.md", "Edited and published the requested correction."), {"text":"Wrote correction."},
+            {"report_offset":0}, {"text":"[BLOCKED] Original independent check remains open."}])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            project = base / "project"
+            project.mkdir()
+            for i in range(65):
+                (project / f"a-{i}.txt").write_text("fixture")
+            (project / "z-notes.md").write_text(("0123456789\n" * 20))
+            service = StudioService(base / "runs", Settings(api_key="test-sentinel"))
+            self.addCleanup(service.close)
+            with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+                run = service.start(request("team", objective="Prepare the corrected delivery", workspace_path=str(project),
+                                            conversation=roster("lead", "analyst", "writer"),
+                                            acceptance_files=["delivery.md","z-notes.md"]))
+                detail = finished(service, run["id"])
+            messages, offered = provider.requests[13]
+            facts = next(json.loads(line) for line in messages[-1]["content"].splitlines()
+                         if line.startswith('{"公开版本":'))
+            self.assertEqual(facts["最近查询"], 9)
+            self.assertEqual(facts["读到新范围或新结果"], 5)
+            self.assertEqual(facts["已覆盖或相同结果"], 4)
+            self.assertEqual(facts["公共区缺少的验收文件"], ["delivery.md"])
+            self.assertEqual(facts["本轮已实际委派角色"], ["analyst"])
+            self.assertEqual(facts["未结独立评审"], [])
+            self.assertEqual({row["tool"] for row in facts["重复命中"]},
+                             {"read_file", "read_lines", "list_dir", "read_handoff_report"})
+            self.assertEqual(offered, provider.requests[4][1])
+            self.assertTrue(any(row["kind"] == "member_report" and row["published"]
+                                for row in detail["room_events"]))
+            self.assertNotIn('{"公开版本":', provider.requests[17][0][-1]["content"])
+
     def test_red_check_carries_report_to_lead_and_repairer_without_publication(self):
         doc = 'Probe URL was invalid.\n' + 'A' * 1500 + ' MIDDLE_PROBE_EVIDENCE ' + 'B' * 1500 + '\nMalformed record causes HTTP 500.'
         class Reader(RecordingProvider):

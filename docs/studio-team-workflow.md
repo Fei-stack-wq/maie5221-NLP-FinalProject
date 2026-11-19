@@ -371,6 +371,10 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 协作者交回工作后，本轮收件人可以继续执行。例如写作者让研究员保存 `counts.md`，随后自行读取它并写出 `summary.md`。两个文件分别归属研究员和写作者。若写作者修改了评审者刚签过的成稿，提交前会重新比对内容哈希，并将当前版本交还评审者核对。只读提问也允许收件人在同伴答复后继续查资料。
 
+在「需要独立核查来源的文件」中指定成稿，再点名一位研究员，研究员仍持有本轮工作区的读写、执行、搜索和网页读取工具。他可以亲自改稿，也可以将写作交给作者。成稿就绪后，实际作者之外的成员须在正式评审中阅读冻结版本、独立取得原始来源，并提交必需的 `source` 标准。明确配置的 `child_checks` 仍由对应成员在自己的任务中通过。执行者尝试提前交付时，每次都会收到当前缺少的证据，在预算内可继续调用工具修复。
+
+校验失败时将具体原因交回模型的接口参考了 Pydantic AI。Studio 在群成员仍可使用修复工具时保留这一反馈循环，并在每次收尾重新检查真实交接和来源签署。[上游校验反馈](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/pydantic_ai_slim/pydantic_ai/messages.py#L2938-L2958) · [上游纠正后再验证的测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L4792-L4818) · [Studio 来源核查与定向工作回归](../tests/test_studio_required_source_review.py)
+
 这里借鉴 OpenAI Agents SDK 的按需调用专家模式。Studio 自行实现了群内收件人、工作区版本及独立验收。定向消息仅在调用成员工具时创建子任务。上游采用 MIT 许可。[上游嵌套运行](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L1085-L1107) · [上游当次调用结果测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L855-L938) · [Studio 收件人与复核回归](../tests/test_studio_addressing.py)
 
 ### 群成员侧栏与最新消息
