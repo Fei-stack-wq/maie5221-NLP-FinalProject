@@ -222,6 +222,24 @@ class MemberProgressTest(unittest.TestCase):
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["inspected"], ["module.py"])
 
+    def test_recovery_requires_matching_operation_result_and_no_fresh_work(self):
+        def observe(code, result):
+            self.observe(args={"code": code}, text=result, meta={"exit_code": 0})
+            return self.p.recovery_feedback()
+
+        for i in range(5):
+            self.assertFalse(observe(f"print({i})", "same stdout"))
+        for i in range(5):
+            self.assertFalse(observe("print(1)", f"distinct stdout {i}"))
+        for i in range(4):
+            self.src.write_text(f"published work {i}")
+            self.assertFalse(observe("print(1)", "same stdout"))
+        self.assertFalse(observe("print(1)", "same stdout"))
+        self.assertIn("3 次", observe("print(1)", "same stdout"))
+        self.assertEqual(self.p.phase(self.budget), "work")
+        self.assertEqual(self.p.evidence()["stop_reason"], "")
+        self.assertFalse(observe("print(2)", "new stdout"))
+
     def test_genuine_small_python_edits_report_versions_outputs_and_missing_paths(self):
         self.p = MemberProgress(self.root, ["guide.md", "review.md"])
         guide = self.root / "guide.md"

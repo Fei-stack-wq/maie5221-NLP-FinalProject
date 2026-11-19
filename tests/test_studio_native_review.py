@@ -119,6 +119,51 @@ class NativeReviewTest(unittest.TestCase):
             self.assertIn(version(label), feedback)
             self.assertIn("从原冻结版本重新发起评审", feedback)
 
+    def test_repeated_identical_review_checks_recover_request_with_evidence_and_all_work_tools(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        scope = ("from pathlib import Path\ntext = Path('delivery.txt').read_text()\n"
+                 "assert 'old warehouse' in text\nprint('PASS destination matches the dispatch')")
+        check = tool("run_python", code=scope)
+        new_check = tool("run_python", code=scope.replace("'old warehouse' in text", "text.endswith('record.')"))
+        steps = self.start_review() + [check] * 7 + [
+            write("review-note.md", "Verified the warehouse. Separately check the dispatch record suffix."),
+            new_check, submit(label, "passed"), {"text":"Delivered."}]
+        detail, provider = self.execute(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        requests = provider.requests
+        evidence_turn = len(self.start_review()) + 7
+        normal, _ = requests[len(self.start_review()) + 2]
+        self.assertIn("进度提醒", normal[-1]["content"])  # Delivered before any compact request.
+        self.assertTrue(any(m["role"] == "tool" for m in normal))
+        prompt, tools = requests[evidence_turn]
+        self.assertEqual(tools, requests[len(self.start_review())][1])
+        self.assertFalse(any(m["role"] in {"tool", "assistant"} for m in prompt))
+        first_review_request = requests[len(self.start_review()) - 1][0]
+        self.assertEqual(prompt[:3], first_review_request[:3])  # System, assignment context, bound review goal.
+        contents = "\n".join(m["content"] for m in prompt)
+        for fact in ("工作上下文恢复", "7 次", "Build and independently verify the shipment label.",
+                     PATH, RULE["description"], version(label),
+                     "PASS destination matches the dispatch", "recent_evidence", "passed_check", '"needs":{}',
+                     "list_review_evidence", "submit_review"):
+            self.assertIn(fact, contents)
+        self.assertIn("write_file", tools)
+        self.assertIn("run_python", tools)
+        self.assertNotIn(scope, contents)
+        owner, = [r["task_id"] for r in detail["room_events"] if r["kind"] == "assignment"
+                  and r["recipient"] == "inspector"]
+        trail = [r for r in detail["events"] if r.get("task_id") == owner]
+        self.assertEqual(sum(r["kind"] == "tool_result" and r["tool"] == "run_python" for r in trail), 8)
+        compact = [r for r in trail if r["kind"] == "step_start" and r.get("compact")]
+        self.assertTrue(compact)
+        self.assertTrue(all(r["phase"] == "work" and set(r["offered_tools"]) == set(tools) for r in compact))
+        # A real write immediately restores the regular request and a different independent check succeeds.
+        self.assertTrue(any(m["role"] == "tool" for m in requests[evidence_turn + 1][0]))
+        report, = [r["handoff"] for r in detail["room_events"] if r["kind"] == "member_report"
+                   and r["role"] == "inspector"]
+        self.assertTrue(report["published"])
+        self.assertEqual(report["native_review"]["state"], "passed")
+        self.assertIn("review-note.md", [f["path"] for f in report["changed_files"]])
+
     def test_same_batch_command_after_review_submission_invalidates_its_handoff(self):
         label = "Shipment destination: old warehouse. Verified dispatch record."
         command = tool("run_python", code=f"from pathlib import Path; Path({PATH!r}).write_text('changed')")
