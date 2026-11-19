@@ -1425,6 +1425,34 @@ class RoomCrew:
         self.handoffs[action] = outcome
         return outcome
 
+    def _editable_review_reports(self, role, required, original, review):
+        """Authorize only this reviewer's explicitly assigned, byte-matched earlier reports."""
+        editable = set()
+        current = {r["task_id"]: r for r in self.reports if r["published"]}
+        history = {turn["run_id"] for turn in self.history}
+        for path in required:
+            if path not in original or path in review.files or Path(path).suffix.lower() not in {".md", ".rst", ".txt"}:
+                continue
+            binding = self.native_reviews.path_candidates.get(path)
+            report = None
+            if binding:
+                task, sha = binding
+                if sha == original[path]:
+                    report = current.get(task)
+            elif self.inherited_review and history:
+                try:
+                    publication = self.inherited_review(path)
+                except ValueError:
+                    continue
+                if (publication and publication["run_id"] in history and publication["role"] == role
+                        and publication["files"].get(path) == original[path]):
+                    report = next((e["handoff"] for e in self.room_events(publication["run_id"])
+                                   if e["kind"] == "member_report" and e.get("published") and e["role"] == role
+                                   and e.get("task_id") == publication["task_id"]), None)
+            if report and report["role"] == role and path in report["deliverable_paths"]:
+                editable.add(path)
+        return editable
+
     def _dispatch(self, role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review=None):
         assignments = self.path / "assignments"
         assignments.mkdir(exist_ok=True)
@@ -1528,7 +1556,8 @@ class RoomCrew:
                     return "作者修订过失败检查，请独立执行实际断言以确认改动。"
                 return None
 
-            session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id,
+            editable_reports = set() if private else self._editable_review_reports(role, required, original, review)
+            session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id, editable_reports=editable_reports,
                                     available_tools={spec.name for spec in registry.specs()},
                                     private_snapshot_issue=private_snapshot_issue if private else None,
                                     promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())

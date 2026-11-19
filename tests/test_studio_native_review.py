@@ -50,6 +50,32 @@ class NativeReviewTest(unittest.TestCase):
                      review={"candidate":"builder","criteria":[RULE]}),
                 tool("read_file", path=PATH)]
 
+    def test_reviewer_can_revise_its_published_report_when_resuming_the_same_candidate(self):
+        project = self.root / "project"
+        project.mkdir()
+        manuscript = "Shipment destination: old warehouse. Verified dispatch record."
+        report_path = "docs/review.md"
+        first = "First review: independent confirmation still outstanding."
+        final = "Final review: the shipping destination has been independently verified."
+        steps = self.start_review()
+        steps[3]["tool_calls"][0]["arguments"]["deliverable_paths"] = [report_path]
+        steps += [write(report_path, first),
+                  submit(manuscript, "inconclusive", cause="verification", action="Recheck the confirmed destination."),
+                  {"text": "The initial report records the open verification question."},
+                  tool("delegate_task", assignee="inspector", objective="Recheck the label and update your report.",
+                       deliverable_paths=[report_path]),
+                  tool("read_file", path=PATH), write(PATH, "replacement manuscript"), write(report_path, final),
+                  submit(manuscript, "passed"), {"text": "Delivered the final guide and review."}]
+        detail, provider = self.execute(steps, workspace_path=str(project))
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        events = [e for e in detail["room_events"] if e["kind"] == "member_report" and e["role"] == "inspector"]
+        self.assertEqual([e["handoff"]["native_review"]["state"] for e in events], ["review", "passed"])
+        snapshots = [next(a["path"] for a in e["artifacts"] if a["project_path"] == report_path) for e in events]
+        self.assertEqual([self.service.artifact(detail["run"]["id"], path)["content"] for path in snapshots], [first, final])
+        self.assertEqual((project / PATH).read_text(), manuscript)
+        self.assertEqual((project / report_path).read_text(), final)
+        self.assertIn("独立评审的冻结文件不可修改", str(provider.requests))
+
     def reviewed_label(self):
         label = "Shipment destination: old warehouse. Verified dispatch record."
         script = self.start_review()

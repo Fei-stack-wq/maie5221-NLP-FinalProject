@@ -75,6 +75,37 @@ class InheritedReviewTest(unittest.TestCase):
         self.assertIn("本群其他成员", str(provider.requests))
         self.assertIn("未观察到", str(provider.requests))
 
+    def test_reviewer_can_update_its_own_report_on_a_later_turn_and_both_versions_remain_available(self):
+        parent, _ = self.seed()
+        note = "docs/review.md"
+        versions = ["Initial independent verification of the warehouse destination.",
+                    "Follow-up independent verification of the current dispatch."]
+        links = []
+        for version in versions:
+            review = self.review(FILE)
+            review["tool_calls"][0]["arguments"]["deliverable_paths"] = [note]
+            detail, _ = self.turn([review, tool("read_file", path=FILE), tool("http_get", url=URL),
+                                   write(note, version), self.submit(), {"text": "Sources verified and reported."}],
+                                  reply(parent, "lead"), required_source_review_paths=[FILE])
+            self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+            parent = detail["run"]["id"]
+            event, = [e for e in detail["room_events"] if e["kind"] == "member_report"]
+            artifact, = [a for a in event["artifacts"] if a["project_path"] == note]
+            links.append((parent, artifact["path"]))
+            self.assertEqual(event["handoff"]["native_review"]["files"], {FILE: SHA})
+        self.assertEqual([self.service.artifact(run_id, path)["content"] for run_id, path in links], versions)
+        self.assertEqual((self.local / note).read_text(), versions[-1])
+
+        (self.local / note).write_text("Edited separately on the user's computer.")
+        review = self.review(FILE)
+        review["tool_calls"][0]["arguments"]["deliverable_paths"] = [note]
+        _, provider = self.turn([review, write(note, "Attempted to overwrite another version."),
+                                 {"text":"[BLOCKED] Report ownership is unresolved."},
+                                 {"text":"[BLOCKED] The local report was changed externally."}],
+                                reply(parent, "lead"), required_source_review_paths=[FILE])
+        self.assertIn("独立评审的冻结文件不可修改", str(provider.requests))
+        self.assertEqual((self.local / note).read_text(), "Edited separately on the user's computer.")
+
     def test_internal_workspace_uses_base_run_and_supports_exact_path(self):
         parent, task = self.seed(local=False)
         detail, _ = self.turn([self.review(FILE), tool("read_file", path=FILE), tool("http_get", url=URL),

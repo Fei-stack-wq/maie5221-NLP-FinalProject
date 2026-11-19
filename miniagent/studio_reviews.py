@@ -408,7 +408,7 @@ def manifest_issue(expected, actual, *, exact=False, secret=""):
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
     def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None,
-                 review_notes=(), available_tools=()):
+                 review_notes=(), available_tools=(), editable_reports=()):
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
@@ -427,7 +427,11 @@ class ReviewSession:
         self.assessment = None
         self.source_files = {}
         self.last_snapshot_issue = None
-        self.frozen = {**original, **item.files}
+        protected = set(item.files) | self.reference_paths | item.required_source_paths
+        for finding in self.retained_findings().values():
+            protected.update(r["path"] for r in finding["receipts"] if r.get("path"))
+        self.editable_reports = set(editable_reports) - protected
+        self.frozen = {path: sha for path, sha in (original | item.files).items() if path not in self.editable_reports}
 
     def guard_file_tools(self, registry):
         for name in ("write_file", "edit_file", "append_file", "delete_file"):
@@ -668,7 +672,9 @@ class ReviewSession:
         return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
                  + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
                  if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件；标准包含 reference_path 时用 read_lines 或 read_file 分别读成稿和指定本地原始记录，逐项对照实际内容，并在该项同时引用 read 和 reference 短 ID。execute 须执行检查。source 核对稿件中的具体论断和亲自打开的外部网页，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
-                "评审期间候选及工作副本中全部继承文件都须保持原字节，包括旧检查脚本。将临时脚本放入系统临时目录，另写评审附件。"
+                "评审期间候选及其他继承的输入均保持原字节，包括旧检查脚本。将临时脚本放入系统临时目录。"
+                + ("本次分派允许直接更新你已发布的评审报告：" + "、".join(sorted(self.editable_reports)) + "。"
+                   if self.editable_reports else "") +
                 "用 submit_review 提交结构化结果；每项引用宿主回执 ID。变更请求写明责任分类与可执行修改。"
                 "业务标准本身不明确时选择 inconclusive/business。材料：" +
                 json.dumps(self.item.briefing(), ensure_ascii=False) +
