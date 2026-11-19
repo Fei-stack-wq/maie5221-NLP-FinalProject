@@ -33,11 +33,11 @@ class NativeReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps, *others, **options):
+    def execute(self, steps, *others, objective="Build and independently verify the shipment label.", **options):
         provider = RecordingProvider(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
             run = self.service.start(request("team",conversation=roster("lead","builder","inspector",*others),
-                 objective="Build and independently verify the shipment label.",acceptance_files=[PATH],
+                 objective=objective,acceptance_files=[PATH],
                  limits={"max_steps":90}, **options))
             detail = finished(self.service, run["id"])
         return detail, provider
@@ -75,6 +75,31 @@ class NativeReviewTest(unittest.TestCase):
         self.assertEqual((project / PATH).read_text(), manuscript)
         self.assertEqual((project / report_path).read_text(), final)
         self.assertIn("独立评审的冻结文件不可修改", str(provider.requests))
+
+    def test_reviewer_cannot_rewrite_its_own_earlier_report_when_bound_as_original_reference(self):
+        ref = "original-dispatch.txt"
+        manuscript = "Shipment destination: old warehouse. Verified dispatch record."
+        project = self.root / "project"
+        project.mkdir()
+        steps = [tool("delegate_task", assignee="inspector", objective="Publish the confirmed dispatch record.",
+                      remaining_roles=["builder"], deliverable_paths=[ref]),
+                 write(ref, manuscript), {"text": "Record archived."}, *self.start_review()]
+        assignment = steps[-2]["tool_calls"][0]["arguments"]
+        assignment["deliverable_paths"] = [ref]
+        assignment["review"]["criteria"] = [{**RULE, "reference_path": ref}]
+        approval = submit(manuscript, "passed")
+        approval["tool_calls"][0]["arguments"]["results"][0]["evidence"].append("reference:" + ref)
+        steps += [write(ref, "Changed dispatch reference."), tool("read_file", path=ref), approval,
+                  {"text": "[BLOCKED] The requested output is also protected reference evidence."},
+                  {"text": "[BLOCKED] Independent input must remain unchanged."}]
+        detail, provider = self.execute(steps, workspace_path=str(project),
+                                       objective="@lead Please obtain the original dispatch, prepare the label and verify it.")
+        self.assertEqual(detail["run"]["status"], "failed", detail["diagnostics"])
+        self.assertIn("独立评审的冻结文件不可修改", str(provider.requests))
+        self.assertEqual((project / ref).read_text(), manuscript)
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        refs = reports[-1]["native_review"]["assessment"]["results"][0]["receipts"]
+        self.assertEqual([r["sha256"] for r in refs if r["kind"] == "reference"], [hashlib.sha256(manuscript.encode()).hexdigest()])
 
     def reviewed_label(self):
         label = "Shipment destination: old warehouse. Verified dispatch record."

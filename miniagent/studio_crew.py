@@ -1431,7 +1431,8 @@ class RoomCrew:
         current = {r["task_id"]: r for r in self.reports if r["published"]}
         history = {turn["run_id"] for turn in self.history}
         for path in required:
-            if path not in original or path in review.files or Path(path).suffix.lower() not in {".md", ".rst", ".txt"}:
+            if (path not in original or path in review.files or path in self.native_reviews.required_source_paths
+                    or Path(path).suffix.lower() not in {".md", ".rst", ".txt"}):
                 continue
             binding = self.native_reviews.path_candidates.get(path)
             report = None
