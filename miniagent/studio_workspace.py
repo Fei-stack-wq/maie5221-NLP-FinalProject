@@ -170,6 +170,18 @@ def _verify_projected(root, paths, proposed):
                 raise WorkspaceError(f"本机交付文件与已发布版本不符，保留本机修改：{name}。")
 
 
+def matches_projection(local, basis, name):
+    """Verify the directory identity and the bytes of one historically delivered file."""
+    try:
+        with _directory(Path(local)) as root:
+            if _identity(root) != basis["directory"]:
+                return False
+            _verify_projected(root, [name], basis["files"])
+        return True
+    except (OSError, WorkspaceError):
+        return False
+
+
 def publish(local, private, baseline, extensions, secret, *, return_basis=False, require_match=False,
             verify_paths=()):
     """Validate all edits before the first write. Replace through anchored directory handles."""

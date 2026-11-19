@@ -1190,6 +1190,43 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             return candidates[0]
         return None
 
+    def _direct_member_projections(self, path, events, local):
+        """Link each projected path to the direct handoff that owned it at the time."""
+        if not local or not (path / "workspace-projection.json").is_file():
+            return {}
+        try:
+            basis = self._projection_basis(path)
+        except StudioError:
+            return {}
+        writers, projected = {}, {}
+        for index, event in enumerate(events):
+            handoff = event.get("handoff") or {}
+            task = event.get("task_id")
+            if not (event.get("published") and handoff.get("published") and task == handoff.get("task_id")):
+                continue
+            if event["kind"] == "direct_delivery" and task == path.name:
+                for change in handoff.get("changed_files", []):
+                    writers[change["path"]] = (index, change.get("sha256"))
+            elif event["kind"] == "member_report":
+                # Members can replace the author's version before projecting.
+                # Artifacts also cover additions beyond the abbreviated change list.
+                for change in handoff.get("changed_files", []):
+                    writers.pop(change["path"], None)
+                for artifact in event.get("artifacts", []):
+                    writers.pop(artifact.get("project_path"), None)
+                receipt = event.get("workspace_delivery") or {}
+                if (receipt.get("status") == "published" and receipt.get("source") == "member"
+                        and receipt.get("role") == event.get("role") and receipt.get("task_id") == task):
+                    for rel in receipt.get("files", []):
+                        projected[rel] = writers.get(rel)
+        witnessed = {}
+        for rel, author in projected.items():
+            if author:
+                index, sha = author
+                if sha and basis["files"].get(rel) == sha and studio_workspace.matches_projection(local, basis, rel):
+                    witnessed.setdefault(index, set()).add(rel)
+        return witnessed
+
     def _inherited_review_publication(self, crew, local, reference):
         """Resolve a published original from this conversation's actual file ancestry."""
         thread = crew.thread
@@ -1217,7 +1254,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             past = thread_info(parent, meta)
             if not past or past["id"] != thread["id"] or past["kind"] != "group" or meta.get("workspace_path") != local:
                 break
-            for e in reversed(self.room_events(parent)):
+            events = self.room_events(parent)
+            final_delivery = meta.get("state") in {"completed", "unverified"}
+            witnessed = {} if final_delivery else self._direct_member_projections(self._directory(parent), events, local)
+            for index in reversed(range(len(events))):
+                e = events[index]
                 if e.get("kind") not in {"member_report", "direct_delivery"} or e.get("role") not in crew.profiles:
                     continue
                 h = e.get("handoff", {})
@@ -1241,17 +1282,23 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 author = promoted.get("author", e["role"])
                 task = promoted.get("source_task", h["task_id"])
                 projection = e.get("workspace_delivery") or {}
-                if e["kind"] == "direct_delivery":
-                    if meta.get("state") not in {"completed", "unverified"}:
-                        continue
-                    projection = meta.get("workspace_delivery") or {}
                 changes = {c["path"]:c.get("sha256") for c in h.get("changed_files", [])}
+                if e["kind"] == "direct_delivery":
+                    if final_delivery:
+                        projection = meta.get("workspace_delivery") or {}
+                    elif index in witnessed:
+                        changes = {rel: changes[rel] for rel in witnessed[index]}
+                        projection = {"status": "published", "files": changes}
+                    else:
+                        continue
                 if reference == task:
                     task_scope.update(h.get("deliverable_paths") or (p for p, sha in changes.items() if sha))
                 for artifact in e.get("artifacts", []):
                     rel = artifact.get("project_path")
                     sha = artifact.get("sha256")
                     if not rel or rel in seen:
+                        continue
+                    if e["kind"] == "direct_delivery" and rel not in changes:
                         continue
                     seen.add(rel)
                     if (not sha or manifest.get(rel) != sha or changes.get(rel, sha) != sha or author not in crew.profiles

@@ -34,7 +34,7 @@ class InheritedReviewTest(unittest.TestCase):
         provider = RecordingProvider(script)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider), \
              patch("miniagent.research.fetch", return_value=Page(URL, "text/plain", BODY.encode(), False)):
-            run = self.service.start(request("team", conversation=conversation, objective="Verify the current dispatch.",
+            run = self.service.start(request("team", conversation=conversation, objective=options.pop("objective", "Verify the current dispatch."),
                 acceptance_files=[FILE], limits={"max_steps":80}, **options))
             return finished(self.service, run["id"]), provider
 
@@ -74,6 +74,38 @@ class InheritedReviewTest(unittest.TestCase):
         self.assertNotIn(FILE, [c["path"] for c in report["changed_files"]])
         self.assertIn("本群其他成员", str(provider.requests))
         self.assertIn("未观察到", str(provider.requests))
+
+    def test_peer_projection_preserves_direct_authorship_after_unsuccessful_turn(self):
+        other = "A private revision that has never been projected."
+        steps = [write(FILE, BODY), tool("delegate_task", assignee="checker", objective="Publish a separate note.",
+                    deliverable_paths=["check.md"], remaining_roles=[]),
+                 write("check.md", "Recorded the delivery date in a separate note."), {"text": "Note delivered."},
+                 write(FILE, other), self.review(FILE, assignee="writer"),
+                 {"text": "[BLOCKED] A separate hold remains."}]
+        previous, _ = self.turn(steps, roster("lead", "writer", "checker"), workspace_path=str(self.local),
+                                objective="@writer Prepare the dispatch and ask the checker to write a note.")
+        parent = previous["run"]["id"]
+        self.assertNotEqual(previous["run"]["status"], "completed")
+        self.assertEqual(self.local.joinpath(FILE).read_text(), BODY)
+        reports = previous["room_events"]
+        member, = [e for e in reports if e["kind"] == "member_report"]
+        self.assertIn(FILE, member["workspace_delivery"]["files"])
+        direct = [e for e in reports if e["kind"] == "direct_delivery"]
+        self.assertEqual(len(direct), 2)
+        self.assertNotEqual(direct[-1]["artifacts"][0]["sha256"], SHA)
+        detail, _ = self.turn([self.review(FILE), tool("read_file", path=FILE), tool("http_get", url=URL),
+                               self.submit(), {"text":"Verified."}, {"text":"Reviewed."}],
+                              reply(parent, "lead"), required_source_review_paths=[FILE])
+        bound, = [e for e in detail["room_events"] if e["kind"] == "published_review_bound"]
+        self.assertEqual(bound["publication"], {"run_id":parent, "task_id":parent, "role":"writer", "files":{FILE:SHA}})
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+
+        # An external edit matching unprojected private bytes is not evidence that
+        # those bytes were ever delivered, even though a direct snapshot exists.
+        self.local.joinpath(FILE).write_text(other)
+        after, _ = self.turn([self.review(FILE), {"text":"[BLOCKED] No matching publication."}],
+                             reply(detail["run"]["id"], "lead"), required_source_review_paths=[FILE])
+        self.assertNotIn("published_review_bound", [e["kind"] for e in after["room_events"]])
 
     def test_reviewer_can_update_its_own_report_on_a_later_turn_and_both_versions_remain_available(self):
         parent, _ = self.seed()
