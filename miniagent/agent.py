@@ -240,7 +240,7 @@ class Agent:
         usage = Usage()
         tool_calls = 0
         acceptance_failures = 0
-        answer_guard_retries = 0
+        blocked_handoff_retries = 0
         reviewed_close_retried = False
         rejected_text_turns = 0
         status = "limit_exceeded"
@@ -571,10 +571,13 @@ class Agent:
                     if not reason and before_answer is not None:
                         reason = before_answer()
                     if reason:
-                        answer_guard_retries += 1
+                        # An active group worker can correct the reported gate.
+                        # A final text-only checkpoint cannot acquire evidence.
+                        can_repair = step_policy is not None and any(spec.name != "abort_task" for spec in offered)
+                        blocked_handoff_retries = 0 if can_repair else blocked_handoff_retries + 1
                         if self.tracer:
                             self.tracer.event("delivery_blocked", **identity, reason=reason)
-                        if answer_guard_retries > 1:
+                        if blocked_handoff_retries > 1:
                             status, error = "error", reason
                             break
                         state.history.append({"role": "user", "content": reason})

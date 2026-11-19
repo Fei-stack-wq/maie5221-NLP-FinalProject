@@ -997,11 +997,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 participants = routed.get("participants", []) if routed else []
                 if not addresses and not participants and len(thread["members"]) == 1:
                     addresses = list(thread["members"])
-                if not addresses and not participants and request["mode"] == "single" and peer_contract:
-                    addresses = [thread["recipient"]]
                 selected = list(dict.fromkeys([*addresses, *participants]))
                 if selected:
-                    requires_team = len(selected) > 1 or peer_contract
+                    # Acceptance binds the proof needed to finish. It does not
+                    # replace one addressed worker with a read-only coordinator.
+                    requires_team = len(selected) > 1
                     request["mode"] = "team" if requires_team else "single"
                     # A structured team may include its coordinator for routing.
                     # Explicit mentions of the lead still require their own report.

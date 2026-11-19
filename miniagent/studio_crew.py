@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from functools import cached_property
 from pathlib import Path
@@ -18,7 +19,7 @@ from .acceptance import _relative_name
 from .agent import Agent
 from .context_window import estimate_tokens
 from .crew_diagnostics import RoomDiagnostics
-from .crew_progress import MemberProgress
+from .crew_progress import MemberProgress, _cover
 from .member_processes import managed_member_processes
 from .peer_recheck import ClosingPeerChecks
 from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_project_file, validate_project_data
@@ -141,7 +142,8 @@ class RoomCrew:
         self.private_read = ""
         self.navigation = []
         self.navigation_seen = set()
-        self.navigation_repeats = 0
+        self.navigation_ranges = {}
+        self.navigation_recent = deque(maxlen=24)
         self.navigation_version = self.project_version
         self.inspection_revision = None
         self.inspection_decision = None
@@ -162,10 +164,18 @@ class RoomCrew:
         if self.read_only:
             return ("你是本轮问题的收件人。请查阅项目后直接在群里回答；需要其他专业意见时可以用 "
                     "delegate_task 邀请一位成员查阅资料，取得其回答后汇总。可邀请角色：" + _json(self.delegate_recipients))
-        return ("你是用户点名的执行者。请自己使用工作工具完成本轮并直接回复用户；无须先委派给自己。"
+        instructions = ("你是用户点名的执行者。请自己使用工作工具完成本轮并直接回复用户；无须先委派给自己。"
                 "确实需要其他专业能力或独立复核时，用 delegate_task 邀请对应成员并说明具体目标。"
                 "已有成稿可用 review.candidate 填项目路径，附 criteria，由另一成员核对实际版本。"
                 "群内可邀请的角色：" + _json([{**v, "prompt": _clip(v["prompt"], 1200)} for v in self.profiles.values()]))
+        if self.native_reviews.required_source_paths:
+            instructions += ("\n本轮必须独立核查来源的成稿：" + _json(sorted(self.native_reviews.required_source_paths))
+                + "。你可以亲自查阅原始来源、修改文件。准备好候选后用 delegate_task 发起正式评审："
+                  "review.candidate 填成稿路径，criteria 包含必需的 source 标准。原作者以外的评审者须亲自读成稿、"
+                  "查原始来源并签署当前版本。如果成稿由其他成员发布，也可以将这次独立评审交给你自己的成员角色。")
+        if self.child_checks:
+            instructions += "\n这些成员各自需要通过明确的子任务验收，请委派对应成员履行：" + _json(self.child_checks)
+        return instructions
 
     def snapshot_direct_changes(self):
         """Freeze the addressed author's bytes before handing them to a peer or ending the turn."""
@@ -228,8 +238,11 @@ class RoomCrew:
                 if (not name.startswith(".") and supported_project_file(name, self.extensions)
                         and not path.is_symlink() and path.is_file()):
                     files.append({"path": str(path.relative_to(root)), "bytes": path.stat(follow_symlinks=False).st_size})
+        required = set(self.delivery.get("files", [])) | self.native_reviews.required_source_paths
+        required.update(check["path"] for check in self.delivery.get("checks", []))
         return {"base_run_id": self.thread.get("base_run_id"), "revision": self.project_version,
-                "total": len(files), "files": files[:64]}
+                "total": len(files), "files": files[:64],
+                "missing_acceptance_files": sorted(required - {f["path"] for f in files})}
 
     def instructions(self):
         roster = [{**v, "prompt": _clip(v["prompt"], 1200)} for v in self.profiles.values()]
@@ -374,18 +387,76 @@ class RoomCrew:
             self.inspection_notified = False
         self.nested_seconds = 0.0
 
+    def _reset_navigation_revision(self):
+        if self.navigation_version == self.project_version:
+            return False
+        self.navigation_version = self.project_version
+        self.navigation.clear()
+        self.navigation_seen.clear()
+        self.navigation_ranges.clear()
+        self.navigation_recent.clear()
+        return True
+
+    def _navigation_outcome(self, obs, path, report_task):
+        if not obs.ok:
+            return "failed"
+        meta = obs.meta
+        version = meta.get("sha256")
+        start = meta.get("offset")
+        end = None
+        if obs.source == "read_lines":
+            start, end = meta.get("char_start"), meta.get("char_end")
+        elif obs.source == "read_file" and type(start) is int and type(meta.get("returned_chars")) is int:
+            end = start + meta["returned_chars"]
+        elif obs.source == "read_handoff_report" and type(start) is int:
+            try:
+                page = json.loads(obs.content)
+            except (ValueError, RecursionError):
+                page = None
+            if isinstance(page, dict) and isinstance(page.get("content"), str):
+                end = start + len(page["content"])
+        if version and type(start) is int and type(end) is int and 0 <= start <= end:
+            # read_file and read_lines share a character coordinate system.
+            # Handoff reports belong to their own immutable task and file.
+            ranges = self.navigation_ranges.setdefault((report_task, path, version), [])
+            return "new" if _cover(ranges, start, end) else "covered"
+        signature = (obs.source, report_task, path, hashlib.sha256(obs.content.encode()).digest())
+        if signature in self.navigation_seen:
+            return "covered"
+        self.navigation_seen.add(signature)
+        return "new"
+
+    def _navigation_feedback(self):
+        outcomes = Counter(status for _, status in self.navigation_recent)
+        if outcomes["covered"] < 2:
+            return ""
+        repeats = Counter(key for key, status in self.navigation_recent if status == "covered")
+        targets = []
+        for (tool, path, task), count in repeats.most_common(8):
+            targets.append({"tool": tool, "path": path, "repeat": count, **({"task": task} if task else {})})
+        reviews = [{"target": r.target, "state": r.state, "reviewer": r.reviewer}
+                   for r in self.native_reviews.items.values() if r.state != "passed"]
+        for item in self.reviewer_probe_reviews.values():
+            if not item.get("resolved"):
+                review = item["review"]
+                reviews.append({"target": review.target, "state": review.state, "reviewer": review.reviewer})
+        facts = {"公开版本": self.project_version, "最近查询": len(self.navigation_recent),
+                 "读到新范围或新结果": outcomes["new"], "已覆盖或相同结果": outcomes["covered"],
+                 "查询失败": outcomes["failed"], "重复命中": targets,
+                 "公共区缺少的验收文件": self.inventory["missing_acceptance_files"],
+                 "本轮已实际委派角色": sorted(self.started_roles),
+                 "未结独立评审": reviews, "待独立复核的检查任务": sorted(self.pending_check_reviews),
+                 "缺少独立来源签署的文件": self.native_reviews.missing_source_reviews()}
+        return ("\n分工提醒：这是同一公开版本近期查询的实测记录。部分重叠但读到新字符的页面计入新范围。"
+                "请结合缺失文件、真实交接及未结复核，选择继续查阅、委派具体工作或说明阻塞。\n" + _json(facts))
+
     def observe_coordinator(self, record, state):
         """Keep attributable public tool receipts in the next compact request."""
         if self.direct:
             self.direct_progress.observe(record, state)
             return
-        if any(o.source == "delegate" for o in record.observations):
-            self.navigation_repeats = 0
-        if self.navigation_version != self.project_version:
+        if self._reset_navigation_revision():
             # A member may publish during this same tool batch.
-            self.navigation.clear()
-            self.navigation_seen.clear()
-            self.navigation_repeats = 0
             return
         observations = [o for o in record.observations
                         if o.source in _PROJECT_READS | _KNOWLEDGE_READS | {"read_handoff_report"}]
@@ -406,20 +477,17 @@ class RoomCrew:
                 args[call["id"]] = json.loads(call["function"]["arguments"])
             except (KeyError, ValueError, TypeError):
                 continue
-        advanced = False
         for obs in observations:
             parameters = args.get(obs.tool_call_id, {})
-            path = obs.meta.get("path", parameters.get("path", "."))
             body = obs.content
-            digest = hashlib.sha256(body.encode()).hexdigest()
-            signature = (obs.source, str(path), digest)
-            if obs.ok and signature not in self.navigation_seen:
-                advanced = True
-                self.navigation_seen.add(signature)
             if obs.source in _KNOWLEDGE_READS:
                 # Only the lead's next compact prompt may see this receipt.
                 self.private_read = body if len(body.encode()) <= 12000 else _clip(body, 8500) + " … " + body[-800:]
                 continue
+            path = os.path.normpath(obs.meta.get("path") or parameters.get("path") or ".")
+            task = parameters.get("task_id") if obs.source == "read_handoff_report" else None
+            outcome = self._navigation_outcome(obs, path, task)
+            self.navigation_recent.append(((obs.source, path, task), outcome))
             excerpt = _clip(body, 1800)
             if len(body.encode()) > 1800:
                 excerpt += " … " + _clip(body[-280:], 400)
@@ -429,7 +497,6 @@ class RoomCrew:
                     entry[key] = _clip(str(parameters[key]), 180)
             self.navigation.append(entry)
         del self.navigation[:-5]
-        self.navigation_repeats = 0 if advanced else self.navigation_repeats + 1
 
     @cached_property
     def delegate_recipients(self):
@@ -819,7 +886,7 @@ class RoomCrew:
         instruction += self._public_state(final=False)
         if self._only_peer_checks_remaining():
             instruction += "\n" + self._peer_check_instruction()
-        self.navigation_version = self.project_version
+        self._reset_navigation_revision()
         if self.navigation:
             # Latest request first so the most recent result survives clipping.
             receipts = _clip(_json(list(reversed(self.navigation))), 6800)
@@ -839,12 +906,12 @@ class RoomCrew:
                                   decision=asdict(self.decision_reads))
         if denied:
             instruction += "\n上次工具请求被拒。请按本轮可用工具修正请求。"
-        if self.navigation_repeats:
-            instruction += (f"\n分工提醒：连续 {self.navigation_repeats} 轮查阅没有观察到新的公开内容。"
-                            "路径与回执见上文。可换个位置查阅、按现有证据分工或说明阻塞。")
+        navigation_feedback = self._navigation_feedback()
+        if navigation_feedback:
+            instruction += navigation_feedback
         elif can_inspect and intake_full:
             instruction += "\n已达到本次勘察的建议用量。请核对剩余预算，优先查明影响分工的缺口。"
-        elif inspect_public and len(self.navigation_seen) >= 3:
+        elif inspect_public and len(self.navigation_recent) >= 3:
             instruction += "\n已收集多项背景信息。只补足直接影响分工的缺口，否则现在进行委派。"
         allowed = controls | _PROJECT_READS if inspect_public else controls
         if inspect_reports:
@@ -923,7 +990,7 @@ class RoomCrew:
         return _json(replies)
 
     def before_answer(self):
-        if self.direct and self.native_reviews.items:
+        if self.direct and (self.native_reviews.items or self.native_reviews.required_source_paths):
             try:
                 self.snapshot_direct_changes()
             except (SnapshotError, OSError) as exc:

@@ -1,6 +1,7 @@
 """Acceptance of the final manuscript is independent of earlier research notes."""
 import hashlib
 import json
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -39,12 +40,13 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
 
-    def execute(self, steps, *, members=("lead", "writer", "checker"), provider_type=RecordingProvider, final_path=FINAL, **kwargs):
+    def execute(self, steps, *, members=("lead", "writer", "checker"), provider_type=RecordingProvider,
+                final_path=FINAL, objective="Publish the sourced dispatch article.", **kwargs):
         provider = provider_type(steps)
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider), \
              patch("miniagent.research.fetch", return_value=Page(URL, "text/plain", ARTICLE.encode(), False)):
             job = self.service.start(request("team", conversation=roster(*members),
-                objective="Publish the sourced dispatch article.", required_source_review_paths=[final_path],
+                objective=objective, required_source_review_paths=[final_path],
                 limits={"max_steps": 90}, **kwargs))
             return finished(self.service, job["id"]), provider
 
@@ -307,3 +309,59 @@ class RequiredSourceReviewTest(unittest.TestCase):
         reports = [r["handoff"] for r in result["room_events"] if r["kind"] == "member_report"]
         self.assertEqual(reports[-1]["native_review"]["reviewer"], "lead")
         self.assertEqual(reports[-1]["native_review"]["author"], "writer")
+
+    def test_addressed_worker_gets_work_tools_and_must_obtain_fresh_independent_source_approval(self):
+        review = {"candidate": FINAL, "criteria": [RULE]}
+        class CurrentVersion(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0):
+                if self.cursor < len(self.script):
+                    for call in self.script[self.cursor].get("tool_calls", []):
+                        if call["name"] == "submit_review":
+                            # The author's freshly archived external source is
+                            # also versioned. Read the real candidate ID shown to the reviewer.
+                            versions = re.findall(r'"candidate_version":"([0-9a-f]{64})"',
+                                                  "\n".join(m.get("content") or "" for m in messages))
+                            call["arguments"]["candidate_version"] = versions[-1]
+                return super().chat(messages, tools, temperature)
+        detail, provider = self.execute([
+            tool("http_get", url=URL), write(FINAL, ARTICLE), {"text": "成稿和原始来源都查过了。"},
+            {"text": "仅凭我自己的来源检查，尝试再次收尾。"},
+            tool("delegate_task", assignee="researcher", objective="Approve the manuscript.", review=review),
+            tool("delegate_task", assignee="checker", objective="Check the final dispatch.",
+                 review={"candidate": FINAL, "criteria": [{**RULE, "method": "inspect"}]}),
+            tool("delegate_task", assignee="checker", objective="Verify against the original source.", review=review),
+            tool("read_file", path=FINAL), submit({FINAL: hashed(ARTICLE)}, FINAL),
+            tool("http_get", url=URL), submit({FINAL: hashed(ARTICLE)}, FINAL), {"text": "已交付。"}],
+            members=("lead", "researcher", "checker"), objective="@researcher 请自己修改成稿，并安排独立核查来源。",
+            provider_type=CurrentVersion)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(detail["run"]["mode"], "single")
+        self.assertTrue({"search_sources", "http_get", "write_file", "edit_file", "delegate_task"} <= set(provider.requests[0][1]))
+        self.assertIn("本轮必须独立核查来源的成稿", str(provider.requests[0][0]))
+        feedback = str(provider.requests)
+        for message in ("指定成稿当前版本缺少独立来源核查", "原作者不能独立验收", "必需的 source 标准", "未观察到"):
+            self.assertIn(message, feedback)
+        direct, = [e for e in detail["room_events"] if e["kind"] == "direct_delivery"]
+        self.assertEqual((direct["role"], direct["task_id"]), ("researcher", detail["run"]["id"]))
+        report, = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        approved = report["native_review"]
+        self.assertEqual((approved["author"], approved["reviewer"], approved["files"][FINAL], approved["state"]),
+                         ("researcher", "checker", hashed(ARTICLE), "passed"))
+        self.assertEqual(approved["assessment"]["candidate_version"], digest(approved["files"]))
+
+    def test_named_root_can_delegate_writing_and_cannot_skip_an_explicit_child_check(self):
+        review = {"candidate": FINAL, "criteria": [RULE]}
+        detail, provider = self.execute([
+            tool("http_get", url=URL), write(NOTES, NOTE), {"text": "研究笔记已好，尝试收尾。"},
+            tool("delegate_task", assignee="writer", objective="Write the manuscript.", remaining_roles=[]),
+            write(FINAL, ARTICLE), {"text": "已交稿。"}, {"text": "稿件已存在，尝试收尾。"},
+            tool("delegate_task", assignee="checker", objective="Independently verify the writer's claims.", review=review),
+            tool("read_file", path=FINAL), tool("http_get", url=URL), submit({FINAL: hashed(ARTICLE)}, FINAL),
+            {"text": "核查完毕。"}], members=("researcher", "writer", "checker"),
+            objective="@researcher 请按需要邀请作者和来源核查者。", child_checks={"writer": {"files": [FINAL]}})
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertEqual(detail["run"]["mode"], "single")
+        self.assertIn("这些成员的交接尚未完成或未通过用户验收：writer", str(provider.requests))
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual([h["role"] for h in reports], ["writer", "checker"])
+        self.assertEqual((reports[0]["status"], reports[1]["native_review"]["author"]), ("completed", "writer"))
