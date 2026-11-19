@@ -33,29 +33,29 @@ _TASKSTORE_SCHEMA = (b"CREATE TABLE creation_keys", b"CREATE INDEX records_task"
 
 def _is_task_section_word(data: bytes, start: int) -> bool:
     """Only the 'sk-' starting inside a corroborated Markdown section word."""
-    if start < 2 or data[start-2:start+1] != b"tas":
+    if start < 2 or data[start - 2:start + 3] != b"task-":
         return False
-    opening = data.rfind(b"[", max(0, start-820), start-2)
+    # The bounded link grammar above fits inside 1 KiB.
+    opening = data.rfind(b"[", max(0, start - 1024), start - 2)
     if opening < 0:
         return False
     link = _SECTION_LINK.match(data, opening)
-    if not link or not link.start(2) <= start-2 < link.end(2):
+    if not link or not link.start(2) <= start - 2 < link.end(2):
         return False
     words = link[1].lower().replace(b" ", b"-")
     if words != link[2]:
         return False
     offset = start - 2 - link.start(2)
-    return ((not offset or words[offset-1:offset] == b"-") and
+    return ((not offset or words[offset - 1:offset] == b"-") and
             words[offset:].startswith(b"task-") and words[offset:].count(b"-") >= 2)
 
 
 def _has_text_credential(data: bytes) -> bool:
-    if not _KEY_PATTERN.search(data):
-        return False
-    text = _STUDIO_TASK_ID.sub(b"[task]", data)
     offset = 0
-    while match := _KEY_PATTERN.search(text, offset):
-        if not _is_task_section_word(text, match.start()):
+    while match := _KEY_PATTERN.search(data, offset):
+        start = match.start()
+        canonical_task = start >= 2 and _STUDIO_TASK_ID.match(data, start - 2)
+        if not canonical_task and not _is_task_section_word(data, start):
             return True
         # The generic pattern is greedy. A separate token may begin inside
         # its match, even elsewhere in the same anchor. Rescan that suffix.

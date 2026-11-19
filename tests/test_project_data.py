@@ -119,7 +119,8 @@ class ProjectDataTest(unittest.TestCase):
         report = self.agent / "factcheck.md"
         report.write_text("Reviewed (" + task + ").")
         self.assertEqual((self.copy() / report.name).read_text(), report.read_text())
-        for value in ("sk-" + "ab012cde" * 4, task + "extra", "extra" + task, self.service.settings.api_key):
+        for value in ("sk-" + "ab012cde" * 4, task + "extra", "extra" + task, "sk-short-" + task,
+                      self.service.settings.api_key):
             report.write_text(task + " " + value)
             with self.subTest(), self.assertRaisesRegex(SnapshotError, "服务凭据"):
                 self.copy()

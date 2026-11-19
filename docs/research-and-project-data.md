@@ -32,7 +32,7 @@ HTML 提取同时返回可见正文和可追踪链接。工具会在来源记录
 
 这个判断借鉴 FEVER 区分支持、反驳与证据不足的标注方法。新闻组曾从一份公告没有列出课程细节，推断学校从未公布细节。遇到此类主张，核查员应比对有发布职责的目录或政策页，主张的范围应限定在实际查阅的资料内。真实回执能证明打开过来源，来源是否支持稿件中的结论由核查员判断。[FEVER 原论文](https://aclanthology.org/N18-1074/)
 
-公开文本允许引用平台自身完整的任务标识。校方新闻返工时，原检测器曾将任务号后半段误报为密钥，导致事实核查虽已通过却无法交接。字符串脱敏借鉴 Gitleaks 对完整标记边界的区分，本项目仅对通用文本检测排除准确的 Studio 任务号，仍对原始字节检查当前服务密钥。[Gitleaks 标记边界与用例](https://github.com/gitleaks/gitleaks/blob/v8.24.2/cmd/generate/config/utils/generate.go)
+公开文本允许引用完整的 Studio 任务标识。Markdown 本页章节链接中，如果可见英文标题的单词与链接片段一一对应，`task` 是完整单词且后面至少还有两个词，凭据扫描也能识别其词尾。扫描从该词之后继续，URL、相邻标记、配置值和同一归档的其余正文仍照常检查。当前服务密钥始终对原始字节做完整匹配。对 A2A 协议的回放用官方原文及旧抓取元数据还原了内容摘要以 `75de7328` 开头的归档，实际快照交接保留全部 163523 字节。区分标记边界的思路参考 Gitleaks，Studio 在 Markdown 内另核对可见文字与本页片段。[Gitleaks 标记边界](https://github.com/gitleaks/gitleaks/blob/v8.24.2/cmd/generate/config/utils/generate.go#L21-L28) · [A2A 协议原文](https://github.com/a2aproject/A2A/blob/main/docs/specification.md) · [Studio 归档交接与凭据回归](../tests/test_project_data.py)
 
 ### 研究资料的临时文件和交接
 
