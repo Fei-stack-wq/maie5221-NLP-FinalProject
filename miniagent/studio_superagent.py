@@ -111,8 +111,11 @@ class StudioAssistant(StudioChannels):
                     return None
         except StudioError:
             return None
+        roster = self._member_state(thread)
+        if not roster["members"]:
+            return None
         return {"kind": "group", "id": group_id, "name": self.channel_label(group_id, room),
-                "members": thread["members"], "lead": thread["recipient"]}
+                "members": roster["members"], "lead": roster["lead"]}
 
     def studio_routing_targets(self, run_id, *, query="", kind=None, offset=0):
         """Only public role briefs and durable rooms in the source project enter the model context."""
@@ -198,7 +201,7 @@ class StudioAssistant(StudioChannels):
                 if group and set(participants) - set(group["members"]):
                     return ToolResult.failure("这个群不包括整项请求所需的所有角色，请改用成员合适的群。", code="missing_members")
             try:
-                receipt = self.request_studio_dispatch(run_id, **request)
+                receipt = self.request_studio_dispatch(run_id, required_participants=participants, **request)
             except StudioError as error:
                 return ToolResult.failure(str(error), code=error.code)
             return ToolResult.success(json.dumps(receipt, ensure_ascii=False))
@@ -221,7 +224,7 @@ class StudioAssistant(StudioChannels):
                   "prompt": {"type": "string", "maxLength": 4000}}, ["id", "name", "prompt"], create_role)
         register("create_studio_group", "选择成员和负责人建立持久群聊。用户有团队任务时，拿到回执即把完整目标派给新群。",
                  {"name": {"type": "string", "maxLength": 100},
-                  "members": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 16},
+                  "members": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16},
                   "lead": {"type": "string"}}, ["name", "members", "lead"], create_group)
         register("dispatch_studio_task", "提交用户的完整目标。单人私聊只能完成一个角色的工作；跨角色接力和独立复核必须派给群。"
                  "接单后结束本轮；首页不会因子任务结束而自动启动后续阶段。",

@@ -19,6 +19,7 @@ from tests.test_studio_service import finished, request
 class PeerChecksTest(unittest.TestCase):
     def room(self):
         room = object.__new__(RoomCrew)
+        room.direct, room.read_only, room.thread, room.direct_candidate = False, False, {}, None
         room.lead = "lead"
         room.profiles = {r: {} for r in ("lead", "author", "qa", "peer")}
         room.plan_order = ["author", "qa", "peer"]

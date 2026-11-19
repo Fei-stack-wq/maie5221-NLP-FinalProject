@@ -71,12 +71,12 @@ class MemberContextTest(unittest.TestCase):
             self.assertIn(sha,final_work)
             self.assertNotIn(old_claim,final_work)
             close, close_tools = provider.requests[-2]
-            self.assertEqual(close_tools,[])
+            self.assertIn("write_file",close_tools)
             close = json.dumps(close,ensure_ascii=False)
             for expected in ("Use Europe/Paris", "What timezone?", "Which ledger is authoritative?",
-                             "Use ledger.sql as original data.", "ORIGINAL_RECORDS", "群内用户确认的问答"):
+                             "Use ledger.sql as original data.", "ORIGINAL_RECORDS", "进度提醒"):
                 self.assertIn(expected,close)
-            for excluded in ("actual-source-line-061","orphaned answer","self-reported decision",old_claim):
+            for excluded in ("orphaned answer","self-reported decision",old_claim):
                 self.assertNotIn(excluded,close)
             events = [json.loads(l) for l in (svc.runs_dir/launched["id"]/"trace.jsonl").read_text().splitlines()]
             compacted = [r for r in events if r["kind"]=="context_compacted" and r.get("level")=="subtask" and r["omitted_groups"]]

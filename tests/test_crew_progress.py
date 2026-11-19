@@ -37,12 +37,12 @@ class MemberProgressTest(unittest.TestCase):
         args = {"code": f"r = subprocess.run({command.split()!r}); print(r.stdout)"}
         self.observe(text="exit_code=0\nstdout:\n" + text.replace("$", duration), args=args)
 
-    def test_same_pass_with_new_timing_and_print_format_closes(self):
+    def test_same_pass_with_new_timing_advises_and_keeps_working(self):
         self.src.write_text("final")
         self.check("Ran 34 tests in $s\n\nOK")
         self.assertEqual(self.p.phase(self.budget), "work")
         self.check("0 0\n['Ran 34 tests in $s', 'OK']", duration="4.015")
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+        self.assertEqual(self.p.phase(self.budget), "work")
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["files"], ["module.py"])
         self.assertEqual(self.p.evidence()["check_signals"], ["unittest · 34 tests OK"])
@@ -83,7 +83,7 @@ class MemberProgressTest(unittest.TestCase):
         self.assertIn("[BLOCKED]",self.p.steering())
         self.assertIn("process_id",self.p.steering())
 
-    def test_repeated_other_passes_handoff_the_original_failure_without_waiving_it(self):
+    def test_repeated_other_passes_warn_without_waiving_the_original_failure(self):
         self.p = MemberProgress(self.root, ["delivery.txt"])
         (self.root/"delivery.txt").write_text("candidate")
         self.observe("write_file",args={"path":"delivery.txt"})
@@ -93,7 +93,7 @@ class MemberProgressTest(unittest.TestCase):
         self.check("2 passed in 0.1s","pytest other")
         self.assertEqual(self.p.phase(self.budget),"work")
         self.check("2 passed in 0.2s","pytest other")
-        self.assertEqual(self.p.phase(self.budget),"handoff")
+        self.assertEqual(self.p.phase(self.budget),"work")
         self.assertIn("[BLOCKED]",self.p.steering())
         self.assertEqual(self.p.failed_checks(),old)
         self.assertTrue(self.p.blocked_reason())
@@ -201,23 +201,24 @@ class MemberProgressTest(unittest.TestCase):
         # Identical bytes written by a test fixture do not create a new version.
         self.src.write_text("new contents")
         self.check("1 passed in 0.35s", "pytest")
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+        self.assertEqual(self.p.phase(self.budget), "work")
 
     def test_missing_required_file_is_not_inferred_from_test_output(self):
         self.p = MemberProgress(self.root, ["report.md"])
         for i in range(8):
             self.check("5 passed in 0.1s", "pytest")
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+        self.assertEqual(self.p.phase(self.budget), "work")
         self.assertIn("report.md", self.p.blocked_reason())
-        self.assertIn("[BLOCKED]", self.p.steering())
+        self.assertIn("report.md", self.p.steering())
+        self.assertIn("进度提醒", self.p.steering())
 
-    def test_pagination_can_progress_but_repeated_inspection_closes(self):
+    def test_pagination_advances_and_repeated_inspection_reports_the_observed_tools(self):
         for i in range(10):
             self.observe("read_file", meta={"path": "module.py", "offset": 100 * i})
             self.assertEqual(self.p.phase(self.budget), "work")
         for i in range(7):
             self.observe(args={"code": f"print(open('module.py').read()[{i}:])"})
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+        self.assertEqual(self.p.phase(self.budget), "work")
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["inspected"], ["module.py"])
 
@@ -281,12 +282,13 @@ class MemberProgressTest(unittest.TestCase):
         read("read_lines")
         self.assertIn("已返回过",self.p.steering())
 
-    def test_dry_listing_preserves_blocker_and_verbal_review_can_finish(self):
+    def test_dry_listing_is_advisory_for_a_verbal_assignment(self):
         self.assertIsNone(self.p.blocked_reason())
         for i in range(7):
             self.observe("list_dir")
-        self.assertEqual(self.p.phase(self.budget), "handoff")
-        self.assertTrue(self.p.blocked_reason())
+        self.assertEqual(self.p.phase(self.budget), "work")
+        self.assertIsNone(self.p.blocked_reason())
+        self.assertIn("list_dir", self.p.stall_feedback())
 
     def test_source_dump_of_passing_output_is_not_a_test(self):
         for i in range(3):
@@ -324,7 +326,7 @@ class MemberProgressTest(unittest.TestCase):
         self.src.write_text("initial implementation")
         for i in range(2):
             self.check("Ran 3 tests in 0.26s\nOK")
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+        self.assertEqual(self.p.phase(self.budget), "work")
         self.assertEqual(self.p.phase(self.budget, "[验收未通过] wrong record"), "work")
         self.assertFalse(self.p.evidence()["check_signals"])
         self.src.write_text("repair")
@@ -377,11 +379,15 @@ class MemberProgressTest(unittest.TestCase):
         self.assertEqual(self.p.evidence()["missing_required_files"], ["guide.md"])
         self.assertIn("本次分工还需交付 guide.md", self.p.steering())
 
-    def test_exact_repetition_requests_handoff_before_rao_loop_limit(self):
-        observation = Observation(step_id="s", source="list_dir", ok=True, content="")
-        state = RAOState(goal="", task_id="t", scratch={"repeat": {"count": 4}})
-        self.p.observe(StepRecord(step=4, observations=[observation]), state)
-        self.assertEqual(self.p.phase(self.budget), "handoff")
+    def test_exact_repetition_reports_the_operation_and_the_still_missing_file(self):
+        self.p = MemberProgress(self.root, ["notes/research.md"])
+        for _ in range(12):
+            self.observe("read_lines", "source content", args={"path": "module.py"}, meta={"path": "module.py"})
+        self.assertEqual(self.p.phase(self.budget), "work")
+        advice = self.p.steering()
+        for text in ("read_lines module.py", "source content", "notes/research.md", "进度提醒"):
+            self.assertIn(text, advice)
+        self.assertEqual(self.p.evidence()["stop_reason"], "")
         self.assertTrue(self.p.blocked_reason())
 
     def test_repeated_distinct_source_pages_get_real_writing_turn_then_verification(self):
@@ -414,12 +420,13 @@ class MemberProgressTest(unittest.TestCase):
         args = {"code": "path = next(Path('sources').glob('*.json')); print(json.loads(path.read_text())['text'])"}
         for line in paragraphs:
             self.observe("run_python", "exit_code=0\nstdout:\n" + line, args=args, meta={"exit_code":0})
-            self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "work")
+            self.assertEqual(self.p.phase(self.budget), "work")
         for i in range(7):
             self.observe("run_python", f"exit_code=0\nstdout:\nvariant-{i}\n" + paragraphs[-1],
                          args=args, meta={"exit_code":0})
-        self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "deliver")
-        self.assertEqual(self.p.phase(self.budget, allow_delivery=True), "handoff")
+        self.assertIn("run_python", self.p.stall_feedback())
+        self.assertIn("notes/research.md", self.p.steering())
+        self.assertEqual(self.p.phase(self.budget), "work")
         self.assertTrue(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["check_signals"], [])
 
@@ -459,8 +466,8 @@ class MemberProgressTest(unittest.TestCase):
                 self.p = MemberProgress(self.root, paths)
                 for _ in range(7):
                     self.observe("list_dir")
-                self.assertEqual(self.p.phase(self.budget.model_copy(update={"steps_left":steps}),
-                                              allow_delivery=True), "handoff")
+                self.assertEqual(self.p.phase(self.budget.model_copy(update={"steps_left":steps})),
+                                 "handoff" if steps == 1 else "work")
 
     def test_recovered_draft_can_write_before_any_new_inspection(self):
         self.p = MemberProgress(self.root, ["report.md", "data.db"])

@@ -49,7 +49,7 @@ def main():
         service.add_profile(legacy)
         onsite = {"id":"onsite","name":"值班工程师","prompt":"检查机房告警记录。"}
         with patch("miniagent.studio_service.DeepSeekProvider",
-                   return_value=ScriptedProvider([{"text":"已经核对告警。"}])):
+                   return_value=ScriptedProvider([{"text":"已经核对告警。\n\n" + "\n\n".join(f"第 {i} 项机房记录已核对。" for i in range(45))}])):
             group = service.start(request("single", objective="复核机房告警", conversation={
                 "kind":"group", "members":["onsite","reviewer"], "recipient":"onsite",
                 "intent":"question", "profiles":[onsite],

@@ -99,9 +99,9 @@ const studioAssistant = (() => {
    ${hasHistory ? `<header class="assistant-heading compact-heading"><span class="assistant-signature">Superagent</span><h1>统一对话</h1></header>` :
     `<header class="assistant-heading welcome-heading"><span class="assistant-identity"><span class="terminal-tile" aria-hidden="true">${icon('terminal')}</span><span class="assistant-signature">Superagent</span></span><h1>今天想完成什么？</h1><p>工作室助手可以直接帮你，也可以把任务交给合适的角色或群聊。进展和交付都会回到这里。</p></header>`}
    ${loadError?`<div class="assistant-load-error" role="status">${icon('info')}<span>${e(loadError)}</span><button type="button" data-assist-retry>重新连接</button></div>`:''}
-   ${hasHistory ? `<div class="assistant-feed" data-key="assistant-feed" aria-label="对话记录">${turns.map(turnRow).join('')}</div>`:''}
+   ${hasHistory ? `<div class="assistant-feed" data-key="assistant-feed" aria-label="对话记录">${turns.map(turnRow).join('')}${roomPanel.endMarker()}</div>`:''}
    ${detail?.pending_questions?.length ? `<div class="assistant-questions" data-key="assistant-questions">${humanQuestions(detail)}</div>` : ''}
-   <div class="assistant-compose-area" data-key="assistant-compose-area">${composer()}</div>
+   <div class="assistant-compose-area" data-key="assistant-compose-area">${hasHistory?roomPanel.jumpButton():''}${composer()}</div>
    ${!hasHistory ? quickActions():''}
    ${loading?'<p class="assistant-note assistant-loading" role="status">正在读取对话…</p>':''}
    </div></section>`;

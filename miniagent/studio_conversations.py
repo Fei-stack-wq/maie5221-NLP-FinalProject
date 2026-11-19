@@ -61,8 +61,8 @@ def validate_conversation(value: object) -> dict:
             or not all(_valid_id(member) for member in members)
             or len({member.lower() for member in members}) != len(members) or recipient not in members):
         raise ValueError("会话成员或回复角色无效。")
-    if (kind == "dm" and len(members) != 1) or (kind == "group" and len(members) < 2):
-        raise ValueError("私聊需要一个角色，群聊至少需要两个不同角色。")
+    if kind == "dm" and len(members) != 1:
+        raise ValueError("私聊只能指定一位角色。")
     profiles = value.get("profiles", [])
     if not isinstance(profiles, list) or len(profiles) > len(members):
         raise ValueError("角色资料须对应群内成员。")
@@ -96,6 +96,40 @@ def member_profiles(thread: dict) -> dict[str, dict]:
     custom = {p["id"]: p for p in thread.get("profiles", [])}
     return {role: custom.get(role, {"id": role, "name": ROLE_LABELS.get(role, role), "prompt": ""})
             for role in thread["members"]}
+
+
+def addressed_members(text: str, thread: dict) -> list[str]:
+    """Only the address at the beginning of a group message selects its recipients."""
+    profiles = member_profiles(thread)
+    ids = {key.casefold(): key for key in profiles}
+    aliases: dict[str, list[str]] = {}
+    for role, profile in profiles.items():
+        aliases.setdefault(profile["name"].casefold(), []).append(role)
+    names = sorted({*profiles, *(p["name"] for p in profiles.values())}, key=len, reverse=True)
+    if not names:
+        return []
+    address = "(?:" + "|".join(map(re.escape, names)) + ")"
+    token = re.compile(r"@" + address + r"(?=$|[\s,:：，、;；!?！？。])", re.IGNORECASE)
+    bare = re.compile(address + r"(?=\s*[，,:：])", re.IGNORECASE)
+    rest = text.lstrip()
+    recipients = []
+    while rest:
+        mention = rest.startswith("@")
+        match = (token if mention else bare).match(rest)
+        if not match:
+            if mention:
+                raise ValueError("点名未匹配本群成员。请在消息开头使用 @角色ID 和空格。")
+            break
+        name = match.group()[int(mention):].casefold()
+        roles = [ids[name]] if name in ids else aliases.get(name, [])
+        if len(roles) != 1:
+            raise ValueError("群内存在同名角色，请用 @角色ID 指定：" + "、".join(roles))
+        if roles[0] not in recipients:
+            recipients.append(roles[0])
+        rest = rest[match.end():].lstrip(" \t\r\n,:：，、;；")
+        if not rest.startswith("@"):
+            break
+    return recipients
 
 
 def project_context(thread: dict, history: list[dict]) -> str:

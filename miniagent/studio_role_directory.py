@@ -83,10 +83,16 @@ def role_directory(service, key=None):
                 continue
             if saved and room_id not in links:
                 links[room_id] = service.linked_roles(room_id)
+            if path.name == room_id:
+                current = service._member_state(thread, saved) if thread["kind"] == "group" else thread
+                for card in room_role_cards(current, saved, links.get(room_id, ())).values():
+                    roles[card["key"]] = card
+                    memberships[card["key"]].add(room_id)
+            # Assignments remain attributable to the roster frozen for this
+            # turn, including members who have since left the channel.
             for member, card in room_role_cards(thread, saved, links.get(room_id, ())).items():
                 role_key = card["key"]
                 roles[role_key] = card
-                memberships[role_key].add(room_id)
                 if key == role_key and meta.get("mode") != "room":
                     task_sources.append((path, member, rooms[room_id], meta))
         except (OSError, ValueError, TypeError, KeyError):

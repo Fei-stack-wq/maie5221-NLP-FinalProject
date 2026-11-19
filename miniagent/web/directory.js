@@ -123,6 +123,7 @@ const chatDirectory = (() => {
   const ids = new FormData(form).getAll('member');
   const select = form.elements.recipient;
   const before = select.value;
+  select.disabled = !ids.length;
   select.innerHTML = chatRoles().filter(role => ids.includes(role.id)).map(role =>
    `<option value="${e(role.id)}" ${role.id === before ? 'selected' : ''}>${e(role.label)}</option>`).join('');
  }
@@ -138,8 +139,7 @@ const chatDirectory = (() => {
   try {
    if (!room) {
     const members = data.getAll('member');
-    if (members.length < 2) throw new Error('请选择至少两位群成员。');
-    payload = {name,members,lead:data.get('recipient')};
+    payload = {name,members,lead:data.get('recipient') || null};
     const workspace = data.get('workspace_path').trim();
     if (workspace) payload.workspace_path = workspace;
     const fingerprint = JSON.stringify(payload);

@@ -110,9 +110,10 @@ class RequiredSourceReviewTest(unittest.TestCase):
                          {"text":"The article checks out."}, {"text":"Delivered."}]
         detail, provider = self.execute(steps, provider_type=ShortReferences)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
-        self.assertEqual(set(provider.requests[len(start)][1]), {"read_lines", "submit_review"})
+        self.assertIn("read_lines", provider.requests[len(start)][1])
+        self.assertIn("submit_review", provider.requests[len(start)][1])
         self.assertIn("list_review_evidence", provider.requests[len(start) + 1][1])
-        self.assertEqual(provider.requests[len(start) + 2][1], ["submit_review"])
+        self.assertEqual(provider.requests[len(start) + 2][1], provider.requests[len(start)][1])
         correction = str(provider.requests[len(start) + 1][0])
         self.assertIn("本次亲自打开的来源", correction)
         self.assertIn('"claim":[{"tool":"read_lines","paths":["final.md"]}]', correction)
@@ -125,14 +126,17 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.assertEqual((read["path"], read["sha256"], source["url"]), (FINAL, hashed(ARTICLE), URL))
         self.assertTrue(source["observed_bytes_sha256"])
 
-    def test_no_progress_at_review_close_eventually_yields_unverified(self):
+    def test_reviewer_can_report_blocked_with_tools_and_without_passing_review(self):
         steps = self.closing_review() + [tool("read_lines", path=f"absent-{i}.md") for i in range(3)]
         steps += [{"text":"[BLOCKED] Could not verify the original file."},
                   {"text":"[BLOCKED] Source criterion is still outstanding."}]
         detail, provider = self.execute(steps)
         self.assertNotEqual(detail["run"]["status"], "completed")
-        stops = [m for m, names in provider.requests if not names and "同一缺口反复未获进展" in str(m)]
-        self.assertTrue(stops)
+        messages, tools = provider.requests[len(steps) - 2]
+        self.assertIn("read_lines", tools)
+        self.assertIn("submit_review", tools)
+        self.assertIn("进度提醒", str(messages))
+        self.assertIn("absent-2.md", str(messages))
         self.assertFalse(any(e.get("handoff", {}).get("native_review", {}).get("state") == "passed"
                              for e in detail["room_events"]))
 
@@ -283,8 +287,23 @@ class RequiredSourceReviewTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(StudioError):
                 self.service.start(request("team", objective="Publish", conversation=roster("lead", "writer", "checker"),
                                            required_source_review_paths=value))
-        for mode, group in [("team", roster("lead", "writer")), ("single", roster("lead", "writer", "checker"))]:
-            with self.subTest(mode=mode), self.assertRaises(StudioError):
-                self.service.start(request(mode, objective="Publish", conversation=group, required_source_review_paths=[FINAL]))
+        with self.assertRaises(StudioError):
+            self.service.start(request("single", objective="Publish", conversation={"kind":"dm","members":["writer"],
+                                       "recipient":"writer","intent":"edit"},
+                                       required_source_review_paths=[FINAL]))
         legacy = request("team", objective="Publish", conversation=roster("lead", "writer"))
         self.assertEqual(self.service._request(legacy), self.service._request({**legacy,"required_source_review_paths":[]}))
+
+    def test_two_people_can_write_and_independently_verify_sources_with_lead_as_reviewer(self):
+        result, _ = self.execute([
+            tool("delegate_task", assignee="writer", objective="Write the shipment article.",
+                 deliverable_paths=[FINAL], remaining_roles=["lead"]),
+            write(FINAL, ARTICLE), {"text":"The article is ready."},
+            tool("delegate_task", assignee="lead", objective="Independently inspect the article and source.",
+                 review={"candidate":FINAL, "criteria":[RULE]}),
+            tool("read_file", path=FINAL), tool("http_get", url=URL), submit({FINAL:hashed(ARTICLE)}, FINAL),
+            {"text":"Reviewed."}, {"text":"Ready."}], members=("lead","writer"))
+        self.assertEqual(result["run"]["status"], "completed", result["diagnostics"])
+        reports = [r["handoff"] for r in result["room_events"] if r["kind"] == "member_report"]
+        self.assertEqual(reports[-1]["native_review"]["reviewer"], "lead")
+        self.assertEqual(reports[-1]["native_review"]["author"], "writer")

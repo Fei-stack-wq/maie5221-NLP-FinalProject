@@ -115,7 +115,7 @@ async function verify(page,url) {
  assert.equal(await groupForm.locator('[name=dispatch]').inputValue(),'team');
  assert(await groupForm.getByLabel('负责人',{exact:true}).isDisabled());
  const namedGroup=page.getByRole('heading',{level:1,name:'电脑维护组',exact:true});
- const lead=page.locator('.thread-head').getByText('负责人 · 验证员',{exact:true});
+ const lead=page.locator('.room-rail li').filter({hasText:'@reviewer'}).getByText('负责人',{exact:true});
  await namedGroup.waitFor();
  await lead.waitFor();
  await groupForm.locator('[name=message]').fill('开始诊断');
@@ -135,7 +135,7 @@ async function verify(page,url) {
  await page.waitForFunction(()=>document.querySelector('.reply-form')?.dataset.parent==='group-message-2');
  await namedGroup.waitFor();
  await lead.waitFor();
- assert.equal(await groupForm.locator('[name=recipient]').inputValue(),profile);
+ assert.equal(await groupForm.locator('[name=recipient]').inputValue(),'reviewer');
  assert.equal(await page.locator('.chat-turn').count(),2);
  await page.goBack();
  await groupLink.waitFor();

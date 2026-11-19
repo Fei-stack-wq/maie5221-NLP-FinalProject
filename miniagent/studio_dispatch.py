@@ -36,7 +36,10 @@ class StudioDispatch:
                     id TEXT PRIMARY KEY, source TEXT NOT NULL, scope TEXT NOT NULL,
                     target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT NOT NULL,
                     objective TEXT NOT NULL, inputs TEXT NOT NULL, acceptance TEXT NOT NULL,
-                    child TEXT NOT NULL UNIQUE, room TEXT, state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '')''')
+                    child TEXT NOT NULL UNIQUE, room TEXT, state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+                    participants TEXT)''')
+                if 'participants' not in {c['name'] for c in db.execute('PRAGMA table_info(dispatches)')}:
+                    db.execute("ALTER TABLE dispatches ADD COLUMN participants TEXT")
                 db.execute('CREATE INDEX IF NOT EXISTS dispatch_source ON dispatches(source)')
                 db.execute('CREATE INDEX IF NOT EXISTS dispatch_pending ON dispatches(state)')
             else:
@@ -45,17 +48,21 @@ class StudioDispatch:
             if write:
                 db.commit()
 
-    def _dispatch_target(self, source, kind, target):
+    def _dispatch_target(self, source, kind, target, participants=()):
         from .studio_service import StudioError
         if not isinstance(target, str) or not target:
             raise StudioError('请提供派工目标的 ID。')
         if kind == 'role':
+            if set(participants) - {target}:
+                raise StudioError('单人派工只能交给指定的角色。', 'missing_members', 409)
             if target in ROLE_LABELS:
                 return ROLE_LABELS[target], target
             return self.current_role(target)['name'], target
         if kind == 'group':
             card = self.studio_routing_group(source, target)
             if card:
+                if set(participants) - set(card['members']):
+                    raise StudioError('目标群当前缺少请求的参与角色。', 'missing_members', 409)
                 return card['name'], card['lead']
             raise StudioError('未找到当前项目可用的命名群聊。', 'unknown_route', 400)
         raise StudioError('派工目标应为角色或群聊。')
@@ -67,7 +74,7 @@ class StudioDispatch:
                           ensure_ascii=False)
 
     def request_studio_dispatch(self, source_run_id, *, target_kind, target_id, objective,
-                                acceptance_files=None, input_files=None):
+                                acceptance_files=None, input_files=None, required_participants=None):
         from .studio_route_results import bind_inputs
         from .studio_service import StudioError, _relative
         inputs = [] if input_files is None else input_files
@@ -84,7 +91,8 @@ class StudioDispatch:
             if (thread.get('superagent') is not True or source_run_id not in self._active
                     or self._cancellations[source_run_id].is_set()):
                 raise StudioError('派工只能由正在执行的统一对话发起。', 'inactive_source', 409)
-            name, _ = self._dispatch_target(source, target_kind, target_id)
+            participants = [] if required_participants is None else required_participants
+            name, _ = self._dispatch_target(source, target_kind, target_id, participants)
             inputs = bind_inputs(self, self._directory(source_run_id), source, inputs)
             # Use the exact same objective and acceptance grammar as native runs.
             checked = self._request({'mode': 'single', 'request_id': str(uuid.uuid4()),
@@ -96,14 +104,17 @@ class StudioDispatch:
             with self._dispatch_db(write=True) as db:
                 row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 if row is not None:
-                    if set(json.loads(row['inputs'])) != set(inputs) or set(json.loads(row['acceptance'])) != set(acceptance):
+                    if (set(json.loads(row['inputs'])) != set(inputs) or set(json.loads(row['acceptance'])) != set(acceptance)
+                            or row['participants'] is not None and set(json.loads(row['participants'])) != set(participants)):
                         raise StudioError('同一派工已登记，但输入或验收条件不同。', 'dispatch_conflict', 409)
+                    if row['state'] == 'queued' and row['participants'] is None:
+                        db.execute('UPDATE dispatches SET participants=? WHERE id=?', (json.dumps(participants), identity))
                 else:
                     child = 'studio-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:12]
                     db.execute('''INSERT INTO dispatches
-                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
-                            target_id, name, objective, json.dumps(inputs), json.dumps(acceptance), child))
+                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,participants,state)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
+                            target_id, name, objective, json.dumps(inputs), json.dumps(acceptance), child, json.dumps(participants)))
                     row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 return self._dispatch_receipt(row)
 
@@ -168,6 +179,8 @@ class StudioDispatch:
                 return {'intent': 'edit', 'kind': 'dm', 'members': [recipient], 'recipient': recipient}
             room_id = previous['room']
         room = self._conversation(self._directory(room_id), with_answers=False)
+        if room and row['target_kind'] == 'group':
+            recipient = room['lead']
         if (not room or room.get('superagent') or recipient not in room['members']
                 or room['workspace_path'] != source.get('workspace_path')):
             raise StudioError('派工目标会话与当前项目不一致。', 'unknown_route', 409)
@@ -208,7 +221,10 @@ class StudioDispatch:
                        'limits': source['request'].get('limits', {})}
             if source.get('workspace_path'):
                 payload['workspace_path'] = source['workspace_path']
-            native = self.start(payload, routed={**pointer, 'child_run_id': row['child'], 'input_files': json.loads(row['inputs'])})
+            group = ({'group_id': row['target_id'], 'participants': json.loads(row['participants'] or '[]')}
+                     if row['target_kind'] == 'group' else {})
+            native = self.start(payload, routed={**pointer, **group, 'child_run_id': row['child'],
+                                                 'input_files': json.loads(row['inputs'])})
             room_id = native['conversation_id']
         db.execute("UPDATE dispatches SET state='started', room=? WHERE id=?", (room_id, row['id']))
 

@@ -271,19 +271,19 @@ class RaoProtocolTest(unittest.TestCase):
         self.assertFalse((self.workspace / "bad-2.txt").exists())
         self.assert_complete_batch(state, ["stop", "later-1", "later-2"])
 
-    def test_loop_termination_completes_batch_and_skips_later_write(self) -> None:
+    def test_loop_advisory_preserves_later_write_in_the_same_batch(self) -> None:
         calls = [ToolCall(id="list", name="list_dir", arguments={"path": "."}), write_call("later", "bad.txt")]
-        unit, _ = self.unit([LLMResponse(tool_calls=calls, finish_reason="tool_calls")], loop_stop=1)
+        unit, _ = self.unit([LLMResponse(tool_calls=calls, finish_reason="tool_calls")], loop_warn=1)
         state = self.state()
         record = unit.step(state, Budget())
-        self.assertEqual(record.terminate_reason, ErrorClass.T_LOOP)
-        self.assertFalse((self.workspace / "bad.txt").exists())
+        self.assertIsNone(record.terminate_reason)
+        self.assertTrue((self.workspace / "bad.txt").exists())
         self.assert_complete_batch(state, ["list", "later"])
 
     def test_loop_warnings_follow_all_tool_results(self) -> None:
         calls = [ToolCall(id="list-1", name="list_dir", arguments={"path": "."}),
                  ToolCall(id="list-2", name="list_dir", arguments={"path": "."})]
-        unit, _ = self.unit([LLMResponse(tool_calls=calls, finish_reason="tool_calls")], loop_warn=1, loop_stop=5)
+        unit, _ = self.unit([LLMResponse(tool_calls=calls, finish_reason="tool_calls")], loop_warn=1)
         state = self.state()
         unit.step(state, Budget())
         self.assert_complete_batch(state, ["list-1", "list-2"])

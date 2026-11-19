@@ -205,7 +205,7 @@ class ConversationTest(unittest.TestCase):
             self.service.start(msg("edit", reply(parent)))
 
     def test_invalid_conversation_configs_and_foreign_threads_rejected(self):
-        for invalid in (None, {}, {"kind":"group","members":["worker"],"intent":"edit","recipient":"worker"},
+        for invalid in (None, {}, {"kind":"group","members":[],"intent":"edit","recipient":"worker"},
                         fresh(members=["worker", "worker"]), {**fresh(), "recipient":"researcher"},
                         {**fresh(), "kind":[]}, {**fresh(), "recipient":[]}, {**fresh(),"members":["worker",{}]},
                         {"parent_run_id":"../elsewhere","recipient":"worker","intent":"question"}):

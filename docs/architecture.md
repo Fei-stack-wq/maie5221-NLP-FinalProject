@@ -9,7 +9,7 @@ Studio 采用同源、单进程部署。浏览器运行静态 HTML、CSS 和 Jav
 | 会话、项目和持久身份 | 角色有固定 ID。私聊和群聊的下一轮可沿用历史分工及用户选定的工作区。角色通用或项目专用的记忆、技能提议支持审核、修订和恢复。 | [角色库](personal-role-library.md) · [会话与工作区](../miniagent/studio_service.py) |
 | 群内执行 | 本群负责人按职责委派。成员在隔离目录工作，通过交接传递文件、检查结果和版本。独立评审能对冻结候选逐项核查，发现产品缺口后发回作者。 | [团队协作](studio-team-workflow.md) · [版本验收](../miniagent/studio_reviews.py) |
 | 模型请求 | 按单次请求窗口预留输出空间。接近水位时收缩发送视图，保留近期完整工具批次和人工问答。滚动摘要记录被移出的目标、决定、产物、检查和阻塞。原始运行轨迹单独保留。 | [窗口投影](../miniagent/request_window.py) · [增量摘要](../miniagent/compaction.py) |
-| 结束与预算 | 默认网页可用 0 表示不限模型步数和累计 tokens。有明确用户上限时执行该上限。结束还取决于当前交付版本、验收、可用时间、取消或可复现的无进展。 | [运行循环](../miniagent/agent.py) · [预算实测](evidence/2026-11-18-optional-turn-budget.md) |
+| 结束与预算 | 默认网页可用 0 表示不限模型步数和累计 tokens。有明确用户上限时执行该上限。结束还取决于当前交付版本、验收、可用时间、取消及有具体原因的阻塞交接。 | [运行循环](../miniagent/agent.py) · [预算实测](evidence/2026-11-18-optional-turn-budget.md) |
 
 Python 源码以一个 `miniagent` 包和 `contracts` 子包为主。后续拆包时，可先把会话 HTTP 适配、群内调度、评审、资料检索和工作区投影各自收拢，以 API 和现有测试约束迁移。单纯搬动文件不能解决负责人把旧的错误当作当前验收结果的问题，版本和回执应由运行时维护。[来源与交接](research-and-project-data.md) · [社区实现对照](agent-harness-research.md)
 
@@ -163,7 +163,7 @@ s_{t+1} = Observe( Act( Reason(s_t) ) )
 - `ask_human` / `delegate_task` / `abort_task` 是**控制工具**：RAO 拦截名字转成决策形态，
   但仍然回一条 `role=tool` 消息（否则下一轮请求 400）。
 - 控制工具不可用时**诚实降级**（`A_UNSUPPORTED` 并提示自行完成），不假装成功。
-- 同一动作（工具 + 规范化参数的 SHA1）连续 3 次告警、5 次终止（`T_LOOP`）。
+- 同一动作连续出现时，RAO 在本批工具回执完整后提示成员检查重复操作。成员可变更做法、继续或报告具体阻塞。
 
 ---
 
@@ -185,7 +185,7 @@ while 预算未耗尽:
 | `completed` | 独立验收通过，且报告及回执可核对 | 成功 |
 | `unverified` | 缺少可用验收 | 保留候选结果，不计成功 |
 | `failed_acceptance` | 打回后仍不通过 | 模型说完成但产物不合格 |
-| `limit_exceeded` | 预算耗尽 / `T_LOOP` | 停损 |
+| `limit_exceeded` | 已配置的预算耗尽 | 停损 |
 | `aborted` | 模型 `abort_task` | 主动放弃 |
 | `error` | Provider 异常 | 基础设施故障 |
 

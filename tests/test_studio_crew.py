@@ -69,7 +69,8 @@ class StudioCrewTest(unittest.TestCase):
                                        objective="Deliver a tested status page.", acceptance_files=[path], limits={"max_steps":90})
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
-        self.assertEqual(provider.requests[14][1], ["rerun_browser_check"])
+        self.assertIn("rerun_browser_check", provider.requests[14][1])
+        self.assertIn("edit_file", provider.requests[14][1])
         trace = [json.loads(line) for line in (self.root / "runs" / detail["run"]["id"] / "trace.jsonl").read_text().splitlines()]
         results = [e for e in trace if e["kind"] == "tool_result" and e["tool"] == "rerun_browser_check"]
         self.assertEqual([r["ok"] for r in results], [False, False, True, False])
@@ -404,28 +405,45 @@ class StudioCrewTest(unittest.TestCase):
         self.assertFalse(reports[0]["published"])
         self.assertEqual(reports[0]["status"], "limit_exceeded")
 
+    def test_addressed_member_retains_tools_and_sees_missing_file_after_repeating_a_read(self):
+        path = "notes/research.md"
+        script = [tool("list_dir", path=".")] * 9 + [
+            write(path, "Documented the requested finding."), {"text":"Research complete."}]
+        result, provider = self.execute(script, roster("lead", "writer", "reviewer"),
+                                        objective="@writer Write up the finding.", acceptance_files=[path])
+        self.assertEqual(result["run"]["status"], "completed", result["diagnostics"])
+        self.assertEqual(len(result["tasks"]), 1)
+        self.assertEqual(result["tasks"][0]["assignee_profile_id"], "writer")
+        request, tools = provider.requests[9]
+        self.assertEqual(tools, provider.requests[0][1])
+        for text in ("进度提醒", "list_dir .", path):
+            self.assertIn(text, str(request[-1]["content"]))
+
     def test_stalled_member_can_write_declared_file_then_verify_before_handoff(self):
         path = "notes/research.md"
         content = "Checked content from the captured evidence. Remaining claims are explicitly unconfirmed."
-        exploration = [tool("run_python", code=f"print('inspecting section {i}')") for i in range(7)]
+        exploration = [tool("run_python", code="print('research material')")] * 10
         script = [tool("delegate_task", assignee="writer", objective="Write the verified note",
                        deliverable_paths=[path], remaining_roles=[]),
-                  *exploration, write(path, content),
+                  *exploration, tool("list_dir", path="."), write(path, content),
                   tool("run_python", code=f"from pathlib import Path\nassert Path({path!r}).read_text() == {content!r}"),
                   {"text":"Ready"}, {"text":"Delivered"}]
         detail, provider = self.execute(script, roster("lead","writer","observer"), objective="Create a research note",
                                        acceptance_files=[path], limits={"max_seconds":120,"max_total_tokens":0,"max_steps":0})
         self.assertEqual(detail["run"]["status"], "completed", detail["report"])
         calls = [row for row in detail["events"] if row["kind"] == "step_start" and row["level"] == "subtask"]
-        delivery, = [row for row in calls if row["phase"] == "deliver"]
-        self.assertEqual(delivery["offered_tools"], ["write_file"])
-        self.assertEqual(delivery["allowed_write_paths"], [path])
-        self.assertIn("run_python", calls[delivery["step"]]["offered_tools"])
+        self.assertTrue(all(row["phase"] == "work" for row in calls))
+        self.assertTrue(all(row["offered_tools"] == calls[0]["offered_tools"] for row in calls))
+        for name in ("write_file", "read_source", "edit_file", "run_python", "list_dir"):
+            self.assertIn(name, calls[-1]["offered_tools"])
+        after_repeats = str(provider.requests[11][0])
+        for text in ("进度提醒", "run_python", path, "research material"):
+            self.assertIn(text, after_repeats)
         report, = [row["handoff"] for row in detail["room_events"] if row["kind"] == "member_report"]
         self.assertTrue(report["published"])
         self.assertEqual([f["path"] for f in report["changed_files"]], [path])
 
-    def test_repeated_green_suite_transitions_to_member_handoff_and_lead_final(self):
+    def test_repeated_green_suite_allows_member_to_decide_on_handoff(self):
         code = ("import subprocess, sys\n"
                 "p = subprocess.run([sys.executable, '-m', 'unittest', 'test_delivery'], capture_output=True, text=True)\n"
                 "print(p.stderr)\nraise SystemExit(p.returncode)")
@@ -437,12 +455,13 @@ class StudioCrewTest(unittest.TestCase):
                                         acceptance_files=["test_delivery.py"])
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         calls = [e for e in detail["events"] if e["kind"] == "step_start"]
-        self.assertEqual([e["phase"] for e in calls], ["coordinate", "work", "work", "work", "handoff", "finalize"])
-        self.assertEqual(provider.requests[-2][1], [])
+        self.assertEqual([e["phase"] for e in calls], ["coordinate", "work", "work", "work", "work", "finalize"])
+        self.assertIn("run_python", provider.requests[-2][1])
+        self.assertIn("进度提醒", str(provider.requests[-2][0]))
         self.assertEqual(provider.requests[-1][1], [])
         [report] = [e for e in detail["room_events"] if e["kind"] == "member_report"]
         self.assertTrue(report["handoff"]["evidence"]["check_signals"])
-        self.assertIn("复查", report["handoff"]["evidence"]["stop_reason"])
+        self.assertEqual(report["handoff"]["evidence"]["stop_reason"], "")
 
     @unittest.skipUnless(shutil.which("pdftotext"), "Poppler is optional")
     def test_researcher_recovers_own_pdf_without_losing_formal_source(self):
@@ -705,7 +724,8 @@ class StudioCrewTest(unittest.TestCase):
         self.assertNotIn(secret_line,str(first))
         self.assertIn("module.py",str(provider.requests[1][0][-1]["content"].split("负责人已核实的公开工作区内容")[1]))
         self.assertIn(secret_line,str(provider.requests[2][0][-1]))
-        self.assertEqual(provider.requests[4][1],["delegate_task"])
+        self.assertIn("read_lines",provider.requests[4][1])
+        self.assertIn("分工提醒",str(provider.requests[4][0]))
         member_input = str(provider.requests[5][0])
         self.assertIn("public_source_locations", member_input)
         self.assertIn(secret_line, member_input)
@@ -736,9 +756,10 @@ class StudioCrewTest(unittest.TestCase):
             detail=finished(self.service,run["id"])
         self.assertEqual(detail["run"]["status"],"completed",detail["diagnostics"])
         self.assertIn("read_lines",provider.requests[1][1])
-        self.assertEqual(provider.requests[2][1],["delegate_task"])
+        self.assertIn("read_lines",provider.requests[2][1])
         self.assertIn("read_lines",provider.requests[5][1])
-        self.assertEqual(provider.requests[6][1],["delegate_task"])
+        self.assertIn("delegate_task",provider.requests[6][1])
+        self.assertIn("read_lines",provider.requests[6][1])
         limits=[e for e in detail["events"] if e["kind"]=="coordinator_intake_limit"]
         self.assertEqual([e["revision"]["tokens"] for e in limits],[10200,15300])
         self.assertEqual([e["decision"]["rounds"] for e in limits],[2,1])

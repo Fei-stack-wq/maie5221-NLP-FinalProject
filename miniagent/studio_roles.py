@@ -59,10 +59,11 @@ class StudioRoles:
     def role_directory(self, key=None):
         return role_directory(self, key)
 
-    def directory_role_keys(self, thread, linked):
+    def directory_role_keys(self, thread, linked, *, saved=None):
         if thread.get("superagent"):
             return {}
-        saved = {p["id"]: p for p in self.profiles()}
+        if saved is None:
+            saved = {p["id"]: p for p in self.profiles()}
         return {member: card["key"] for member, card in room_role_cards(thread, saved, linked).items()}
 
     def validate_role_refs(self, value):
@@ -145,7 +146,8 @@ class StudioRoles:
             profile = self.current_role(role)
             path = self._directory(room_id)
             root = self._meta(path).get("thread", {})
-            if root.get("id") != room_id or not self._can_link(root, profile):
+            current = self._member_state(root) if root.get("id") == room_id and root.get("kind") == "group" else root
+            if root.get("id") != room_id or not self._can_link(current, profile):
                 raise StudioError("旧会话中没有与本角色资料一致的成员。", "profile_conflict", 409)
             room = self._conversation(path, with_answers=False)
             if room["head_run_id"] != payload["expected_head"] or not room["can_continue"]:
@@ -163,13 +165,15 @@ class StudioRoles:
                 continue
             meta = self._meta(self._directory(row["head_run_id"]))
             thread = meta.get("thread", {})
+            root = self._meta(self._directory(row["id"])).get("thread", {})
+            roster = self._member_state(root) if root.get("kind") == "group" else thread
             project = meta.get("workspace_path") or thread.get("knowledge_project_id")
             if project is None:
                 project = self._conversation(self._directory(row["head_run_id"]), with_answers=False)["knowledge_project_id"]
             item = {**row, "project": project, "status": meta.get("state")}
-            if role in thread.get("saved_roles", []) or role in self.linked_roles(row["id"]):
+            if role in roster.get("saved_roles", []) or role in self.linked_roles(row["id"]):
                 rooms.append(item)
-            elif self._can_link(self._meta(self._directory(row["id"])).get("thread", {}), profile):
+            elif self._can_link(roster, profile):
                 unbound.append(item)
         return {"role": profile, "entries": self.role_memory.list(role, include_inactive=True),
                 "active_entries": self.role_memory.list(role), "conversations": rooms,

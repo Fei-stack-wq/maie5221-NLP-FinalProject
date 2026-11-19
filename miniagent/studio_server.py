@@ -18,6 +18,8 @@ from .studio_preview import PREVIEW_CSP, html_preview
 
 MAX_BODY_BYTES = 65536
 _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
+           "/room-panel.js": ("room-panel.js", "text/javascript; charset=utf-8"),
+           "/room-panel.css": ("room-panel.css", "text/css; charset=utf-8"),
            "/directory.js": ("directory.js", "text/javascript; charset=utf-8"),
            "/directory.css": ("directory.css", "text/css; charset=utf-8"),
            "/index.html": ("index.html", "text/html; charset=utf-8"),
@@ -153,6 +155,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._json(200, service.list_conversations())
             return
         parts = path.split("/")
+        if parts[:4] == ["", "api", "directory", "channels"] and len(parts) == 6 and parts[5] == "members":
+            self._json(200, service.channel_members(parts[4]))
+            return
         if parts[:4] == ["", "api", "directory", "roles"] and len(parts) in (4, 5):
             self._json(200, service.role_directory(parts[4] if len(parts) == 5 else None))
             return
@@ -208,8 +213,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             len(parts) == 5 and parts[4] in {"edit", "knowledge", "bind"} or
             len(parts) == 7 and parts[4] == "knowledge" and parts[6] in {"status", "restore"})
         channel_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) in (4, 5)
+        members_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) == 6 and parts[5] == "members"
         if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages")
-                and not (cancel or reply or review or profile_op or channel_op)) or url.query:
+                and not (cancel or reply or review or profile_op or channel_op or members_op)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -246,6 +252,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             except (WorkspaceError, TimeoutError) as exc:
                 raise StudioError(str(exc), "picker_unavailable", 409) from None
             self._json(200, {"path": selected})
+            return
+        if members_op:
+            self._json(200, self.server.studio_service.update_members(parts[4], payload))
             return
         if channel_op:
             service = self.server.studio_service

@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from miniagent.config import Settings
@@ -174,6 +175,45 @@ class StudioDispatchTest(unittest.TestCase):
         self.assertEqual(native['conversation']['head_run_id'], child['child_run_id'])
         self.assertTrue(any(e['kind'] == 'assignment' and e['recipient'] == 'reviewer' for e in native['room_events']))
         self.assertNotIn('dispatch_studio_task', team.requests[0][1])
+
+    def test_queued_handoff_keeps_required_participants_until_the_group_takes_the_task(self):
+        # An existing Studio opens an outbox created before membership was mutable.
+        with closing(sqlite3.connect(self.service._dispatch_path)) as db:
+            db.execute("""CREATE TABLE dispatches (id TEXT PRIMARY KEY, source TEXT, scope TEXT, target_kind TEXT,
+                       target_id TEXT, target_name TEXT, objective TEXT, inputs TEXT, acceptance TEXT,
+                       child TEXT UNIQUE, room TEXT, state TEXT, error TEXT DEFAULT '')""")
+            db.execute("""INSERT INTO dispatches (id,source,scope,target_kind,target_id,target_name,
+                           objective,inputs,acceptance,child,state) VALUES
+                           ('old','historical','[]','group','old-room','Old','Prior job','[]','[]','old-child','failed')""")
+            db.commit()
+        project = self.root / 'shared'
+        project.mkdir()
+        room = self.service.create_channel({'request_id': str(uuid.uuid4()), 'name': '维护项目',
+            'members': ['maintainer', 'reviewer'], 'lead': 'maintainer', 'workspace_path': str(project)})['id']
+        entered, release = threading.Event(), threading.Event()
+        class Held(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0):
+                if self.requests:
+                    entered.set()
+                    release.wait(5)
+                return super().chat(messages, tools, temperature)
+        task = tool('dispatch_studio_task', target_kind='group', target_id=room, objective='核查设备',
+                    required_participants=['maintainer', 'reviewer'])
+        with patch('miniagent.studio_service.DeepSeekProvider', return_value=Held([task, {'text':'已交接'}])) as providers:
+            try:
+                source = self.service.send_superagent({**message('交给维护组'), 'workspace_path': str(project)})['id']
+                self.assertTrue(entered.wait(4))
+                self.assertEqual(self.service.studio_dispatches(source)[0]['status'], 'queued')
+                self.service.update_members(room, {'revision': 0, 'members': ['maintainer'], 'lead': 'maintainer'})
+            finally:
+                release.set()
+            dispatch, = self.settled(source)
+            self.assertEqual(dispatch['status'], 'failed', dispatch)
+            self.assertIn('成员已变化', dispatch['error'])
+            self.assertIsNone(dispatch['child_run_id'])
+            self.assertEqual(providers.call_count, 1)
+            self.assertEqual(self.service.detail(room)['conversation']['turns'], [])
+        self.assertEqual(self.service.studio_dispatches('historical')[0]['status'], 'failed')
 
     def test_second_host_queues_busy_role_and_native_completion_delivers_next_turn(self):
         entered, release = threading.Event(), threading.Event()

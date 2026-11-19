@@ -283,12 +283,13 @@ class StepPolicyTest(unittest.TestCase):
         self.assertEqual(observed, ["opening time","opening time","closing time","approve operating this machine?",
                                     "approve operating this machine?","opening time"])
 
-    def test_repeated_duplicate_only_turns_stop_without_more_human_requests(self):
+    def test_repeated_questions_reuse_answer_and_leave_work_tools_available(self):
         ask = {"tool_calls":[{"name":"ask_human","arguments":{"decision_kind":"business_requirement","question":"when?"}}]}
         received = []
-        agent, provider = self.agent([ask] * 8, human_handler=lambda q: received.append(q) or "tomorrow")
+        agent, provider = self.agent([ask] * 8 + [{"text":"confirmed tomorrow"}],
+                                     human_handler=lambda q: received.append(q) or "tomorrow")
         result = agent.run("confirm requirements")
-        self.assertEqual(result.steps, 3)
-        self.assertIn(ErrorClass.T_LOOP, result.error)
-        self.assertEqual(len(provider.requests), 3)
+        self.assertEqual(result.status, "unverified")
+        self.assertEqual(result.steps, 9)
+        self.assertIn("write_file", provider.requests[-1][1])
         self.assertEqual(received, ["when?"])

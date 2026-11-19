@@ -15,7 +15,7 @@ const fixtureDetail=()=>{
 };
 const roles = [{id:'worker',label:'通用助手'},{id:'reviewer',label:'评审员'}];
 const completeThread = {
- id:'demo-project',kind:'group',members:['worker','reviewer'],head_run_id:'fixture',
+ id:'demo-project',kind:'group',lead:'worker',members:['worker','reviewer'],head_run_id:'fixture',
  artifact_run_id:'fixture',can_continue:true,
  turns:[{run_id:'fixture',user:'请制作网页。',recipient:'worker',answer:'已生成网页。',status:'unverified',intent:'edit'}]
 };
@@ -77,8 +77,8 @@ window.addEventListener('load',async()=>{
   document.querySelector('#tab-chat').click();
   const form=document.querySelector('.reply-form'),draft=form.elements.message;
   draft.value='请解释速度计算。';draft.dispatchEvent(new Event('input',{bubbles:true}));
-  form.elements.recipient.value='reviewer';form.elements.recipient.dispatchEvent(new Event('change',{bubbles:true}));
   form.elements.intent.value='question';form.elements.intent.dispatchEvent(new Event('change',{bubbles:true}));
+  form.elements.recipient.value='reviewer';form.elements.recipient.dispatchEvent(new Event('change',{bubbles:true}));
   draft.focus();const beforeDraft=fixturePolls;
   await waitFor(()=>fixturePolls>beforeDraft);
   check('reply draft, recipient and focus survive polling',document.activeElement===draft&&draft.value==='请解释速度计算。'&&form.elements.recipient.value==='reviewer');
@@ -96,10 +96,10 @@ window.addEventListener('load',async()=>{
   const group=document.querySelector('#dialog-form form');
   group.elements.objective.value='请检查游戏。';
   const reviewer=group.querySelector('[name="member"][value="reviewer"]');
-  reviewer.checked=false;reviewer.dispatchEvent(new Event('change',{bubbles:true}));
+  for(const box of group.querySelectorAll('[name=member]'))box.checked=false;reviewer.dispatchEvent(new Event('change',{bubbles:true}));
   group.requestSubmit();
-  check('group requires two members before dispatch',fixturePosts.length===2&&!group.querySelector('.form-error').hidden);
-  reviewer.checked=true;reviewer.dispatchEvent(new Event('change',{bubbles:true}));
+  check('sending a task needs an available recipient',fixturePosts.length===2&&group.elements.recipient.validity.valueMissing);
+  for(const box of group.querySelectorAll('[name=member]'))box.checked=true;reviewer.dispatchEvent(new Event('change',{bubbles:true}));
   group.elements.recipient.value='reviewer';group.requestSubmit();
   await waitFor(()=>fixturePosts.length===3);
   check('new group includes roster and explicit responder',fixturePosts[2].conversation.kind==='group'&&fixturePosts[2].conversation.members.length===2&&fixturePosts[2].conversation.recipient==='reviewer');

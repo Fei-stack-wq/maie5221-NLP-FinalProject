@@ -503,7 +503,6 @@ class RAOUnit:
         delegate_handler: Callable[[dict[str, Any]], Observation] | None = None,
         max_actions_per_step: int = 4,
         loop_warn: int = 3,
-        loop_stop: int = 5,
         enable_control_tools: bool = True,
         action_recorder: Callable[[RAOState, list[Action]], list[str]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
@@ -521,7 +520,6 @@ class RAOUnit:
         self.delegate_handler = delegate_handler
         self.max_actions_per_step = max_actions_per_step
         self.loop_warn = loop_warn
-        self.loop_stop = loop_stop
         self.enable_control_tools = enable_control_tools
         self.delegate_spec = DELEGATE_TOOL
         self.tool_started: Callable[[int, Action], None] | None = None
@@ -868,9 +866,7 @@ class RAOUnit:
                     repeat["count"] += 1
                 else:
                     repeat["sig"], repeat["count"] = signature, 1
-                if repeat["count"] >= self.loop_stop:
-                    terminate = ErrorClass.T_LOOP
-                elif repeat["count"] >= self.loop_warn:
+                if repeat["count"] >= self.loop_warn:
                     feedback.append(
                         {
                             "role": "user",
@@ -890,18 +886,6 @@ class RAOUnit:
         # Keep all tool results adjacent to their assistant batch. Interleaving
         # a user warning before the final result breaks subsequent requests.
         state.history.extend(feedback)
-        # Repeated clarification requests can otherwise consume the whole task
-        # while the coordinator is waiting for an answer it already received.
-        # A batch that did other work is allowed to continue.
-        duplicate_only = observations and all(obs.source == "human_gate" and "answered_action" in obs.meta
-                                              for obs in observations)
-        if duplicate_only:
-            answered = sorted({obs.meta["answered_action"] for obs in observations})
-            if state.scratch.get("duplicate_question_turn") == answered and terminate is None:
-                terminate = ErrorClass.T_LOOP
-            state.scratch["duplicate_question_turn"] = answered
-        else:
-            state.scratch.pop("duplicate_question_turn", None)
         budget.spend(seconds=time.perf_counter() - budget_timer)
         return kind, observations, terminate
 

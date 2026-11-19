@@ -36,7 +36,7 @@ class StudioRoutingChoicesTest(unittest.TestCase):
             run_id, model = self.assistant(message("请把环境维护工作交给小维"), [
                 tool("list_studio_targets", query="维护"),
                 tool("dispatch_studio_task", required_participants=["maintainer"], **args), {"text": "小维已接单。"}])
-        dispatch.assert_called_once_with(run_id, **args)
+        dispatch.assert_called_once_with(run_id, required_participants=["maintainer"], **args)
         messages, offered = model.requests[0]
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("Superagent", messages[0]["content"])
@@ -100,7 +100,7 @@ class StudioRoutingChoicesTest(unittest.TestCase):
                 tool("dispatch_studio_task", **addressed, required_participants=["writer", "researcher"]),
                 tool("dispatch_studio_task", **addressed, required_participants=["writer", "reviewer"]),
                 {"text": "已将整项工作交给通知组。"}])
-        dispatch.assert_called_once_with(source, **addressed)
+        dispatch.assert_called_once_with(source, required_participants=["writer", "reviewer"], **addressed)
         self.assertIn("向群负责人派发所有阶段", str(model.requests[1][0]))
         self.assertIn("不包括整项请求所需的所有角色", str(model.requests[2][0]))
 

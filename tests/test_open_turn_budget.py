@@ -37,7 +37,7 @@ class OpenTurnBudgetTest(unittest.TestCase):
         self.assertEqual((budget.steps_left, budget.actions_left), (None, None))
         self.assertEqual((self.root/'work/work.md').read_text(), 'Completed independent check 403.')
 
-    def test_explicit_cap_cancel_and_repeated_action_still_stop(self):
+    def test_explicit_cap_and_cancel_still_stop_while_repeat_warnings_allow_recovery(self):
         work = [write('work.md', str(i)) for i in range(10)]
         result, budget = self.execute(work, Limits(max_steps=3))
         self.assertEqual((result.status, budget.steps_used, budget.steps_left), ('limit_exceeded', 3, 0))
@@ -47,9 +47,10 @@ class OpenTurnBudgetTest(unittest.TestCase):
                       registry=build_default_registry(), settings=Settings(), should_cancel=lambda: bool(cancelled))
         result = agent.run('Stop on request', budget=budget, on_step=lambda r,s: cancelled.append(True))
         self.assertEqual((result.status, budget.steps_used), ('aborted', 1))
-        result, budget = self.execute([tool('list_dir')] * 12, Limits())
-        self.assertFalse(result.succeeded)
-        self.assertLess(budget.steps_used, 12)
+        result, budget = self.execute([tool('list_dir')] * 12 + [write('result.md', 'real result'), {'text':'done'}],
+                                      Limits(), acceptance=accept_files('result.md', min_bytes=1))
+        self.assertTrue(result.succeeded, result.error)
+        self.assertEqual(budget.steps_used, 14)
 
     def test_team_accepts_seventeenth_substantive_handoff_and_preserves_unlimited_forks(self):
         script = []

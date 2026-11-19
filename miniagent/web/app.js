@@ -2,6 +2,7 @@
 // Buildless local UI. All runtime-owned text passes through escapeHTML; no raw
 // model HTML, remote resources or provider credentials enter this application.
 const icons = {
+ down:'M12 4v14m-6-6 6 6 6-6',
  messages:'M21 13a3 3 0 0 1-3 3H9l-6 4v-5a3 3 0 0 1-1-2V6a3 3 0 0 1 3-3h13a3 3 0 0 1 3 3Z',user:'M20 21v-2a5 5 0 0 0-5-5H9a5 5 0 0 0-5 5v2M16 6a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
  hash:'M10 3 7 21M17 3l-3 18M4 9h16M3 15h16',pin:'m15 3 6 6-3 1-3 4v3l-2 1-7-7 1-2h3l4-3ZM9 15l-6 6',pinFilled:'m15 3 6 6-3 1-3 4v3l-2 1-7-7 1-2h3l4-3ZM9 15l-6 6m6-12 6 6',
  plus:'M12 5v14M5 12h14',grid:'M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z',
@@ -116,7 +117,7 @@ const chatRoles = () => [...(state.config?.conversation_roles || []),
 const roleLabel = id => state.detail?.conversation?.profiles?.find(p=>p.id===id)?.name || chatRoles().find(role => role.id === id)?.label || id;
 function memberLink(thread,id) {
  const key=thread?.role_keys?.[id];
- const name=thread?.profiles?.find(profile=>profile.id===id)?.name || chatRoles().find(role=>role.id===id)?.label || id;
+ const name=thread?.member_names?.[id] || thread?.profiles?.find(profile=>profile.id===id)?.name || chatRoles().find(role=>role.id===id)?.label || id;
  return key ? `<a class="member-profile" href="${roleLink(key)}">${e(name)}</a>` : e(name);
 }
 const chatMode = mode => mode === 'single' || mode === 'group';
@@ -170,7 +171,7 @@ function ruleFields(value='') {
 function sourceReviewField(value='', enabled=true) {
  return `<label class="field-label" ${enabled?'':'hidden'}>需要独立核查来源的文件（选填）
   <input name="required_source_review_paths" value="${e(value)}" ${enabled?'':'disabled'} placeholder="例如 report.md">
-  <small>群内至少需要三人。由另一位成员打开原始来源核查最终版本，多个路径用逗号分隔。</small></label>`;
+  <small>由另一位成员打开原始来源核查最终版本，多个路径用逗号分隔。</small></label>`;
 }
 function childFields(value='', group=true) {
  return `<label class="field-label">子任务检查（按${group?'角色 ID':'规划 ID'}）<textarea name="child_checks" rows="2"
@@ -556,20 +557,21 @@ function chatTransitionNotice(thread, run) {
 
 function conversationComposer(thread,run) {
  if (run.status==='waiting_user' && thread.head_run_id===run.id) return '';
+ if (thread.kind==='group' && !thread.members.length && thread.head_run_id===run.id && !runActive(run)) return '<p class="chat-notice">添加群成员后即可发送消息。<button type="button" class="text-button" data-edit-members>添加成员</button></p>';
  const unavailable = chatTransitionNotice(thread,run);
  if (unavailable) return unavailable;
  const draft = chatDrafts.get(thread.id) || {};
  const last = thread.turns.at(-1);
- const dispatch = draft.dispatch || last?.mode || (thread.kind==='group' && !last ? 'team' : 'single');
+ const dispatch = draft.dispatch || (thread.kind==='group' ? 'team' : 'single');
  const status = pendingChat.has(thread.id);
  const intent = draft.intent || 'edit';
  const teamLead = dispatch==='team' && intent==='edit' ? thread.lead : null;
- const recipient = teamLead || draft.recipient || last?.recipient || thread.recipient || thread.members[0];
+ const recipient = teamLead || [draft.recipient,last?.recipient,thread.recipient].find(id=>thread.members.includes(id)) || thread.members[0];
  const hasProvider = state.config?.provider_ready;
  return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}">
    <fieldset ${status ? 'disabled' : ''}>
     <label class="composer-label" for="chat-reply">继续对话</label>
-    <textarea id="chat-reply" name="message" maxlength="8000" required placeholder="提出问题，或描述下一步要修改的地方…">${e(draft.message || '')}</textarea>
+    <textarea id="chat-reply" name="message" maxlength="8000" required placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
     <div class="reply-options">
      ${thread.kind==='group' && intent==='edit'?dispatchField(dispatch):''}
      <label class="field-label"><span id="reply-recipient-label">${teamLead?'负责人':'回复角色'}</span>
@@ -605,24 +607,25 @@ function conversationPanel(detail) {
    : `<a class="text-button" href="#run/${encodeURIComponent(turn.run_id)}">查看本轮</a>`;
   const note = runActive(turn) ? '正在处理…' : '本轮没有保存回复正文，可在运行详情查看产物和记录。';
   return `<article class="chat-turn" data-key="turn-${e(turn.run_id)}">
-   <div class="chat-user"><div class="speaker">你 <small>发给 ${e(roleLabel(turn.recipient))}</small></div>
+   <div class="chat-user"><div class="speaker">你 <small>发给 ${e(turn.member_names?.[turn.recipient] || roleLabel(turn.recipient))}</small></div>
    <p>${e(turn.user)}</p></div>
-   ${roomMessages(turn.events||[],turn.run_id)}
+   ${roomMessages(turn.events||[],turn.run_id,turn.member_names)}
    ${window.StudioActivity?.renderTurn(turn,detail)||''}
-   <div class="chat-agent"><div class="speaker">${icon('cpu')} ${e(roleLabel(turn.recipient))} ${link}</div>
+   <div class="chat-agent"><div class="speaker">${icon('cpu')} ${memberLink(turn.role_keys?turn:thread,turn.recipient)} ${link}</div>
     ${turn.answer ? `<div class="chat-answer prose">${markdown(turn.answer)}</div>` : `<p class="muted-note">${e(note)}</p>`}
     ${turn.answer_truncated ? '<small>这里只展示回复节选。</small>' : ''}${turnFiles(turn)}</div></article>`;
  }).join('');
  const versionLink = latestVersion === detail.run.id
   ? '<button class="text-button" data-tab="artifacts">查看当前产物</button>'
   : latestVersion ? `<a class="text-button" href="#run/${encodeURIComponent(latestVersion)}/artifacts">查看项目产物</a>` : '';
- return `<section class="chat-thread" data-key="thread-${e(thread.id)}">
+ const group = thread.kind==='group';
+ return `<div class="${group?'group-chat-layout':'private-chat-layout'}"><section class="chat-thread" data-key="thread-${e(thread.id)}">
    <header class="thread-head"><div><h2>${thread.kind === 'group' ? '项目群聊' : '项目私聊'}</h2>
-    <p>${thread.kind==='group' && thread.lead
-      ? `<span>负责人 · ${memberLink(thread,thread.lead)}</span><br>成员 · ` : ''}${thread.members.map(id=>memberLink(thread,id)).join('、')}</p>
+    ${group?'':`<p>${thread.members.map(id=>memberLink(thread,id)).join('、')}</p>`}
     ${thread.workspace_path?`<p class="thread-workspace">${icon('folder')}工作区 <code>${e(thread.workspace_path)}</code></p>`:''}</div><div class="chat-actions">${versionLink}
    <a class="text-button" href="/api/runs/${encodeURIComponent(detail.run.id)}/room.zip" download>导出完整会话</a></div></header>
-   <div class="chat-history">${history || (thread.kind==='group'?'<p class="room-first-message">群聊已就绪。发出第一条消息，负责人即可安排成员协作。</p>':'')}</div>${conversationComposer(thread,detail.run)}</section>`;
+   <div class="chat-history">${history || (group?'<p class="room-first-message">还没有群消息。</p>':'')}${history?roomPanel.endMarker():''}</div>${history?roomPanel.jumpButton():''}${conversationComposer(thread,detail.run)}</section>
+   ${group?roomPanel.rail(thread,thread.head_run_id===detail.run.id && !runActive(detail.run) && thread.can_continue):''}</div>`;
 }
 
 function rememberReply(form) {
@@ -782,7 +785,7 @@ function diagnosis(detail){
  const title=cancelling?'正在取消任务':active?(activity.length?activity.some(a=>a.phase==='planning')?'正在规划任务':'正在执行 Agent 步骤':'正在执行任务'):issue.title;
  return `<section class="diagnosis ${active?'running':issue?.severity==='warning'&&!endedWithoutChecks(detail)?'warning':''}" data-key="diagnosis"><div class="diagnosis-header"><h2>${e(title)}</h2><button class="secondary" data-action="download-diagnostics">${icon('download')}导出诊断</button></div>${active?`<p class="activity-live"><span class="dot"></span>${activity.length?activity.map(a=>`${e(({coordinate:'负责人分工',work:'执行任务',deliver:'写入分工文件',handoff:'成员交接',finalize:'负责人收尾',planning:'规划任务'})[a.phase]||a.task_id?.split(':').pop()||'整体目标')}${a.step?' 第 '+e(a.step)+' 轮':''}，已用时 ${duration(typeof a.started_ts==='number'?Date.now()-a.started_ts*1000:null)}`).join('；'):'任务状态会自动更新。'}</p>`:`<p>${task?`${e(task.assignee_profile_id||'Agent')}${issue.step?' 第 '+e(issue.step)+' 轮':''}：`:''}${e(issue.message)}</p>`}<div class="diagnosis-facts"><span>执行 <strong>${e(cancelling?'正在取消':execution[d.execution_status]||d.execution_status)}</strong></span><span>验收 <strong>${e(verification[d.acceptance_status]||d.acceptance_status)}</strong></span>${d.configuration?.max_steps!=null?`<span>轮数上限 <strong>${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps)}</strong></span>`:''}${d.configuration?.max_total_tokens!=null?`<span>累计 token 预算 <strong>${d.configuration.max_total_tokens===0?'不限':Number(d.configuration.max_total_tokens).toLocaleString()}</strong></span>`:''}${d.blocked_tasks?.length?`<span>后续受阻 <strong>${d.blocked_tasks.length} 个任务</strong></span>`:''}${issue?.completion_tokens!=null?`<span>本轮输出 <strong>${Number(issue.completion_tokens).toLocaleString()} token</strong></span>`:''}</div>${!active&&issue?.suggestion?`<p class="next-step">下一步：${e(issue.suggestion)}</p>`:''}${!active&&d.acceptance_status==='not_configured'&&issue?.code!=='no_acceptance'?'<p>此外，本次未配置独立验收，不能判定目标已达成。</p>':''}${detail.run.status==='unverified'&&d.execution_status==='failed'?'<p>旧版总状态保存为“未验证”；日志确认存在执行失败。原始记录保持不变。</p>':''}<details data-key="diagnostic-evidence"><summary>查看失败证据、阻塞链与运行配置</summary>${issue?.request_id?`<p>模型请求 <code>${e(issue.request_id)}</code></p>`:''}${issue?.finish_reason?`<p>结束原因 <code>${e(issue.finish_reason)}</code>；输出上限 ${e(issue.max_output_tokens??'旧记录未保存')}；耗时 ${duration(issue.latency_ms)}</p>`:''}${(d.blocked_tasks||[]).map(t=>`<p>${e(t.task_id?.split(':').pop())} / ${e(t.assignee)}：${e(t.reason)}</p>`).join('')}<p>${Object.keys(d.configuration||{}).length?`模型 ${e(d.configuration.model)}；thinking ${e(d.configuration.thinking)}；单次输出上限 ${e(d.configuration.max_output_tokens)} token；执行轮数上限 ${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps??'未记录')}；累计 token 预算 ${e(d.configuration.max_total_tokens??'未记录')}；任务时限 ${e(d.configuration.max_task_seconds??d.configuration.max_seconds??'未记录')} 秒。`:'旧运行没有保存配置快照；当前服务配置不代表当时配置。'}</p>${d.incomplete?'<p>日志已截断，此诊断只基于保留的记录。</p>':''}</details></section>`;
 }
-function roomMessages(events,runId) {
+function roomMessages(events,runId,names={}) {
  const kinds={goal:'任务',assignment:'分工',member_report:'成员交付',runtime_reroute:'平台转交返工',human_question:'询问',human_answer:'用户答复',question_closed:'等待结束',human_review:'人工评审'};
  return events.map(row=>{
   const reserve = row.reserved;
@@ -794,7 +797,7 @@ function roomMessages(events,runId) {
    ${checks.map(check=>`<p>${e(check)}</p>`).join('')}
    ${row.artifacts?.length ? `<details class="turn-files member-files" ${row.artifacts.length<=5?'open':''}>
     <summary>${handoff.published?'成员交付文件':'成员诊断报告'} · ${row.artifacts.length}</summary><div>${row.artifacts.map(file=>artifactLink(runId,file)).join('')}</div></details>` : ''}</div>` : '';
-  return `<div class="room-event"><strong>${e(kinds[row.kind]||row.kind)} · ${e(row.role==='user'?'你':roleLabel(row.role))}</strong>${row.recipient?` → ${e(roleLabel(row.recipient))}`:''}
+  return `<div class="room-event"><strong>${e(kinds[row.kind]||row.kind)} · ${e(row.role==='user'?'你':(names?.[row.role] || roleLabel(row.role)))}</strong>${row.recipient?` → ${e(names?.[row.recipient] || roleLabel(row.recipient))}`:''}
    <p>${e(row.text)}</p>${receipt}${reserve?`<small>后续委派与收尾预留 · ${reserve.steps_left==null?'不限轮数':e(reserve.steps_left)+' 步'} · ${reserve.tokens_left==null?'不限 token':e(Number(reserve.tokens_left).toLocaleString())+' token'}</small>`:''}</div>`;
  }).join('');
 }
@@ -828,7 +831,7 @@ function detailContent(){if(!state.detail)return '<div class="initial-loading"><
  const title=state.tab==='chat' && d.conversation?.kind==='group' && (room?.title || d.conversation.title) || r.title;
  const back = state.tab==='chat' ? ['#chats','返回最近对话'] : ['#runs','返回全部任务'];
  const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page"><div class="detail-top"><a class="back-link" href="${back[0]}">${icon('left')}${back[1]}</a><div class="detail-heading"><h1>${e(title)}</h1><div class="detail-actions"><span id="thread-pin">${chatDirectory.managementButton(room)}</span>${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'&&endedWithoutChecks(d)?'':diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
-function render({reset=false}={}){document.body.classList.toggle('assistant-view',state.route==='assistant');const html=state.route==='assistant'?studioAssistant.page():state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatDirectory.page():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();}
+function render({reset=false}={}){document.body.classList.toggle('assistant-view',state.route==='assistant');const html=state.route==='assistant'?studioAssistant.page():state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatDirectory.page():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();roomPanel.scheduleScrollCheck();}
 function parseRoute() {
  const [hash, query=''] = location.hash.slice(1).split('?');
  if (hash.startsWith('run/')) {
@@ -945,7 +948,7 @@ async function submit(form) {
   const recipient = fields.get('recipient');
   const intent = fields.get('intent');
   const members = mode === 'group' ? fields.getAll('member') : [recipient];
-  if (mode === 'group' && members.length < 2) return showError('请选择至少两位群成员。');
+  if (mode === 'group' && !members.length) return showError('请先选择本轮处理消息的群成员。');
   if (!recipient || !members.includes(recipient)) return showError('请选择本轮回复的群成员或私聊角色。');
   payload.conversation = {kind:mode==='group'?'group':'dm',members,recipient,intent};
   if (mode==='group' && intent==='edit' && fields.get('dispatch')==='team') payload.mode='team';

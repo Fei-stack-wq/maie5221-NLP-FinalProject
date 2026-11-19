@@ -152,7 +152,7 @@ class RaoStepTest(unittest.TestCase):
             any("已连续重复" in str(m.get("content", "")) for m in state.history)
         )
 
-    def test_loop_terminates_after_five_repeats(self) -> None:
+    def test_loop_can_continue_past_five_repeats(self) -> None:
         same = {"tool_calls": [{"name": "list_dir", "arguments": {"path": "."}}]}
         unit = _unit(self.root, [same] * 6)
         state = _state()
@@ -163,7 +163,8 @@ class RaoStepTest(unittest.TestCase):
             if record.terminate_reason:
                 break
         assert record is not None
-        self.assertEqual(record.terminate_reason, ErrorClass.T_LOOP)
+        self.assertIsNone(record.terminate_reason)
+        self.assertEqual(state.scratch["repeat"]["count"], 6)
 
     def test_ask_human_without_handler_is_denied(self) -> None:
         unit = _unit(

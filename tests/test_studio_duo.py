@@ -54,15 +54,16 @@ class TeamRecipientsTest(unittest.TestCase):
                          ['xiaowei','reviewer','xiaowei'])
         self.assertEqual(self.service.artifact(detail['run']['id'], 'agents/xiaowei/env-report.md')['content'], readings)
 
-    def test_lead_handoff_alone_cannot_finish_and_cannot_supply_own_independent_review(self):
-        create = tool('delegate_task', assignee='lead', objective='撰写报告', deliverable_paths=['report.md'])
+    def test_planned_independent_peer_cannot_be_replaced_by_self_review(self):
+        create = tool('delegate_task', assignee='lead', objective='撰写报告', deliverable_paths=['report.md'],
+                      remaining_roles=['reviewer'])
         self_review = tool('delegate_task', assignee='lead', objective='对自己验收', deliverable_paths=['report.md'],
-                           review={'candidate':'lead','criteria':[{'id':'r','kind':'inspect','description':'check facts'}]})
+                           review={'candidate':'lead','criteria':[{'id':'r','method':'inspect','description':'check facts'}]})
         detail, _ = self.execute(('lead','reviewer'), [create, write('report.md', 'This report has one author.'),
             {'text':'Done.'}, self_review, self_review, {'text':'All work is done.'}], acceptance_files=['report.md'])
         self.assertEqual(detail['run']['status'], 'failed', detail['run'])
         self.assertEqual([e['recipient'] for e in detail['room_events'] if e['kind']=='assignment'], ['lead'])
-        self.assertTrue(any('reviewer' in e.get('preview','') and e.get('ok') is False for e in detail['events']))
+        self.assertTrue(any('原作者不能' in e.get('preview','') and e.get('ok') is False for e in detail['events']))
 
     def test_invalid_larger_room_recipient_gets_real_choices_then_bounded_failure(self):
         invalid = tool('delegate_task', assignee='outsider', objective='写报告', deliverable_paths=['report.md'])
@@ -123,15 +124,15 @@ class TeamRecipientsTest(unittest.TestCase):
         self.assertEqual([row['role'] for row in reports], ['lead', 'inspector', 'lead', 'inspector'])
         self.assertEqual([row['native_review']['state'] for row in reports[1:]], ['repair','review','passed'])
 
-    def test_three_person_lead_requires_concrete_file_and_cannot_finish_alone(self):
+    def test_three_person_lead_can_complete_the_only_file_assignment(self):
         missing_path = tool('delegate_task', assignee='lead', objective='再分配整组工作')
         create = tool('delegate_task', assignee='lead', objective='整理笔记', remaining_roles=[],
                       deliverable_paths=['notes.md'])
         detail, _ = self.execute(('lead','writer','reviewer'), [
             missing_path, create, write('notes.md','First stage completed.'), {'text':'已交接。'},
-            {'text':'[BLOCKED] 尚缺其他成员的交接。'},
+            {'text':'已整理笔记。'},
         ], acceptance_files=['notes.md'])
-        self.assertEqual(detail['run']['status'], 'failed')
+        self.assertEqual(detail['run']['status'], 'completed', detail['diagnostics'])
         self.assertEqual([e['recipient'] for e in detail['room_events'] if e['kind']=='assignment'], ['lead'])
         self.assertTrue(any(e.get('ok') is False and 'deliverable_paths' in e.get('preview','')
                             for e in detail['events']))

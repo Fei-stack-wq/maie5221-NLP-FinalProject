@@ -84,6 +84,14 @@ class StudioHTTPTest(unittest.TestCase):
         details = json.loads(self.fetch(path="/api/runs/" + row["id"])[2])["conversation"]
         self.assertTrue(details["can_continue"])
         self.assertEqual(details["turns"], [])
+        roster = endpoint + "/" + row["id"] + "/members"
+        self.assertEqual(json.loads(self.fetch(path=roster)[2])["revision"], 0)
+        change = json.dumps({"revision": 0, "members": ["reviewer"], "lead": "reviewer"})
+        self.assertEqual(self.fetch("POST", roster, change, {"Content-Type": "application/json"})[0], 403)
+        status, _, body = self.fetch("POST", roster, change, headers)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["members"], ["reviewer"])
+        self.assertEqual(json.loads(self.fetch("POST", roster, change, headers)[2])["code"], "stale_membership")
         status, _, body = self.fetch("POST", endpoint + "/" + row["id"], '{"pinned":false}', headers)
         self.assertEqual(status, 200, body)
         self.assertFalse(json.loads(body)["channel"]["pinned"])

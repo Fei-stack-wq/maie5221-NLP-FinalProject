@@ -70,7 +70,7 @@ PowerShell 可直接设置进程环境变量后执行相同 Python 命令。`.en
 
 `to_assistant_message()` 统一处理普通 answer、控制工具和多个工具的消息。禁止手写一个只含 content/tool_calls 的简化版本而丢失 reasoning。
 
-历史满足以下顺序：`assistant(tool_calls=[c1,c2]) → tool(c1) → tool(c2) → 下一条 assistant/user`。工具警告及人工反馈必须等批次闭合后再追加；达到动作上限、循环检测、abort 后，尚未执行的调用各回一条 skipped，不能遗漏或重复 tool result。调用 ID 以批次为作用域。
+历史满足以下顺序：`assistant(tool_calls=[c1,c2]) → tool(c1) → tool(c2) → 下一条 assistant/user`。工具警告及人工反馈必须等批次闭合后再追加；达到动作上限或 abort 后，尚未执行的调用各回一条 skipped，不能遗漏或重复 tool result。调用 ID 以批次为作用域。
 
 正常 `stop` 必须无 tool_calls，正常 `tool_calls` 必须有调用。`length`、`content_filter`、`insufficient_system_resource`、`aborted` 不视为成功答复：保留用量，RAO 返回 `T_PROTOCOL`，Agent 终态 `error`；不执行该响应中的工具，Worker 不调用验收器；编排器仍可生成 root 验收报告，但规划/执行错误优先决定 error 终态，即使 root 检查 passed 也不计成功。合法但不完整的调用批次可以写入历史并补 skipped；坏信封整批拒绝。
 

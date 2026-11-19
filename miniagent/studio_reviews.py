@@ -426,8 +426,6 @@ class ReviewSession:
         self.receipts = {}
         self.assessment = None
         self.source_files = {}
-        self.closing_needs = None
-        self.closing_attempts = 0
         self.last_snapshot_issue = None
         self.frozen = {**original, **item.files}
 
@@ -467,8 +465,6 @@ class ReviewSession:
         return self.last_snapshot_issue is None
 
     def observe(self, record):
-        if self.closing_needs is not None and record.observations:
-            self.closing_attempts += 1
         retrieved = [obs for obs in record.observations if obs.ok and obs.source in {"search_sources", "http_get"}]
         if retrieved:
             versions = self.progress.project_versions()
@@ -638,16 +634,8 @@ class ReviewSession:
 
     def closing_options(self):
         needs = self.evidence_needs()
-        gaps = {(cid, step["tool"], path) for cid, steps in needs.items()
-                for step in steps for path in step.get("paths", [""])}
-        if self.closing_needs is None or gaps < self.closing_needs:
-            self.closing_needs, self.closing_attempts = gaps, 0
-        # At handoff only a change in missing, host-observed prerequisites
-        # reopens correction attempts. Rephrasing a verdict cannot buy time.
-        if self.closing_attempts >= 3:
-            return frozenset()
         tools = {"submit_review"}
-        if self.closing_attempts or len(self.receipts) > 6:
+        if len(self.receipts) > 6:
             tools.add("list_review_evidence")
         for steps in needs.values():
             tools.update(step["tool"] for step in steps)

@@ -55,7 +55,7 @@ from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
 from .studio_acceptance import build_checks
 from .studio_crew import RoomCrew
-from .studio_conversations import (ROLE_LABELS, SnapshotError, copy_project, project_context,
+from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, copy_project, member_profiles, project_context,
                                    thread_info, validate_conversation)
 
 MAX_PREVIEW_BYTES = 262144
@@ -490,8 +490,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 })
                 if path.name == identity:
                     item["title"] = "Superagent" if thread.get("superagent") else meta.get("title", "")
-                    if directory:
-                        roots[identity] = meta
+                    roots[identity] = meta
                 if thread.get("superagent"):
                     item["superagent"] = True
                 if thread["ordinal"] > item["turn_count"]:
@@ -502,6 +501,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             rows = conversations.values()
             if directory:
                 rows = [self._room_card(row, roots.get(row["id"], {})) for row in rows]
+            else:
+                for row in rows:
+                    if row["kind"] == "group" and row["id"] in roots:
+                        row["members"] = self._member_state(roots[row["id"]]["thread"])["members"]
         ordered = sorted(rows, key=lambda item: (item["updated_at"], item["id"]), reverse=True)
         return self._redact(ordered)
 
@@ -584,6 +587,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         turns, artifact_id = [], None
         previous = anchor[1].name if anchor else None
         project_id = initial["id"]
+        linked = self.linked_roles(initial["id"])
+        saved = {p["id"]: p for p in self.profiles()}
         for index, (ordinal, directory, meta, thread) in enumerate(related, start=1):
             if ordinal != index or previous != thread["parent_run_id"]:
                 raise StudioError("会话历史不连续，无法安全继续。", "thread_conflict", 409)
@@ -636,6 +641,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                           "run_id": directory.name, "user": meta.get("title", ""),
                           "events": list(reversed(events)), "events_truncated": events_truncated,
                           "mode": meta.get("mode"),
+                          "member_names": {role: p["name"] for role, p in member_profiles(thread).items()},
+                          "role_keys": self.directory_role_keys(thread, linked, saved=saved),
                           "recipient": thread["recipient"], "answer": answer_text, "answer_truncated": truncated,
                           "intent": thread["intent"], "status": state})
         head = turns[-1] if turns else {"run_id": previous, "status": "ready"}
@@ -651,17 +658,23 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 related[-1][1], related[-1][3], public_events, verify=True)]
         group_title = (self.channel_label(initial["id"], anchor[2] if anchor else {})
                        if initial["kind"] == "group" else None)
-        linked = self.linked_roles(initial["id"])
-        return {"id": initial["id"], "kind": initial["kind"], "members": initial["members"],
-                "role_keys": self.directory_role_keys(initial, linked),
+        roster = initial
+        group_settings = {}
+        if initial["kind"] == "group" and before is None:
+            root = anchor[3] if anchor else related[0][3]
+            roster = self._member_state(root, saved)
+            group_settings = {"lead": roster["lead"], "membership_revision": roster["revision"]}
+            can_continue = can_continue and bool(roster["members"])
+        return {"id": initial["id"], "kind": initial["kind"], "members": roster["members"],
+                "role_keys": self.directory_role_keys(roster, linked, saved=saved),
                 **({"title": group_title} if group_title else {}),
-                **({"lead": anchor[3]["recipient"]} if anchor else {}),
+                **group_settings,
                 "superagent": bool(initial.get("superagent")),
-                "recipient": anchor[3]["recipient"] if anchor else initial["recipient"],
+                "recipient": group_settings.get("lead", initial["recipient"]),
                 "recovery_candidates": candidates,
                 "head_run_id": head.get("run_id"), "artifact_run_id": artifact_id,
-                "profiles": (related[-1][3] if related else initial).get("profiles", []),
-                "saved_roles": sorted(set(initial.get("saved_roles", [])) | set(linked)),
+                "profiles": roster.get("profiles", []),
+                "saved_roles": sorted((set(roster.get("saved_roles", [])) | set(linked)) & set(roster["members"])),
                 "knowledge_project_id": project_id,
                 "workspace_path": (related[-1][2] if related else anchor[2] if anchor else {}).get("workspace_path"),
                 "can_continue": can_continue, "turns": turns}
@@ -672,6 +685,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             return {**self.bind_roles(message), "id": run_id, "knowledge_project_id": run_id,
                     "ordinal": 1, "parent_run_id": None, "base_run_id": None}
         room = self._conversation(self._directory(parent), with_answers=False)
+        if room and room["kind"] == "group" and not room["members"]:
+            raise StudioError("这个群还没有成员，请先邀请一位角色。", "empty_group", 409)
         if room is None or room["head_run_id"] != parent or not room["can_continue"]:
             raise StudioError("请等待本轮结束，并从会话的最新一轮发送。", "stale_head", 409)
         if message["recipient"] not in room["members"]:
@@ -848,7 +863,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         if len(set(source_paths)) != len(source_paths):
             raise StudioError("来源核查文件不可重复。")
         if source_paths:
-            if mode != "team" or "conversation" not in payload:
+            if mode not in {"single", "team"} or "conversation" not in payload:
                 raise StudioError("来源核查需要群聊中的团队任务。")
             files = list(dict.fromkeys([*files, *source_paths]))
             if len(files) > 20:
@@ -859,7 +874,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         child_checks = payload.get("child_checks", {})
         if (not isinstance(checks, list) or not isinstance(child_checks, dict) or len(child_checks) > 20
                 or (mode in {"demo", "team-demo"} and (checks or child_checks))
-                or (child_checks and mode != "team")):
+                or (child_checks and mode != "team" and not (mode == "single" and "conversation" in payload))):
             raise StudioError("验收规则或子任务验收配置无效。")
         try:
             build_checks(files, checks)
@@ -909,8 +924,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 message = self.validate_role_refs(payload["conversation"])
             except ValueError as exc:
                 raise StudioError(str(exc)) from None
-            if mode == "team" and (message["intent"] != "edit" or message.get("kind", "group") != "group"):
-                raise StudioError("群内协作需要向群聊发送任务。")
+            if mode == "team" and message.get("kind", "group") != "group":
+                raise StudioError("群内协作需要向群聊发送消息。")
             if message["intent"] == "question" and (files or checks):
                 raise StudioError("只读问答无需填写验收文件。")
             result["conversation"] = message
@@ -956,15 +971,52 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             if request["mode"] in {"single", "team"} and not self.settings.api_key.strip():
                 raise StudioError("本机尚未配置 DeepSeek API key，请先配置后启动工作室。", "provider_unavailable", 409)
             run_id = routed["child_run_id"] if routed else "studio-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
-            thread = self._next_turn(run_id, request["conversation"], mode=request["mode"]) if "conversation" in request else None
+            message = request.get("conversation")
+            if routed and routed.get("group_id"):
+                roster = self._member_state(self._membership_root(routed["group_id"]))
+                if not roster["members"] or set(routed["participants"]) - set(roster["members"]):
+                    raise StudioError("目标群成员已变化，无法按原要求派工。", "missing_members", 409)
+                # The queued request names the channel. Resolve its current lead
+                # under the same inter-process lock that freezes the turn.
+                message = {**message, "recipient": roster["lead"]}
+            thread = self._next_turn(run_id, message, mode=request["mode"]) if message else None
             if superagent:
                 thread["superagent"] = True
             if thread and request["mode"] == "team" and thread["kind"] != "group":
                 raise StudioError("私聊内不能启动群组协作。")
-            if request.get("required_source_review_paths") and len(set(thread["members"]) - {thread["recipient"]}) < 2:
-                raise StudioError("来源核查需要负责人以外至少两位成员，分别负责成稿和独立评审。")
-            if thread and request.get("child_checks", {}).keys() - (set(thread["members"]) - {thread["recipient"]}):
-                raise StudioError("群内子任务验收须绑定给当前负责人以外的成员。")
+            peer_contract = request.get("required_source_review_paths") or request.get("child_checks")
+            if thread and peer_contract and (thread["kind"] != "group" or thread["intent"] != "edit"):
+                raise StudioError("独立来源核查和成员验收需要群内执行任务。")
+            if thread and thread["kind"] == "group":
+                if not thread.get("parent_run_id"):
+                    thread["group_lead"] = thread["recipient"]
+                try:
+                    addresses = addressed_members(request["objective"], thread)
+                except ValueError as exc:
+                    raise StudioError(str(exc), "invalid_addressee") from None
+                participants = routed.get("participants", []) if routed else []
+                if not addresses and not participants and len(thread["members"]) == 1:
+                    addresses = list(thread["members"])
+                if not addresses and not participants and request["mode"] == "single" and peer_contract:
+                    addresses = [thread["recipient"]]
+                selected = list(dict.fromkeys([*addresses, *participants]))
+                if selected:
+                    requires_team = len(selected) > 1 or peer_contract
+                    request["mode"] = "team" if requires_team else "single"
+                    # A structured team may include its coordinator for routing.
+                    # Explicit mentions of the lead still require their own report.
+                    thread["addressed_roles"] = [role for role in selected if not requires_team
+                                                 or role != thread["recipient"] or role in addresses]
+                    if request["mode"] == "single":
+                        thread["recipient"] = selected[0]
+                if request["mode"] == "single" and thread["intent"] == "edit":
+                    thread["direct_execution"] = True
+                if request["mode"] == "team" and thread["intent"] == "question":
+                    thread["team_question"] = True
+            if request.get("required_source_review_paths") and len(thread["members"]) < 2:
+                raise StudioError("来源核查需要两位不同成员，分别负责成稿和独立评审。")
+            if thread and request.get("child_checks", {}).keys() - set(thread["members"]):
+                raise StudioError("群内子任务验收须绑定给本群成员。")
             if not self._slots.acquire(blocking=False):
                 raise StudioError("同时运行的任务已达上限，请等待当前任务结束。", "busy", 429)
             path = self.runs_dir / run_id
@@ -1165,7 +1217,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             if not past or past["id"] != thread["id"] or past["kind"] != "group" or meta.get("workspace_path") != local:
                 break
             for e in reversed(self.room_events(parent)):
-                if e.get("kind") != "member_report" or e.get("role") not in crew.profiles:
+                if e.get("kind") not in {"member_report", "direct_delivery"} or e.get("role") not in crew.profiles:
                     continue
                 h = e.get("handoff", {})
                 old = h.get("native_review") or {}
@@ -1188,6 +1240,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 author = promoted.get("author", e["role"])
                 task = promoted.get("source_task", h["task_id"])
                 projection = e.get("workspace_delivery") or {}
+                if e["kind"] == "direct_delivery":
+                    if meta.get("state") not in {"completed", "unverified"}:
+                        continue
+                    projection = meta.get("workspace_delivery") or {}
                 changes = {c["path"]:c.get("sha256") for c in h.get("changed_files", [])}
                 if reference == task:
                     task_scope.update(h.get("deliverable_paths") or (p for p, sha in changes.items() if sha))
@@ -1263,6 +1319,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
     @staticmethod
     def _workspace(path: Path, thread: dict) -> Path:
         if thread["intent"] == "question":
+            if thread.get("team_question"):
+                return path / "context" / "agents" / thread["recipient"]
             return path / "context" / "project"
         return path / "agents" / thread["recipient"]
 
@@ -1487,8 +1545,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 workspace = self._workspace(path, thread)
                 sandbox = Sandbox(workspace, agent_name=recipient)
                 crew = None
-                if mode == "team":
-                    crew = RoomCrew(run_id, path, thread, room["turns"], provider, settings, tracer,
+                if mode == "team" or thread.get("direct_execution"):
+                    crew = RoomCrew(run_id, path / "context" if question else path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
                                     delivery, role_session=roles)
@@ -1499,10 +1557,14 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                             raise ValueError("无法核对本群发布记录：" + str(exc)) from None
                     crew.inherited_review = inherited_review
                     self._load_prior_diagnostics(crew, thread)
-                    context += "\n" + crew.instructions()
+                    context += "\n" + (crew.direct_instructions() if crew.direct else crew.instructions())
+                    if thread.get("addressed_roles") and not crew.direct:
+                        context += "\n本轮需实际参与的点名成员：" + "、".join(thread["addressed_roles"])
+                    if question:
+                        context += "\n本轮为只读讨论，请委派点名成员阅读项目并给出意见，保留现有文件。"
                     self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
                 registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
-                prompt = COORDINATOR_PROMPT if crew else None
+                prompt = COORDINATOR_PROMPT if crew and not crew.direct else None
                 step_policy = crew.coordinator_policy if crew else None
                 if thread.get("superagent") and not question:
                     self.add_superagent_tools(registry, run_id)
@@ -1531,7 +1593,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                               human_request_gate=crew.human_request_gate if crew else None, should_cancel=should_cancel)
                 if crew:
                     agent.unit.delegate_spec = crew.delegate_spec
-                if question:
+                if question and not crew:
                     agent.unit.enable_control_tools = False
                 result = agent.run(request["objective"], task_id=run_id, acceptance=acceptance,
                                    budget=crew.budget if crew else None, conversation_context=context,
@@ -1539,6 +1601,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                                    before_answer=crew.before_answer if crew else None,
                                    step_policy=step_policy,
                                    on_step=crew.observe_coordinator if crew else None)
+                if crew and crew.direct and result.status in {"completed", "unverified"}:
+                    try:
+                        crew.snapshot_direct_changes()
+                    except SnapshotError as exc:
+                        tracer.event("direct_snapshot_unavailable", task_id=run_id, reason=str(exc))
                 if result.answer:
                     # Write the public final answer only. Keep reasoning, raw
                     # tool buffers, and credentials out of the transcript.

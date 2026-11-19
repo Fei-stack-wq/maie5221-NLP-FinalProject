@@ -18,7 +18,7 @@
   const minutes = ms => ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(1) + ' s';
   const cache = new Map();
 
-  function render(activity) {
+  function render(activity, memberNames={}) {
     const calls = activity?.calls;
     if (!Array.isArray(calls) || !calls.length) return '';
     const recent = calls.at(-1);
@@ -32,7 +32,7 @@
         <span class="activity-title">${escape(title)} ${call.summary ? `<code>${escape(call.summary)}</code>` : ''}</span>
         <span class="activity-state">${escape(states[state])}</span></summary>
         <div class="activity-info"><code>${escape(call.tool)}</code>
-          ${call.role ? `<span>${escape(typeof roleLabel === 'function' ? roleLabel(call.role) : call.role)}</span>` : ''}
+          ${call.role ? `<span>${escape(memberNames?.[call.role] || (typeof roleLabel === 'function' ? roleLabel(call.role) : call.role))}</span>` : ''}
           ${Number.isFinite(call.duration_ms) ? `<span>${escape(minutes(call.duration_ms))}</span>` : ''}</div>
         ${result ? `<pre class="activity-result">${result}</pre>` : ''}</details>`;
     }).join('');
@@ -50,7 +50,7 @@
   }
 
   function renderTurn(turn, detail) {
-    if (turn.run_id === detail?.run?.id) return render(detail.activity);
+    if (turn.run_id === detail?.run?.id) return render(detail.activity,turn.member_names);
     return block('history', turn.run_id, '', '查看本轮工具调用');
   }
 
@@ -103,6 +103,7 @@
     cache.set(key, entry);
     details.querySelector('.activity-body').innerHTML = entry.html;
     try {
+      const memberNames = typeof state === 'undefined' ? null : state.detail?.conversation?.turns?.find(turn=>turn.run_id===run)?.member_names;
       const base = '/api/runs/' + encodeURIComponent(run);
       const url = activityKind === 'history' ? base + '/activity' :
         base + '/excerpt?' + new URLSearchParams({path});
@@ -115,7 +116,7 @@
       } else {
         const data = await response.json();
         if (activityKind === 'history') {
-          entry.html = render(data) || '<p class="activity-note">本轮没有工具调用记录。</p>';
+          entry.html = render(data,memberNames) || '<p class="activity-note">本轮没有工具调用记录。</p>';
         } else {
           if (typeof data.content !== 'string') throw Error();
           const lines = data.content.split('\n');

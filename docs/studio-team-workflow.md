@@ -1,6 +1,6 @@
 # 工作室里的团队任务与续聊
 
-在「对话 → 工作室角色」填写角色 ID、名称和职责。保存后，该角色可用于新私聊或多个群。每个群在建群时保存自己的成员和职责快照。已有会话仍可继续使用原来的内置角色。
+在「对话 → 工作室角色」填写角色 ID、名称和职责。保存后，该角色可用于新私聊或多个群。每个群独立维护当前成员和负责人，每次接单保存当时的角色和职责。已有会话仍可继续使用原来的内置角色。
 
 ## 在一个群里做两道题
 
@@ -32,6 +32,10 @@
 
 ## 本机接口
 
+群成员接口以稳定的会话 ID 定位。 `GET /api/directory/channels/{id}/members` 返回 `conversation_id`、`revision`、有序的角色 ID 数组 `members`、负责人 `lead` 及显示名映射 `member_names`。向相同地址 POST `{"revision":0,"members":["writer","reviewer"],"lead":"writer"}` 可以原子地增删成员和更换负责人。移除最后一位成员时提交空数组和 `lead: null`。旧群第一次读取的版本为 0，修改版本过期返回 HTTP 409 及 `stale_membership`，重新读取名单后可以按当前意愿再改。
+
+修改和新任务入场共用 SQLite 写锁。新任务取锁时保存实际名单，进行中的任务按其接单时的成员继续。历史消息保留当轮的显示名与角色身份，即使成员离群，也能在角色详情找到当时接过的任务。跨会话派工保存约定的参与者，在群接单时再次核对。名单变化导致缺少必需角色会在派工回执里报告。当前名单独立于侧栏的固定状态和历史任务文件。实现参考 Matrix Synapse 将同一房间的成员修改串行执行，以及按时间点检索成员名单的测试。Studio 使用本地版本号校验，并为每次任务固定执行名单。[Synapse 成员修改的锁](https://github.com/element-hq/synapse/blob/f92c6455efbecaba1ddb1595e597aec0d7e4fb42/synapse/handlers/room_member.py#L653-L674) · [成员离开与历史名单测试](https://github.com/element-hq/synapse/blob/f92c6455efbecaba1ddb1595e597aec0d7e4fb42/tests/rest/client/test_rooms.py#L597-L674) · [Studio 运行中变更与并发测试](../tests/test_studio_channels.py)
+
 | 操作 | 接口 |
 | --- | --- |
 | 保存可复用角色 | POST /api/profiles，字段为 id、name、prompt |
@@ -46,9 +50,9 @@
 
 ## 负责人如何结束一轮
 
-负责人先选择与目标相关的成员，通过委派工具的 `remaining_roles` 声明后续分工。负责人首次分工或处理受阻交接时，可在公共项目中只读查找、搜索和查看文件。下一次路由会携带最近查到的内容与行号。系统按实际用量限制同一公共版本上的查阅开销，到达额度后进入委派，具体人选、任务和验收由负责人决定。每位成员在独立副本工作，回执包含分工目标、实际修改的路径与内容摘要、观察到的检查、剩余问题和实际用量。发布或受阻都会进入公共群记录。文件发布和用户配置的独立验收各自记录结论。
+负责人先选择与目标相关的成员，通过委派工具的 `remaining_roles` 声明后续分工。负责人首次分工或处理受阻交接时，可在公共项目中只读查找、搜索和查看文件。下一次路由会携带最近查到的内容与行号。系统根据实测用量提醒负责人核对分工所需的资料和剩余预算。负责人可以继续查阅，也可以委派。每位成员在独立副本工作，回执包含分工目标、实际修改的路径与内容摘要、观察到的检查、剩余问题和实际用量。发布或受阻都会进入公共群记录。文件发布和用户配置的独立验收各自记录结论。
 
-成员可以按不同位置阅读已有项目、搜索入口、修改源码、运行测试并准备交付说明。缺少文档时会提示补齐文件，成员在这一阶段继续拥有完整的工作工具。同一版本连续通过相同检查，或多轮只重复查看已有证据，会触发成员的交接阶段。文件有实质变动后，先前的测试结果需要重验。交接阶段只允许给出最终答复，也可以明确报告阻塞。未解决的已知失败会阻止发布。
+成员可以按不同位置阅读已有项目、搜索入口、修改源码、运行测试并准备交付说明。缺少文档时会提示补齐文件，成员在这一阶段继续拥有完整的工作工具。同一版本连续通过相同检查，或多轮只重复查看已有证据时，成员会收到进度提醒，可以继续工作或主动交接。文件有实质变动后，先前的测试结果需要重验。交接阶段只允许给出最终答复，也可以明确报告阻塞。未解决的已知失败会阻止发布。
 
 分配成员前先计算负责人汇总和后续路由所需的轮数、工具次数、时间与 token，再在待办成员之间分配可用额度。预算按预计的收尾输入和输出留存。成员只接收当前分工、用户已确认的决定、可见文件清单和近期成功交付的摘要。长任务压缩工作历史时，保留最近读取的位置和文件版本、实际改动及测试回执。服务端产生的 `assignment.reserved`、`assignment.allocation` 和 `member_report.usage` 可与模型实际用量核对。负责人最后一次请求只携带必要目标、决定和交接摘要，当轮可用工具为空。用户配置的最终验收仍由运行时独立执行。连续达到同一阻塞时，以失败回执结束，保留文件和证据供续聊。
 
@@ -103,9 +107,9 @@ print("PASS: submitted the booking through the visible form")
 
 群成员可以调用 `read_source` 对 `http_get` 或 `search_sources` 已归档的正文或结果分页。在同一份归档上读取原始 JSON 和读取正文分别记录字符范围。用 Python 从归档抽出正文时，宿主也能识别先前未见的原文节选。阅读进度只用于决定下一步是否继续工作，独立评审需要自己的来源和检查回执。
 
-连续七轮工具调用没有产生新文件、新的阅读范围或检查结果时，成员如有预算且尚缺指定文本文件，会得到一次 `deliver` 回合。该回合保留已读材料，仅对缺失的目标路径开放 `write_file`。实际写入会使成员回到 `work`，可继续编辑、补来源和验证。如果同一批缺失文件仍未产生，成员进入文字交接，负责人能看到具体缺项。独立评审沿用各自的签署与取证流程。
+工作阶段的重复操作只触发进度提醒。例如，成员多次通过 Python 阅读同一段资料时，下一次模型请求会列出最近调用的工具、路径、调用次数、最近结果节选及约定的缺失文件。成员仍可查阅其他来源、补正文、运行检查、返回成果或说明阻塞。已回答的相同业务问题复用先前答复。预算进入收尾预留、用户取消以及独立评审签署结果，各自按对应事件处理。历史失败详情仍可解释旧版本按停滞次数转入文字交接的记录。
 
-这里参考 OpenAI Agents SDK 按当前运行上下文计算工具可用性，并在执行前处理已失效工具的做法。Studio 将 `deliver` 的写入范围绑定到本次委派声明的文件，并核对工作目录里实际产生的版本。[上游工具筛选](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L302-L320) · [上游执行前拒绝测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_run_step_execution.py#L1604-L1639) · [成员进度回归](../tests/test_crew_progress.py) · [群聊交付回归](../tests/test_studio_crew.py)
+这一行为参考 Pi 的 Agent 主循环。在当前工具批次所有回执到齐后，Pi 注入下一轮指导并继续处理请求，取消和模型错误各有明确的退出路径。Studio 在这一步提供本次成员分工的工作区证据，并对照用户要求执行独立验收。[Pi 工具批次和后续指导](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/src/agent-loop.ts#L233-L305) · [Pi 批次后注入消息测试](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/test/agent-loop.test.ts#L815-L870) · [Pi 中途取消测试](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/agent/test/agent-loop.test.ts#L1003-L1033) · [成员进度回归](../tests/test_crew_progress.py) · [普通群聊入口回归](../tests/test_studio_crew.py)
 
 失败详情会把同一次成员尝试的工具清单、实际调用和交接回执对齐。若写工具曾经开放、成员一次也没调用、宿主因停滞收起工具，且最终确实缺文件，界面会说明在哪一步转入文字交接，并列出这次分工缺少的路径。真正的工具错误、预算耗尽、发布到本地目录失败都有各自的诊断。这里参考 OpenAI Agents SDK 通过所属运行和 span 身份关联工具与结束事件的做法，Studio 另外核对持久任务尝试与群聊交接记录。[轨迹导出](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tracing/spans.py#L373-L405) · [工具轨迹测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_tracing.py#L452-L481) · [Studio 失败诊断回归](../tests/test_studio_diagnostics.py)
 
@@ -207,7 +211,7 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 原检查证据按仍未解决的检查范围保留一份，重复失败不会替换原件；解决后释放。达到 16 个原文名额时保留先前证据，将未收录的范围与原调用明确列入 `undisclosed_failure_probes`。交接总量或内容校验导致无法转交的范围列入 `untransferred_failure_probes`。这些失败继续阻止发布，不会作为已复核项省略。
 
-运行证据 `failed_check_details` 显示原检查调用、步骤、工具外层退出码、检查进程退出码和错误节选。`scope_id` 与 `complete_verification` 的键是检查范围标识，文件摘要使用明确的 `sha256` 字段；不会要求模型猜测这些键或轮询不存在的异步进程。带 `subprocess` 和顶层断言的 `run_python` 是独立内联检查，内层退出 0 不掩盖外层 `AssertionError`。候选已经齐全、同一版本的其他检查重复通过而原失败仍未关闭时，成员收到定向的 `[BLOCKED]` 交接提示；新文件尚未交付或候选真实发生变化时，继续保留工作工具。该提示只改变移交时机，不批准成果，也不自动重放命令。
+运行证据 `failed_check_details` 显示原检查调用、步骤、工具外层退出码、检查进程退出码和错误节选。`scope_id` 与 `complete_verification` 的键是检查范围标识，文件摘要使用明确的 `sha256` 字段；不会要求模型猜测这些键或轮询不存在的异步进程。带 `subprocess` 和顶层断言的 `run_python` 是独立内联检查，内层退出 0 不掩盖外层 `AssertionError`。候选已经齐全、同一版本的其他检查重复通过而原失败仍未关闭时，成员收到定向的 `[BLOCKED]` 交接提示；新文件尚未交付或候选真实发生变化时，继续保留工作工具。成员自主决定继续修复或移交；提示本身不产生通过记录。
 
 这一补充参考 pytest 将 `nodeid`、`outcome`、异常 `longrepr` 和捕获输出分别保存的机制，尤其是 `TestReport.from_item_and_call` 对实际异常的判断；其回归确认异常在序列化后仍存在、导入包装错误不会盖住原始异常。Studio 使用既有工具身份和冻结候选，另外保存成员编辑过的脚本原文供第三方裁决；未复制上游代码或引入依赖。[pytest 8.3.5 的报告构造与异常分支](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/reports.py#L270-L403) · [异常保留与导入错误回归](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_reports.py#L390-L414) · [Studio 普通群入口的 191/9→200/0→独立裁决回归](../tests/test_private_candidate_review.py) · [步骤证据与停滞回归](../tests/test_crew_progress.py)
 
@@ -241,7 +245,7 @@ Pi 的 Bash 工具及其超时回归分别保存进程退出、超时原因与�
 
 评审人可调用 `list_review_evidence` 分页查阅本次尝试的宿主回执。每条短 ID 指向实际观察及其类别，来源附原始 URL 和记录摘要，文件附路径、版本和读取范围。同一 URL 返回不同内容时，每次取得的版本有独立 ID。逐项提交会一起返回存在问题的标准 ID、证据要求和缺失的工具操作。报告保留本次引用的证据、任务尝试与原工具调用 ID。
 
-例如，评审人已执行网页测试并从发行方取得公告，但只用 shell 查看成稿时，收尾仍允许用 `read_lines` 读取指定成稿。拿到文件回执后，以它和对应的来源回执提交事实判断。若满足剩余取证条件的集合持续缩小，可在本次分配的时间和预算内继续。相同缺口连续三个收尾工具回合仍未缩小时，系统收回工具并要求明确交接未验证项。独立验收与最终发布仍分别检查绑定版本和用户标准。
+例如，评审人已执行网页测试并从发行方取得公告，但只用 shell 查看成稿时，收尾仍允许用 `read_lines` 读取指定成稿。拿到文件回执后，以它和对应的来源回执提交事实判断。评审员在本次分配的时间和预算内可以继续取证。缺口持续存在时，宿主会提醒尚缺的回执，由评审员继续取证或报告证据不足。独立验收与最终发布仍分别检查绑定版本和用户标准。
 
 普通 `execute` 评审的提交错误列出该标准可选的最新 `passed_check` 短 ID 和用例名称，评审人须选择实际支持该项判断的回执。只有读取、文件摘要或自定义脚本退出记录时，目录会按本角色获准的工具说明如何对冻结输入执行断言。达到收尾条件时仍沿用本轮取证次数和预算。测试以完整退出 0 的自建脚本和一个真实文件哈希重现错误，再经实际断言及短 ID 完成签署。[普通入口与权限回归](../tests/test_execute_review_guidance.py) · [Pydantic AI 工具验证纠错测试](https://github.com/pydantic/pydantic-ai/blob/6d52359b40e72b643306902b672dc963c660beb5/tests/test_tools.py#L4792-L4818)
 
@@ -343,14 +347,30 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 每个派工有持久的 `dispatch_id` 和预留的子运行 ID。来源轮成功收尾并释放工作位置后，调度器创建原生私聊或群任务。相同来源轮对同一目标重复提交同一工作会返回同一回执。目标会话忙时保留队列项。进程重启后按已发布运行的来源身份重新关联。来源轮失败或取消时，尚未发出的派工会记录原因。角色接单沿用该助手在本项目的派工私聊，个人另开的私聊独立保存。
 
-在任意规模的群里，负责人都可以用自己的角色 ID 认领具体文件。比如在研究、写作、复核三人群，研究员兼任负责人时，先用自己的成员执行任务写入笔记，再把笔记交给写作者，最后由复核者检查成稿。负责人协调时使用只读工具，认领的子任务使用独立可写工作副本；两者分别计量。至少一位其他成员应有实际交接，独立评审仍由另一位角色完成。按文件名发起正式复核时，宿主核对当前版本的生产者和 SHA。本轮显式转入的角色私聊原件也可按文件路径定位原作者；发生变更后，须依据新版本重新核对。
+在团队分工模式下，负责人可以用自己的角色 ID 认领具体文件。例如研究员兼任负责人时，可以先写研究笔记，再把笔记交给写作者。协调和成员执行分别计量。一个人已完成全部工作即可交付。选择正式独立复核时，宿主核对文件当前版本、生产者和评审者身份。本轮转入的角色私聊原件也可按路径定位原作者，文件改变后需要对新版重新核对。
 
 来源回合的 `dispatches` 列出收件者、工作说明、状态、子运行与会话 ID、待答问题、答复和交付文件。每次派工都有独立的原生运行和验收记录，预算亦按运行计量。要求文件存在的验收只证明该项文件检查通过，判断其内容可采用独立成员复核和已有的验收规则。主页可继续接收新消息，并刷新较早回合的待办。
 
 选了本机目录时，接单方从该项目目录签出工作副本。显式转交的工作区文件或历史交付按项目相对路径放入子工作区，同名冲突会报告。成功或未配置独立验收的子运行收尾时，只发布负责人的公开工作区里新增、修改或明确指定验收的文件。交付封存到原生 handoff 快照。后续工作看得到相对路径、SHA-256 和 `dispatch:<UUID>/<项目路径>` 引用。打开或转交时核对内容哈希。模型可通过 `list_studio_deliveries` 查找本项目记录，通过 `read_studio_delivery` 阅读实际文本。
 
-这里参考了 OpenAI Agents SDK 将专家作为工具调用时建立单独运行上下文、完成后把结果交还调用者的实现。Studio 把协调和生成工件分成两个任务，可复用同一角色身份，并单独校验发布文件、群成员的实际交接与审阅者身份。三阶段端到端回归核对每份文件的实际发布人和后续读取回执，也覆盖角色 ID 无效、负责人缺少具体文件和只有负责人交接。[嵌套运行](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L1085-L1107) · [读取本次结果的测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L855-L938) · [输入错误处理回归](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L1509-L1532) · [Studio 分派测试](../tests/test_studio_duo.py)
+团队的实际分工使用单独的成员运行，完成后将当次结果交还调用者。Studio 的回归覆盖研究、写作、复核之间的文件传递、错误收件人重选、以及仅负责人完成即可交付。[Studio 分派测试](../tests/test_studio_duo.py)
 
 作者修订后，可以把新版本再交给原评审员。宿主会查出评审员上次收到的版本，仅当当前私有副本仍与该版本逐字节相同、新版来自同一上游会话且轮次更晚，才替换本轮输入。评审员另行编辑过的文件、异源同名文件、用户本地修改都会触发冲突。版本覆盖规则参考 Git 的双树合并，并增加了派工身份核对。[Git 版本选择](https://github.com/git/git/blob/v2.47.0/unpack-trees.c#L2935-L2941) · [工作副本保留测试](https://github.com/git/git/blob/v2.47.0/t/t1001-read-tree-m-2way.sh#L282-L303) · [工作室四轮回归](../tests/test_studio_route_revisions.py)
 
 开源参照采用 OpenAI Agents SDK 的管理者调用专家并提取本次结果的模式，以及按实际能力向模型开放工具的做法。Studio 将专家执行落到原生持久会话，使单执行位置也能完成交接。Temporal SDK 的稳定运行身份与重复启动处理用于核对本地崩溃恢复语义。当前实现沿用项目原有运行时与 SQLite。[专家调用实现](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L646-L692) · [当前调用结果测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L896-L938) · [工具可见性](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_preparation.py#L98-L141) · [Temporal 重复运行处理](https://github.com/temporalio/sdk-python/blob/e64f9dd3b3b513da6676caf5c1a6cbbb36119503/temporalio/client/_impl.py#L201-L221) · [重复运行测试](https://github.com/temporalio/sdk-python/blob/e64f9dd3b3b513da6676caf5c1a6cbbb36119503/tests/test_client.py#L111-L145)
+
+### 群里的收件人与独立复核
+
+群里的每条消息都可以选择本轮收件人。在开头输入 `@writer`、`@写作者` 或 `写作者，` 可以点名，也可以在收件人菜单选择一位成员。成员显示名相同时请用角色 ID。正文里的电子邮箱、被引用的角色名和其他 `@` 字样属于消息内容。收件人在当前成员名单中解析，长期群负责人保留原身份。
+
+例如发送「@writer 请写明 Python 环境配置并保存为 setup.md」。写作者以本轮根任务执行，直接读写工作副本、运行验证并回复；有需要时可临时委派另一位成员。选择「提问」时收件人只有查询工具。在群成员只有一人的情况下，普通消息也由这位成员直接接单。
+
+用「@writer @reviewer」可要求两人实际参与，收尾检查当次交接记录。未点名时，负责人根据任务选择实际执行成员；一个人完成即可结束。需要独立复核时，作者先产生候选，另一位成员通过 `delegate_task.review` 明确候选和标准，再读取原件并提交证据。系统以文件 SHA-256 和实际作者核对独立性。两位不同成员即可承担作者和评审者。成功提交的定向修改也能在原群后续轮次按文件路径发起独立复核。选了本机目录时，只有实际发布到该目录且内容仍相符的版本可沿用这份作者回执。
+
+这里借鉴 OpenAI Agents SDK 的按需调用专家模式。Studio 自行实现了群内收件人、工作区版本及独立验收。定向消息仅在调用成员工具时创建子任务。上游采用 MIT 许可。[上游嵌套运行](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L1085-L1107) · [上游当次调用结果测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L855-L938) · [Studio 收件人与复核回归](../tests/test_studio_addressing.py)
+
+### 群成员侧栏与最新消息
+
+在项目群聊的右栏可以查看成员、打开角色档案，或点 `@` 把角色放到下一条消息的开头。窄屏的成员列表放在对话上方，可以展开。点「管理」可搜索角色、增减成员和交接群负责人。保存时核对名单版本；另一窗口已经更新过名单时，重新载入当前成员供选择。运行中的任务保留接单时的成员，历史消息保留当时的发言角色。
+
+在群聊、私聊或统一对话读到较早的消息时，点「最新消息」或按 End 键可回到最后一条消息末尾。输入消息时 End 仍用于移动文本光标。「最新消息」跟随消息区的位置，滚动到消息末尾或空对话时收起。界面参考 Zulip 按当前频道显示成员和根据消息滚动位置显示跳转按钮的交互，Studio 的成员同时是可被点名执行的角色。[Zulip 成员列表](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/buddy_list.ts#L93-L137) · [跳转按钮](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/scroll_to_bottom_button.ts#L143-L200) · [空会话与当前位置回归](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/scroll_to_bottom_button.test.cjs#L259-L295)
