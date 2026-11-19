@@ -420,7 +420,7 @@ def manifest_issue(expected, actual, *, exact=False, secret=""):
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
     def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None,
-                 review_notes=(), available_tools=(), editable_reports=(), report_outputs=()):
+                 review_notes=(), available_tools=(), editable_reports=(), report_outputs=(), reviewer_task=None):
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
@@ -437,6 +437,8 @@ class ReviewSession:
         self.attempt_id = attempt_id
         self.receipts = {}
         self.assessment = None
+        self.reviewer_task = reviewer_task
+        self.submission_issue = ""
         self.source_files = {}
         self.last_snapshot_issue = None
         protected = set(item.files) | self.reference_paths | item.required_source_paths
@@ -548,6 +550,42 @@ class ReviewSession:
         for d in evidence["diagnostic_checks"]:
             row = {"kind":"diagnostic", "tool":d["tool"], "check":d["check"], "reason":d["reason"]}
             self._add("observation:" + digest(row)[:12], row, None)
+        if self.assessment and any(obs.ok and obs.source == "submit_review" for obs in record.observations):
+            # Other tools in the same batch can introduce failures after the
+            # submission. Close only after the full observed batch agrees.
+            if self.assessment["verdict"] == "passed":
+                _, self.submission_issue = self.reviewer_failures(self.assessment["results"])
+                if self.submission_issue:
+                    self.assessment = None
+                    return
+            self.progress.require_handoff("结构化验收结果已记录")
+
+    def reviewer_failures(self, results):
+        """A public product judgment may dispute only explicitly cited, transferable failures."""
+        if not self.reviewer_task or not (failed := self.progress.failed_checks()):
+            return {}, ""
+        probes = self.progress.inline_failures()
+        cited = {e["receipt_id"] for finding in results if finding["verdict"] == "passed"
+                 for e in finding["receipts"] if e["kind"] == "failed_check"}
+        details = {r["scope_id"]: r for r in self.progress.evidence()["failed_check_details"]}
+        disputes, outstanding = {}, []
+        for scope, label in failed.items():
+            receipt = self._resolve("fail:" + scope)
+            probe = probes.get(scope, {})
+            transferable = bool(receipt and probe.get("task_id") == self.reviewer_task)
+            if transferable and receipt["receipt_id"] in cited:
+                disputes[scope] = probe
+            else:
+                detail = details.get(scope, {})
+                outstanding.append({"scope": scope, "label": label, "ref": receipt and receipt["ref"],
+                    "tool": detail.get("tool"), "check": detail.get("check"), "tool_call_id": detail.get("tool_call_id"),
+                    "error": (detail.get("error_excerpt") or "")[:700], "available_for_peer": transferable})
+        if not outstanding:
+            return disputes, ""
+        return {}, ("仍有未处理的实跑失败，全通过签署尚未生效。请核实原检查，同一检查复验通过会清除此项。"
+            "若你确认是检查方法有误且 available_for_peer 为 true，在对应既有标准的 evidence 同时列出失败 ref 与实际正面证据，"
+            "说明分歧，由独立同伴裁决。确有产品缺陷时提交 changes_requested/product；证据不足可提交 inconclusive/verification。"
+            "不同脚本产生的 PASS 不能单独核销原失败。实际回执：" + json.dumps(outstanding, ensure_ascii=False))
 
     def _add(self, ref, row, tool_call_id):
         fingerprint = digest(row)
@@ -680,6 +718,8 @@ class ReviewSession:
             summary.update(self.execution_guidance())
         if self.last_snapshot_issue:
             summary["snapshot_issue"] = self.last_snapshot_issue
+        if self.submission_issue:
+            summary["submission_issue"] = self.submission_issue
         return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
     def closing_options(self):
@@ -854,10 +894,16 @@ class ReviewSession:
                 if problem:
                     self.promotion_issue_seen = True
                     raise ValueError(problem)
+            if verdict == "passed":
+                _, self.submission_issue = self.reviewer_failures(results)
+                if not self.submission_issue and self.reviewer_task and (missing_paths := self.progress.pending_paths()):
+                    self.submission_issue = "请先交付本次分工指定的附件，再提交全通过签署：" + "、".join(sorted(missing_paths))
+                if self.submission_issue:
+                    raise ValueError(self.submission_issue)
+            self.submission_issue = ""
             self.assessment = {"target":self.item.target,"candidate_version":self.item.version,
                                "evaluator":self.item.reviewer,"attempt_id":self.attempt_id,
                                "verdict":verdict,"results":results}
-            self.progress.require_handoff("结构化验收结果已记录")
             return ToolResult.success("验收已记录：" + verdict)
         except (ValueError, OSError) as exc:
             return ToolResult.failure(str(exc))

@@ -670,7 +670,7 @@ class RoomCrew:
         return self.native_reviews.next(self._review_answers())
 
     @staticmethod
-    def _bound_probe_conflicts(review, session, progress, task_id):
+    def _bound_probe_conflicts(review, session, progress):
         """Only an accepted finding's explicit contrary evidence is disputed.
 
         Incidental exploratory failures do not acquire new product criteria.
@@ -680,14 +680,8 @@ class RoomCrew:
                 or session.assessment["verdict"] != "passed" or progress.pending_paths()
                 or session.snapshot_issue()):
             return {}
-        failed = progress.failed_checks()
-        cited = {r["scope"] for finding in session.assessment["results"] for r in finding["receipts"]
-                 if finding["verdict"] == "passed" and r["kind"] == "failed_check"}
-        probes = progress.inline_failures()
-        if not failed or not failed.keys() <= cited or not failed.keys() <= probes.keys():
-            return {}
-        return {scope: probes[scope] for scope in failed} if all(
-            probes[scope].get("task_id") == task_id for scope in failed) else {}
+        bound, _ = session.reviewer_failures(session.assessment["results"])
+        return bound
 
     def _queue_reviewer_probes(self, parent, report, draft, assessment, support):
         # Even an unavailable independent actor must not erase accepted signed
@@ -696,6 +690,7 @@ class RoomCrew:
         probes = draft["inline_failures"]
         if (not draft["checkpoint"] or not draft["manifest"]
                 or set(probes) != set(draft["failed_checks"]) or len(probes) > 24):
+            parent.host_issue = "失败检查的完整原始探针或冻结快照无法交付给独立同伴。请恢复原检查和输入后重新验证。"
             return False
         # The coordinator may adjudicate in an isolated member task when
         # someone else authored the product and someone else signed the probe.
@@ -1560,6 +1555,7 @@ class RoomCrew:
             editable_reports = set() if private else self._editable_review_reports(role, required, original, review)
             fresh_reports = {p for p in required if p not in original and Path(p).suffix.lower() in {".md", ".txt", ".rst"}}
             session = ReviewSession(review, baseline, progress, execution.attempt.attempt_id, editable_reports=editable_reports,
+                                    reviewer_task=record.task_id if not private and review.kind == "product" else None,
                                     report_outputs=fresh_reports if not private else (),
                                     available_tools={spec.name for spec in registry.specs()},
                                     private_snapshot_issue=private_snapshot_issue if private else None,
@@ -1759,12 +1755,12 @@ class RoomCrew:
                               token_reserve=reserve, seconds_reserve=handoff_seconds)
 
         def handoff_issue():
-            if not private and self._bound_probe_conflicts(review, session, progress, record_id):
+            if not private and self._bound_probe_conflicts(review, session, progress):
                 # A valid signed assessment with explicit contrary evidence is
                 # handed to an independent peer, not silently made effective.
                 return None
             if session and not session.assessment:
-                return session.last_snapshot_issue or "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
+                return session.last_snapshot_issue or session.submission_issue or "独立验收尚未调用 submit_review。请逐项提交判断与宿主回执。"
             if session and session.assessment["verdict"] != "passed" and not progress.pending_paths():
                 # Finding an observable product failure is a valid outcome of a review.
                 return None
@@ -1856,7 +1852,7 @@ class RoomCrew:
             usage["seconds"] = round(time.monotonic() - started, 3)
         status = result.status
         text = result.answer or result.error or status
-        bound_probes = self._bound_probe_conflicts(review, session, progress, record_id)
+        bound_probes = self._bound_probe_conflicts(review, session, progress)
         disputed = bool(bound_probes and not private and not self.should_cancel()
                         and (status in {"completed", "unverified"} or text.startswith("[BLOCKED]"))
                         and not (spec and not result.succeeded))
@@ -1930,6 +1926,7 @@ class RoomCrew:
                 review.repair_blocked(progress.project_versions(), progress.failed_checks(), progress.pending_paths())
             elif not private_repair:
                 review.state = "blocked"
+                review.host_issue = (session.submission_issue if session else "") or issue or text
         native_target = review.target if review and review.state == "passed" and published else None
         ledger = {**evidence, "pending_verification": []} if published and promotion else evidence
         reviewed = self._record_check_reviews(role, record.task_id, text, ledger, baseline if promotion else original,

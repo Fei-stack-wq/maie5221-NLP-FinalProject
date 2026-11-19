@@ -183,6 +183,44 @@ class BoundReviewerProbeTest(unittest.TestCase):
         contexts = json.dumps(provider.probe_contexts, ensure_ascii=False)
         self.assertIn(BAD_SCOPE, contexts)
 
+    def test_missing_failure_receipt_rejected_before_handoff_then_adjudicated_on_same_candidate(self):
+        steps = self.start_bound_review()
+        unbound = bound_submission()
+        unbound["tool_calls"][0]["arguments"]["results"][0]["evidence"] = ["file:" + PATH, "pass:" + FIXED_SCOPE]
+        steps[-2:-2] = [unbound, tool("list_review_evidence"), tool("read_lines", path=PATH)]
+        steps += self.peer_steps() + [{"text":"Verified the actual label independently."}, {"text":"Delivered."}]
+        detail, reports, provider = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        original, arbiter = reports[1:]
+        self.assertEqual(original["native_review"]["assessment"]["verdict"], "passed")
+        self.assertEqual(arbiter["native_review"]["state"], "passed")
+        path = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
+        trace = [json.loads(line) for line in path.read_text().splitlines()]
+        calls = [r for r in trace if r.get("kind") == "tool_result" and r.get("task_id") == original["task_id"]]
+        submissions = [r for r in calls if r.get("tool") == "submit_review"]
+        self.assertEqual([r["ok"] for r in submissions], [False, True])
+        failed = original["evidence"]["failed_check_details"][0]
+        rejection = next(m["content"] for messages, _ in provider.requests for m in messages
+                         if m.get("role") == "tool" and "全通过签署尚未生效" in str(m.get("content")))
+        self.assertIn(failed["tool_call_id"], rejection)
+        bound = original["native_review"]["assessment"]["results"][0]["receipts"]
+        self.assertIn(next(r["ref"] for r in bound if r["kind"] == "failed_check"), rejection)
+        self.assertTrue(any(r["ok"] and r.get("tool") == "read_lines" for r in calls))
+        self.assertEqual([e["text"] for e in detail["room_events"] if e["kind"] == "reviewer_probe_resolved"],
+                         ["probe_corrected"])
+
+    def test_unprocessed_probe_preserves_reason_when_reviewer_cannot_finish(self):
+        steps = self.start_bound_review()
+        steps[-2]["tool_calls"][0]["arguments"]["results"][0]["evidence"] = ["file:" + PATH, "pass:" + FIXED_SCOPE]
+        steps += [{"text":"[BLOCKED] The independent review could not finish."}]
+        detail, reports, _ = self.run_steps(steps)
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        review = reports[-1]["native_review"]
+        self.assertIsNone(review["assessment"])
+        self.assertEqual(review["state"], "blocked")
+        self.assertIn("实跑失败", review["host_issue"])
+        self.assertIn(BAD_SCOPE, review["host_issue"])
+
     def test_incomplete_original_source_cannot_gain_the_bound_probe_exception(self):
         oversized = BAD_PROBE + "# full source unavailable to the bounded probe ledger\n" * 700
         self.assertGreater(len(oversized.encode()), 32768)
