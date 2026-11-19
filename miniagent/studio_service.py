@@ -1668,6 +1668,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                         return assistant_policy
                 if crew:
                     registry.add(crew.diagnostics.tool())
+                    if crew.direct:
+                        crew.guard_probe_inputs(registry)
                 agent = Agent(name=recipient, provider=provider, registry=registry,
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
                               human_handler=(self._human_handler(run_id, recipient, deadline=crew.deadline - crew.close_seconds)

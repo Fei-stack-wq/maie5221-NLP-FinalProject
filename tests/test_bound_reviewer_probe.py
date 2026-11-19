@@ -539,6 +539,49 @@ class BoundReviewerProbeTest(unittest.TestCase):
         checks = [e for e in detail["room_events"] if e["kind"] == "reviewer_probe_pending"]
         self.assertEqual(len(checks), 1, "The adjudicator's local probe must not recursively open a new review.")
 
+    def test_addressed_lead_resumes_same_adjudicator_before_touching_frozen_report(self):
+        initial = "Earlier public inspection report."
+        prefix = [tool("delegate_task", assignee="inspector", objective="Publish the initial inspection note.",
+                       deliverable_paths=["inspection.md"]), write("inspection.md", initial), {"text":"Published."}]
+        first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="verification", action="Remeasure from the same frozen label.")
+        steps = prefix + self.start_bound_review() + first + [{"text":"The quantity needs independent remeasurement."},
+            tool("append_file", path="inspection.md", content="Premature coordinator edit."),
+            tool("edit_file", path=PATH, old_text="10", new_text="11"), tool("read_file", path="inspection.md")]
+        steps += self.peer_steps() + [{"text":"Confirmed the frozen quantity."},
+            tool("append_file", path="inspection.md", content=" Coordinator recorded the closure."), {"text":"Delivered."}]
+        detail, reports, provider = self.run_steps(steps, objective="@lead Coordinate the label and its independent review.")
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        child = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([r["role"] for r in child], ["arbiter", "arbiter"])
+        version = child[0]["native_review"]["candidate_version"]
+        self.assertEqual(child[1]["native_review"]["candidate_version"], version)
+        ctx = [m["content"] for messages, _ in provider.requests for m in messages if isinstance(m.get("content"), str)]
+        self.assertTrue(any("独立裁决正在等待 arbiter" in m and version in m and "省略 review 和 recover_from" in m for m in ctx))
+        run = self.root / "runs" / detail["run"]["id"]
+        events = [json.loads(line) for line in (run / "trace.jsonl").read_text().splitlines()]
+        writes = [(e["tool"], e["ok"]) for e in events if e.get("task_id") == detail["run"]["id"]
+                  and e["kind"] == "tool_result" and e["tool"] in {"append_file", "edit_file"}]
+        self.assertEqual(writes, [("append_file", False), ("edit_file", False), ("append_file", True)])
+        result = (run / "agents" / "lead" / "inspection.md").read_text()
+        self.assertNotIn("Premature coordinator edit", result)
+        self.assertIn("Coordinator recorded the closure", result)
+
+    def test_changed_public_bytes_keep_probe_blocked_and_identify_the_changed_file(self):
+        first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="verification", action="Remeasure the frozen label.")
+        steps = self.start_bound_review() + first + [{"text":"The quantity needs remeasurement."},
+            tool("run_python", code="from pathlib import Path\nPath('inspection.md').write_text('new public text')"),
+            tool("delegate_task", assignee="arbiter", objective="Resume original adjudication."),
+            {"text":"[BLOCKED] The public review report was changed."}]
+        detail, reports, provider = self.run_steps(steps, objective="@lead Coordinate the quantity verification.")
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([r["native_review"]["assessment"]["verdict"] for r in children], ["inconclusive"])
+        text = [m["content"] for messages, _ in provider.requests for m in messages if m.get("role") == "tool"]
+        self.assertTrue(any("此次冻结裁决已失效" in m and "公开基线差异" in m and "inspection.md" in m for m in text))
+        self.assertFalse(any(e["kind"] == "reviewer_probe_resolved" for e in detail["room_events"]))
+
     def test_business_answer_resumes_the_same_frozen_probe_without_a_second_question(self):
         first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
         first[-1]["_probe_finding"].update(cause="business", reason="The unit label has two plausible meanings.",

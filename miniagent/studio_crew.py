@@ -11,8 +11,8 @@ import tempfile
 import time
 import uuid
 from collections import Counter, deque
-from dataclasses import asdict, dataclass
-from functools import cached_property
+from dataclasses import asdict, dataclass, replace
+from functools import cached_property, partial
 from pathlib import Path
 
 from .acceptance import _relative_name
@@ -25,6 +25,7 @@ from .peer_recheck import ClosingPeerChecks
 from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_project_file, validate_project_data
 from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, ToolCompletion, policy_messages
 from .sandbox import Sandbox
+from .schemas import ToolResult
 from .studio_acceptance import build_checks
 from .studio_reviews import CandidateLookupError, InheritedCriteriaConflict, Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
@@ -669,6 +670,53 @@ class RoomCrew:
                 return child
         return self.native_reviews.next(self._review_answers())
 
+    def _pending_probe(self):
+        return next((r for r in getattr(self, "reviewer_probe_reviews", {}).values() if not r["resolved"]), None)
+
+    def _probe_dispatch_hint(self, pending):
+        if not pending:
+            return ""
+        child = pending["review"]
+        if child.state == "blocked":
+            return ("本轮独立裁决已经阻塞，重复委派不能解锁。请向用户报告目标 " + child.target + " 的具体原因：" +
+                    (child.host_issue or "未取得符合标准的新证据或有效工件。"))
+        if child.state != "review":
+            return ""
+        request = {"assignee": child.reviewer, "objective": "在同一冻结候选上补查未决原标准，提交独立裁决。",
+                   "deliverable_paths": []}
+        return ("独立裁决正在等待 " + child.reviewer + "，目标 " + child.target + "，候选 SHA-256 " + child.version +
+                "。从负责人调用 delegate_task " + _json(request) + "，省略 review 和 recover_from。"
+                "宿主会恢复独立成员的冻结副本。即使你本人就是该成员，也请从独立成员任务中签署。"
+                "请保持公共工作区的当前版本，裁决结束后再编辑成稿和评审报告。")
+
+    def guard_probe_inputs(self, registry):
+        for name in ("write_file", "edit_file", "append_file", "delete_file"):
+            if tool := registry.get(name):
+                registry.add(replace(tool, fn=partial(self._guard_probe_input, name, tool.fn)))
+
+    def _guard_probe_input(self, name, original, ctx, args):
+        pending = self._pending_probe()
+        if pending and pending["review"].state == "review":
+            child = pending["review"]
+            draft = self.private_drafts.get(child.author)
+            if not draft or draft["task_id"] != child.draft_task or draft["version"] != self.project_version:
+                return original(ctx, args)
+            path = ctx.sandbox.resolve(args["path"])
+            rel = ctx.sandbox.relative(path)
+            protected = child.probe_product_files.keys() | set(pending["report"]["deliverable_paths"])
+            if rel in protected:
+                base = pending["base"].get(rel)
+                same_write = name == "write_file" and hashlib.sha256(args["content"].encode()).hexdigest() == base
+                same_edit = name == "edit_file" and args["old_text"] == args["new_text"]
+                would_change = not (same_write or same_edit or name == "append_file" and not args["content"]
+                                    or name == "delete_file" and not path.exists())
+                # Do not obstruct restoring already-changed public bytes. The
+                # normal checkpoint/base validation still runs before dispatch.
+                if would_change and (not path.exists() and base is None or path.is_file() and base
+                        and path.stat().st_size <= 8 * 1024**2 and hashlib.sha256(path.read_bytes()).hexdigest() == base):
+                    return ToolResult.failure(f"修改裁决输入 {rel} 会使当前冻结候选失效。" + self._probe_dispatch_hint(pending))
+        return original(ctx, args)
+
     @staticmethod
     def _bound_probe_conflicts(review, session, progress):
         """Only an accepted finding's explicit contrary evidence is disputed.
@@ -847,9 +895,12 @@ class RoomCrew:
     def coordinator_policy(self, state, budget):
         bare_close = StepPolicy("finalize", allowed_tools=frozenset(), compact=True)
         self.close_tokens = estimate_tokens(policy_messages(state, bare_close)) + self.close_state_bytes + 2304
+        probe_hint = self._probe_dispatch_hint(self._pending_probe())
         if self.direct:
             recovery = self.direct_progress.recovery_feedback()
             instruction = self.direct_instructions() + "\n" + self.direct_progress.steering()
+            if probe_hint:
+                instruction = probe_hint + "\n" + instruction
             if recovery:
                 instruction += ("\n" + recovery + "\n当前阅读位置：" + _json(self.direct_progress.read_checkpoint())
                                 + "\n本轮成员交接：" + _json([{k: r[k] for k in ("role", "task_id", "published",
@@ -886,6 +937,8 @@ class RoomCrew:
                               + self._peer_check_instruction(), frozenset(), compact=True)
         personal = self.role_session.context(self.lead, state.goal) if self.role_session else ""
         instruction = self.instructions() + self._prior_context()
+        if probe_hint:
+            instruction = probe_hint + "\n" + instruction
         if personal:
             instruction += "\n" + personal
         if self.private_read:
@@ -1230,7 +1283,8 @@ class RoomCrew:
                         + _json(peers) + "。")
                 return self._reject_destination(("lead_assignment", role), hint)
         if review and review.kind == "reviewer_probe" and payload.get("review") is not None:
-            return self._observation(False, "当前须裁决已绑定的评审探针。请省略 review，沿用宿主逐项标准。")
+            return self._observation(False, "当前须裁决已绑定的评审探针。请省略 review，沿用宿主逐项标准。" +
+                                     self._probe_dispatch_hint(self._pending_probe()))
         peer_check = False
         if self._only_peer_checks_remaining():
             selection = payload.get("review")
@@ -1363,7 +1417,12 @@ class RoomCrew:
         if review and review.draft_task and (not draft or draft["task_id"] != review.draft_task
                 or draft["version"] != self.project_version or draft["manifest"] != review.files):
             review.state = "blocked"
-            return self._observation(False, "候选检查点或公共版本已变化，请重新选择最新检查点。")
+            review.host_issue = ("候选检查点或公共版本已变化，此次冻结裁决已失效。请保留已有证据，"
+                                 "在同群下一轮选择已发布的当前版本发起独立复核。")
+            if self.direct and draft and (difference := manifest_issue(draft["base"], self.direct_baseline,
+                                                                      exact=True, secret=self.settings.api_key)):
+                review.host_issue += "公开基线差异：" + difference
+            return self._observation(False, review.host_issue)
         if draft and draft["version"] != self.project_version:
             draft = None
         transfer = donor != role
