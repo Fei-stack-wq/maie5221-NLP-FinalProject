@@ -223,6 +223,8 @@ class Agent:
             task_id=task_id,
             history=history,
         )
+        if conversation_context:
+            state.scratch["work_context"] = conversation_context
         budget = budget or Budget.from_limits(limits)
         initial_seconds = min(budget.seconds_left, limits.max_seconds)
         initial_steps, initial_tokens = budget.steps_left, budget.tokens_left

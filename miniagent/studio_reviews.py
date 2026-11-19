@@ -619,7 +619,7 @@ class ReviewSession:
                 and any(self.item.probe_product_files.get(path) == sha
                         for path, sha in receipt.get("asserted_inputs", {}).items()))
 
-    def guidance(self):
+    def guidance(self, *, show_examples=True):
         # Avoid repeatedly projecting every URL or duplicating the raw records.
         # The paginated tool returns the original, unabridged source mapped to each ref.
         by_kind = {}
@@ -627,7 +627,9 @@ class ReviewSession:
             label = receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt.get("check") or ""
             by_kind.setdefault(receipt["kind"], []).append([receipt["ref"], label[:110]])
         summary = {"recent_evidence":{k:v[-6:] for k,v in by_kind.items()},
-                   "needs":self.evidence_needs(), "catalog":"list_review_evidence", **self.execution_guidance()}
+                   "needs":self.evidence_needs(), "catalog":"list_review_evidence"}
+        if show_examples:
+            summary.update(self.execution_guidance())
         if self.last_snapshot_issue:
             summary["snapshot_issue"] = self.last_snapshot_issue
         return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))

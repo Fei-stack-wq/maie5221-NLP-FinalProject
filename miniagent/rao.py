@@ -363,6 +363,8 @@ def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]
     """
     if policy.compact:
         messages = [m for m in state.history[:1] if m.get("role") == "system"]
+        if policy.phase == "work" and (context := state.scratch.get("work_context")):
+            messages.append({"role": "user", "content": context})
         messages.append({"role": "user", "content": state.goal})
         for question, reply in state.scratch.get("human_replies", []):
             messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})

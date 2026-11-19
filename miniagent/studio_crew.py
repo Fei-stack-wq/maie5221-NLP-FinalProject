@@ -853,7 +853,14 @@ class RoomCrew:
         bare_close = StepPolicy("finalize", allowed_tools=frozenset(), compact=True)
         self.close_tokens = estimate_tokens(policy_messages(state, bare_close)) + self.close_state_bytes + 2304
         if self.direct:
-            return StepPolicy("work", self.direct_instructions() + "\n" + self.direct_progress.steering())
+            recovery = self.direct_progress.recovery_feedback()
+            instruction = self.direct_instructions() + "\n" + self.direct_progress.steering()
+            if recovery:
+                instruction += ("\n" + recovery + "\n当前阅读位置：" + _json(self.direct_progress.read_checkpoint())
+                                + "\n本轮成员交接：" + _json([{k: r[k] for k in ("role", "task_id", "published",
+                                                                                   "remaining_issue")} for r in self.reports[-4:]])
+                                + "\n缺少独立来源签署的文件：" + _json(self.native_reviews.missing_source_reviews()))
+            return StepPolicy("work", instruction, compact=bool(recovery))
         pending = self.before_answer() or self.delivery_issue or self.dispatch_ended
         authenticated = () if pending else self._reviewed_delivery()
         review_header = ""
@@ -1699,18 +1706,25 @@ class RoomCrew:
             # textual assignment. On subsequent work reserve the handoff when
             # capping the next provider reply, before its usage is charged.
             steering = progress.steering()
+            recovery = progress.recovery_feedback()
+            if recovery:
+                steering = recovery + "\n" + steering + "\n群内已确认决定：" + _json(group_decisions)
             if session and not session.assessment:
-                steering += "\n提交逐项结论时可引用的宿主回执：" + session.guidance()
+                if recovery:
+                    steering += ("\n当前独立评审尚未签署。可用 list_review_evidence 核对已有短 ID 与候选版本，"
+                                 "根据 needs 补查真实缺项、写评审附件，或用 submit_review 提交有依据的逐项判断。")
+                steering += "\n提交逐项结论时可引用的宿主回执：" + session.guidance(show_examples=not recovery)
             if work_receipt and state.step_index >= 2:
                 # The normal RAO projection keeps recent complete tool
                 # batches, including full actionable reads. This small host
                 # receipt survives when the provider drops older batches.
                 steering += "\n宿主工作记录（文件版本、已读位置、真实检查）：" + _clip(_json(work_receipt), 2200)
-            work = StepPolicy("work", steering, work_tools)
+            work = StepPolicy("work", steering, work_tools, compact=bool(recovery))
             minimum = estimate_tokens(work_schemas) + 768 + estimate_tokens(state.history[:3])
             if not budget.has_tokens(reserve + minimum + 1):
                 return closing if state.step_index else work
-            return StepPolicy("work", steering, work_tools, token_reserve=reserve, seconds_reserve=handoff_seconds)
+            return StepPolicy("work", steering, work_tools, compact=bool(recovery),
+                              token_reserve=reserve, seconds_reserve=handoff_seconds)
 
         def handoff_issue():
             if not private and self._bound_probe_conflicts(review, session, progress, record_id):

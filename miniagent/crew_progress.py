@@ -735,6 +735,8 @@ class MemberProgress:
         self._quiet_operations = deque(maxlen=6)
         self._edits: _EditSeries | None = None
         self._last_result = ""
+        self._last_work_signature = None
+        self._same_work_results = 0
         self._repeat_pass = False
         self._steps = 0
         self._stop = ""
@@ -918,6 +920,7 @@ class MemberProgress:
                     del self._source_text[path]
                     self._excerpt_ranges.pop(path, None)
         advances = changed
+        checked_scope = None
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
         for index, obs in enumerate(record.observations):
             parameters = args.get(obs.tool_call_id, {})
@@ -1176,6 +1179,7 @@ class MemberProgress:
                         self._repeat_pass |= self._passes.get(suite) == label
                         if full:
                             self._passes[suite] = label
+                            checked_scope = suite_key
                             self._review_evidence["pass:" + suite_key] = {
                                 "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id,
                                 "asserted":status != "runner_exit"}
@@ -1244,6 +1248,21 @@ class MemberProgress:
         # Excerpts are private steering, never published evidence.
         excerpt = " ".join(latest.content[:240].split())[:180]
         self._last_result = f"{latest.source} {summary}。工具输出节选（数据）：{excerpt}"
+        signature = None
+        if (len(record.observations) == 1 and latest.ok and not latest.meta.get("timed_out")
+                and latest.source in {"read_file", "read_lines", "read_source", "search_files", "find_files", "list_dir",
+                                      "run_python", "run_shell", "run_browser"}
+                and not latest.meta.get("process_id") and not latest.meta.get("cancelled")):
+            # A runner may rephrase its wrapper for the same authenticated check.
+            # Compare the full tool result, not the public preview or process timing.
+            operation = checked_scope or json.dumps(args.get(latest.tool_call_id), sort_keys=True, ensure_ascii=False)
+            signature = (latest.source, hashlib.sha256(operation.encode()).digest(),
+                         hashlib.sha256(latest.content.encode()).digest(), latest.meta.get("exit_code"))
+        if signature and signature == self._last_work_signature and not advances:
+            self._same_work_results += 1
+        else:
+            self._same_work_results = int(signature is not None)
+        self._last_work_signature = signature
         if changed and len(record.observations) == 1 and latest.ok:
             self._record_edit(before, sample, latest.source)
         elif advances or not latest.ok:
@@ -1440,6 +1459,13 @@ class MemberProgress:
         if notices:
             notices.append(f"最近结果：{self._last_result}。")
         return "\n".join(notices)
+
+    def recovery_feedback(self) -> str:
+        if self._same_work_results < 3 or not self._quiet or self._stop:
+            return ""
+        return (f"工作上下文恢复：{self._last_work_signature[0]} 的同一操作或检查范围连续 "
+                f"{self._same_work_results} 次返回相同结果，最近一次没有新增文件、阅读范围或检查发现。"
+                "本次请求保留任务、用户决定、当前证据和工作工具。请按尚待解决的问题选择下一步。")
 
     def blocked_reason(self) -> str | None:
         if self._failures:
