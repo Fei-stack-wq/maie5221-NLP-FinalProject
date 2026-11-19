@@ -210,6 +210,8 @@ CLI / StudioService ───┴─ Orchestrator          计划校验 → 路�
 
 ## 测试与开发
 
+Mid_Test 六道题均已用真实 DeepSeek 在原群完成并通过独立实物验收。逐题交付、返工次数、运行 ID 和已知限制见[六题验收报告](docs/mid-test-status.md)。
+
 ```powershell
 python -m unittest discover -s tests -t . -v
 ```
