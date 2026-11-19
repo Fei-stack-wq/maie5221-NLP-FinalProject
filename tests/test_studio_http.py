@@ -52,6 +52,22 @@ class StudioHTTPTest(unittest.TestCase):
         headers = {key: value for key, value in headers.items() if value is not None}
         return self.fetch("POST", "/api/runs", json.dumps(value).encode(), headers)
 
+    def test_superagent_http_replay_head_and_same_origin_guard(self):
+        from miniagent.providers import ScriptedProvider
+        endpoint = "/api/superagent/messages"
+        payload = json.dumps({"request_id": str(uuid.uuid4()), "message": "你好", "parent_run_id": None})
+        headers = {"Content-Type": "application/json", "Origin": self.origin, "X-Studio-Token": self.server.studio_token}
+        self.assertEqual(json.loads(self.fetch(path="/api/superagent")[2])["head_run_id"], None)
+        self.assertEqual(self.fetch("POST", endpoint, payload, {"Content-Type": "application/json"})[0], 403)
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=ScriptedProvider([{"text": "你好"}])):
+            status, _, body = self.fetch("POST", endpoint, payload, headers)
+            self.assertEqual(status, 202, body)
+            run_id = json.loads(body)["run"]["id"]
+            finished(self.service, run_id)
+        self.assertEqual(json.loads(self.fetch(path="/api/superagent")[2]),
+                         {"conversation_id": run_id, "head_run_id": run_id})
+        self.assertEqual(json.loads(self.fetch("POST", endpoint, payload, headers)[2])["run"]["id"], run_id)
+
     def test_native_folder_picker_uses_existing_origin_and_token_gate(self):
         route = "/api/workspaces/pick"
         headers = {"Origin": self.origin, "Content-Type": "application/json",

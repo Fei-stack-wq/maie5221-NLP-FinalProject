@@ -1,0 +1,25 @@
+.activity-group,.activity-lazy{margin:.55rem 0;color:inherit;font-size:.8rem;text-align:start}
+.activity-group>summary,.activity-lazy>summary{cursor:pointer;color:var(--muted,#66645e);width:fit-content;max-width:100%;overflow-wrap:anywhere}
+.activity-group>summary b{font-variant-numeric:tabular-nums;font-weight:500;padding-inline:.2rem}
+.activity-latest{margin-inline-start:.65rem;font-size:.74rem;color:var(--muted,#66645e)}
+.activity-calls{max-height:23rem;overflow:auto;border-inline-start:1px solid var(--line,#d4d2ca);margin:.45rem 0 .6rem .26rem;padding-inline-start:.7rem}
+.activity-call{padding:.17rem 0;min-width:0}
+.activity-call>summary{display:flex;align-items:baseline;gap:.4rem;cursor:pointer;list-style:none;padding:.22rem 0;min-width:0}
+.activity-call>summary::-webkit-details-marker{display:none}
+.activity-indicator{width:.42rem;height:.42rem;border-radius:100%;background:#658273;flex:none;align-self:center}
+.activity-indicator[data-status=running]{background:#ae7038;box-shadow:0 0 0 2px #ae703824}
+.activity-indicator[data-status=failed]{background:#b74240}
+.activity-indicator[data-status=interrupted]{background:#8a8378}
+.activity-title,.activity-title code{min-width:0;overflow-wrap:anywhere}
+.activity-title code,.activity-info code,.activity-preview-text,.activity-result{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.activity-title code{font-size:.75rem;margin-inline-start:.12rem}
+.activity-state,.activity-info,.activity-note{color:var(--muted,#66645e);font-size:.73rem}
+.activity-state{margin-inline-start:auto;white-space:nowrap;padding-inline:.4rem}
+.activity-info{display:flex;gap:.7rem;margin:.2rem 0 .2rem .8rem;flex-wrap:wrap}
+.activity-result,.activity-preview-text{font-size:.77rem;line-height:1.55;background:var(--surface-soft,#f2f1eb);border-radius:.3rem;padding:.55rem .7rem;white-space:pre-wrap;overflow-wrap:anywhere;margin:.25rem 0;max-height:17rem;overflow:auto}
+.activity-result{margin-inline-start:.8rem}
+.activity-file-preview{margin:.2rem 0 .5rem;flex-basis:100%;min-width:0;max-width:100%}
+.activity-note{margin:.35rem 0}
+.activity-group summary:focus-visible,.activity-lazy summary:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+.activity-image-body::part(thumbnail){display:block;max-inline-size:min(100%,32rem);max-block-size:18rem;box-sizing:border-box;object-fit:contain;margin:.4rem 0;border:1px solid var(--line,#d4d2ca);border-radius:.35rem}
+.activity-image-body::part(retry){font:inherit;color:inherit;background:none;border:0;text-decoration:underline;cursor:pointer;padding:.3rem 0}

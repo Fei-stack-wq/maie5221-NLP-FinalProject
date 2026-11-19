@@ -1,5 +1,7 @@
 # 个人 Agent 工作室：分阶段开发计划
 
+> **2026-11-19 统一对话入口。** Superagent 可以在同一个长期对话中按用户的要求创建角色、选择成员与负责人、建立群聊。用户从消息直接进入已有角色或新群，查看工具进展和本轮产物。角色库存储、群内分工与项目验收继续由各自模块负责。此前的 Mid_Test 六题均已完成独立实物验收。[工作室操作说明](local-studio-gui.md) · [六题验收记录](mid-test-status.md)
+
 > 更新：2026-11-17（America/Los_Angeles）。M0-01 已合入 `main`，基线 `fa6d928`；初次评估基线为 `3e195e2`。
 > 状态：**M0-01 已交付；M0-02 已以 `07c9fe2` 合入并推送 `main`；M0-03 已完成并合入 main；M0-04 已实现持久任务、事务状态与运行期接入**。M0-04 工作分支为 `jinyuwu/m0-04-task-store`。接口与证据边界见 [M0-02](m0-02-acceptance-and-metrics.md)、[M0-03](m0-03-provider-protocol.md) 和 [M0-04](m0-04-task-store.md)。新增 **M0-UI-01 本地网页工作室**，开发分支 `jinyuwu/local-studio-gui`；任务操作与观测先接入。2026-11-17 按真实任务反馈新增 **M0-H01/H02 Harness 基础门槛**，先补执行可靠性，再做 M1 角色和 skill 管理，参见 [机制调研与验收](harness-foundations.md)。工作室已提前接入 M2-03 中的项目私聊、群聊及逐轮指定接收人，后续交付见第 5.2 节。
 

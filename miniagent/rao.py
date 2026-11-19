@@ -523,6 +523,8 @@ class RAOUnit:
         self.loop_warn = loop_warn
         self.loop_stop = loop_stop
         self.enable_control_tools = enable_control_tools
+        self.tool_started: Callable[[int, Action], None] | None = None
+        self.tool_observed: Callable[[int, Action, Observation], None] | None = None
         self.action_recorder = action_recorder
         self.should_cancel = should_cancel
 
@@ -813,6 +815,8 @@ class RAOUnit:
                     ts=time.time(),
                 )
             elif action.tool in CONTROL_TOOLS and self.enable_control_tools:
+                if self.tool_started:
+                    self.tool_started(state.step_index, action)
                 kind, obs, terminate = self._run_control(action, state, step_id)
                 if obs.ok:
                     if obs.source == "human":
@@ -827,6 +831,8 @@ class RAOUnit:
                     state.scratch["control_feedback:" + action.tool] = control_error
                     state.scratch["delivery_feedback"] = control_error
             else:
+                if self.tool_started:
+                    self.tool_started(state.step_index, action)
                 result = self.registry.dispatch(
                     action.tool,
                     action.arguments,
@@ -875,6 +881,8 @@ class RAOUnit:
                     )
 
             obs = obs.model_copy(update={"action_id": action.action_id, "tool_call_id": call_id})
+            if self.tool_observed:
+                self.tool_observed(state.step_index, action, obs)
             observations.append(obs)
             state.history.append(obs.to_message(call_id))
 

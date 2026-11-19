@@ -312,3 +312,13 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 依据 Python 标准库的实现：`run_path` 明确设置模块名并返回执行后的全局字典；其测试验证自定义 `run_name`、脚本路径与异常。`unittest` 先获得已执行测试的结果，再用 `wasSuccessful()` 决定进程退出码，并对零测试单独处理，因此单独观察 exit 0 不能反推出具体业务断言。这里只提供该标准 API 的适配指引，没有复制上游源码或改变验收判定。[CPython run_path](https://github.com/python/cpython/blob/v3.14.0/Lib/runpy.py#L262-L294) · [脚本名、路径与异常测试](https://github.com/python/cpython/blob/v3.14.0/Lib/test/test_runpy.py#L631-L683) · [unittest 结果与退出码](https://github.com/python/cpython/blob/v3.14.0/Lib/unittest/main.py#L264-L277) · [端到端回归](../tests/test_existing_python_check.py)
 
 T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双尺寸翻页函数真实完成后产生可引用 E 回执；更改 HTML 的负例真实退出 1，旧候选版本与旧 E 被拒绝。这是新离线验证，未改写历史 failed，也不代表线上任务重新执行完成。
+
+### Superagent 的统一对话与工作室工具
+
+统一助手沿用单聊的模型、工具注册表、文件工作区、运行轨迹和任务状态。只有从统一入口创建的对话会获得 `list_studio_roles`、`create_studio_role` 和 `create_studio_group`。已保存的角色可立即用于私聊，或作为群聊成员与负责人。普通群成员使用其原有权限。
+
+`GET /api/superagent` 返回固定会话的 `conversation_id` 和当前 `head_run_id`，首条消息之前两者为 null。`POST /api/superagent/messages` 接受 UUID `request_id`、文本 `message`、当前 `parent_run_id` 及可选的 `workspace_path`。首次发送可省略父轮或传 null。刷新后可以按返回的运行 ID 读取原有详情接口。发送方复用相同请求 ID 可以找回已有运行。来自多个页面的不同消息争用同一父轮时，后到的页面取得 `stale_head`，应先同步对话。工作进程异常退出会释放该轮的 SQLite 写锁。用户随后可以发起新一轮，已执行过的工具不会自动重放。
+
+每次成功创建会写入 `studio_entity` 事件，内含类型、名称和实体 ID。原生空群的 `mode` 为 `room`，状态为 `ready`，轮数为零。在首次发送消息前，用户可以打开、刷新和检查成员。第一次消息会使用这个群实际保存的角色与负责人。用户明确切换本地目录时，统一助手保留聊天历史，重新取所选目录的文件。新群默认使用创建时的项目目录，第一条真实消息再从磁盘读取工作副本。
+
+工具定义参考 OpenAI Agents SDK 将工具名、参数 schema 和当前运行的执行上下文绑定，在参数不匹配或执行失败时给模型返回可修正的错误。Studio 使用现有 ToolRegistry 和服务端角色、群聊存储完成这些操作。参考了接口设计，未复制上游源码。上游采用 MIT 许可证。[函数工具调用实现](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/tool.py#L2809-L2851) · [错误输入和执行异常测试](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_function_tool.py#L642-L665) · [统一对话端到端测试](../tests/test_studio_superagent.py)

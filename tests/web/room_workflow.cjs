@@ -28,10 +28,15 @@ async function checkSourceReviewRequest(page, url, form, requests) {
 
 async function room(page, url) {
   const requests = [];
+  const screenshotRequests = [];
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   page.on('request', request => {
     if (request.method() === 'POST' && request.url() === url + 'api/runs') requests.push(request.postDataJSON());
+    const requested = new URL(request.url());
+    if (requested.pathname.endsWith('/preview') && requested.searchParams.get('path')?.endsWith('room-screen.png')) {
+      screenshotRequests.push(request.url());
+    }
   });
   await page.goto(url + '#chats');
   await page.getByRole('link',{name:'管理工作室角色'}).click();
@@ -123,6 +128,31 @@ async function room(page, url) {
   const preview = await previewPage;
   await preview.frameLocator('iframe').getByRole('heading',{name:'Room fixture preview'}).waitFor();
   await preview.close();
+  const disclosure = files.locator('details[data-activity-kind="image"]');
+  const summary = disclosure.locator('summary');
+  await summary.waitFor();
+  assert.equal(await disclosure.locator('img').count(), 0);
+  assert.deepEqual(screenshotRequests, []);
+  assert.equal(await files.locator('details[data-path$=".html"]').count(), 0);
+  const source = await files.locator('a').filter({hasText:'agents/lead/room-screen.png'}).getAttribute('href');
+  const screenshotURL = new URL(source, url).href;
+  await page.route(screenshotURL, route => route.fulfill({status:403, body:'未获授权'}), {times:1});
+  await summary.click();
+  const retry = disclosure.getByRole('button', {name:'截图加载失败 · 重试'});
+  await retry.click();
+  const thumbnail = disclosure.getByRole('img', {name:'截图 room-screen.png'});
+  await thumbnail.evaluate(image => image.decode());
+  assert.deepEqual(await thumbnail.evaluate(img => [img.naturalWidth, img.naturalHeight]), [41,29]);
+  assert.deepEqual(screenshotRequests, [screenshotURL, screenshotURL]);
+  await summary.click();
+  await summary.click();
+  assert.equal(await thumbnail.isVisible(), true);
+  assert.equal(screenshotRequests.length, 2);
+  const previousSize = page.viewportSize();
+  await page.setViewportSize({width:375, height:800});
+  const thumbnailBounds = await thumbnail.boundingBox();
+  assert(0 < thumbnailBounds.width && thumbnailBounds.x >= 0 && thumbnailBounds.x + thumbnailBounds.width <= 375);
+  await page.setViewportSize(previousSize);
   const screenshotPopup = page.waitForEvent('popup');
   await files.locator('a').filter({hasText:'agents/lead/room-screen.png'}).click();
   const screenshot = await screenshotPopup;

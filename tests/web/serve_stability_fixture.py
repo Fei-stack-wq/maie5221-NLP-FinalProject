@@ -22,7 +22,7 @@ class Handler(BaseHTTPRequestHandler):
                 '<script src="/studio_live_dom.js" defer></script><script src="/app.js" defer></script>',
             ).encode()
             content_type = 'text/html'
-        elif self.path in ('/app.js', '/style.css'):
+        elif self.path in {f'/{asset.name}' for asset in WEB.iterdir() if asset.suffix in {'.js', '.css'}}:
             data = (WEB / self.path[1:]).read_bytes()
             content_type = 'text/css' if self.path.endswith('css') else 'text/javascript'
         elif self.path == '/studio_live_dom.js':

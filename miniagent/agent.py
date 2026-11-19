@@ -39,6 +39,7 @@ from .rao import (
 )
 from .sandbox import Sandbox
 from .schemas import RunResult, Usage
+from .tool_activity import created_name, target_for
 from .tools import ToolRegistry
 from .task_service import ExecutionHandle, TaskService
 from .task_store import StoreError
@@ -200,6 +201,15 @@ class Agent:
             "parent_task_id": parent_task_id,
             "level": "subtask" if root_id is not None and root_id != task_id else "goal",
         }
+        if self.tracer:
+            def tool_started(step, action):
+                self.tracer.event("tool_start", **identity, agent=self.name, step=step, tool=action.tool,
+                                  action_id=action.action_id, tool_call_id=action.id,
+                                  target=target_for(action.tool, action.arguments))
+            self.unit.tool_started = tool_started
+            self.unit.tool_observed = lambda step, action, obs: self._trace_tool(identity, step, obs, action.tool)
+        else:
+            self.unit.tool_started = self.unit.tool_observed = None
         limits = self.settings.limits
         started = time.perf_counter()
 
@@ -759,22 +769,39 @@ class Agent:
             request_id=record.request_id,
             max_output_tokens=request_output_limit,
         )
+        # Calls with bound action IDs were emitted as soon as they returned. Preserve
+        # protocol errors and old synthetic observations that never reached dispatch.
         for obs in record.observations:
-            command_metrics = {}
-            if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:
-                metrics = ("exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
-                           "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state", "replayed_tool_call_id")
-                command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
-            self.tracer.event(
-                "tool_result",
-                **identity,
-                step=record.step,
-                tool=obs.source,
-                action_id=obs.action_id,
-                tool_call_id=obs.tool_call_id,
-                ok=obs.ok,
-                error_class=obs.error_class,
-                artifacts=obs.artifacts,
-                preview=obs.content[:200],
-                **command_metrics,
-            )
+            if not obs.action_id:
+                self._trace_tool(identity, record.step, obs, obs.source)
+
+    def _trace_tool(self, identity, step, obs, operation):
+        command_metrics = {}
+        if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:
+            metrics = ("exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
+                       "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state", "replayed_tool_call_id")
+            command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
+        if obs.source == operation and obs.ok:
+            if operation in {"run_shell", "run_python"}:
+                command_metrics["complete_preview"] = not obs.truncated and len(obs.content) <= 200
+            entity = obs.meta.get("entity")
+            if created_name(operation, entity):
+                command_metrics["created_entity"] = {key: entity[key] for key in ("kind", "id", "name")}
+        for key in ("bytes", "returned_chars", "count"):
+            if type(obs.meta.get(key)) is int:
+                command_metrics[key] = obs.meta[key]
+        self.tracer.event(
+            "tool_result",
+            **identity,
+            step=step,
+            agent=self.name,
+            operation=operation,
+            tool=obs.source,
+            action_id=obs.action_id,
+            tool_call_id=obs.tool_call_id,
+            ok=obs.ok,
+            error_class=obs.error_class,
+            artifacts=obs.artifacts,
+            preview=obs.content[:200],
+            **command_metrics,
+        )

@@ -19,6 +19,10 @@ from .studio_preview import PREVIEW_CSP, html_preview
 MAX_BODY_BYTES = 65536
 _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
            "/index.html": ("index.html", "text/html; charset=utf-8"),
+           "/superagent.css": ("superagent.css", "text/css; charset=utf-8"),
+           "/superagent.js": ("superagent.js", "text/javascript; charset=utf-8"),
+           "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
+           "/activity.css": ("activity.css", "text/css; charset=utf-8"),
            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
            "/style.css": ("style.css", "text/css; charset=utf-8")}
 _CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
@@ -131,6 +135,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         if path == "/api/bootstrap":
             self._json(200, {**service.bootstrap(), "csrf_token": self.server.studio_token})
             return
+        if path == "/api/superagent":
+            self._json(200, service.superagent_head())
+            return
         if path == "/api/profiles":
             self._json(200, {"profiles": service.profiles()})
             return
@@ -148,6 +155,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             if parts[6] == "history":
                 self._json(200, service.role_operation(parts[3], "history", {}, parts[5]))
                 return
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "activity":
+            self._json(200, service.tool_activity(parts[3]))
+            return
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room.zip":
             self._send(200, service.room_bundle(parts[3]), "application/zip", filename=f"{parts[3]}-room.zip")
             return
@@ -158,11 +168,13 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:3] == ["", "api", "runs"]:
             self._json(200, service.detail(parts[3]))
             return
-        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] in {"artifact", "preview", "download"}:
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] in {"artifact", "preview", "download", "excerpt"}:
             params = parse_qs(url.query, keep_blank_values=True)
             if set(params) != {"path"} or len(params["path"]) != 1:
                 raise StudioError("缺少产物路径。")
-            if parts[4] == "download":
+            if parts[4] == "excerpt":
+                self._json(200, service.artifact_excerpt(parts[3], params["path"][0]))
+            elif parts[4] == "download":
                 from urllib.parse import quote
                 name = params["path"][0]
                 data = service.download_artifact(parts[3], name)
@@ -187,7 +199,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         profile_op = parts[:3] == ["", "api", "profiles"] and (
             len(parts) == 5 and parts[4] in {"edit", "knowledge", "bind"} or
             len(parts) == 7 and parts[4] == "knowledge" and parts[6] in {"status", "restore"})
-        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick") and not (cancel or reply or review or profile_op)) or url.query:
+        if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages") and not (cancel or reply or review or profile_op)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -235,6 +247,9 @@ class StudioHandler(BaseHTTPRequestHandler):
                 result = service.role_operation(parts[3], parts[6] if len(parts) == 7 else "save",
                                                 payload, parts[5] if len(parts) == 7 else None)
             self._json(200, result)
+            return
+        if url.path == "/api/superagent/messages":
+            self._json(202, {"run": self.server.studio_service.send_superagent(payload)})
             return
         if url.path == "/api/profiles":
             self._json(200, {"profile": self.server.studio_service.add_profile(payload)})

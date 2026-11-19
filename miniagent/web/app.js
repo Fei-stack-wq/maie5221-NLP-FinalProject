@@ -18,7 +18,7 @@ const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'
 const e = escapeHTML;
 const labels = {completed:'已完成',passed:'通过',succeeded:'已完成',running:'运行中',queued:'排队中',verifying:'验收中',created:'已创建',ready:'待执行',failed:'失败',error:'错误',cancelled:'已取消',cancel_requested:'正在取消',unverified:'未验证',interrupted:'待核实',blocked:'受阻',waiting_user:'等待回复',ended:'已结束'};
 const modeLabels = {demo:'单 Agent 演示','team-demo':'协作演示',single:'单 Agent',team:'多 Agent 协作',cli:'CLI 运行',imported:'历史 CLI 运行'};
-const state = {config:null,chats:null,runs:[],detail:null,route:'home',runId:null,tab:'overview',search:'',filter:'all',logFilter:'all',selectedFile:null,fileData:null,expanded:new Set(),logOpen:new Set(),polling:false,online:true,initialized:false,detailSignature:'',submission:null,cancelling:new Set(),downloads:new Set()};
+const state = {config:null,chats:null,runs:[],detail:null,route:'assistant',runId:null,tab:'overview',search:'',filter:'all',logFilter:'all',selectedFile:null,fileData:null,expanded:new Set(),logOpen:new Set(),polling:false,online:true,initialized:false,detailSignature:'',submission:null,cancelling:new Set(),downloads:new Set()};
 let toastTimer;
 const $ = selector => document.querySelector(selector);
 const main = $('#main');
@@ -90,7 +90,7 @@ function toast(message){$('#toast').textContent=message;$('#toast').hidden=false
 async function api(path,options={}){const response=await fetch(path,{...options,headers:{'Accept':'application/json',...(options.body?{'Content-Type':'application/json','X-Studio-Token':state.config?.csrf_token || ''}:{}),...options.headers}});let data;try{data=await response.json();}catch{throw new Error('服务未返回可读取的数据，请检查本地服务。');}if(!response.ok){const err=new Error(typeof data.error==='string'?data.error:'请求失败，请稍后重试。');err.code=data.code;err.status=response.status;throw err;}return data;}
 function setOnline(value){state.online=value;$('#connection-banner').hidden=value;patchHTML($('#server-status'),`<span class="dot"></span>${value?'本地服务':'重新连接中'}`);}
 function mobileNav(){const open=$('#sidebar').classList.contains('open');$('#sidebar').inert=window.matchMedia('(max-width:650px)').matches&&!open;const button=$('[data-action="menu"]');button.setAttribute('aria-expanded',String(open));}
-function updateSidebar(){mobileNav(); setText($('#nav-count'),state.runs.length);patchHTML($('#recent-nav'),state.runs.slice(0,4).map(r=>`<a class="recent-link" data-key="recent-${e(r.id)}" href="#run/${encodeURIComponent(r.id)}">${icon(stateIcon(r.status))}<span>${e(r.title)}</span></a>`).join('')||'<p class="side-empty">你的任务会显示在这里</p>');document.querySelectorAll('[data-nav]').forEach(n=>n.classList.toggle('active',n.dataset.nav===state.route || (state.route==='detail'&&n.dataset.nav===(state.tab==='chat'?'chats':'runs'))));$('#breadcrumb-current').textContent=state.route==='detail'?'任务详情':state.route==='runs'?'全部任务':state.route==='chats'?'对话':state.route==='roles'?'角色库':'工作台';if(state.config){$('#provider-label').textContent=state.config.provider_ready?'DeepSeek 已配置':'离线模式就绪';$('#provider-caption').textContent=state.config.provider_ready?state.config.model:'无需 API key，即可体验';$('#provider-dot').classList.toggle('ready',state.config.provider_ready);}}
+function updateSidebar(){mobileNav(); setText($('#nav-count'),state.runs.length);patchHTML($('#recent-nav'),state.runs.slice(0,4).map(r=>`<a class="recent-link" data-key="recent-${e(r.id)}" href="#run/${encodeURIComponent(r.id)}">${icon(stateIcon(r.status))}<span>${e(r.title)}</span></a>`).join('')||'<p class="side-empty">你的任务会显示在这里</p>');document.querySelectorAll('[data-nav]').forEach(n=>{const active=n.dataset.nav===state.route || (state.route==='detail'&&n.dataset.nav===(state.tab==='chat'?'chats':'runs'));n.classList.toggle('active',active);if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');});$('#breadcrumb-current').textContent=state.route==='assistant'?'统一对话':state.route==='detail'?'任务详情':state.route==='runs'?'全部任务':state.route==='chats'?'对话':state.route==='roles'?'角色库':'工作台';if(state.config){$('#provider-label').textContent=state.config.provider_ready?'DeepSeek 已配置':'离线模式就绪';$('#provider-caption').textContent=state.config.provider_ready?state.config.model:'无需 API key，即可体验';$('#provider-dot').classList.toggle('ready',state.config.provider_ready);}}
 const runLimitFields = [
  {name:'max_steps',label:'执行轮数上限（0 为不限）',value:0,min:0,max:1000},
  {name:'max_total_tokens',label:'累计 token 上限（0 为不限）',value:0,min:0,max:100000000},
@@ -114,6 +114,7 @@ const chatRoles = () => [...(state.config?.conversation_roles || []),
 const roleLabel = id => state.detail?.conversation?.profiles?.find(p=>p.id===id)?.name || chatRoles().find(role => role.id === id)?.label || id;
 const chatMode = mode => mode === 'single' || mode === 'group';
 const chatLink = id => '#run/' + encodeURIComponent(id) + '/chat';
+const latestChatLink = id => chatLink(id) + '?latest=1';
 
 const databaseFile = path => /\.(db|sqlite|sqlite3)$/i.test(path);
 function fileURL(runId, path, endpoint) {
@@ -127,7 +128,7 @@ function artifactLink(runId, file) {
   : '#run/' + encodeURIComponent(runId) + '/artifacts?' + new URLSearchParams({path});
  const action = preview ? '预览' : binary ? '下载' : '查看';
  return `<a class="turn-file" href="${e(href)}" ${preview?'target="_blank" rel="noopener noreferrer"':binary?'download':''}
-  title="${e(file.project_path||path)}${file.sha256?' · SHA-256 '+e(file.sha256):''}">${icon(binary?'download':preview?'link':'file')}<span>${e(file.project_path || path)}</span><small>${action} · ${e(sizeText(file.size))}</small></a>`;
+  title="${e(file.project_path||path)}${file.sha256?' · SHA-256 '+e(file.sha256):''}">${icon(binary?'download':preview?'link':'file')}<span>${e(file.project_path || path)}</span><small>${action} · ${e(sizeText(file.size))}</small></a>${window.StudioActivity?.preview(runId,file)||''}`;
 }
 function turnFiles(turn) {
  const files = turn.artifacts || [];
@@ -494,17 +495,21 @@ function conversationComposer(thread,run) {
  if (unavailable) return unavailable;
  const draft = chatDrafts.get(thread.id) || {};
  const last = thread.turns.at(-1);
- const recipient = draft.recipient || last?.recipient || thread.members[0];
+ const dispatch = draft.dispatch || last?.mode || (thread.kind==='group' && !last ? 'team' : 'single');
  const status = pendingChat.has(thread.id);
  const intent = draft.intent || 'edit';
+ const teamLead = dispatch==='team' && intent==='edit' ? thread.lead : null;
+ const recipient = teamLead || draft.recipient || last?.recipient || thread.recipient || thread.members[0];
  const hasProvider = state.config?.provider_ready;
  return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}">
    <fieldset ${status ? 'disabled' : ''}>
     <label class="composer-label" for="chat-reply">继续对话</label>
     <textarea id="chat-reply" name="message" maxlength="8000" required placeholder="提出问题，或描述下一步要修改的地方…">${e(draft.message || '')}</textarea>
     <div class="reply-options">
-     ${thread.kind==='group' && intent==='edit'?dispatchField(draft.dispatch||last?.mode||'single'):''}
-     <label class="field-label">回复角色<select name="recipient" ${thread.kind === 'dm' ? 'disabled' : ''}>${roleOptions(thread.members,recipient)}</select></label>
+     ${thread.kind==='group' && intent==='edit'?dispatchField(dispatch):''}
+     <label class="field-label"><span id="reply-recipient-label">${teamLead?'负责人':'回复角色'}</span>
+      <select name="recipient" aria-labelledby="reply-recipient-label" ${teamLead || thread.kind==='dm' ? 'disabled' : ''}>
+      ${roleOptions(teamLead?[teamLead]:thread.members,recipient)}</select></label>
      <label class="field-label">消息类型<select name="intent">${intentOptions(intent)}</select></label>
      <label class="field-label" ${intent === 'question' ? 'hidden' : ''}>本轮验收文件（选填）
       <input name="acceptance_files" ${intent === 'question' ? 'disabled' : ''} placeholder="例如 snake/game.js" value="${e(draft.files || '')}"></label>
@@ -518,7 +523,7 @@ function conversationComposer(thread,run) {
          return `<option value="${e(key)}" ${draft.base===key?'selected':''}>成员草稿 · ${e(roleLabel(c.role))} · ${e(c.objective)} (${e(c.task_id.slice(-8))})</option>`;
        }).join('')}
        <option value="empty" ${draft.base==='empty'?'selected':''}>新任务，使用空工作区</option></select></label>
-       ${ruleFields(draft.rules||'')}${thread.kind==='group'?sourceReviewField(draft.sourcePaths,(draft.dispatch||last?.mode)==='team'):''}${thread.kind==='group' && (draft.dispatch||last?.mode)==='team'?childFields(draft.children):''}`:''}
+       ${ruleFields(draft.rules||'')}${thread.kind==='group'?sourceReviewField(draft.sourcePaths,dispatch==='team'):''}${thread.kind==='group' && dispatch==='team'?childFields(draft.children):''}`:''}
      ${limitFields(false,draft.limits || run.limits || {})}</details>
     <div class="reply-footer"><span class="muted-note">${hasProvider ? (intent === 'question' ? '仅查询项目文件与对话记录。' : '基于最近可用的项目版本修改，旧版可随时查看。') : '继续对话需要配置本机 DeepSeek API key。'}</span>
      <button type="submit" class="primary" ${!hasProvider || status ? 'disabled' : ''}>${status ? '正在发送…' : '发送'}${icon('arrow')}</button></div>
@@ -538,6 +543,7 @@ function conversationPanel(detail) {
    <div class="chat-user"><div class="speaker">你 <small>发给 ${e(roleLabel(turn.recipient))}</small></div>
    <p>${e(turn.user)}</p></div>
    ${roomMessages(turn.events||[],turn.run_id)}
+   ${window.StudioActivity?.renderTurn(turn,detail)||''}
    <div class="chat-agent"><div class="speaker">${icon('cpu')} ${e(roleLabel(turn.recipient))} ${link}</div>
     ${turn.answer ? `<div class="chat-answer prose">${markdown(turn.answer)}</div>` : `<p class="muted-note">${e(note)}</p>`}
     ${turn.answer_truncated ? '<small>这里只展示回复节选。</small>' : ''}${turnFiles(turn)}</div></article>`;
@@ -547,10 +553,11 @@ function conversationPanel(detail) {
   : latestVersion ? `<a class="text-button" href="#run/${encodeURIComponent(latestVersion)}/artifacts">查看项目产物</a>` : '';
  return `<section class="chat-thread" data-key="thread-${e(thread.id)}">
    <header class="thread-head"><div><h2>${thread.kind === 'group' ? '项目群聊' : '项目私聊'}</h2>
-    <p>${e(thread.members.map(roleLabel).join('、'))}</p>
+    <p>${thread.kind==='group' && thread.lead
+      ? `<span>负责人 · ${e(roleLabel(thread.lead))}</span><br>成员 · ` : ''}${e(thread.members.map(roleLabel).join('、'))}</p>
     ${thread.workspace_path?`<p class="thread-workspace">${icon('folder')}工作区 <code>${e(thread.workspace_path)}</code></p>`:''}</div><div class="chat-actions">${versionLink}
    <a class="text-button" href="/api/runs/${encodeURIComponent(detail.run.id)}/room.zip" download>导出完整会话</a></div></header>
-   <div class="chat-history">${history}</div>${conversationComposer(thread,detail.run)}</section>`;
+   <div class="chat-history">${history || (thread.kind==='group'?'<p class="room-first-message">群聊已就绪。发出第一条消息，负责人即可安排成员协作。</p>':'')}</div>${conversationComposer(thread,detail.run)}</section>`;
 }
 
 function rememberReply(form) {
@@ -601,7 +608,9 @@ async function sendReply(form) {
   const data = await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
   chatDrafts.delete(id);
   chatSubmissions.delete(id);
-  if (state.runId === form.dataset.parent) location.hash = chatLink(data.run.id);
+  if (state.runId === form.dataset.parent) {
+   location.hash = state.followLatest ? latestChatLink(data.run.id) : chatLink(data.run.id);
+  }
   toast('消息已发送。');
  } catch(error) {
   draft.error = error.message;
@@ -667,6 +676,7 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
   <p class="form-error" role="alert" hidden></p></div><p class="form-note">${icon('shield')}<span>${note}</span></p></form>`;
 }
 function runModeLabel(run, conversationKind=run.conversation_kind) {
+ if (run.mode==='room' && conversationKind==='group') return '项目群聊';
  if (run.mode==='single' && conversationKind) return conversationKind==='group' ? '群聊' : '私聊';
  return modeLabels[run.mode] || run.mode || '历史运行';
 }
@@ -745,17 +755,20 @@ async function submitDiscussion(form) {
  try {
   await api(path,{method:'POST',body:JSON.stringify(body)});
   form.reset();
-  await refreshDetail();
+  if(state.route==='assistant')await studioAssistant.refresh(true);else await refreshDetail();
  }catch(error){toast(error.message);}finally{button.disabled=false;}
 }
-function detailContent(){if(!state.detail)return '<div class="initial-loading"><span class="spinner"></span>正在读取任务…</div>';const d=state.detail,r=d.run;const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page"><div class="detail-top"><a class="back-link" href="#runs">${icon('left')}返回全部任务</a><div class="detail-heading"><h1>${e(r.title)}</h1><div class="detail-actions">${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'&&endedWithoutChecks(d)?'':diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
-function render({reset=false}={}){const html=state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatsPage():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();}
+function detailContent(){if(!state.detail)return '<div class="initial-loading"><span class="spinner"></span>正在读取任务…</div>';const d=state.detail,r=d.run;
+ const title=state.tab==='chat' && d.conversation?.kind==='group' && d.conversation.title || r.title;
+ const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page"><div class="detail-top"><a class="back-link" href="#runs">${icon('left')}返回全部任务</a><div class="detail-heading"><h1>${e(title)}</h1><div class="detail-actions">${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'&&endedWithoutChecks(d)?'':diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
+function render({reset=false}={}){document.body.classList.toggle('assistant-view',state.route==='assistant');const html=state.route==='assistant'?studioAssistant.page():state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatsPage():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();}
 function parseRoute() {
  const [hash, query=''] = location.hash.slice(1).split('?');
  if (hash.startsWith('run/')) {
   try {
    const [encoded, tab] = hash.slice(4).split('/');
    return {route:'detail', runId:decodeURIComponent(encoded), tab:['chat','artifacts'].includes(tab)?tab:'overview',
+    followLatest:tab==='chat' && new URLSearchParams(query).get('latest')==='1',
     file:tab==='artifacts' ? new URLSearchParams(query).get('path') : null};
   } catch { return {route:'runs',runId:null}; }
  }
@@ -763,21 +776,49 @@ function parseRoute() {
   try {return {route:'roles',roleId:decodeURIComponent(hash.slice(6)) || null,runId:null};}
   catch {return {route:'roles',roleId:null,runId:null};}
  }
- return {route:['runs','chats'].includes(hash)?hash:'home',runId:null};
+ return {route:['runs','chats','home'].includes(hash)?hash:'assistant',runId:null};
 }
 async function route(){const next=parseRoute();const changed=next.runId!==state.runId;
  if (state.route!==next.route || roleView.id!==(next.roleId || null)) {
   Object.assign(roleView,{id:next.roleId||null,detail:null,error:'',filter:'current',kind:'memory'});
   if ($('#role-dialog')?.open) $('#role-dialog').close();
  }
+ state.followLatest=Boolean(next.followLatest);
  state.route=next.route;state.runId=next.runId;if(changed){state.detail=null;state.detailSignature='';state.tab=next.tab||'overview';state.selectedFile=null;state.fileData=null;state.expanded.clear();state.logOpen.clear();}else if(next.tab){state.tab=next.tab;}$('#sidebar').classList.remove('open');render({reset:true});window.scrollTo({top:0,behavior:'instant'});if(state.route==='detail') {
   if(next.file) await selectFile(next.file);
   await refreshDetail();
   if(state.runId===next.runId && state.tab==='artifacts' && !state.selectedFile && state.detail?.artifacts?.length)
    await selectFile(state.detail.artifacts[0].path);
- }if(state.route==='chats')await refreshChats();if(state.route==='roles')await loadRole();}
-async function refreshDetail(){const id=state.runId;if(!id)return;try{const detail=await api(`/api/runs/${encodeURIComponent(id)}`);if(state.runId!==id)return;const signature=JSON.stringify(detail);state.detail=detail;if(signature!==state.detailSignature){state.detailSignature=signature;render();if(state.tab==='artifacts'&&!state.selectedFile&&detail.artifacts?.length)selectFile(detail.artifacts[0].path);}setOnline(true);}catch(error){if(state.runId===id&&!state.detail)main.innerHTML=`<div class="page error-panel"><h2>暂时无法读取任务</h2><p>${e(error.message)}</p><a href="#runs" class="secondary">返回任务列表</a></div>`;if(!error.code)setOnline(false);}}
-async function refresh(){if(state.polling)return;state.polling=true;try{if(!state.config)state.config=await api('/api/bootstrap');const data=await api('/api/runs');state.runs=data.runs||[];setOnline(true);if(!state.initialized){state.initialized=true;await route();}updateSidebar();if(state.route==='home'&&$('#home-runs')){patchHTML($('#home-runs'),state.runs.length?`<div class="run-list">${state.runs.slice(0,5).map(runRow).join('')}</div>`:empty('工作室已经准备好了','运行上方演示，你的第一个任务会出现在这里。'));const count=$('.section-title .count-badge');setText(count,state.runs.length);}if(state.route==='runs'&&$('#all-runs'))patchHTML($('#all-runs'),runList());if(state.route==='detail')await refreshDetail();if(state.route==='chats')await refreshChats();}catch{setOnline(false);}finally{state.polling=false;}}
+ }if(state.route==='assistant'){studioAssistant.enter();await studioAssistant.refresh();}if(state.route==='chats')await refreshChats();if(state.route==='roles')await loadRole();}
+async function refreshDetail() {
+ const id=state.runId;
+ if (!id) return;
+ try {
+  const detail=await api(`/api/runs/${encodeURIComponent(id)}`);
+  if (state.runId!==id) return;
+  const thread=detail.conversation;
+  if (state.tab==='chat' && thread?.superagent) {
+   location.replace('#assistant');
+   return;
+  }
+  if (state.tab==='chat' && state.followLatest && thread?.head_run_id && thread.head_run_id!==id) {
+   location.replace(latestChatLink(thread.head_run_id));
+   return;
+  }
+  const signature=JSON.stringify(detail);
+  state.detail=detail;
+  if (signature!==state.detailSignature) {
+   state.detailSignature=signature;
+   render();
+   if (state.tab==='artifacts' && !state.selectedFile && detail.artifacts?.length) selectFile(detail.artifacts[0].path);
+  }
+  setOnline(true);
+ } catch(error) {
+  if (state.runId===id && !state.detail) main.innerHTML=`<div class="page error-panel"><h2>暂时无法读取任务</h2><p>${e(error.message)}</p><a href="#runs" class="secondary">返回任务列表</a></div>`;
+  if (!error.code) setOnline(false);
+ }
+}
+async function refresh(){if(state.polling)return;state.polling=true;try{if(!state.config)state.config=await api('/api/bootstrap');const data=await api('/api/runs');state.runs=data.runs||[];setOnline(true);if(!state.initialized){state.initialized=true;await route();}updateSidebar();if(state.route==='home'&&$('#home-runs')){patchHTML($('#home-runs'),state.runs.length?`<div class="run-list">${state.runs.slice(0,5).map(runRow).join('')}</div>`:empty('工作室已经准备好了','运行上方演示，你的第一个任务会出现在这里。'));const count=$('.section-title .count-badge');setText(count,state.runs.length);}if(state.route==='runs'&&$('#all-runs'))patchHTML($('#all-runs'),runList());if(state.route==='detail')await refreshDetail();if(state.route==='assistant')await studioAssistant.refresh();if(state.route==='chats')await refreshChats();}catch{setOnline(false);}finally{state.polling=false;}}
 function formTitle(mode){return mode==='group'?'新建群聊':mode==='single'?'新建私聊':'开始一个新任务';}
 function openForm(mode=state.config?.provider_ready?'single':'team-demo',objective=''){ $('#dialog-title').textContent=formTitle(mode); $('#dialog-form').innerHTML=formHTML('dialog',mode,objective);$('#task-dialog').showModal();setTimeout(()=>$('#dialog-objective').focus(),0);}
 function swapMode(form,mode,objective=''){const savedWorkspace=form.elements.workspace_path?.value||'';const savedLimits=runLimitFields.map(field=>[field.name,form.querySelector(`[name="${field.name}"]`)?.value]);const prefix=form.dataset.prefix;if(prefix==='dialog')$('#dialog-title').textContent=formTitle(mode);const advanced=!form.querySelector('.advanced').hidden;const custom=objective || (!form.elements.objective.readOnly?form.elements.objective.value:'');form.outerHTML=formHTML(prefix,mode,custom);const replacement=document.querySelector(`form[data-prefix="${prefix}"]`);if(replacement.elements.workspace_path)replacement.elements.workspace_path.value=savedWorkspace;for(const [name,value] of savedLimits){if(value!==undefined)replacement.querySelector(`[name="${name}"]`).value=value;}if(advanced){replacement.querySelector('.advanced').hidden=false;replacement.querySelector('[data-action="advanced"]').setAttribute('aria-expanded','true');}}
@@ -891,6 +932,7 @@ document.addEventListener('change',event=>{const form=event.target.closest('form
 document.addEventListener('input',event=>{const reply=event.target.closest('.reply-form');if(reply)rememberReply(reply);if(event.target.id==='run-search'){state.search=event.target.value;patchHTML($('#all-runs'),runList());}});
 document.addEventListener('toggle',event=>{if(event.target.matches?.('[data-log]')){const key=event.target.dataset.log;if(event.target.open)state.logOpen.add(key);else state.logOpen.delete(key);}},true);
 document.addEventListener('click',event=>{
+ if(event.target.closest('.skip-link')){event.preventDefault();main.focus();return;}
  const roleButton=event.target.closest('[data-role-action]');
  if(roleButton){runRoleAction(roleButton);return;}
  const template=event.target.closest('[data-template]');if(template){const value=template.dataset.template,form=$('form[data-prefix="home"]');swapMode(form,value==='maintenance'?'single':value,value==='maintenance'?'生成一份电脑维护诊断计划 maintenance.md，包含信息收集、排查步骤和验证方法。':'');if(value==='maintenance'){const f=$('form[data-prefix="home"]');f.querySelector('[name="acceptance_files"]').value='maintenance.md';}$('#home-objective')?.focus();return;}
@@ -912,7 +954,8 @@ document.addEventListener('click',event=>{
  if(action==='connection')showConnection();
  if(action==='menu'){$('#sidebar').classList.toggle('open');mobileNav();}
  if(action==='refresh' && state.route==='roles')loadRole();
- if(action==='refresh' && state.route!=='roles')refresh().then(()=>toast(state.online?'任务状态已更新。':'服务未连接，请检查启动终端。'));
+ if(action==='refresh' && state.route==='assistant')studioAssistant.refresh(true);
+ if(action==='refresh' && !['roles','assistant'].includes(state.route))refresh().then(()=>toast(state.online?'任务状态已更新。':'服务未连接，请检查启动终端。'));
  if(action==='advanced'){const button=event.target.closest('button'),panel=button.closest('form').querySelector('.advanced');panel.hidden=!panel.hidden;button.setAttribute('aria-expanded',String(!panel.hidden));}
  if(action==='cancel-run')cancelRun();
  if(action==='download-artifacts')downloadArtifacts();

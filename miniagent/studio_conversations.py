@@ -77,7 +77,7 @@ def validate_conversation(value: object) -> dict:
 
 
 def thread_info(run_id: str, meta: dict) -> dict | None:
-    if meta.get("mode") in ("demo", "single", "team") and "thread" in meta:
+    if meta.get("mode") in ("demo", "single", "team", "room") and "thread" in meta:
         return meta["thread"]
     if meta.get("mode") not in ("demo", "single"):
         return None
@@ -119,6 +119,9 @@ def project_context(thread: dict, history: list[dict]) -> str:
                             "回复摘录": turn["answer_truncated"] or len(answer) > 5000}, ensure_ascii=False)
         decisions = [{"role": e["role"], "kind": e["kind"], "text": e["text"][:1600]}
                      for e in turn.get("events", []) if e["kind"] in {"member_report", "human_answer"}]
+        if thread.get("superagent"):
+            decisions.extend({"已创建": e["entity"]} for e in turn.get("events", [])
+                             if e["kind"] == "studio_entity" and isinstance(e.get("entity"), dict))
         if decisions:
             entry += "\n" + json.dumps(decisions[-12:], ensure_ascii=False)
         cost = len(entry.encode("utf-8")) + 1
