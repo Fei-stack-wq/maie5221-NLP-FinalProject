@@ -60,8 +60,10 @@
 
 ### 4.1 配置、诊断和成果取回
 
-- `Limits`、配置入口及 Studio 负责一致的运行预算。默认 `max_steps=0`（不限轮数及派生的任务工具调用总数）、任务累计 `max_total_tokens=0`（不限）、`max_seconds=3600`；单次模型输出仍为 `300000`。新任务保存实际生效快照，旧任务快照保持原样。
+- `Limits`、配置入口及 Studio 负责一致的运行预算。默认 `max_steps=0`（不限轮数及派生的任务工具调用总数）、任务累计 `max_total_tokens=0`（不限）、`max_seconds=0`（不限总耗时）；单次模型输出仍为 `300000`。新任务保存实际生效快照，旧任务快照保持原样。
 - `MA_MAX_STEPS`、`MA_MAX_TOTAL_TOKENS`、`MA_MAX_SECONDS` 支持本机默认；任务发起入口可覆盖相应预算。输入校验不能接受布尔值、非有限数或越界值。
+- 任务配置使用 0 表示不限。运行时预算及日志的 `seconds_left` / `seconds_remaining` 用 JSON `null` 表示没有截止时间，数值 0 表示有限余额已耗尽。不限时的群与成员不切分时间，用户可用“停止”取消运行或等待中的人工请求。显式时限取父任务剩余时间与子任务额度中的较短者，并为交接和收尾留出时间。单次模型请求仍受传输配置约束，工具保留自己的等待上限。
+- 时限语义参考 CPython 的 `Timeout.reschedule(None)` 和 `timeout_at()`，其中未设置截止时间的任务仍可由调用者取消。Studio 沿用同步单调钟和条件变量。参见 [CPython 3.13.1 的实现](https://github.com/python/cpython/blob/v3.13.1/Lib/asyncio/timeouts.py) 及其[嵌套时限与取消用例](https://github.com/python/cpython/blob/v3.13.1/Lib/test/test_asyncio/test_timeouts.py)。
 - `StudioService` / 诊断层根据真实退出原因显示限制名称、消费及上限；恢复事件显示为恢复过程。文件存在、模型自称完成、工具返回成功均不能升级为独立验收通过。
 - 已失败或已取消任务仍能下载工件。工作区 ZIP 是当时可读取的受支持文本 / 代码文件副本，不是不可变 ArtifactStore；每文件不超过 8 MiB、总内容不超过 20 MiB，超限拒绝导出而不截断文件。它不包含符号链接、隐藏文件、二进制文件或工作区外文件，也不把原始推理和密钥一并导出。
 

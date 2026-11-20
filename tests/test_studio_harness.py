@@ -111,15 +111,18 @@ class StudioHarnessTest(unittest.TestCase):
         old_meta = json.loads(path.read_text())
         old_meta.pop("effective_limits", None)
         old_meta["request"]["limits"].pop("max_steps")
+        old_meta["request"]["limits"].pop("max_seconds")
         path.write_text(json.dumps(old_meta))
         historic = self.service.detail(run["id"])
         self.assertEqual(historic["run"]["limits"]["max_steps"], 2)
+        self.assertEqual(historic["run"]["limits"]["max_seconds"], 75)
         self.assertEqual(historic["diagnostics"]["configuration"]["max_steps"], 2)
         # A second task uses the host default and reaches independent acceptance.
         _, default_detail = self.demo()
         default_config = next(event["configuration"] for event in default_detail["events"]
                               if event["kind"] == "studio_configuration")
         self.assertEqual(default_config["max_steps"], 0)
+        self.assertEqual(default_config["max_task_seconds"], 0)
         self.assertEqual(default_config["max_total_tokens"], 0)
         self.assertEqual(self.service.settings.limits.max_steps, 0)
         self.assertEqual(self.service.detail(run["id"])["run"]["status"], "failed")
@@ -130,7 +133,7 @@ class StudioHarnessTest(unittest.TestCase):
         invalid = [None, [], {"unknown": 2}, {"max_steps": -1}, {"max_steps": 1001},
                    {"max_steps": True}, {"max_steps": 2.5}, {"max_steps": "20"},
                    {"max_total_tokens": -1}, {"max_total_tokens": 100000001},
-                   {"max_total_tokens": False}, {"max_seconds": 0}, {"max_seconds": 86401},
+                   {"max_total_tokens": False}, {"max_seconds": -1}, {"max_seconds": 86401},
                    {"max_seconds": float("inf")}, {"max_seconds": float("nan")},
                    {"max_seconds": True}]
         for limits in invalid:

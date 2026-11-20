@@ -10,6 +10,7 @@ import json
 import math
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -79,8 +80,86 @@ def _strict_json_object(text: str) -> dict[str, Any]:
     return result
 
 
+def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str], None],
+                            should_cancel: Callable[[], bool] | None) -> dict:
+    """Rebuild the ordinary completion envelope. Only assistant content reaches notify."""
+    identity = {}
+    content, reasoning = [], []
+    calls = {}
+    finish = usage = None
+    try:
+        for event in events:
+            if should_cancel and should_cancel():
+                raise ProviderError("Provider request cancelled", code="cancelled")
+            _require("error" not in event, "Provider stream returned an error")
+            for key in ("model", "id"):
+                if key in event:
+                    _require(isinstance(event[key], str) and identity.get(key, event[key]) == event[key],
+                             "Conflicting provider stream identity")
+                    identity[key] = event[key]
+            if event.get("usage") is not None:
+                _require(usage is None, "Duplicate stream usage")
+                usage = event["usage"]
+            choices = event.get("choices")
+            if choices == [] and event.get("usage") is not None:
+                continue  # Some OpenAI-compatible endpoints send a separate usage event.
+            _require(isinstance(choices, list) and len(choices) == 1 and isinstance(choices[0], dict),
+                     "Invalid provider stream choices")
+            choice = choices[0]
+            _require(choice.get("index", 0) == 0 and finish is None, "Unexpected stream choice")
+            delta = choice.get("delta")
+            _require(isinstance(delta, dict) and delta.get("role", "assistant") in ("assistant", None),
+                     "Invalid assistant stream delta")
+            fragments = delta.get("tool_calls")
+            if fragments is None:
+                fragments = []
+            _require(isinstance(fragments, list), "Invalid stream tool calls")
+            if fragments and not calls:
+                notify("discard", "")
+            for item in fragments:
+                _require(isinstance(item, dict), "Invalid stream tool fragment")
+                index = item.get("index")
+                _require(type(index) is int and index >= 0, "Invalid stream tool index")
+                call = calls.setdefault(index, {"id": None, "type": None, "names": [], "arguments": []})
+                for key in ("id", "type"):
+                    value = item.get(key)
+                    if value is not None:
+                        _require(isinstance(value, str) and (call[key] is None or call[key] == value),
+                                 "Conflicting stream tool identity")
+                        call[key] = value
+                function = item.get("function", {})
+                _require(isinstance(function, dict), "Invalid stream function fragment")
+                for source, target in (("name", "names"), ("arguments", "arguments")):
+                    part = function.get(source)
+                    if part is not None:
+                        _require(isinstance(part, str), "Invalid stream function text")
+                        call[target].append(part)
+            for field, parts in (("reasoning_content", reasoning), ("content", content)):
+                part = delta.get(field)
+                if part is not None:
+                    _require(isinstance(part, str), "Invalid assistant stream text")
+                    parts.append(part)
+                    if field == "content" and part and not calls:
+                        notify("delta", part)
+            finish = choice.get("finish_reason")
+        _require(isinstance(finish, str), "Provider stream lacks a final choice")
+        _require(sorted(calls) == list(range(len(calls))), "Incomplete stream tool indexes")
+        message = {"role": "assistant", "content": "".join(content) if content else None}
+        if reasoning:
+            message["reasoning_content"] = "".join(reasoning)
+        if calls:
+            message["tool_calls"] = [{"id": call["id"], "type": call["type"],
+                                      "function": {"name": "".join(call["names"]), "arguments": "".join(call["arguments"])}}
+                                     for _, call in sorted(calls.items())]
+        return {**identity, "usage": usage, "choices": [{"finish_reason": finish, "message": message}]}
+    except Exception:
+        # The next HTTP attempt starts with empty accumulators and a new preview.
+        notify("discard", "")
+        raise
+
+
 class DeepSeekProvider(Provider):
-    """Non-streaming official API adapter with explicit thinking configuration.
+    """Official API adapter with opt-in streaming and explicit thinking configuration.
 
     max_retries means additional HTTP attempts, not total attempts. The request
     deadline is separate from the future root BudgetLedger. Environment values
@@ -201,7 +280,9 @@ class DeepSeekProvider(Provider):
 
     def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
              temperature: float = 0.0, *, max_output_tokens: int | None = None,
-             deadline_seconds: float | None = None, required_tool: str | None = None) -> LLMResponse:
+             deadline_seconds: float | None = None, required_tool: str | None = None,
+             on_stream: Callable[[str, str], None] | None = None,
+             should_cancel: Callable[[], bool] | None = None) -> LLMResponse:
         if self._insufficient_balance:
             raise self._balance_error(0)
         payload = self._build_payload(messages, tools, temperature)
@@ -215,8 +296,11 @@ class DeepSeekProvider(Provider):
             payload["max_tokens"] = max_output_tokens
         started = time.perf_counter()
         try:
-            result = (self._post_with_retry(payload) if deadline_seconds is None else
-                      self._post_with_retry(payload, deadline_seconds=deadline_seconds))
+            options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
+            if on_stream is not None:
+                payload.update(stream=True, stream_options={"include_usage": True})
+                options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel)
+            result = self._post_with_retry(payload, **options)
         except ProviderError as exc:
             if exc.status_code == 402 and urlsplit(self.base_url).hostname == "api.deepseek.com":
                 self._insufficient_balance = True
@@ -231,12 +315,13 @@ class DeepSeekProvider(Provider):
             raise
         return response.model_copy(update={"request_attempts": result.attempts})
 
-    def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None) -> HTTPResult:
+    def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None,
+                         stream_decoder: Callable[[Iterator[dict]], dict] | None = None) -> HTTPResult:
         return post_json(
             f"{self.base_url}/chat/completions", payload, api_key=self.api_key,
             timeout=self.timeout, deadline_seconds=(self.deadline_seconds if deadline_seconds is None else
                                                    min(self.deadline_seconds, deadline_seconds)),
-            max_retries=self.max_retries,
+            max_retries=self.max_retries, **({"stream_decoder": stream_decoder} if stream_decoder else {}),
         )
 
     def _parse(self, data: dict[str, Any], latency_ms: float) -> LLMResponse:

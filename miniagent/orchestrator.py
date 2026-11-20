@@ -364,9 +364,11 @@ class Orchestrator:
         planner_retries: int = 1,
         task_service: TaskService | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        on_assistant_stream: Callable[[dict], None] | None = None,
     ) -> None:
         self.provider = provider
         self.settings = settings
+        self.on_assistant_stream = on_assistant_stream
         self.should_cancel = should_cancel or (lambda: False)
         self.roster = roster or [
             AgentCard(name="worker", skills=["通用", "整理", "写作"]),
@@ -989,6 +991,8 @@ class Orchestrator:
                 on_step=lambda record, _state: board.record(task.id, record),
             )
             parameters = inspect.signature(agent.run).parameters
+            if self.on_assistant_stream and "on_assistant_stream" in parameters:
+                kwargs["on_assistant_stream"] = self.on_assistant_stream
             if "execution" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
                 kwargs["execution"] = execution
             if not isinstance(agent, Agent):

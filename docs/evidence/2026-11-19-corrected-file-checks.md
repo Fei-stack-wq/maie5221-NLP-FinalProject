@@ -1,5 +1,15 @@
 # 修订测试脚本后的独立交接
 
+## 负责人直接送审首稿
+
+会议室原型任务 `studio-20261120-022154-a06ec242598a` 的首稿已有完整检查点。开发者报告按钮断言疑似误报，留下三个未结的浏览器检查。负责人可以让开发者修复，也可以立即用 `delegate_task.review` 指定其他成员评审这份首稿。后者会同时收到原检查的调用标识、代码、失败输出和冻结版本，每条可披露的失败成为一个必签的检查项。未具备完整原始材料的失败继续阻止发布。独立成员可以签署通过、要求修改或记录证据不足。
+
+原型通过 `app.py` 返回内嵌 HTML。评审者检查页面时，宿主把真实浏览器断言使用的响应字节与冻结源码中完整 HTML 的摘要比对。同一次回归先省略原错误，再引用与产品无关的计算，都被拒绝。评审者随后在实际 HTTP 页面上验证按钮，并对原错误与业务要求分别签署，宿主才发布原作者候选。复跑命令为 `python -m unittest tests.test_private_candidate_review.PrivateCandidateTest.test_lead_can_send_first_unresolved_browser_probe_directly_to_independent_review`，需本地 Chromium。
+
+Gerrit 在具体 patch set 上记录评审与验证投票，并通过独立提交条件判断修改能否合入。Studio 借鉴其版本绑定的决策边界，增加原始工具回执与冻结产物的关联。 [Gerrit 的评审与验证标签](https://gerrit-review.googlesource.com/Documentation/config-labels.html)
+
+## 作者修订了测试脚本
+
 软件组运行 `studio-20261119-211722-50fe965b6e68` 使用平台版本 `6a3fc5a`。开发者在第 37 步运行 `python3 tests/ui_smoke.py`，脚本 SHA-256 为 `3555e4066dd60586d56d49b6966417096f234fcd2efb2ff21489ea4393c6b42d`。浏览器启动前，查找 Chromium 的函数因缺少 `import glob` 抛出 `NameError`。第 38 步只添加了这个导入。第 39 步在相同目录执行同一命令，新 SHA 为 `b01140e1223f08339113ba642f39e32a559a234d91ddb52bd3450b4ec856ea15`。从持久化工具参数重建这两步的七个文件，逐次比对写入哈希后，在隔离目录以 Chromium 重放。旧版以 1 退出，新版以 0 退出，真实表单操作产生了 201、409、201、200 四个响应。
 
 运行还保留着 `tests/test_bookings.py` 的另一项待复核义务。原先作者只能把内联 Python 或浏览器探针的失败自动交给独立成员，而且任何待执行脚本都会拦截交接。因此即使经过原命令重测，作者也只能继续留在这次分工。第 52 步解决了另一条浏览器故障，但旧文件型脚本失败仍在账本中。

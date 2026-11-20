@@ -46,6 +46,61 @@ from .tools import ToolRegistry
 from .task_service import ExecutionHandle, TaskService
 from .task_store import StoreError
 
+
+class _AssistantPreview:
+    """Ephemeral text for one model turn. A retry gets a fresh message identity."""
+
+    def __init__(self, emit, role, task_id, step):
+        self.emit = emit
+        self.identity = {"role": role, "task_id": task_id, "step": step}
+        self.stream_id = None
+        self.tail = ""
+        self.deferred = []
+
+    def _send(self, kind, text=""):
+        if self.emit is None:
+            return
+        if kind == "delta" and not self.stream_id:
+            self.stream_id = uuid.uuid4().hex
+        if self.stream_id:
+            try:
+                self.emit({**self.identity, "stream_id": self.stream_id, "kind": kind,
+                           **({"text": text} if kind == "delta" else {})})
+            except Exception:
+                # An unavailable preview consumer must not repeat or stop tools.
+                self.emit = None
+
+    def receive(self, kind, text):
+        if kind == "discard":
+            self.close()
+            return
+        if self.deferred:
+            self.deferred.append(text)
+            return
+        text = self.tail + text
+        self.tail = ""
+        # DeepSeek sometimes writes an invocation marker into ordinary text.
+        # RAO judges it in context (including fenced examples) at completion.
+        boundary = min((i for token in ("<|", "<｜") if (i := text.find(token)) >= 0), default=len(text))
+        if boundary < len(text):
+            self.deferred.append(text[boundary:])
+            text = text[:boundary]
+        elif text.endswith("<"):
+            self.tail, text = "<", text[:-1]
+        if text:
+            self._send("delta", text)
+
+    def close(self, *, accepted=False):
+        if accepted:
+            final = self.tail + "".join(self.deferred)
+            if final:
+                self._send("delta", final)
+        self._send("end" if accepted else "discard")
+        self.stream_id = None
+        self.tail = ""
+        self.deferred.clear()
+
+
 SYSTEM_PROMPT = (
     """你是「{agent}」，一个多智能体系统中的成员。
 
@@ -137,12 +192,15 @@ class Agent:
         step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
         preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
         tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
+        on_assistant_stream: Callable[[dict], None] | None = None,
     ) -> RunResult:
         """跑完一个任务。
 
         ``budget`` 由调度器注入（编排一个多子任务计划时共享大局预算）；
         不传则按 ``settings.limits`` 新建。
         ``on_step`` 是给调度器的钩子：每步结束立刻回调，用于写黑板、检查依赖。
+        ``on_assistant_stream`` 接收临时正文事件。每项带 stream_id、role、task_id 与 step；
+        delta 的 text 是新增文字，end 与 discard 分别结束与撤销预览，正式结果以 RunResult 为准。
         """
         task_id = task_id or (execution.task.task_id if execution else f"task-{uuid.uuid4().hex}")
         durable_task = None
@@ -237,7 +295,13 @@ class Agent:
         if conversation_context:
             state.scratch["work_context"] = conversation_context
         budget = budget or Budget.from_limits(limits)
-        initial_seconds = min(budget.seconds_left, limits.max_seconds)
+        initial_seconds = budget.capped_seconds(limits.max_seconds or None)
+
+        def remaining_seconds(reserve: float = 0) -> float | None:
+            if initial_seconds is None:
+                return None
+            return initial_seconds - (time.perf_counter() - started) - reserve
+
         initial_steps, initial_tokens = budget.steps_left, budget.tokens_left
         initial_actions = budget.actions_left
         excluded_ranges: list[tuple[int, int]] = []
@@ -291,7 +355,7 @@ class Agent:
         corrected_protocols: set[str] = set()
 
         def budget_reason() -> str:
-            if budget.seconds_left <= 0:
+            if not budget.has_time():
                 return f"超过时间上限 {initial_seconds:.0f}s"
             if not budget.has_tokens(0):
                 return f"超过 token 预算 {initial_tokens}"
@@ -301,13 +365,17 @@ class Agent:
                 return f"超过动作总数上限 {initial_actions}"
             return budget.reason(limits)
 
+        preview = None
         owned_commands = self.sandbox.command_sessions is None
         if owned_commands:
             self.sandbox.command_sessions = CommandSessions()
         try:
             acceptance = bind(acceptance, self.sandbox.root, task_id=task_id, objective=task)
             while True:
-                budget.seconds_left = initial_seconds - (time.perf_counter() - started)
+                if preview:
+                    preview.close()
+                    preview = None
+                budget.seconds_left = remaining_seconds()
                 if cancellation_observed():
                     status, error = "aborted", "用户请求停止"
                     break
@@ -315,7 +383,7 @@ class Agent:
                 offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
                 text_only = step_policy is not None and not offered
                 # The final text needs a model step, but consumes no tool actions.
-                if (not budget.has_steps(1) or not budget.has_tokens(0) or budget.seconds_left <= 0
+                if (not budget.has_steps(1) or not budget.has_tokens(0) or not budget.has_time()
                         or (not budget.has_actions(1) and not text_only)):
                     error = budget_reason()
                     break
@@ -377,7 +445,7 @@ class Agent:
                         policy_messages(state, policy), projection, self.provider,
                         context_window_tokens=self.settings.context_window_tokens,
                         available_tokens=spendable_tokens,
-                        seconds_left=initial_seconds - (time.perf_counter() - started) - policy.seconds_reserve,
+                        seconds_left=remaining_seconds(policy.seconds_reserve),
                         force=retry_envelope is not None,
                     )
                     projection = summary.projection
@@ -416,9 +484,9 @@ class Agent:
                             input_estimate_source=projection.estimate_source,
                         )
                     last_omitted = projection.omitted_groups
-                budget.seconds_left = initial_seconds - (time.perf_counter() - started)
-                if budget.seconds_left <= policy.seconds_reserve:
-                    error = budget_reason() if budget.seconds_left <= 0 else "本轮请求已无可用时间，剩余时间已预留给收尾。"
+                budget.seconds_left = remaining_seconds()
+                if not budget.has_time(policy.seconds_reserve):
+                    error = budget_reason() if not budget.has_time() else "本轮请求已无可用时间，剩余时间已预留给收尾。"
                     break
                 budget.spend(steps=1)
                 step_started = time.perf_counter()
@@ -443,7 +511,7 @@ class Agent:
                         offered_tools=[spec.name for spec in offered], requested_tool=policy.required_tool,
                         allowed_write_paths=sorted(policy.allowed_write_paths) if policy.allowed_write_paths is not None else None,
                         provider_config=provider_configuration(self.provider),
-                        seconds_remaining=round(max(0, budget.seconds_left), 2),
+                        seconds_remaining=None if budget.seconds_left is None else round(max(0, budget.seconds_left), 2),
                         tokens_remaining=budget.tokens_left, tokens_used=budget.tokens_used,
                         steps_remaining=budget.steps_left,
                         context_window_tokens=self.settings.context_window_tokens,
@@ -455,13 +523,17 @@ class Agent:
                         input_estimate_source=projection.estimate_source,
                     )
                 state.scratch.pop("tool_protocol_feedback", None)
+                if (on_assistant_stream and policy.phase in {"work", "handoff", "finalize"}
+                        and not policy.required_tool and not policy.bound_handoff):
+                    preview = _AssistantPreview(on_assistant_stream, self.name, task_id, state.step_index + 1)
                 try:
                     record = self.unit.step(
                         state, budget, request_history=projection.messages, max_output_tokens=request_output_limit,
                         allowed_tools=policy.allowed_tools, token_reserve=policy.token_reserve,
                         allowed_write_paths=policy.allowed_write_paths, required_tool=policy.required_tool,
                         bound_handoff=policy.bound_handoff,
-                        request_seconds=budget.seconds_left - policy.seconds_reserve if step_policy else None,
+                        **({"on_stream": preview.receive} if preview else {}),
+                        request_seconds=budget.available_seconds(policy.seconds_reserve),
                     )
                 except ProviderError as exc:
                     if (exc.code != "context_length_exceeded" or overflow_used or not budget.has_steps(1)
@@ -511,8 +583,8 @@ class Agent:
                         self.tracer.event("cancel_observed", **identity, step=state.step_index)
                     status, error = "aborted", "用户请求停止"
                     break
-                budget.seconds_left = initial_seconds - (time.perf_counter() - started)
-                if record.terminate_reason == ErrorClass.T_BUDGET or not budget.has_tokens(0) or budget.seconds_left <= 0:
+                budget.seconds_left = remaining_seconds()
+                if record.terminate_reason == ErrorClass.T_BUDGET or not budget.has_tokens(0) or not budget.has_time():
                     status, error = "limit_exceeded", budget_reason()
                     break
                 if record.unstructured_tool_call:
@@ -591,7 +663,7 @@ class Agent:
                             and record.answer.lstrip().startswith("[BLOCKED]")):
                         if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
                             retry = (not reviewed_close_retried and budget.has_steps(1)
-                                     and budget.has_tokens(1) and budget.seconds_left > 0)
+                                     and budget.has_tokens(1) and budget.has_time())
                             if self.tracer:
                                 self.tracer.event("reviewed_delivery_blocked", **identity, step=record.step,
                                                   action="request_clarification" if retry else "preserve_block",
@@ -661,9 +733,13 @@ class Agent:
                             **payload,
                         )
                     if verdict == "passed":
+                        if preview:
+                            preview.close(accepted=completion is None)
                         status = "completed"
                         break
                     if verdict in {"unverified", "error"}:
+                        if preview:
+                            preview.close(accepted=completion is None and verdict == "unverified")
                         status, error = verdict, why
                         break
                     acceptance_failures += 1
@@ -722,6 +798,8 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
             status, error = "error", f"{type(exc).__name__}: {exc}"
         finally:
+            if preview:
+                preview.close()
             if owned_commands:
                 self.sandbox.command_sessions.close()
                 self.sandbox.command_sessions = None

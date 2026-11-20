@@ -25,6 +25,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import timezone
 from email.utils import parsedate_to_datetime
+from collections.abc import Callable, Iterator
 from typing import Any
 
 
@@ -118,7 +119,7 @@ def _clamp_socket_timeout(response: Any, seconds: float) -> None:
     sock.settimeout(seconds)
 
 
-def _read_response(response: Any, deadline: float, timeout: float, attempts: int) -> bytes:
+def _response_chunks(response: Any, deadline: float, timeout: float, attempts: int) -> Iterator[bytes]:
     raw_length = response.headers.get("Content-Length")
     if raw_length is not None:
         try:
@@ -130,7 +131,6 @@ def _read_response(response: Any, deadline: float, timeout: float, attempts: int
     reader = getattr(response, "read1", None)
     if not callable(reader):
         raise ProviderError("Provider response does not support bounded reads", code="invalid_response", attempts=attempts)
-    chunks: list[bytes] = []
     size = 0
     while True:
         _clamp_socket_timeout(response, min(timeout, _remaining(deadline, attempts)))
@@ -141,11 +141,41 @@ def _read_response(response: Any, deadline: float, timeout: float, attempts: int
         if type(chunk) is not bytes:
             raise ProviderError("Provider response was not bytes", code="invalid_response", attempts=attempts)
         if not chunk:
-            return b"".join(chunks)
+            return
         size += len(chunk)
         if size > MAX_RESPONSE_BYTES:
             raise ProviderError("Provider response exceeded the byte limit", code="response_too_large", attempts=attempts)
-        chunks.append(chunk)
+        yield chunk
+
+
+def _read_response(response: Any, deadline: float, timeout: float, attempts: int) -> bytes:
+    return b"".join(_response_chunks(response, deadline, timeout, attempts))
+
+
+def _sse_events(chunks: Iterator[bytes], attempts: int) -> Iterator[dict]:
+    """Decode data-only SSE events after complete lines, including split UTF-8/CRLF."""
+    pending = bytearray()
+    data = []
+    ended_cr = False
+    for chunk in chunks:
+        if ended_cr and chunk.startswith(b"\n"):
+            chunk = chunk[1:]
+        ended_cr = chunk.endswith(b"\r")
+        lines = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+        for line in lines[:-1]:
+            pending.extend(line)
+            if not pending and data:
+                payload = b"\n".join(data)
+                data.clear()
+                if payload == b"[DONE]":
+                    return
+                yield _parse_response(payload, attempts)
+            elif pending == b"data" or pending.startswith(b"data:"):
+                data.append(bytes(pending[5:]).removeprefix(b" "))
+            pending.clear()
+        pending.extend(lines[-1])
+    raise ProviderError("Provider event stream ended prematurely", code="incomplete_stream",
+                        attempts=attempts, retryable=True)
 
 
 def _parse_response(raw: bytes, attempts: int) -> dict[str, Any]:
@@ -246,6 +276,7 @@ def _retry_after(value: str | None, attempts: int, status: int | None) -> float 
 def post_json(
     url: str, payload: dict, *, api_key: str, timeout: float = 60.0,
     deadline_seconds: float = 120.0, max_retries: int = 2,
+    stream_decoder: Callable[[Iterator[dict]], dict] | None = None,
 ) -> HTTPResult:
     """POST one JSON body; max_retries counts *additional* HTTP attempts.
 
@@ -267,7 +298,7 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
         _remaining(deadline, attempt - 1)
         request = urllib.request.Request(
             url, data=body, method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json",
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream" if stream_decoder else "application/json",
                      "Authorization": f"Bearer {api_key}"},
         )
         retry_after = None
@@ -282,15 +313,22 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
                     if _is_context_overflow(response, status, deadline, timeout, attempt):
                         raise _http_error(status, attempt, overflow=True)
                     raise urllib.error.HTTPError(url, status, "", response.headers, None)
-                raw = _read_response(response, deadline, timeout, attempt)
-                data = _parse_response(raw, attempt)
+                if stream_decoder is None:
+                    data = _parse_response(_read_response(response, deadline, timeout, attempt), attempt)
+                else:
+                    chunks = _response_chunks(response, deadline, timeout, attempt)
+                    data = stream_decoder(_sse_events(chunks, attempt))
                 _remaining(deadline, attempt)
                 return HTTPResult(data=data, attempts=attempt,
                                   latency_ms=round((time.monotonic() - started) * 1000, 2))
             finally:
                 _close(response)
-        except ProviderError:
-            raise
+        except ProviderError as exc:
+            if not exc.attempts:
+                exc.attempts = attempt
+            if exc.code != "incomplete_stream":
+                raise
+            error = exc
         except urllib.error.HTTPError as exc:
             try:
                 overflow = _is_context_overflow(exc, exc.code, deadline, timeout, attempt)

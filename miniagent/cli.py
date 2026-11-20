@@ -157,12 +157,15 @@ def _main(argv: list[str] | None = None) -> int:
     studio.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
 
     for cmd in (run, demo, evaluate, orchestrate):
+        cmd.add_argument("--max-seconds", type=float, help="整个任务的墙钟秒数，0 为不限，默认读取任务配置")
         cmd.add_argument("--max-steps", type=int, help="模型累计轮数上限，0 为不限，默认读取任务配置")
 
     args = parser.parse_args(argv)
-    if getattr(args, "max_steps", None) is not None:
+    limits = {name: getattr(args, name) for name in ("max_steps", "max_seconds")
+              if getattr(args, name, None) is not None}
+    if limits:
         try:
-            settings = replace(settings, limits=configured_limits(settings.limits, {"max_steps": args.max_steps}))
+            settings = replace(settings, limits=configured_limits(settings.limits, limits))
         except ValueError as exc:
             parser.error(str(exc))
 

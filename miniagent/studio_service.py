@@ -51,6 +51,7 @@ from .studio_role_memory import RoleMemoryStore
 from . import studio_workspace
 from . import studio_route_results
 from .studio_discussion import RoomDiscussion
+from .studio_reply_stream import ReplyStream
 from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
 from .studio_acceptance import build_checks
@@ -175,6 +176,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="studio-job")
         self._slots = threading.BoundedSemaphore(max_workers)
         self._active: set[str] = set()
+        self._reply_streams: dict[str, ReplyStream] = {}
         self._assistant_turns = {}
         self._cancellations: dict[str, threading.Event] = {}
         self._answers = threading.Condition(self._lock)
@@ -222,8 +224,17 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
     def close(self, wait: bool = True) -> None:
         with self._lock:
             self._closed = True
+            for cancellation in self._cancellations.values():
+                cancellation.set()
             self._answers.notify_all()
+            for stream in self._reply_streams.values():
+                stream.close()
         self._executor.shutdown(wait=wait)
+
+    def reply_stream(self, run_id):
+        with self._lock:
+            self._directory(run_id)
+            return self._reply_streams.get(run_id)
 
     def _redact(self, value: Any) -> Any:
         if isinstance(value, str):
@@ -450,10 +461,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             duration = 0
         thread = thread_info(path.name, meta)
         limits = dict(meta.get("effective_limits", meta.get("request", {}).get("limits", {})))
-        if "max_steps" not in limits:
+        if "max_steps" not in limits or "max_seconds" not in limits:
             config = next((e.get("configuration", {}) for e in events if e.get("kind") == "studio_configuration"), {})
-            if "max_steps" in config:
-                limits["max_steps"] = config["max_steps"]
+            for key, recorded in (("max_steps", "max_steps"), ("max_seconds", "max_task_seconds")):
+                if recorded in config:
+                    limits.setdefault(key, config[recorded])
         return {"conversation_id": thread["id"] if thread else None,
                 "conversation_kind": thread["kind"] if thread else None,
                 "recipient": thread["recipient"] if thread else None,
@@ -554,6 +566,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 "report": report.decode("utf-8", errors="replace"), "report_truncated": report_truncated}
         data["activity"] = self._activity(path, events, log_truncated)
         data["conversation"] = self._conversation(path)
+        if not data["conversation"]:
+            answer, truncated = _read_file(path, "conversation-answer.txt", MAX_PREVIEW_BYTES, missing=True)
+            if answer:
+                data.update(answer=answer.decode("utf-8", errors="ignore"), answer_truncated=truncated)
         conversation = data["conversation"] or {}
         recoverable = (conversation.get("recovery_candidates", [])
                        if conversation.get("head_run_id") == run_id else [])
@@ -1123,6 +1139,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 if routed or (thread and thread.get("superagent")):
                     self._assistant_turns[run_id] = self._claim_assistant_turn(path)
                 self._active.add(run_id)
+                self._reply_streams[run_id] = ReplyStream(self.settings.api_key)
                 self._cancellations[run_id] = threading.Event()
                 result = self._summary(path)
                 self._executor.submit(self._worker, run_id, request)
@@ -1130,6 +1147,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             except BaseException:
                 self._release_assistant_turn(run_id)
                 self._active.discard(run_id)
+                if stream := self._reply_streams.pop(run_id, None):
+                    stream.close()
                 self._cancellations.pop(run_id, None)
                 self._slots.release()
                 if published:
@@ -1503,7 +1522,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     receipt.update(source="member", role=role, task_id=fields.get("task_id"))
                     fields["workspace_delivery"] = receipt
                     self._update_meta(run_id, workspace_member_delivery=receipt)
-        return self._record_room_event(run_id, role, kind, text, **fields)
+        row = self._record_room_event(run_id, role, kind, text, **fields)
+        if kind in {"assignment", "member_report"} and (stream := self.reply_stream(run_id)):
+            stream.room_changed(kind, fields.get("task_id"))
+        return row
 
     def deliver_public_workspace(self, run_id):
         """Deliver an existing terminal group's canonical project without changing its grading."""
@@ -1579,6 +1601,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 finally:
                     self._release_assistant_turn(run_id)
                     self._active.discard(run_id)
+                    if stream := self._reply_streams.pop(run_id, None):
+                        stream.close()
                     self._cancellations.pop(run_id, None)
                     self._slots.release()
             self._drain_studio_dispatches()
@@ -1593,6 +1617,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                            interaction_mode=request.get("interaction_mode", "interactive"),
                            limits=configured_limits(self.settings.limits, saved_limits))
         should_cancel = self._cancellations[run_id].is_set
+        stream = self.reply_stream(run_id)
+        stream_reply = stream.publish if stream else None
         mode = request["mode"]
         examples = Path(__file__).resolve().parent.parent / "examples"
         if mode == "demo":
@@ -1628,7 +1654,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                                              }))
                 orchestrator = Orchestrator(provider=provider, settings=settings, run_dir=path, tracer=tracer,
                                             task_service=service, root_acceptance=root_acceptance, acceptances=children,
-                                            should_cancel=should_cancel)
+                                            should_cancel=should_cancel, on_assistant_stream=stream_reply)
                 result = orchestrator.run(request["objective"], scheduler=request["scheduler"],
                                           max_parallel=2, goal_id=run_id)
             else:
@@ -1663,7 +1689,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     crew = RoomCrew(run_id, path / "context" if question else path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
-                                    delivery, role_session=roles)
+                                    delivery, role_session=roles, on_assistant_stream=stream_reply)
                     def inherited_review(reference):
                         try:
                             return self._inherited_review_publication(crew, metadata.get("workspace_path"), reference)
@@ -1700,7 +1726,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                         crew.guard_probe_inputs(registry)
                 agent = Agent(name=recipient, provider=provider, registry=registry,
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
-                              human_handler=(self._human_handler(run_id, recipient, deadline=crew.deadline - crew.close_seconds)
+                              human_handler=(self._human_handler(run_id, recipient, deadline=None if crew.deadline is None else crew.deadline - crew.close_seconds)
                                              if crew else self._human_handler(run_id, recipient)
                                              if "conversation" in request else None),
                               delegate_handler=crew.delegate if crew else None,
@@ -1714,7 +1740,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                                    system_prompt=prompt,
                                    before_answer=crew.before_answer if crew else None,
                                    step_policy=step_policy,
-                                   on_step=crew.observe_coordinator if crew else None)
+                                   on_step=crew.observe_coordinator if crew else None,
+                                   on_assistant_stream=stream_reply)
                 if crew and crew.direct and result.status in {"completed", "unverified"}:
                     try:
                         crew.snapshot_direct_changes()

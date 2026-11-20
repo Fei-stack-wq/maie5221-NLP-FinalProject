@@ -38,7 +38,8 @@ class CliTest(unittest.TestCase):
     def test_explicit_positive_and_unlimited_turn_caps(self) -> None:
         for cap, expected in [(1, 1), (0, 0)]:
             with self.subTest(cap=cap):
-                code, output = self._run(["demo", "--runs-dir", str(self.base / str(cap)), "--max-steps", str(cap)])
+                code, output = self._run(["demo", "--runs-dir", str(self.base / str(cap)), "--max-steps", str(cap),
+                                          "--max-seconds", "0" if not cap else "120"])
                 self.assertEqual(code, expected, output)
 
     def test_eval_with_mock_writes_report(self) -> None:

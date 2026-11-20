@@ -1352,6 +1352,9 @@ class MemberProgress:
                             self._review_evidence["pass:" + suite_key] = {
                                 "kind":"passed_check","label":label,"scope":suite_key,"tool_call_id":obs.tool_call_id,
                                 "asserted":status != "runner_exit"}
+                            if (obs.source == "run_shell" and status == "passed" and invocation
+                                    and invocation.complete and not invocation.script):
+                                self._review_evidence["pass:" + suite_key]["test_runner"] = invocation.caption
                             code = parameters.get("code", "")
                             if obs.source in {"run_python", "run_browser"} and status != "runner_exit":
                                 inputs = _asserted_inputs(code)
@@ -1616,7 +1619,7 @@ class MemberProgress:
         if not self._steps and not self._resumed:
             return "work"
         if (not budget.has_steps(2) or not budget.has_actions(2)
-                or not budget.has_tokens(1) or budget.seconds_left <= 0):
+                or not budget.has_tokens(1) or not budget.has_time()):
             self._stop = "为最终交接保留本次分工的剩余额度"
             return "handoff"
         return "work"

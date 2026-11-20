@@ -26,11 +26,13 @@ def digest(value) -> str:
 
 
 class Rule(Criterion):
-    id: str = Field(min_length=1, max_length=80)
-    description: str = Field(min_length=1, max_length=1200)
+    id: str = Field(min_length=1, max_length=80, description="本次验收中的唯一标准 ID。沿用原标准时须保留原 ID 和定义。")
+    description: str = Field(min_length=1, max_length=1200, description="说明该项要检查的具体结果。")
     required: bool = True
-    method: Literal["inspect", "execute", "source"]
-    reference_path: str | None = Field(default=None, min_length=1, max_length=500)
+    method: Literal["inspect", "execute", "source"] = Field(
+        description="inspect 检查文件，execute 验证实际运行行为，source 须独立打开外部网页核实事实。")
+    reference_path: str | None = Field(default=None, min_length=1, max_length=500, description=(
+        "仅在 inspect 需要对照第二份原始记录时填写该记录的工作区规范相对路径。核对成稿自身的字数、哈希或结构时省略。"))
 
     @model_validator(mode="after")
     def check_local_reference(self):
@@ -44,9 +46,15 @@ class Rule(Criterion):
 
 
 class ReviewRequest(BaseModel):
+    """对指定候选进行独立验收。"""
+
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    candidate: str = Field(min_length=1, max_length=160)
-    criteria: list[Rule] = Field(default_factory=list, max_length=24)
+    candidate: str = Field(min_length=1, max_length=160, description=(
+        "填写候选作者的任务 ID 或当前角色 ID。引用同群已发布或继承的原件可用成稿路径、原任务 ID 或唯一的原作者标识。"
+        "须由原作者以外的成员独立评审。"))
+    criteria: list[Rule] = Field(default_factory=list, max_length=24, description=(
+        "首次验收须至少给出一个 required=true 的标准，每个 ID 只用一次。复核同一已发布原件时，宿主保留未通过的"
+        "必需项，可省略 criteria 以沿用这些项。新增要求用新 ID；用户指定来源核查的成稿须包含必需的 source 标准。"))
 
 
 class CandidateLookupError(ValueError):
@@ -74,26 +82,21 @@ class Finding(BaseModel):
 class Submission(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     candidate_version: str = Field(pattern="^[a-f0-9]{64}$", description="从本轮验收上下文复制绑定版本的完整摘要。")
-    results: list[Finding] = Field(min_length=1, max_length=24, description="按绑定标准提交逐项结论，每项 ID 只用一次。")
+    results: list[Finding] = Field(min_length=1, max_length=24, description=(
+        "每个绑定标准恰有一个结论，每个 ID 只提交一次。复验时可以沿用宿主已保留的结论，须补齐其余项。"))
 
 
-# Explicit wire schemas are also consumed by OpenAI-compatible providers.
-REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候选作者任务 ID（或当前角色 ID；可用同群已发布的成稿路径、原任务 ID 或唯一的原作者引用继承的原件）引用候选。",
-    "properties": {"candidate": {"type": "string"}, "criteria": {"type": "array",
-        "description": "新增标准。复核上轮同一已发布原件时，宿主原样加入未通过的必需项；可省略 criteria 以只沿用这些项。首次验收须给出必需标准。",
-        "items": {
-        "type": "object", "properties": {"id":{"type":"string"}, "description":{"type":"string"},
-            "method":{"type":"string","enum":["inspect","execute","source"],
-                      "description":"inspect 检查文件，对照本地原件时填写 reference_path；execute 验证实际运行行为；source 须独立打开外部网页核实事实。"},
-            "reference_path":{"type":"string","description":"仅在 inspect 需对照第二份原始记录时填写。核对成稿自身的字数、哈希、结构请省略。"},
-            "required":{"type":"boolean"}},
-        "required":["id","description","method"], "additionalProperties":False}}},
-    "required": ["candidate"], "additionalProperties":False}
-# Inline the model's sole nested type for providers that expect the item
-# definition in place. Lengths, version format and optional fields come from
-# the same Pydantic contract used to parse actual submissions.
-SUBMIT_SCHEMA = Submission.model_json_schema()
-SUBMIT_SCHEMA["properties"]["results"]["items"] = SUBMIT_SCHEMA.pop("$defs")["Finding"]
+def _review_tool_schema(model: type[BaseModel], collection: str) -> dict:
+    """Inline the one nested item type so a review schema can itself be embedded in another tool."""
+    schema = model.model_json_schema()
+    array = schema["properties"][collection]
+    definition = array["items"]["$ref"].removeprefix("#/$defs/")
+    array["items"] = schema.pop("$defs")[definition]
+    return schema
+
+
+REVIEW_REQUEST_SCHEMA = _review_tool_schema(ReviewRequest, "criteria")
+SUBMIT_SCHEMA = _review_tool_schema(Submission, "results")
 
 
 @dataclass
@@ -383,6 +386,7 @@ class ReviewQueue:
         draft_task = None
         objective = author["objective"]
         probes = {}
+        probe_products = {}
         if publication:
             inherited_rules = {}
             for raw_rule in publication["unresolved"]:
@@ -424,15 +428,23 @@ class ReviewQueue:
             files = draft["manifest"]
             if draft.get("review_after_repair"):
                 objective = draft["origin"]["objective"]
-                for scope, probe in draft.get("inline_failures", {}).items():
-                    ref = "probe_" + scope
-                    if len(spec.criteria) >= 24 or ref in ids:
-                        continue  # Its failed scope stays mandatory in the host.
-                    spec.criteria.append(Rule(id=ref, method="execute", description=(
-                        "用独立执行检查复核原检查涉及的业务行为，说明每项原失败来源与所见结果；"
-                        "不能仅以作者改写后的 PASS 汇总代替复核。原任务 "
-                        + probe["task_id"] + "，工具回执 " + probe["tool_call_id"])))
-                    probes[scope] = probe
+            # An explicit review selects this complete checkpoint. The first
+            # candidate and a later repair disclose the same original evidence.
+            targets = set(draft.get("required", ()))
+            for scope, probe in draft.get("inline_failures", {}).items():
+                ref = "probe_" + scope
+                if len(spec.criteria) >= 24 or ref in ids:
+                    continue  # Its failed scope stays mandatory in the host.
+                spec.criteria.append(Rule(id=ref, method="execute", description=(
+                    "用独立执行检查复核原检查涉及的业务行为，说明每项原失败来源与所见结果；"
+                    "不能仅以作者改写后的 PASS 汇总代替复核。原任务 "
+                    + probe["task_id"] + "，工具回执 " + probe["tool_call_id"])))
+                probes[scope] = probe
+                targets.update(probe.get("input_paths", ()))
+                targets.update(probe.get("investigation_paths", ()))
+                targets.update(probe.get("program_inputs", {}))
+            if probes:
+                probe_products = {p: files[p] for p in targets if p in files}
         if not files:
             raise ValueError("该交接没有可绑定版本的工件。")
         published_paths = {p for p, sha in files.items() if sha}
@@ -461,7 +473,7 @@ class ReviewQueue:
         if required_sources and not any(rule.method == "source" and rule.required for rule in spec.criteria):
             raise ValueError("这个候选含用户指定的最终文件，请加入必需的 source 标准：" + "、".join(sorted(required_sources)))
         review = Review(author["task_id"], author["role"], reviewer, objective, spec.criteria, dict(files), draft_task=draft_task, probes=probes,
-                        required_source_paths=required_sources, comparison_targets=comparison_targets)
+                        required_source_paths=required_sources, comparison_targets=comparison_targets, probe_product_files=probe_products)
         if publication:
             review.publication = {k:publication[k] for k in ("run_id", "task_id", "role", "files")}
             if publication.get("criteria_corrections"):
@@ -848,16 +860,23 @@ class ReviewSession:
         references = self.item.probe_reference_inputs.get(rule.id, {})
         probe = self.item.probes.get(rule.id.removeprefix("probe_"), {})
         browser_probe = probe.get("tool") == "run_browser"
-        target_paths = probe.get("browser_inputs") or probe.get("program_inputs") or (probe.get("input_paths", ())
+        target_paths = probe.get("browser_inputs") or probe.get("program_inputs") or probe.get("investigation_paths") or (probe.get("input_paths", ())
                       if self.item.kind == "product" or browser_probe else ())
         products = {p: sha for p, sha in self.item.probe_product_files.items()
                     if not target_paths or p in target_paths}
-        browser_required = browser_probe and (self.item.kind == "product" or target_paths)
+        # A browser harness can fail before it opens a document. When a
+        # page was observed, the peer must exercise that same frozen product.
+        browser_required = browser_probe and target_paths
         inputs = receipt.get("browser_inputs" if browser_required else "asserted_inputs", {})
+        # If no product input was observed (e.g. an assertion on constants),
+        # a peer's direct test-suite run on the frozen
+        # candidate remains admissible; a bare exit or constant assertion is not.
+        independent_suite = (self.item.kind == "product" and probe.get("tool") == "run_python"
+                             and not target_paths and receipt.get("test_runner"))
         return (receipt.get("kind") == "passed_check" and receipt.get("asserted")
                 and references.items() <= receipt.get("asserted_inputs", {}).items()
-                and any(path not in references and products.get(path) == sha
-                        for path, sha in inputs.items()))
+                and (bool(independent_suite) or any(path not in references and products.get(path) == sha
+                                                   for path, sha in inputs.items())))
 
     def guidance(self, *, show_examples=True):
         # Avoid repeatedly projecting every URL or duplicating the raw records.

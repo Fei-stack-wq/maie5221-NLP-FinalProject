@@ -32,6 +32,7 @@ _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
            "/markdown-reader.css": ("markdown-reader.css", "text/css; charset=utf-8"),
            "/markdown-it.min.js": ("vendor/markdown-it.min.js", "text/javascript; charset=utf-8"),
            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+           "/reply-stream.js": ("reply-stream.js", "text/javascript; charset=utf-8"),
            "/style.css": ("style.css", "text/css; charset=utf-8")}
 _CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
@@ -80,6 +81,33 @@ class StudioHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: dict):
         data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         self._send(status, data, "application/json; charset=utf-8")
+
+    def _reply_stream(self, run_id):
+        stream = self.server.studio_service.reply_stream(run_id)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        cursor = None
+        try:
+            while True:
+                cursor, frames = stream.updates(cursor) if stream else (0, [("done", {})])
+                if not frames:
+                    self.wfile.write(b": heartbeat\n\n")
+                for kind, data in frames:
+                    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                    self.wfile.write(f"event: {kind}\ndata: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                if frames and frames[-1][0] == "done":
+                    return
+        except OSError:
+            # Closing the browser or switching conversations just disconnects
+            # this reader. It never cancels the job or retries the model call.
+            return
 
     def _guard(self, *, mutation: bool = False):
         port = self.server.server_address[1]
@@ -172,6 +200,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             if parts[6] == "history":
                 self._json(200, service.role_operation(parts[3], "history", {}, parts[5]))
                 return
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "reply-stream":
+            self._reply_stream(parts[3])
+            return
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "activity":
             self._json(200, service.tool_activity(parts[3]))
             return

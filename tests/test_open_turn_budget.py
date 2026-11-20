@@ -71,7 +71,14 @@ class OpenTurnBudgetTest(unittest.TestCase):
         for e in assignments:
             self.assertIsNone(e['allocation']['steps_left'])
             self.assertIsNone(e['allocation']['actions_left'])
-            self.assertGreater(e['reserved']['seconds_left'],0)
+            self.assertIsNone(e['reserved']['seconds_left'])
+            self.assertIsNone(e['allocation']['seconds_left'])
+            for share in e['protected_peer_shares'].values():
+                self.assertIsNone(share['seconds_left'])
+        self.assertEqual(detail['run']['limits']['max_seconds'], 0)
+        steps = [event for event in detail['events'] if event['kind'] == 'step_start']
+        self.assertTrue(steps)
+        self.assertTrue(all(event['seconds_remaining'] is None for event in steps))
         self.assertEqual(detail['run']['limits']['max_steps'],0)
         self.assertEqual(detail['diagnostics']['configuration']['max_steps'],0)
         child = Budget.from_limits(Limits(max_steps=0,max_total_tokens=600)).fork(.5)

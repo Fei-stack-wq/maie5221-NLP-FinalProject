@@ -1,7 +1,9 @@
 """Exercise provisional candidate selection, peer review and guarded promotion through Studio."""
 import ast
 import hashlib
+import importlib.util
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +69,63 @@ class PrivateCandidateTest(unittest.TestCase):
             detail = finished(self.service,run["id"])
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"]=="member_report"]
         return detail,reports
+
+    @unittest.skipUnless(os.name == "posix" and importlib.util.find_spec("playwright"), "local Playwright required")
+    def test_lead_can_send_first_unresolved_browser_probe_directly_to_independent_review(self):
+        html = "<!doctype html><html><body><button>Reserve room</button></body></html>"
+        source = ("from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+                  "PAGE = " + repr(html) + "\n"
+                  "class Handler(BaseHTTPRequestHandler):\n"
+                  "    def do_GET(self):\n        self.send_response(200)\n"
+                  "        self.send_header('Content-Type','text/html')\n        self.end_headers()\n"
+                  "        self.wfile.write(PAGE.encode())\n")
+        def check(caption):
+            return ("from http.server import HTTPServer\nimport runpy,threading\n"
+                    "handler=runpy.run_path('server.py')['Handler']\n"
+                    "with HTTPServer(('127.0.0.1',0),handler) as http:\n"
+                    "    threading.Thread(target=http.serve_forever,daemon=True).start()\n"
+                    "    try:\n        page.goto(f'http://127.0.0.1:{http.server_port}/')\n"
+                    f"        expect(page.get_by_role('button')).to_have_text({caption!r},timeout=250)\n"
+                    "    finally:\n        http.shutdown()")
+        wrong, right = check("Reserve hall"), check("Reserve room")
+        unrelated = "assert 10 > 5\nprint('PASS independent constant')"
+        def browser_scope(code):
+            key = hashlib.sha256((".\0" + ast.dump(ast.parse(code))).encode()).hexdigest()
+            return _check_key("browser " + key)
+        scope = browser_scope(wrong)
+        version = digest({**manifest(NEW), "server.py": hashlib.sha256(source.encode()).hexdigest()})
+        def sign(*refs):
+            return tool("submit_review", candidate_version=version, results=[
+                {"criterion_id": key, "reason": "Observed the reservation page.", "verdict": "passed",
+                 "evidence": [ref]} for key, ref in zip((RULE["id"], "probe_" + scope), refs)])
+        file_ref = "file:" + PATH
+        steps = [tool("delegate_task", assignee="builder", objective="Deliver the reservation page.",
+                      deliverable_paths=[PATH,"server.py"], remaining_roles=["inspector"]),
+                 write(PATH,NEW), write("server.py",source), tool("run_browser",code=wrong),
+                 {"text":"[BLOCKED] The expected button caption did not match. Please investigate."},
+                 tool("delegate_task",assignee="inspector",objective="Independently adjudicate the first candidate.",
+                      review={"candidate":"builder","criteria":[RULE]}), tool("read_file",path=PATH),
+                 sign(file_ref), tool("run_python",code=unrelated),
+                 sign(file_ref,"pass:" + _check_key(_script_inputs(unrelated)[1])),
+                 tool("run_browser",code=right), sign(file_ref,"pass:" + browser_scope(right)),
+                 {"text":"Verified the frozen page."}, {"text":"Delivered."}]
+        detail, reports = self.run_steps(steps)
+        trace = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        if any("环境缺少 Chromium/Chrome" in e.get("preview", "") for e in events):
+            self.skipTest("local Chromium required")
+        self.assertEqual(detail["run"]["status"], "completed", [(r["role"],r["remaining_issue"][:300]) for r in reports])
+        author, reviewer = reports
+        self.assertEqual([author["role"], reviewer["role"]], ["builder", "inspector"])
+        self.assertFalse(author["published"])
+        self.assertNotIn("author_probe_review",author)
+        self.assertIn("reviewable_candidate",author)
+        self.assertEqual(reviewer["promoted_candidate"]["source_task"],author["task_id"])
+        self.assertEqual(reviewer["native_review"]["state"],"passed")
+        self.assertEqual([e["ok"] for e in events if e["kind"] == "tool_result" and e["tool"] == "submit_review"],
+                         [False, False, True])
+        check, = [r for r in reviewer["native_review"]["assessment"]["results"] if r["criterion_id"] == "probe_" + scope]
+        self.assertEqual(check["receipts"][0]["browser_inputs"], {"server.py": hashlib.sha256(source.encode()).hexdigest()})
 
     def test_corrected_selector_on_first_handoff_requires_independent_frozen_product_assertion(self):
         html = '<label for="startSelect">Start</label><select id="startSelect"><option>09:00</option></select>'

@@ -35,6 +35,12 @@
 .roster-dialog footer {justify-content:flex-end;margin-top:16px}
 .roster-dialog .muted-note {margin-top:12px}
 .chat-end {display:block;height:1px;outline:none;scroll-margin-bottom:24px}
+.reply-stream:empty {display:none}
+.live-reply {min-width:0;margin:12px 0;padding-left:12px;border-left:2px solid var(--line)}
+.live-reply-byline {color:var(--muted);font-size:12px;line-height:1.6;margin-bottom:5px}
+.live-reply-text {white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;color:var(--ink)}
+.assistant-reply:has(>.reply-stream:not(:empty))>.assistant-pending {display:none}
+.reply-stream:not(:empty)+.chat-agent .turn-status>span {display:none}
 .jump-latest {position:fixed;z-index:5;right:24px;bottom:20px;display:inline-flex;align-items:center;gap:7px;padding:9px 13px;border:1px solid #cfcfc1;border-radius:20px;background:#fffefa;color:#484c40;box-shadow:0 2px 8px #30382717;font-size:12px}
 .jump-latest:hover {background:#eeefe6}
 .jump-latest svg {width:16px;height:16px}

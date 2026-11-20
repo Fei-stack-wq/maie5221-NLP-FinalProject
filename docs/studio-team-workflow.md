@@ -123,6 +123,8 @@ print("PASS: submitted the booking through the visible form")
 
 负责人可以在同一次委派中声明成员负责的 `deliverable_paths`。分工已有测试证据但还缺指定的文本产物时，成员会看到缺失路径、最近的检查结果，并保留编辑源码和复测的工具。系统保存上一次未发布的草稿及其公共版本，恢复时会把实际检查、缺失路径和工作目录一并交还。对同一组缺口反复改写任务描述，仍计入同一次返工；为其他已选成员保留的执行额度会单独计算。日志可区分成员间发布、草稿续修、向本机工作区写回和最后一次独立验收。
 
+当首稿已有完整、当前版本的检查点，负责人可直接用 `delegate_task.review` 指定其他成员验收，或让原作者续修。显式送审会一并移交可披露的原检查和失败输出。复核者针对冻结产品逐项签署，通过后宿主才发布。详情见[原始检查的独立交接](evidence/2026-11-19-corrected-file-checks.md)。
+
 最近一轮群组编辑失败后，打开「项目对话 → 本轮选项与预算 → 项目文件」。每个可接续的「成员草稿」显示成员、委派目标和任务编号的末八位。选定后发送，新轮会基于该任务保存的完整文件执行，验收仍按新轮配置运行。聊天记录保留 `recovery_source` 的成员和任务编号。
 
 客户端读取 `GET /api/runs/<群头运行编号>` 的 `conversation.recovery_candidates`，每项含 `task_id`、`role` 和 `objective`。发送时，`conversation` 传入最新 `parent_run_id`、`intent: "edit"`、回复角色、`recover_failed: true` 和选中的 `recover_task_id`。草稿可以交给群中其他角色继续。无需提供本地路径。

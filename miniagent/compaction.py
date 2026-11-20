@@ -169,7 +169,7 @@ class RollingCompactor:
         if available_tokens is not None:
             # Keep the main projected request plus useful output affordable.
             window = min(window, available_tokens - projection.estimated_input_tokens - output - 512)
-        if window < 1024 or seconds_left <= 1 or output < 128:
+        if window < 1024 or (seconds_left is not None and seconds_left <= 1) or output < 128:
             return self._with_checkpoint(projection, "insufficient_budget", available_tokens)
         # Current authenticated objective remains verbatim in the main request.
         # Only a hint is needed by the summarizer to prioritize earlier events.
@@ -191,7 +191,7 @@ class RollingCompactor:
             return self._with_checkpoint(projection, "insufficient_budget", available_tokens)
         messages = _request(self._summary, additions, goal)
         input_estimate = estimate_tokens(messages) + 512
-        deadline = min(25.0, seconds_left / 2)
+        deadline = 25.0 if seconds_left is None else min(25.0, seconds_left / 2)
         try:
             if adapter is None:
                 # Preserve this run's main thinking configuration. Summary

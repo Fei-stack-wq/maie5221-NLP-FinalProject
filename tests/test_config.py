@@ -22,7 +22,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.request_timeout_seconds, 120)
         self.assertEqual(settings.request_deadline_seconds, 3600)
         self.assertEqual(settings.limits.max_total_tokens, 0)
-        self.assertEqual(settings.limits.max_seconds, 3600)
+        self.assertEqual(settings.limits.max_seconds, 0)
         self.assertEqual(settings.limits.max_steps, 0)
         self.assertEqual(settings.max_retries, 2)
         self.assertEqual(settings.temperature, 0)
@@ -199,12 +199,13 @@ class SettingsTest(unittest.TestCase):
     def test_invalid_budget_configuration_never_silently_disables_a_limit(self):
         for key, values in {"max_steps": [-1, 1001, True, "12", 1.5],
                             "max_total_tokens": [-1, 100000001, True, "100"],
-                            "max_seconds": [0, 86401, float("nan"), float("inf"), True]}.items():
+                            "max_seconds": [-1, .5, None, 86401, float("nan"), float("inf"), True]}.items():
             for value in values:
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     configured_limits(Limits(), {key: value})
         with self.assertRaises(ValueError):
             configured_limits(Limits(), {"unknown": 3})
+        self.assertEqual(configured_limits(Limits(max_seconds=7200), {"max_seconds": 0}).max_seconds, 0)
         base = Limits(tool_timeout_seconds=7)
         changed = configured_limits(base, {"max_steps": 300})
         self.assertEqual((base.max_steps, changed.max_steps, changed.tool_timeout_seconds), (0, 300, 7))

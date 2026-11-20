@@ -45,6 +45,7 @@ const studioAssistant = (() => {
    <p class="dispatch-objective">${e(dispatch.objective)}</p>
    ${dispatch.error ? `<p class="dispatch-error">${e(dispatch.error)}</p>` : ''}
    ${dispatch.answer ? `<div class="dispatch-answer prose">${markdown(dispatch.answer,{run_id:dispatch.child_run_id, artifacts:dispatch.artifacts})}</div>` : ''}
+   ${dispatch.child_run_id?studioReplyStreams.slot({...dispatch,run_id:dispatch.child_run_id}):''}
    ${dispatch.answer_truncated ? '<small class="assistant-note">此处显示答复节选，可进入对话查看全文。</small>' : ''}
    ${dispatch.child_run_id ? turnFiles({run_id:dispatch.child_run_id,artifacts:dispatch.artifacts}) + questions : ''}</section>`;
  }
@@ -64,6 +65,7 @@ const studioAssistant = (() => {
    <div class="assistant-reply"><div class="assistant-byline"><span class="small-terminal" aria-hidden="true">${icon('terminal')}</span><strong>工作室助手</strong><a href="#run/${encodeURIComponent(turn.run_id)}" title="查看本轮运行详情">本轮详情 ${icon('chevron')}</a></div>
    ${activity}
    ${turn.answer ? `<div class="assistant-answer prose">${markdown(turn.answer,turn)}</div>` : ''}
+   ${studioReplyStreams.slot(turn,false)}
    ${turn.answer_truncated?'<small class="assistant-note">此处显示回复节选，完整记录见本轮详情。</small>':''}
    <div class="assistant-entities">${entities}</div>${dispatches}${turnFiles(turn)}${status}</div></article>`;
  }

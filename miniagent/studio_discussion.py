@@ -48,11 +48,15 @@ class RoomDiscussion:
             with self._answers:
                 path = self._directory(run_id)
                 meta = self._meta(path)
-                limit = meta.get("request", {}).get("limits", {}).get("max_seconds", self.settings.limits.max_seconds)
-                start = datetime.fromisoformat(meta["created_at"].replace("Z", "+00:00"))
-                remaining = limit - (datetime.now(timezone.utc) - start).total_seconds()
-                room_deadline = time.monotonic() + max(0, remaining)
-                expires = min(room_deadline, deadline) if deadline is not None else room_deadline
+                limits = meta.get("effective_limits", meta.get("request", {}).get("limits", {}))
+                limit = limits.get("max_seconds", self.settings.limits.max_seconds)
+                room_deadline = None
+                expires = deadline
+                if limit:
+                    start = datetime.fromisoformat(meta["created_at"].replace("Z", "+00:00"))
+                    remaining = limit - (datetime.now(timezone.utc) - start).total_seconds()
+                    room_deadline = time.monotonic() + max(0, remaining)
+                    expires = room_deadline if deadline is None else min(room_deadline, deadline)
                 identity = uuid.uuid4().hex
                 key = (run_id, identity)
                 if self._closed or self._cancellations[run_id].is_set():
@@ -61,12 +65,12 @@ class RoomDiscussion:
                 self._questions[key] = {"request_id": identity, "role": role, "text": self._redact(question), "answer": None, "deadline": expires}
                 try:
                     while self._questions[key]["answer"] is None:
-                        if self._closed or self._cancellations[run_id].is_set() or time.monotonic() >= expires:
-                            if time.monotonic() >= room_deadline:
+                        if self._closed or self._cancellations[run_id].is_set() or (expires is not None and time.monotonic() >= expires):
+                            if room_deadline is not None and time.monotonic() >= room_deadline:
                                 self._cancellations[run_id].set()
                             self._record_room_event(run_id, role, "question_closed", "等待结束，本次没有收到答复。", request_id=identity)
                             return None
-                        self._answers.wait(timeout=max(0.01, expires - time.monotonic()))
+                        self._answers.wait(timeout=None if expires is None else max(0.0, expires - time.monotonic()))
                     return self._questions[key]["answer"]
                 finally:
                     del self._questions[key]
@@ -85,7 +89,7 @@ class RoomDiscussion:
                     raise StudioError("这条问题已经回答。", "answer_conflict", 409)
             pending = self._questions.get((run_id, request_id))
             if (pending is None or self._closed or self._cancellations[run_id].is_set()
-                    or time.monotonic() >= pending["deadline"]):
+                    or (pending["deadline"] is not None and time.monotonic() >= pending["deadline"])):
                 raise StudioError("本次执行没有在等待这条答复。", "not_waiting", 409)
             row = self._record_room_event(run_id, "user", "human_answer", answer, request_id=request_id,
                                           recipient=pending["role"])

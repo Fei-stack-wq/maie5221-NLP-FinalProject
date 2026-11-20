@@ -275,6 +275,15 @@ class HarnessRuntimeTest(unittest.TestCase):
         self.assertEqual(result.status, "unverified", result.error)
         self.assertEqual(sum("测试进展提醒" in str(m.get("content")) for m in provider.requests[-1]), 1)
 
+    def test_unlimited_task_can_finish_after_a_long_elapsed_interval(self):
+        clock = [0.0]
+        provider = RecordingProvider([response(write("delivery", "a.txt")), response(text="done")],
+                                     after_response=lambda: clock.__setitem__(0, clock[0] + 7200))
+        with patch("time.perf_counter", side_effect=lambda: clock[0]):
+            result = self.agent(provider).run("write", acceptance=accept_files("a.txt", min_bytes=1))
+        self.assertEqual(result.status, "completed", result.error)
+        self.assertEqual((self.root / "workspace" / "a.txt").read_text(), "working artifact")
+
     def test_slow_provider_exhausting_time_budget_does_not_execute_tools(self):
         # Advance a deterministic clock during the API call; no real sleep.
         clock = [0.0]

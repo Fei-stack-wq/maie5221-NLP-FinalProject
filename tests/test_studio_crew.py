@@ -365,7 +365,7 @@ class StudioCrewTest(unittest.TestCase):
                   assign("reviewer", "Check the published draft"), tool("read_file", path="work.txt"),
                   {"text": "The text covers the request."}, {"text": "Ready."}]
         detail, provider = self.execute(script, group, objective="Prepare a reviewed draft",
-                                        limits={"max_steps": 100, "max_total_tokens": 1_000_000}, acceptance_files=["work.txt"])
+                                        limits={"max_steps": 100, "max_total_tokens": 1_000_000, "max_seconds": 3600}, acceptance_files=["work.txt"])
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         self.assertIn("reviewer", str(provider.requests[4][0]))
         self.assertEqual(provider.requests[-1][1], [])
@@ -847,7 +847,7 @@ class StudioCrewTest(unittest.TestCase):
             script = [tool("delegate_task", assignee="dev", objective="Resolve the issue", remaining_roles=[]),
                       tool("ask_human", question="Which instance can be used?"), {"text": "[BLOCKED] no reply"},
                       {"text": "[BLOCKED] Missing required instance selection."}]
-            detail, _ = self.execute(script, roster("lead", "dev"), objective="Diagnose service")
+            detail, _ = self.execute(script, roster("lead", "dev"), objective="Diagnose service", limits={"max_seconds": 120})
         self.assertTrue(observed and observed[0] is not None)
         self.assertEqual(detail["run"]["status"], "failed", detail["diagnostics"])
         self.assertTrue(any(e["kind"] == "question_closed" for e in detail["room_events"]))

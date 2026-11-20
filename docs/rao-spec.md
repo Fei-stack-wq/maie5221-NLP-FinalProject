@@ -102,12 +102,12 @@ class Action(BaseModel):
 
 | 维度             | 默认值                               | 来源                                       |
 | ---------------- | ------------------------------------ | ------------------------------------------ |
-| `steps_left`   | 12                                   | `Limits.max_steps`                       |
-| `seconds_left` | 120                                  | `Limits.max_seconds`（由驱动方每轮刷新） |
-| `tokens_left`  | 200000                               | `Limits.max_total_tokens`                |
-| `actions_left` | max_steps × max_tool_calls_per_step | 派生                                       |
+| `steps_left`   | `null`                              | `Limits.max_steps`                       |
+| `seconds_left` | `null`                              | `Limits.max_seconds`（由驱动方每轮刷新） |
+| `tokens_left`  | `null`                              | `Limits.max_total_tokens`                |
+| `actions_left` | `null`                              | 显式限制轮数时由 max_steps × max_tool_calls_per_step 派生                                       |
 
-- `spend()` 只会让数字变小；`exhausted` 在任一维度 ≤0（token 为 <0）时成立。
+- 配置中的 0 表示不限，对应剩余预算中的 `null`。有限余额在使用时扣减，时间、轮数、动作的剩余值 ≤0 或 token 余额 <0 时，`exhausted` 成立。
 - `reason()` 的判定顺序固定为 **时间 → 步数 → 动作数 → token**，保证同一个 run 报告的原因稳定。
 - `fork(ratio)` 把剩余预算切一块给子任务（默认各半），用于委派。
 

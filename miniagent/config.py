@@ -109,8 +109,8 @@ class Limits:
     max_steps: int = 0
     """模型轮数上限。0 表示持续计数，无累计轮数和派生动作数上限。"""
 
-    max_seconds: float = 3600.0
-    """单个任务的总墙钟时间上限。"""
+    max_seconds: float = 0
+    """整个任务的墙钟时间上限，0 为不限。单次网络请求与工具仍有各自的等待上限。"""
 
     max_total_tokens: int = 0
     """任务累计输入和输出 token 上限。0 表示仅记录用量。"""
@@ -132,7 +132,10 @@ def configured_limits(base: Limits, changes: dict) -> Limits:
     if "max_total_tokens" in changes:
         _integer("max_total_tokens", changes["max_total_tokens"], 0, 100_000_000)
     if "max_seconds" in changes:
-        _number("max_seconds", changes["max_seconds"], 1, 86400)
+        seconds = changes["max_seconds"]
+        _number("max_seconds", seconds, 0, 86400)
+        if 0 < seconds < 1:
+            raise ValueError("max_seconds must be zero or at least one second")
     return replace(base, **changes)
 
 
@@ -194,6 +197,6 @@ class Settings:
             limits=configured_limits(Limits(), {
                 "max_steps": _env_integer("MA_MAX_STEPS", str(Limits.max_steps)),
                 "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", str(Limits.max_total_tokens)),
-                "max_seconds": _env_number("MA_MAX_SECONDS", "3600"),
+                "max_seconds": _env_number("MA_MAX_SECONDS", str(Limits.max_seconds)),
             }),
         )

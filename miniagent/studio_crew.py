@@ -40,7 +40,7 @@ _INCIDENTAL_DATA = SQLITE_EXTENSIONS | {".log", ".csv", ".tsv", ".jsonl"}
 @dataclass
 class _ReadAllowance:
     max_tokens: int | None
-    max_seconds: float
+    max_seconds: float | None
     max_rounds: int
     tokens: int = 0
     seconds: float = 0.0
@@ -49,7 +49,8 @@ class _ReadAllowance:
     @property
     def exhausted(self):
         return ((self.max_tokens is not None and self.tokens >= self.max_tokens)
-                or self.seconds >= self.max_seconds or self.rounds >= self.max_rounds)
+                or (self.max_seconds is not None and self.seconds >= self.max_seconds)
+                or self.rounds >= self.max_rounds)
 
     def record(self, tokens, seconds):
         self.tokens += tokens
@@ -81,8 +82,9 @@ class CandidateAcceptanceError(SnapshotError):
 class RoomCrew:
     def __init__(self, run_id, path, thread, history, provider, settings, tracer,
                  service, should_cancel, human_handler, record_event, room_events, extensions, child_checks,
-                 delivery=None, *, role_session=None):
+                 delivery=None, *, role_session=None, on_assistant_stream=None):
         self.role_session = role_session
+        self.on_assistant_stream = on_assistant_stream
         self.inherited_review = None
         self.run_id = run_id
         self.path = path
@@ -100,7 +102,7 @@ class RoomCrew:
         self.room_events = room_events
         self.extensions = extensions
         self.budget = Budget.from_limits(settings.limits)
-        self.deadline = time.monotonic() + self.budget.seconds_left
+        self.deadline = None if self.budget.seconds_left is None else time.monotonic() + self.budget.seconds_left
         self.handoffs = {}
         self.reports = []
         self.diagnostics = RoomDiagnostics(path, settings.api_key)
@@ -137,7 +139,7 @@ class RoomCrew:
         self.routed_repairs = set()
         self.last_dispatch_error = ""
         self.close_tokens = 0
-        self.close_seconds = min(90, self.budget.seconds_left * .12)
+        self.close_seconds = 0 if self.budget.seconds_left is None else min(90, self.budget.seconds_left * .12)
         self.close_state_bytes = 8000 if self.budget.tokens_left is None else min(8000, max(1200, self.budget.tokens_left // 16))
         self.inventory = self._inventory()
         self.private_read = ""
@@ -377,18 +379,18 @@ class RoomCrew:
         # unsuccessful handoffs. Each new dispatch decision receives a
         # smaller allowance for looking into genuinely new information.
         available = budget.available_tokens(self.close_tokens)
-        seconds = max(.1, budget.seconds_left - self.close_seconds)
+        seconds = budget.available_seconds(self.close_seconds)
         steps = None if budget.steps_left is None else max(1, budget.steps_left - 2)
         if self.inspection_revision != self.project_version:
             self.inspection_revision = self.project_version
             self.revision_reads = _ReadAllowance(None if available is None else max(1024, math.ceil(.03*available)),
-                                                 max(1.0, .045*seconds), 9 if steps is None else max(2, math.ceil(.09*steps)))
+                                                 None if seconds is None else max(1.0, .045*seconds), 9 if steps is None else max(2, math.ceil(.09*steps)))
             self.inspection_decision = None
         decision = (self.project_version, len(self.reports))
         if self.inspection_decision != decision:
             self.inspection_decision = decision
             self.decision_reads = _ReadAllowance(None if available is None else max(768, math.ceil(.015*available)),
-                                                 max(.5, .018*seconds), 5 if steps is None else max(2, math.ceil(.05*steps)))
+                                                 None if seconds is None else max(.5, .018*seconds), 5 if steps is None else max(2, math.ceil(.05*steps)))
             self.inspection_notified = False
         self.nested_seconds = 0.0
 
@@ -875,7 +877,7 @@ class RoomCrew:
         """A corrected author check can freeze the draft for a peer, never publish it or clear a failure."""
         probes = draft["inline_failures"]
         support = self._transferable_probe_support(probes, support)
-        if (self.should_cancel() or self.budget.exhausted or time.monotonic() >= self.deadline
+        if (self.should_cancel() or self.budget.exhausted or (self.deadline is not None and time.monotonic() >= self.deadline)
                 or not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or not support or not probes
                 or probes.keys() != draft["failed_checks"].keys() or report["role"] == reviewer):
             return False
@@ -1176,7 +1178,7 @@ class RoomCrew:
         if can_inspect and not budget.has_tokens(self.close_tokens + decision_input + 1):
             allowed = controls
             decision_input = input_cost(controls)
-        if (not budget.has_steps(3 if self.assigned else 2) or budget.seconds_left <= self.close_seconds
+        if (not budget.has_steps(3 if self.assigned else 2) or not budget.has_time(self.close_seconds)
                 or not budget.has_tokens(self.close_tokens + decision_input + 1)):
             return closing
         dispatch_limit = decision_input + 8192
@@ -1335,6 +1337,11 @@ class RoomCrew:
         self.invalid_route = decision
         return self._observation(False, message)
 
+    def _remaining_seconds(self):
+        remaining = None if self.deadline is None else self.deadline - time.monotonic()
+        balance = self.budget.capped_seconds(remaining)
+        return None if balance is None else max(0.0, balance)
+
     def _split_budget(self, count, available_seconds):
         b = self.budget
         next_dispatch = min(14000, self.close_tokens + 2000)
@@ -1343,13 +1350,14 @@ class RoomCrew:
             steps_left=None if b.steps_left is None else count + lead_retry,
             actions_left=None if b.actions_left is None else count,
             tokens_left=0 if b.tokens_left is None else self.close_tokens + (count - 1) * next_dispatch,
-            seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count - 1),
+            seconds_left=(None if available_seconds is None else
+                          self.close_seconds + min(self.close_seconds / 2, 15) * (count - 1)),
         )
         share = Budget(
             steps_left=None if b.steps_left is None else (b.steps_left - reserved.steps_left) // count,
             actions_left=None if b.actions_left is None else (b.actions_left - reserved.actions_left) // count,
             tokens_left=None if b.tokens_left is None else (b.tokens_left - reserved.tokens_left) // count,
-            seconds_left=(available_seconds - reserved.seconds_left) / count,
+            seconds_left=None if available_seconds is None else (available_seconds - reserved.seconds_left) / count,
         )
         return share, reserved
 
@@ -1360,7 +1368,7 @@ class RoomCrew:
         return child, reserved
 
     def _allocation_plan(self, role, planned, review=None, recovery=False):
-        available_seconds = min(self.budget.seconds_left, self.deadline - time.monotonic())
+        available_seconds = self._remaining_seconds()
         addressed = set(self.thread.get("addressed_roles", []))
         if self.direct:
             addressed.discard(self.lead)
@@ -1406,10 +1414,11 @@ class RoomCrew:
         author, reviewer = review.author, review.reviewer
         share, reserved, protected = self._allocation_plan(author, self.planned, review)
         peer = protected.get(reviewer)
-        capacity = {role: round(allocation.seconds_left, 3) for role, allocation in
+        remaining_seconds = self._remaining_seconds()
+        capacity = {role: None if allocation.seconds_left is None else round(allocation.seconds_left, 3) for role, allocation in
                     ((author, share), (reviewer, peer)) if allocation is not None}
         receipt = {"provider_error_code": "deadline_exceeded", "checkpoint_task": frozen["task_id"],
-                   "remaining_seconds": round(max(0, min(self.budget.seconds_left, self.deadline - time.monotonic())), 3),
+                   "remaining_seconds": None if remaining_seconds is None else round(remaining_seconds, 3),
                    "member_seconds": capacity, "reserved_seconds": reserved.seconds_left}
         obstruction = ""
         if self.should_cancel():
@@ -1770,7 +1779,7 @@ class RoomCrew:
             return self._observation(False, self.dispatch_ended)
         if allocated.exhausted or not allocated.has_tokens(1000):
             remaining = self.budget.model_dump()
-            remaining["seconds_left"] = max(0, min(remaining["seconds_left"], self.deadline - time.monotonic()))
+            remaining["seconds_left"] = self._remaining_seconds()
             self.dispatch_ended = "已无委派预算。剩余额度无法同时安排这项分工和负责人收尾。"
             self.record_event(self.run_id, "studio", "dispatch_budget_exhausted", self.dispatch_ended,
                               task_id=self.run_id, recipient=role, remaining=remaining, reserved=reserved.model_dump(),
@@ -1877,8 +1886,8 @@ class RoomCrew:
                           protected_peer_shares={k:v.model_dump() for k,v in self.untapped_shares.items()})
         execution = self.service.start(record.task_id, expected_revision=record.revision,
                                        context={"role": role, "workspace": str(workspace), "public_room": self.thread["id"]})
-        handoff_seconds = min(30, allocated.seconds_left * .1)
-        human_deadline = time.monotonic() + allocated.seconds_left - handoff_seconds
+        handoff_seconds = 0 if allocated.seconds_left is None else min(30, allocated.seconds_left * .1)
+        human_deadline = None if allocated.seconds_left is None else time.monotonic() + allocated.seconds_left - handoff_seconds
         registry = build_default_registry(read_only=self.read_only)
         if self.diagnostics.files:
             registry.add(self.diagnostics.tool())
@@ -2112,7 +2121,7 @@ class RoomCrew:
             # than the allocation or taking another member's share.
             spendable = budget.model_copy(update={"steps_left": None if budget.steps_left is None else budget.steps_left - 1,
                                                   "tokens_left": budget.available_tokens(reserve),
-                                                  "seconds_left": budget.seconds_left - handoff_seconds})
+                                                  "seconds_left": budget.available_seconds(handoff_seconds)})
             if preflight:
                 progress.require_handoff("工作调用的受保护输入超过可用 token；使用保留的最终交接额度")
             phase = progress.phase(spendable, state.scratch.get("delivery_feedback", ""))
@@ -2354,6 +2363,7 @@ class RoomCrew:
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,
                                     on_step=observe, before_answer=preflight_publication,
+                                    on_assistant_stream=self.on_assistant_stream,
                                     preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True),
                                     tool_completion=complete_signed_review)
                 # A model may mark its honest gap [BLOCKED] after signing. Only a
@@ -2417,7 +2427,7 @@ class RoomCrew:
             if mismatch:
                 product_changes = []
                 issue = "独立评审的公共候选已变化或无法核实，此次签署不能委派返工：" + mismatch
-        if pending_verification and (self.should_cancel() or self.budget.exhausted or time.monotonic() >= self.deadline):
+        if pending_verification and (self.should_cancel() or self.budget.exhausted or (self.deadline is not None and time.monotonic() >= self.deadline)):
             pending_verification = False
         if published:
             if not private:

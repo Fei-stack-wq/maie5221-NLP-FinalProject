@@ -199,7 +199,7 @@ class Budget(BaseModel):
     """四维预算。单调递减，父任务可向子任务切分。"""
 
     steps_left: int | None = Field(default_factory=lambda: Limits().max_steps or None)
-    seconds_left: float = Field(default_factory=lambda: Limits().max_seconds)
+    seconds_left: float | None = Field(default_factory=lambda: Limits().max_seconds or None)
     # None disables the cumulative cap. Zero is an exhausted finite allocation.
     tokens_left: int | None = Field(default_factory=lambda: Limits().max_total_tokens or None)
     _tokens_used: int = PrivateAttr(default=0)
@@ -212,7 +212,7 @@ class Budget(BaseModel):
         """按 Limits 造一份预算。factor < 1 用于给子任务打折。"""
         return cls(
             steps_left=max(1, int(limits.max_steps * factor)) if limits.max_steps else None,
-            seconds_left=limits.max_seconds * factor,
+            seconds_left=limits.max_seconds * factor if limits.max_seconds else None,
             tokens_left=int(limits.max_total_tokens * factor) if limits.max_total_tokens else None,
             actions_left=max(
                 1,
@@ -237,7 +237,8 @@ class Budget(BaseModel):
         self._tokens_used += tokens
         if self.tokens_left is not None:
             self.tokens_left -= tokens
-        self.seconds_left -= seconds
+        if self.seconds_left is not None:
+            self.seconds_left -= seconds
         return self
 
     @property
@@ -263,6 +264,17 @@ class Budget(BaseModel):
     def has_actions(self, minimum: int) -> bool:
         return self.actions_left is None or self.actions_left >= minimum
 
+    def has_time(self, reserve: float = 0) -> bool:
+        return self.seconds_left is None or self.seconds_left > reserve
+
+    def available_seconds(self, reserve: float = 0) -> float | None:
+        return None if self.seconds_left is None else self.seconds_left - reserve
+
+    def capped_seconds(self, other: float | None) -> float | None:
+        if self.seconds_left is None:
+            return other
+        return self.seconds_left if other is None else min(self.seconds_left, other)
+
     def available_tokens(self, reserve: int = 0) -> int | None:
         return None if self.tokens_left is None else self.tokens_left - reserve
 
@@ -272,11 +284,11 @@ class Budget(BaseModel):
             not self.has_steps(1)
             or not self.has_actions(1)
             or not self.has_tokens(0)
-            or self.seconds_left <= 0
+            or not self.has_time()
         )
 
     def reason(self, limits: Limits | None = None) -> str:
-        if self.seconds_left <= 0:
+        if not self.has_time():
             total = limits.max_seconds if limits else 0
             return f"超过时间上限 {total:.0f}s"
         if not self.has_steps(1):
@@ -294,13 +306,14 @@ class Budget(BaseModel):
         ratio = min(max(ratio, 0.0), 1.0)
         child = Budget(
             steps_left=max(1, int(self.steps_left * ratio)) if self.steps_left is not None and self.steps_left > 1 else self.steps_left,
-            seconds_left=self.seconds_left * ratio,
+            seconds_left=None if self.seconds_left is None else self.seconds_left * ratio,
             tokens_left=None if self.tokens_left is None else int(self.tokens_left * ratio),
             actions_left=max(1, int(self.actions_left * ratio)) if self.actions_left is not None and self.actions_left > 1 else self.actions_left,
         )
         if self.steps_left is not None:
             self.steps_left -= child.steps_left
-        self.seconds_left -= child.seconds_left
+        if child.seconds_left is not None:
+            self.seconds_left -= child.seconds_left
         if self.tokens_left is not None:
             self.tokens_left -= child.tokens_left
         if self.actions_left is not None:
@@ -650,11 +663,15 @@ class RAOUnit:
                allowed_tools: frozenset[str] | None = None,
                request_seconds: float | None = None,
                allowed_write_paths: frozenset[str] | None = None,
-               required_tool: str | None = None) -> tuple[Decision, LLMResponse]:
+               required_tool: str | None = None,
+               on_stream: Callable[[str, str], None] | None = None) -> tuple[Decision, LLMResponse]:
         messages = state.history if request_history is None else request_history
         tools = self.tool_specs(allowed_tools, allowed_write_paths)
-        if isinstance(self.provider, DeepSeekProvider) and max_output_tokens is not None:
+        if isinstance(self.provider, DeepSeekProvider) and (max_output_tokens is not None or on_stream is not None):
             limits = {"max_output_tokens": max_output_tokens}
+            if on_stream is not None:
+                limits["on_stream"] = on_stream
+                limits["should_cancel"] = self.should_cancel
             if required_tool is not None and self.provider.thinking == "disabled":
                 limits["required_tool"] = required_tool
             if request_seconds is not None:
@@ -663,7 +680,10 @@ class RAOUnit:
                                           **limits)
         else:
             response = self.provider.chat(messages, tools, temperature=self.temperature)
-        return self.parse_response(response), response
+        decision = self.parse_response(response)
+        if on_stream is not None and decision.kind != "answer":
+            on_stream("discard", "")
+        return decision, response
 
     def parse_response(self, response: LLMResponse) -> Decision:
         """把模型回复归一成闭集里的一个决策。
@@ -719,7 +739,7 @@ class RAOUnit:
         tool_deadline: float | None = None,
     ) -> tuple[str, list[Observation], str | None]:
         """执行决策。返回 (实际决策形态, 观察列表, 终止原因)。"""
-        if tool_deadline is None:
+        if tool_deadline is None and budget.seconds_left is not None:
             tool_deadline = time.monotonic() + budget.seconds_left
         observations: list[Observation] = []
         terminate: str | None = None
@@ -819,7 +839,7 @@ class RAOUnit:
             call_id = action.id
             if self.should_cancel and self.should_cancel():
                 terminate = ErrorClass.T_CANCEL
-            elif not budget.has_tokens(0) or budget.seconds_left <= 0:
+            elif not budget.has_tokens(0) or not budget.has_time():
                 terminate = ErrorClass.T_BUDGET
             if terminate:
                 obs = Observation(
@@ -1084,22 +1104,24 @@ class RAOUnit:
              allowed_tools: frozenset[str] | None = None, token_reserve: int = 0,
              request_seconds: float | None = None,
              allowed_write_paths: frozenset[str] | None = None,
-             required_tool: str | None = None, bound_handoff: BoundHandoff | None = None) -> StepRecord:
+             required_tool: str | None = None, bound_handoff: BoundHandoff | None = None,
+             on_stream: Callable[[str, str], None] | None = None) -> StepRecord:
         """完整的一步：Reason → Act → Observe，并把观察追加进历史。"""
         started = time.perf_counter()
-        tool_deadline = time.monotonic() + min(budget.seconds_left, request_seconds
-                                                if request_seconds is not None else budget.seconds_left)
+        request_seconds = budget.capped_seconds(request_seconds)
+        tool_deadline = None if request_seconds is None else time.monotonic() + request_seconds
         state.step_index += 1
 
         if self.should_cancel and self.should_cancel():
             return StepRecord(step=state.step_index, ok=False, decision_kind="abort",
                               error_class=ErrorClass.T_CANCEL, terminate_reason=ErrorClass.T_CANCEL)
-        if not budget.has_tokens(0) or budget.seconds_left <= 0:
+        if not budget.has_tokens(0) or not budget.has_time():
             return StepRecord(step=state.step_index, ok=False,
                               error_class=ErrorClass.T_BUDGET, terminate_reason=ErrorClass.T_BUDGET)
         decision, response = self.decide(state, request_history, max_output_tokens=max_output_tokens,
                                          allowed_tools=allowed_tools, request_seconds=request_seconds, required_tool=required_tool,
-                                         allowed_write_paths=allowed_write_paths)
+                                         allowed_write_paths=allowed_write_paths,
+                                         **({"on_stream": on_stream} if on_stream is not None else {}))
         try:
             raw_usage = getattr(response, "usage", None)
             if isinstance(raw_usage, Usage):
@@ -1119,7 +1141,7 @@ class RAOUnit:
             state.history.append(message)
         protocol_error = decision.protocol_error or envelope_error
         cancelled = bool(self.should_cancel and self.should_cancel())
-        budget_overrun = not budget.has_tokens(0) or budget.seconds_left <= 0
+        budget_overrun = not budget.has_tokens(0) or not budget.has_time()
         host_handoff = None
         if protocol_error or cancelled or budget_overrun:
             terminate = (ErrorClass.T_CANCEL if cancelled else ErrorClass.T_BUDGET

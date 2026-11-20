@@ -233,6 +233,20 @@ class BudgetTest(unittest.TestCase):
         self.assertTrue(budget.exhausted)
         self.assertIn("最大步数", budget.reason(Limits(max_steps=2)))
 
+    def test_unlimited_wall_time_forks_and_zero_balance(self) -> None:
+        parent = Budget.from_limits(Limits(max_seconds=0))
+        child = parent.fork()
+        for budget in (child, parent):
+            budget.spend(seconds=1000000)
+            self.assertIsNone(budget.model_dump(mode="json")["seconds_left"])
+            self.assertTrue(budget.has_time(1000000))
+            self.assertEqual(budget.capped_seconds(5), 5)
+        finite = Budget.from_limits(Limits(max_seconds=60))
+        self.assertEqual(finite.fork().seconds_left, 30)
+        finite.spend(seconds=30)
+        self.assertEqual(finite.seconds_left, 0)
+        self.assertTrue(finite.exhausted)
+
     def test_seconds_reason_takes_priority(self) -> None:
         budget = Budget(steps_left=0, seconds_left=-1.0, tokens_left=100, actions_left=4)
         self.assertIn("时间上限", budget.reason(Limits(max_seconds=30)))
