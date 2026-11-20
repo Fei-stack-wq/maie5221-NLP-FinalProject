@@ -14,6 +14,7 @@ from .acceptance import _relative_name
 from .contracts.acceptance import CheckResult, Criterion
 from .contracts.base import EvidenceRef
 from .project_data import PROJECT_CACHE_DIRS
+from .probe_coverage import corrected_assertion
 from .schemas import ToolResult
 from .studio_conversations import snapshot_location
 from .tools import Tool
@@ -104,6 +105,7 @@ class Review:
     state: str = "review"
     latest: dict = field(default_factory=dict)
     visited: set = field(default_factory=set)
+    interrupted_checkpoints: dict = field(default_factory=dict)
     answer_at: str = ""
     answered_issues: set = field(default_factory=set)
     draft_task: str | None = None
@@ -119,6 +121,7 @@ class Review:
     comparison_targets: set[str] = field(default_factory=set)
     peer_recheck: dict = field(default_factory=dict)
     revision_reports: set[str] = field(default_factory=set)
+    covered_failed_sites: set = field(default_factory=set)
 
     def compare_with(self, reference):
         return (self.comparison_targets or {p for p, sha in self.files.items() if sha}) - {reference}
@@ -200,6 +203,9 @@ class Review:
 
     def apply(self, assessment, human_state):
         previous = {g["criterion_id"] for g in self.verification_gaps()}
+        self.covered_failed_sites.update(self._covered_sites(self.latest))
+        new_sites = self._covered_sites(assessment) - self.covered_failed_sites
+        self.covered_failed_sites.update(new_sites)
         self.latest = assessment
         required = {r.id for r in self.criteria if r.required}
         gaps = [r for r in assessment["results"] if r["criterion_id"] in required and r["verdict"] != "passed"]
@@ -209,7 +215,8 @@ class Review:
         # IDs of tool calls and prose can change without the candidate or
         # findings changing. Only fresh substantive evidence can reopen work.
         key = (self.version, tuple(sorted((g["criterion_id"], g["verdict"], g["cause"],
-                    tuple(sorted(e["fingerprint"] for e in g["receipts"]))) for g in gaps)), human_state)
+                    tuple(sorted(e["fingerprint"] for e in g["receipts"]))) for g in gaps)), human_state,
+               frozenset(self.covered_failed_sites))
         if key in self.visited:
             self.state = "blocked"
             return
@@ -225,10 +232,49 @@ class Review:
             self.answer_at = human_state
         else:
             remaining = {g["criterion_id"] for g in gaps}
-            # One opportunity to obtain an independent source for this gap.
-            # New tool IDs, different read ranges or another 403 must not buy
-            # more attempts against identical bytes and unresolved criteria.
-            self.state = "blocked" if previous and not remaining < previous else "review"
+            # A new receipt ID, another failed attempt or a rewritten summary
+            # cannot make progress on a frozen obligation.
+            advanced = remaining < previous or (remaining <= previous and new_sites)
+            self.state = "blocked" if previous and not advanced else "review"
+
+    def _covered_sites(self, assessment):
+        if self.kind != "reviewer_probe" or assessment.get("candidate_version") != self.version:
+            return set()
+        return {(self.version, g["criterion_id"], receipt["countercheck"]["original_line"])
+                for g in assessment.get("results", []) if g.get("cause") == "verification"
+                and g.get("verdict") == "inconclusive" and g["criterion_id"].removeprefix("probe_") in self.probes
+                for receipt in g["receipts"] if receipt.get("countercheck")}
+
+    def interrupted_repair(self, frozen, receipts):
+        """Resume only new product bytes or attributable evidence on a known checkpoint."""
+        evidence = frozen["evidence"]
+        paths = frozen["required"] or self.files
+        product = {path: frozen["manifest"].get(path) for path in paths}
+        key = (self.version, digest(product))
+        failures = set(frozen["failed_checks"])
+        prior = self.interrupted_checkpoints.get(key)
+        # Keep the original commands across restores. An identical script exit with
+        # a new tool-call ID or a new script unrelated to a failure adds no coverage.
+        commands = dict(prior["commands"]) if prior else {}
+        for entry in evidence["failed_check_details"]:
+            if entry.get("check") and entry["scope_id"] in failures:
+                commands[entry["check"]] = entry["scope_id"]
+        verified = {ref for ref, row in receipts.items() if ref.startswith("pass:") and row.get("asserted")
+                    and any(product.get(path) == sha for path, sha in row.get("asserted_inputs", {}).items())}
+        for entry in evidence["script_exits"].values():
+            scope = commands.get(entry["check"])
+            if scope and entry["exit_code"] == 0 and frozen["manifest"].get(entry["path"]) == entry["sha256"]:
+                verified.add("exit:" + scope)
+        if prior:
+            if not failures < prior["failures"] and not verified - prior["verified"]:
+                return "同一冻结返工再次请求到期，交付、未消除的检查及已运行脚本的证据均无变化或未改善。"
+            failures &= prior["failures"]
+            verified |= prior["verified"]
+        self.interrupted_checkpoints[key] = {"failures":failures, "verified":verified, "commands":commands}
+        self.visited.add(("provider_deadline", key, frozenset(failures), frozenset(verified)))
+        self.state = "repair"
+        self.host_issue = ""
+        return ""
 
     def repair_blocked(self, snapshot, failed, missing):
         # Public-candidate repairs that could not publish can retry with fresh evidence.
@@ -458,6 +504,7 @@ class ReviewSession:
         self.progress = progress
         self.attempt_id = attempt_id
         self.receipts = {}
+        self.counterchecks = {}
         self.assessment = None
         self.reviewer_task = reviewer_task
         self.submission_issue = ""
@@ -580,7 +627,13 @@ class ReviewSession:
                 if self.progress.project_versions().get(note["path"]) != note["sha256"]:
                     del self.receipts[ref]
         for ref, event in current.items():
-            self._add(ref, {k:v for k,v in event.items() if k != "tool_call_id"}, event["tool_call_id"])
+            receipt = self._add(ref, {k:v for k,v in event.items() if k != "tool_call_id"}, event["tool_call_id"])
+            if self.item.kind == "reviewer_probe" and (observed := self.progress.observed_python_checks.get(event["tool_call_id"])):
+                for rule in self.item.criteria:
+                    probe = self.item.probes.get(rule.id.removeprefix("probe_"))
+                    if (probe and rule.required and rule.method == "execute" and self._product_assertion(receipt, rule)
+                            and (site := corrected_assertion(probe, *observed))):
+                        self.counterchecks[(rule.id, receipt["receipt_id"])] = site
         for d in evidence["diagnostic_checks"]:
             row = {"kind":"diagnostic", "tool":d["tool"], "check":d["check"], "reason":d["reason"]}
             self._add("observation:" + digest(row)[:12], row, None)
@@ -681,6 +734,7 @@ class ReviewSession:
         self.receipts[short] = {**row, "ref":short, "legacy_ref":ref, "attempt_id":self.attempt_id,
                                 "tool_call_id":tool_call_id, "fingerprint":fingerprint,
                                 "receipt_id":receipt_id}
+        return self.receipts[short]
 
     def _resolve(self, ref):
         if ref in self.receipts:
@@ -820,7 +874,7 @@ class ReviewSession:
     def closing_options(self):
         needs = self.evidence_needs()
         tools = {"submit_review"}
-        if len(self.receipts) > 6:
+        if len(self.receipts) > 6 or self.item.kind == "reviewer_probe" and self.receipts:
             tools.add("list_review_evidence")
         for steps in needs.values():
             tools.update(step["tool"] for step in steps)
@@ -908,8 +962,11 @@ class ReviewSession:
                 raise ValueError("这些 E 引用是历史执行回执：" + json.dumps(expired, ensure_ascii=False)
                     + "。先定稿报告；若已有 current_ref，请核对后引用它或当前唯一 alias。否则在当前版本复跑原检查，"
                       "用 list_review_evidence 获取新 E 后直接签署，无需把 E 写回报告。")
+            current = [r["ref"] for r in self.receipts.values()
+                       if self.item.kind == "reviewer_probe" and rule.method == "execute" and self._product_assertion(r, rule)]
+            hint = "。本标准当前的产品断言回执 " + current[-1] + "，请核对是否适用" if current else ""
             raise ValueError("引用了未观察到或不唯一的证据：" + "、".join(r[:160] for r in unknown)
-                             + "。从 list_review_evidence 选择相符的短 ID。")
+                             + hint + "。从 list_review_evidence 选择相符的短 ID。")
         kinds = {e["kind"] for e in receipts}
         if rule.reference_path and (result.verdict == "passed" or result.cause == "product"):
             if not (any(e["kind"] == "reference" and e["path"] == rule.reference_path for e in receipts)
@@ -953,6 +1010,8 @@ class ReviewSession:
         check = CheckResult(criterion_id=rule.id,
             verdict={"passed":"passed","changes_requested":"failed","inconclusive":"unverified"}[result.verdict],
             reason=result.reason, evidence_refs=[EvidenceRef(kind="receipt", id=e["receipt_id"]) for e in receipts])
+        receipts = [{**r, "countercheck": site} if (site := self.counterchecks.get((rule.id, r["receipt_id"]))) else r
+                    for r in receipts]
         return {**result.model_dump(), "check_result":check.model_dump(), "receipts":receipts}
 
     def submit(self, ctx, args):
@@ -978,6 +1037,12 @@ class ReviewSession:
                     results.append(self._finding(rule, result))
                 except ValueError as exc:
                     issue = {"criterion_id":rule.id, "method":rule.method, "message":str(exc)}
+                    if self.item.kind == "reviewer_probe" and rule.method == "execute":
+                        if result.verdict == "passed" and (result.cause or result.action):
+                            issue["verdict_fields"] = "若维持 passed，省略 cause 和 action。"
+                        if open_checks := self.progress.failed_checks():
+                            issue["pending"] = (f"本轮裁决仍有 {len(open_checks)} 项失败检查，"
+                                "请用 list_review_evidence 核对失败与纠正回执，再决定逐项结论。")
                     if result.verdict == "passed" and self.ordinary_execution(rule):
                         issue["passed_checks"] = [{"ref":r["ref"], "label":r["label"]} for r in self.receipts.values()
                                                   if r["kind"] == "passed_check"][-6:]

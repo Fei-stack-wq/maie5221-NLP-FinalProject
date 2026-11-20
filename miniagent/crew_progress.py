@@ -744,6 +744,7 @@ class MemberProgress:
         self._inspected = set()
         self._passes = {}
         self._review_evidence = {}
+        self.observed_python_checks = {}
         self._inline_failures = {}
         self._probe_support = {}
         self._corroborating_runs = {}
@@ -977,6 +978,7 @@ class MemberProgress:
 
     def observe(self, record: StepRecord, state: RAOState) -> None:
         self._steps += 1
+        self.observed_python_checks.clear()
         if not record.observations:
             return
         self._read_hint = ""
@@ -1354,15 +1356,18 @@ class MemberProgress:
                                     inputs.update(browser_inputs)
                                 self._review_evidence["pass:" + suite_key]["asserted_inputs"] = {
                                     p: self._current[p] for p in inputs if p in self._current}
-                            if (self._inline_failures and status != "runner_exit" and obs.tool_call_id
+                            if (status != "runner_exit" and obs.tool_call_id and obs.ok
                                     and obs.source in {"run_python", "run_browser"}
                                     and type(exit_code) is int and exit_code == 0
                                     and 0 < len(code.encode()) <= 32768 and len(obs.content.encode()) <= 8192
                                     and not _output_truncated(obs) and not obs.meta.get("timed_out")
                                     and not obs.meta.get("cancelled")):
-                                self._retain_probe_support({"scope": suite_key, "code": code,
-                                    "output": obs.content, "exit_code": exit_code, "tool": obs.source,
-                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id, "step": record.step}, inputs)
+                                if obs.source == "run_python":
+                                    self.observed_python_checks[obs.tool_call_id] = (code, obs.content)
+                                if self._inline_failures:
+                                    self._retain_probe_support({"scope": suite_key, "code": code,
+                                        "output": obs.content, "exit_code": exit_code, "tool": obs.source,
+                                        "tool_call_id": obs.tool_call_id, "task_id": state.task_id, "step": record.step}, inputs)
                             if status != "runner_exit":
                                 original_probe = self._inline_failures.get(suite_key, {})
                                 revised_script = (original_probe.get("kind") == "edited_script" and

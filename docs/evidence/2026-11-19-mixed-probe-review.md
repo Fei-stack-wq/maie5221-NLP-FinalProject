@@ -16,3 +16,5 @@ pytest 的 `LFPlugin` 按实际运行的测试节点更新失败记录，收集�
 - 普通群聊入口使用真实 Chromium。作者先提交错断言，再实测修正版，重放原错两次、编辑 README，最后请求团队内部裁决。工作室未发起人类请求。评审者第一次签署因遗漏另一个脚本而被拒，补跑后按当前版本签署和发布。负例把真实房间容量改成 2 人，评审者在当前页面测出回退，旧成功回执无法签署，最终记录 `changes_requested/product`，候选保留为私有。[群聊回归](../../tests/test_mixed_browser_script_handoff.py)
 - Python 用例先尝试用常量断言解释失败，再针对原文件实际取证。它核对了首次失败的 ID 在产品改动、重复失败后仍绑定至历史调查回执，同时当前版本仍有未关闭的失败。[成员检查回归](../../tests/test_crew_progress.py)
 - 在隔离目录从第 6 轮 SQLite 的原始写文件及编辑动作复原 7 个产品文本文件，每一步都核对工具记录的 SHA-256。使用真实 Chromium 和本地服务运行第 16、17 步的原始脚本，唯一改动为独立端口，再次执行第 16 步。退出依次为 1、0、1。核到的页面 SHA-256 为 `17d9828712954ef0959412b4d9d8d57e717e0b7bd0bfecc3d53a6bc0e8b768ab`，原失败与真实改正已绑定，另一个脚本继续待复核。运行记录位于本地验收目录 `trial-6/evidence/software-qa/trial6-mixed-probe-reproduction.json`。此项重放使用当时的产物和工具参数；它不代表一次新模型运行。
+
+第七轮的裁决者在同次 `submit_review` 中拼错了一个回执 ID，又为 `passed` 设置了 `cause` 和 `action`。工具回执现同时指出字段冲突、可核对的本标准冻结产品断言短 ID，以及本次裁决尚存的失败检查数。裁决者可通过 `list_review_evidence` 逐条核对事实，再自行判定和提交。签署工具仍严格验证每个调用提供的原始引用。Pydantic AI 同样把工具参数校验细节作为工具结果返回模型，以便模型自行修订调用。[Pydantic AI 工具校验与重试](https://pydantic.dev/docs/ai/tools-toolsets/tools-advanced/#tool-retries)

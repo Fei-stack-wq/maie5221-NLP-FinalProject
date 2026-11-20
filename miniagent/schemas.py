@@ -169,6 +169,7 @@ class RunResult(BaseModel):
     status: Status = "error"
     answer: str = ""
     error: str = ""
+    provider_error_code: str | None = None
     duration_ms: float = 0.0
     steps: int = 0
     tool_calls: int = 0

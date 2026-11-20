@@ -86,6 +86,15 @@ class ExecuteReviewGuidanceTest(unittest.TestCase):
         self.assertEqual(finding["evidence"], [receipt["ref"]])
         self.assertRegex(receipt["ref"], r"^E[0-9a-f]{16}$")
 
+    def test_one_receipt_can_be_looked_up_while_closing_a_probe_review(self):
+        files = {PATH: SHA}
+        rule = Rule(id="probe_quantity", method="execute", description=RULE["description"])
+        review = Review("target", "writer", "reviewer", "Check the disputed quantity.", [rule], files,
+                        kind="reviewer_probe", probes={"quantity": {"tool": "run_python"}})
+        session = ReviewSession(review, files, Mock(), "attempt")
+        session._add("pass:quantity", {"kind": "passed_check", "label": "Quantity checked"}, None)
+        self.assertEqual(session.closing_options(), {"submit_review", "list_review_evidence"})
+
     def test_closing_offers_only_the_roles_registered_execution_tools(self):
         files = {PATH: SHA}
         rule = Rule.model_validate(RULE)

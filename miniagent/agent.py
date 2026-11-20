@@ -250,6 +250,7 @@ class Agent:
         status = "limit_exceeded"
         answer = ""
         error = ""
+        provider_error_code = None
         acceptance_spec = None
         acceptance_report = None
         acceptance_evidence = []
@@ -706,6 +707,7 @@ class Agent:
             if cancellation_observed():
                 status, error = "aborted", "用户请求停止"
             else:
+                provider_error_code = exc.code
                 status, error = "error", f"模型调用失败：{exc}"
         except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
             status, error = "error", f"{type(exc).__name__}: {exc}"
@@ -731,6 +733,7 @@ class Agent:
             status=status,  # type: ignore[arg-type]
             answer=answer,
             error=error,
+            provider_error_code=provider_error_code,
             duration_ms=duration_ms,
             steps=state.step_index,
             tool_calls=tool_calls,

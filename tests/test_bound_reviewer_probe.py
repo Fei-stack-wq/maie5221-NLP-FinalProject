@@ -870,6 +870,93 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.assertFalse(child["published"])
         self.assertFalse(any(e["kind"] == "reviewer_probe_resolved" for e in detail["room_events"]))
 
+    def test_new_observed_countercheck_advances_an_unchanged_gap_without_waiving_new_failures(self):
+        corrected = BAD_PROBE.replace(" + 10", "") + "print('PASS rechecked the original quantity')\n"
+        peer_error = BAD_PROBE.replace("== 10", "== 11")
+        other_error = BAD_PROBE.replace("== 10", "== 12")
+
+        def unresolved(evidence, peer_probe=PEER_PROBE, failed=()):
+            steps = self.peer_steps(verdict="inconclusive", evidence=evidence, peer_probe=peer_probe)
+            finding = steps.pop()
+            finding["_probe_finding"].update(cause="verification", action="Remeasure both calculations independently.")
+            steps[-1:-1] = [tool("run_python", code=code) for code in failed]
+            return steps + [finding, {"text": "[BLOCKED] Signed the remaining measurement conflict."}]
+
+        first = unresolved(["pass:" + PEER_SCOPE])
+        second = unresolved(["fail:" + scope(peer_error), "fail:" + scope(other_error), "pass:" + scope(corrected)],
+                            corrected, (peer_error, other_error))
+        invalid = {"_probe_finding": {"criterion_id": "probe_" + BAD_SCOPE, "verdict": "passed",
+                   "reason": "This extra ID was mistyped.", "evidence": ["E0000000000000000"],
+                   "cause": "verification", "action": "Recheck both measurements."}}
+        second.insert(-2, invalid)
+        steps = self.start_bound_review() + first + second + self.peer_steps() + [
+            {"text": "Confirmed from the untouched candidate."}, {"text": "Delivered."}]
+        detail, reports, provider = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([(r["role"], r["native_review"]["state"]) for r in children],
+                         [("arbiter","review"), ("arbiter","review"), ("arbiter","passed")])
+        self.assertEqual(len({r["native_review"]["candidate_version"] for r in children}), 1)
+        decision = children[1]["native_review"]["assessment"]
+        receipts = decision["results"][0]["receipts"]
+        positive, = [r for r in receipts if "countercheck" in r]
+        self.assertEqual(positive["countercheck"]["observed_case"], "PASS rechecked the original quantity")
+        self.assertEqual([r["scope"] for r in receipts if r["kind"] == "failed_check"],
+                         [scope(peer_error), scope(other_error)])
+        self.assertFalse(children[1]["published"])
+        rejection = next(m["content"] for messages, _ in provider.requests for m in messages
+                         if m.get("role") == "tool" and "引用了未观察到" in m["content"])
+        self.assertIn(positive["ref"], rejection.split("list_review_evidence")[0])
+        issues, _ = json.JSONDecoder().raw_decode(rejection[rejection.index('[{"criterion_id"'):])
+        self.assertIn("省略 cause 和 action", issues[0]["verdict_fields"])
+        self.assertIn("2 项失败检查", issues[0]["pending"])
+
+    def test_new_calls_repeating_same_original_assertion_or_additional_failure_do_not_reopen_review(self):
+        corrected = BAD_PROBE.replace(" + 10", "") + "print('PASS rechecked quantity')\n"
+        failed = BAD_PROBE.replace("== 10", "== 12")
+        first = self.peer_steps(verdict="inconclusive", evidence=["pass:" + scope(corrected)], peer_probe=corrected)
+        first[-1]["_probe_finding"].update(cause="verification", action="Obtain further independent evidence.")
+        renamed = corrected.replace("rechecked quantity", "quantity confirmed again")
+        second = self.peer_steps(verdict="inconclusive", evidence=["pass:" + scope(renamed), "fail:" + scope(failed)],
+                                 peer_probe=renamed)
+        second[-2:-2] = [tool("run_python", code=failed)]
+        second[-1]["_probe_finding"].update(cause="verification", action="Remeasure the quantity.")
+        steps = self.start_bound_review() + first + [{"text":"[BLOCKED] Signed the gap."}] + second + [
+            {"text":"[BLOCKED] Same evidence."}, {"text":"[BLOCKED] No new evidence."}]
+        detail, reports, _ = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "failed")
+        children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([r["native_review"]["state"] for r in children], ["review", "blocked"])
+        self.assertTrue(all(not r["published"] for r in children))
+        positives = [next(e for e in r["native_review"]["assessment"]["results"][0]["receipts"] if "countercheck" in e)
+                     for r in children]
+        self.assertNotEqual(positives[0]["tool_call_id"], positives[1]["tool_call_id"])
+        self.assertEqual(positives[0]["countercheck"]["original_line"], positives[1]["countercheck"]["original_line"])
+
+    def test_countercheck_requires_the_failure_site_and_its_own_observed_success_case(self):
+        from miniagent.probe_coverage import corrected_assertion
+        probe = {"tool":"run_python", "exit_code":1, "code":"assert ready(), 'after restart'\n",
+                 "error":'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\nAssertionError: after restart'}
+        original = "assert ready(), 'after restart'"
+        caption = "print('PASS checked restart')"
+        output = "exit_code=0\nstdout:\nPASS checked restart\n"
+        valid = "try:\n    " + original + "\n    " + caption + "\nfinally:\n    pass"
+        self.assertEqual(corrected_assertion(probe, valid, output)["checked_line"], 2)
+        for code in (
+            "if False:\n    " + original + "\n" + caption,
+            "try:\n    " + original + "\nexcept AssertionError:\n    pass\n" + caption,
+            original.replace("after restart", "initial start") + "\n" + caption,
+            "assert True, 'after restart'\n" + caption,
+            original + "\n" + caption + "\n" + caption,
+            original + "\n" + caption + "\nif False:\n    " + original,
+        ):
+            with self.subTest(code=code):
+                self.assertIsNone(corrected_assertion(probe, code, output))
+        self.assertIsNone(corrected_assertion(probe, valid, "exit_code=0\nstderr:\nPASS checked restart"))
+        self.assertIsNone(corrected_assertion(probe, valid, "exit_code=0\nstdout:\nPASS another case"))
+        self.assertIsNone(corrected_assertion({**probe,"error":probe["error"].replace('in <module>', 'in func')},
+                                              valid, output))
+
     def test_signed_blocked_handoff_with_repeated_verification_gap_stops_on_same_version(self):
         def unresolved():
             steps = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])

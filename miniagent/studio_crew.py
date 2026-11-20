@@ -1341,6 +1341,12 @@ class RoomCrew:
         return share, reserved
 
     def _allocation(self, role, planned, review=None, recovery=False, *, record_shares=True):
+        child, reserved, protected = self._allocation_plan(role, planned, review, recovery)
+        if record_shares:
+            self.untapped_shares = protected
+        return child, reserved
+
+    def _allocation_plan(self, role, planned, review=None, recovery=False):
         available_seconds = min(self.budget.seconds_left, self.deadline - time.monotonic())
         addressed = set(self.thread.get("addressed_roles", []))
         if self.direct:
@@ -1380,9 +1386,37 @@ class RoomCrew:
                     balance = available_seconds if field == "seconds_left" else getattr(self.budget, field)
                     remaining = balance - getattr(reserved, field) - sum(getattr(v, field) for v in protected.values())
                     setattr(child, field, min(max(getattr(child, field), getattr(entitlement, field)), remaining))
-        if record_shares:
-            self.untapped_shares = protected
-        return child, reserved
+        return child, reserved, protected
+
+    def _resume_interrupted_repair(self, review, frozen, progress):
+        """A timed-out author's checkpoint is an execution recovery, never a product verdict."""
+        author, reviewer = review.author, review.reviewer
+        share, reserved, protected = self._allocation_plan(author, self.planned, review)
+        peer = protected.get(reviewer)
+        capacity = {role: round(allocation.seconds_left, 3) for role, allocation in
+                    ((author, share), (reviewer, peer)) if allocation is not None}
+        receipt = {"provider_error_code": "deadline_exceeded", "checkpoint_task": frozen["task_id"],
+                   "remaining_seconds": round(max(0, min(self.budget.seconds_left, self.deadline - time.monotonic())), 3),
+                   "member_seconds": capacity, "reserved_seconds": reserved.seconds_left}
+        obstruction = ""
+        if self.should_cancel():
+            obstruction = "用户已取消本轮。"
+        elif not frozen["checkpoint"] or not frozen["manifest"]:
+            obstruction = "成员请求到期，未取得可安全恢复的冻结草稿。"
+        elif peer is None or any(allocation.exhausted or not allocation.has_steps(2)
+                or not allocation.has_actions(2) or not allocation.has_tokens(1000)
+                for role, allocation in ((author, share), (reviewer, peer))):
+            obstruction = "成员请求到期，剩余额度不足以安排原作者返工、原验收者重新取证签署和负责人收尾。"
+        else:
+            obstruction = review.interrupted_repair(frozen, progress.review_evidence())
+        if obstruction:
+            review.state = "blocked"
+            review.host_issue = obstruction
+        else:
+            # Preserve the original signed version. Only the original author
+            # may restore this newer, still-unpublished working checkpoint.
+            frozen["repair_for"] = (review.target, review.version)
+        return {**receipt, "resume": not obstruction, "reason": obstruction or "按冻结检查点恢复原作者分工，保留原验收者。"}
 
     def _eligible_repairs(self, origin):
         elected = list(dict.fromkeys([*self.plan_order, *self.child_checks]))
@@ -1672,8 +1706,10 @@ class RoomCrew:
             draft = None
         if review and not review.draft_task and review.state == "review":
             draft = None
-        if review and review.draft_task and (not draft or draft["task_id"] != review.draft_task
-                or draft["version"] != self.project_version or draft["manifest"] != review.files):
+        continuing_repair = (review and review.state == "repair" and draft and role == review.author
+                             and draft.get("repair_for") == (review.target, review.version))
+        if review and review.draft_task and (not draft or draft["version"] != self.project_version
+                or not continuing_repair and (draft["task_id"] != review.draft_task or draft["manifest"] != review.files)):
             review.state = "blocked"
             review.host_issue = ("候选检查点或公共版本已变化，此次冻结裁决已失效。请保留已有证据，"
                                  "在同群下一轮选择已发布的当前版本发起独立复核。")
@@ -1791,9 +1827,10 @@ class RoomCrew:
             restored = assignment / "restored"
             try:
                 copy_project(draft["checkpoint"], draft["role"], restored, self.extensions, secret=self.settings.api_key)
-                if review and review.draft_task and (original != draft["base"] or _manifest(restored) != review.files):
-                    review.state = "blocked"
-                    raise SnapshotError("候选或公共基线已有变化。")
+                if review and (review.draft_task or draft.get("repair_for")):
+                    if original != draft["base"] or _manifest(restored) != draft["manifest"]:
+                        review.state = "blocked"
+                        raise SnapshotError("冻结草稿或公共基线已有变化。")
             except (SnapshotError, OSError) as exc:
                 if review and review.draft_task:
                     review.state = "blocked"
@@ -2356,8 +2393,15 @@ class RoomCrew:
                 else:
                     public_versions[change["path"]] = change["sha256"]
         evidence = progress.evidence()
+        interrupted_repair = bool(review and review.state == "repair" and not session
+                                  and result.status == "error" and result.provider_error_code == "deadline_exceeded")
+        terminal_repair_error = bool(review and review.state == "repair" and not session
+                                     and (result.status == "aborted" or result.provider_error_code) and not interrupted_repair)
         if review:
-            if host_repair:
+            if terminal_repair_error:
+                review.state = "blocked"
+                review.host_issue = issue
+            elif host_repair:
                 review.host_issue = issue
                 reason = ("hard_check", review.version, issue)
                 review.state = "blocked" if reason in review.visited else "repair"
@@ -2370,9 +2414,9 @@ class RoomCrew:
                     review.revision_reports.update(paths)
             elif not session and published:
                 review.repaired(public_versions, [c["path"] for c in changes])
-            elif not session and not private:
+            elif not session and not private and not interrupted_repair:
                 review.repair_blocked(progress.project_versions(), progress.failed_checks(), progress.pending_paths())
-            elif not private_repair:
+            elif not private_repair and not interrupted_repair:
                 review.state = "blocked"
                 review.host_issue = (session.submission_issue if session else "") or issue or text
         native_target = review.target if review and review.state == "passed" and published else None
@@ -2430,7 +2474,9 @@ class RoomCrew:
                 elif reviewer := author_handoff or (text.startswith("[BLOCKED]") and author_probe_reviewer()):
                     queued_probe_review = self._queue_author_probes(
                         review, report, self.private_drafts[role], progress.corrected_probe_support(), reviewer)
-            if private_repair and not queued_probe_review:
+            if interrupted_repair:
+                report["interrupted_repair"] = self._resume_interrupted_repair(review, frozen, progress)
+            elif private_repair and not queued_probe_review and not terminal_repair_error:
                 replacement = self.private_drafts[role]
                 if not issue and replacement["reviewable"] and replacement["manifest"] != review.files:
                     review.host_issue = ""
