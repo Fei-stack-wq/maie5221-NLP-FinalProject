@@ -123,3 +123,20 @@ class DiscussionHTTPTest(unittest.TestCase):
                 self.assertEqual(checks(root)[0],accepted)
         with self.assertRaises(ValueError):
             build_checks([], [{"kind":"exec","path":"anything"}])
+
+    def test_named_file_means_nonempty_even_for_short_or_binary_outputs(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "version.txt").write_text("v1")
+            rule = {"kind":"contains", "path":"version.txt", "text":"v1"}
+            for criteria in ([], [rule]):
+                check = build_checks(["out.bin"], criteria)
+                output = root / "out.bin"
+                output.unlink(missing_ok=True)
+                self.assertFalse(check(root)[0])
+                output.touch()
+                self.assertFalse(check(root)[0])
+                output.write_bytes(bytes([255]))
+                self.assertTrue(check(root)[0])

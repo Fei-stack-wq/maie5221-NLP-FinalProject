@@ -128,6 +128,36 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.assertNotEqual(rejected["native_review"]["candidate_version"], decision["candidate_version"])
         self.assertEqual(decision["assessment"]["candidate_version"], decision["candidate_version"])
 
+    def test_caption_repair_on_sourced_artifact_preserves_the_original_observation(self):
+        files = {FINAL: hashed(ARTICLE)}
+        updated = ARTICLE + "\nDestination confirmed by the signed dispatch, first sentence."
+        caption_rule = {"id":"caption", "method":"inspect", "description":"Label the destination."}
+        def sign(caption):
+            call = submit(files, FINAL)
+            call["tool_calls"][0]["arguments"]["results"].append(caption)
+            return call
+        rejected = {"criterion_id":"caption", "verdict":"changes_requested", "cause":"product",
+                    "reason":"The destination caption is missing.", "action":"Label it Mill Street.",
+                    "evidence":["file:" + FINAL]}
+        passed = {"criterion_id":"caption", "verdict":"passed", "reason":"The label matches the original.",
+                  "evidence":["file:" + FINAL]}
+        steps = [tool("delegate_task", assignee="writer", objective="Prepare the dispatch.", deliverable_paths=[FINAL]),
+                 write(FINAL, ARTICLE), {"text":"Ready."},
+                 tool("delegate_task", assignee="checker", objective="Verify the dispatch and caption.",
+                      review={"candidate":FINAL,"criteria":[RULE,caption_rule]}),
+                 tool("read_file",path=FINAL), tool("http_get",url=URL), sign(rejected), {"text":"Caption needs a revision."},
+                 tool("delegate_task",assignee="writer",objective="Revise the caption."),
+                 tool("http_get",url=URL), write(FINAL,updated), {"text":"Retained the original destination."},
+                 tool("delegate_task",assignee="checker",objective="Check the corrected version."),
+                 tool("read_file",path=FINAL), tool("http_get",url=URL), sign(passed), {"text":"Delivered."}]
+        detail, provider = self.execute(steps, provider_type=CurrentCandidateProvider)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(reports[1]["review_action"]["criteria"], ["caption"])
+        self.assertIn("保留正确的口径", reports[2]["objective"])
+        self.assertIn("比较各系列的指标定义", str(provider.requests[4][0]))
+        self.assertEqual(reports[3]["native_review"]["files"][FINAL], hashed(updated))
+
     def closing_review(self):
         review = {"candidate": "writer", "criteria": [RULE]}
         return [tool("delegate_task", assignee="writer", objective="Write final article.", deliverable_paths=[FINAL],

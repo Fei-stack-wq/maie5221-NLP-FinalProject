@@ -895,6 +895,31 @@ function roomName(turn,id) {
  return id==='user'?'你':id==='studio'?'Studio':memberLink(turn,id);
 }
 
+function roomSignedReview(row) {
+ const handoff = row.handoff, review = handoff?.native_review, signed = review?.assessment;
+ if (row.kind!=='member_report' || !['assessed','published'].includes(row.disposition) || !signed
+     || !row.task_id || row.task_id!==handoff.task_id || !row.role || row.role!==handoff.role
+     || row.role!==review.reviewer || row.role!==signed.evaluator || !signed.attempt_id
+     || !review.target || review.target!==signed.target || !/^[a-f0-9]{64}$/.test(signed.candidate_version)
+     || signed.candidate_version!==review.candidate_version) return null;
+ const verdictNames = {passed:'通过',changes_requested:'要求修改',inconclusive:'暂未定论'};
+ const findings = signed.results;
+ if (!Object.hasOwn(verdictNames,signed.verdict) || !Array.isArray(findings) || !findings.length
+     || !findings.every(f=>f?.criterion_id && Object.hasOwn(verdictNames,f.verdict))) return null;
+ const pending = findings.filter(f=>f.verdict!=='passed');
+ const lines = [`${findings.length-pending.length} 项通过。`];
+ for (const finding of pending.slice(0,2)) {
+  const next = finding.cause==='business'?'待明确':finding.cause==='verification'?'待补证或复验'
+   :finding.verdict==='changes_requested'?'待修改':'待补证';
+  const action = Array.from(roomLine(finding.action || finding.reason));
+  const hint = action.length>40?action.slice(0,39).join('')+'…':action.join('').replace(/[。.!！]$/u,'')+'。';
+  lines.push(finding.criterion_id+' '+next+(action.length?'，'+hint:'。'));
+ }
+ if (pending.length>2) lines.push(`另有 ${pending.length-2} 项见评审材料。`);
+ const items = findings.map(f=>`<li><b>${e(f.criterion_id)} · ${e(verdictNames[f.verdict])}</b> ${e(f.reason || '')} ${e(f.action || '')}</li>`).join('');
+ return {summary:lines.join(' '),receipt:'评审已签署 · '+verdictNames[signed.verdict],items};
+}
+
 function roomMessage(row,index,turn) {
  const isUser = row.role==='user';
  const assignment = row.kind==='assignment';
@@ -910,7 +935,9 @@ function roomMessage(row,index,turn) {
   && row.task_id && candidate?.task_id===row.task_id && candidate.task_id===handoff.task_id
   && /^[a-f0-9]{64}$/.test(candidate.candidate_version) && candidate.files_total>0;
  const issue = savedCandidate ? (reason || source).replace(/^\s*\[BLOCKED\]\s*(?:[—:：-]\s*)?/u,'') : reason;
- const summary = isUser ? source : blocked ? roomLine(issue || '交接受阻') : roomLine(row.chat_message || source);
+ const signed = roomSignedReview(row);
+ const summary = isUser ? source : signed ? signed.summary : blocked ? roomLine(issue || '交接受阻')
+  : disposition==='assessed' ? '收到评审交接，签署记录待核对。' : roomLine(row.chat_message || source);
  const names = recipient ? [recipient,turn.member_names?.[recipient],roleLabel(recipient)].filter(Boolean) : [];
  const addressed = names.find(name=>summary.startsWith('@'+name)
   && (!summary[name.length+1] || /[\s，,:：、。!！]/u.test(summary[name.length+1])));
@@ -918,16 +945,17 @@ function roomMessage(row,index,turn) {
  const mention = recipient && !(addressed && isUser) ? `<span class="room-mention">@${roomName(turn,recipient)}</span> ` : '';
  const files = row.artifacts || [];
  const receipt = row.kind==='human_review' ? ({passed:'人工评审通过',failed:'人工评审未通过'})[row.verdict]
+  : signed ? signed.receipt+(disposition==='published' && row.published && handoff.published?' · 本次交接已发布':'')
   : savedCandidate ? '候选已保存 · 可独立复核'
-  : ({published:'已交接',assessed:'已提交评审',awaiting_review:'等待独立复核',blocked:'交接受阻 · 平台回执',unpublished:'尚未发布'})[disposition];
+  : ({published:'已交接',assessed:'评审交接记录',awaiting_review:'等待独立复核',blocked:'交接受阻 · 平台回执',unpublished:'尚未发布'})[disposition];
  const paths = (row.deliverable_paths || []).map(path=>`<span>${inlineMarkdown(path,turn,row)}</span>`).join(' ');
  const full = summary!==source || row.text_truncated;
  const hasMaterials = assignment || report || full && !isUser;
- const label = assignment?'派工材料':report?'交付材料':'完整消息';
+ const label = assignment?'派工材料':signed?'评审材料':report?'交付材料':'完整消息';
  const more = row.text_truncated?historyButton(turn.run_id,index+1,'读取完整原文'):'';
  const checks = handoff?.evidence?.check_signals || [];
  const materials = hasMaterials ? `<details class="room-material" data-key="materials"><summary>${label}${files.length?` · ${files.length} 个文件`:''}</summary>
-  <div class="room-material-body">${source && (full || assignment || report)?`<div class="prose">${markdown(source,turn,row)}</div>`:''}${more}
+  <div class="room-material-body">${signed?`<ul class="room-review-findings">${signed.items}</ul>${source?'<b>成员原话</b>':''}`:''}${source && (full || assignment || report)?`<div class="prose">${markdown(source,turn,row)}</div>`:''}${more}
   ${row.expectation?`<p><b>验收要求</b> ${inlineMarkdown(row.expectation,turn,row)}</p>`:''}
   ${paths?`<p><b>交付路径</b> ${paths}</p>`:''}
   ${handoff?.remaining_issue?`<p><b>待处理</b> ${inlineMarkdown(handoff.remaining_issue,turn,row)}</p>`:''}

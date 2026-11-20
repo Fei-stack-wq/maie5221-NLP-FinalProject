@@ -14,6 +14,45 @@ from tests.test_studio_service import finished, request
 
 
 class ReviewRevisionRoutingTest(unittest.TestCase):
+    def test_autonomous_rejection_hands_the_failed_check_straight_back_to_author(self):
+        root = make_temp_dir("signed-red-review")
+        self.addCleanup(cleanup, root)
+        service = StudioService(root / "runs", Settings(api_key="test-credential"))
+        self.addCleanup(service.close)
+        old, new = "Old warehouse", "New warehouse"
+        probe = "from pathlib import Path\nassert Path('delivery.txt').read_text() == 'New warehouse'\nprint('PASS destination')"
+        scope = _check_key(_script_inputs(probe)[1])
+        rule = {"id":"destination", "description":"Verify the destination.", "method":"execute"}
+        change = {"criterion_id":"destination", "verdict":"changes_requested", "cause":"product",
+                  "reason":"The printed destination is old.", "action":"Print New warehouse.",
+                  "evidence":["fail:" + scope]}
+        passed = {"criterion_id":"destination", "verdict":"passed", "reason":"The destination matches.",
+                  "evidence":["pass:" + scope]}
+        steps = [tool("delegate_task", assignee="author", objective="Write the label.", deliverable_paths=[PATH]),
+                 write(PATH, old), {"text":"Label ready."},
+                 tool("delegate_task", assignee="risk", objective="Check the destination.",
+                      review={"candidate":PATH,"criteria":[rule]}),
+                 tool("run_python", code=probe), tool("submit_review", candidate_version=version(old), results=[change]),
+                 tool("delegate_task", assignee="author", objective="Fix the signed finding."),
+                 write(PATH, new), {"text":"Updated."},
+                 tool("delegate_task", assignee="risk", objective="Recheck the updated label."),
+                 tool("run_python", code=probe), tool("submit_review", candidate_version=version(new), results=[passed]),
+                 {"text":"Delivered the verified label."}]
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=RecordingProvider(steps)):
+            run = service.start(request("team", conversation=roster("lead","author","risk"),
+                objective="Independently check the delivery label.", acceptance_files=[PATH],
+                interaction_mode="autonomous", limits={"max_steps":60}))
+            detail = finished(service, run["id"])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual(detail["run"]["status"], "completed", [(r["role"], r["remaining_issue"]) for r in reports])
+        first, final = [r for r in reports if r["role"] == "risk"]
+        self.assertTrue(first["evidence"]["failed_check_details"])
+        self.assertEqual(first["signed_handoff"]["assessment"]["verdict"], "changes_requested")
+        self.assertEqual(first["review_action"]["assignee"], "author")
+        self.assertIn(change["action"], first["summary"])
+        self.assertEqual(final["native_review"]["assessment"]["verdict"], "passed")
+        self.assertEqual(final["native_review"]["candidate_version"], version(new))
+
     def test_changed_candidate_after_signing_cannot_be_routed_as_a_current_repair(self):
         root = make_temp_dir("review-stale-rejection")
         self.addCleanup(cleanup, root)

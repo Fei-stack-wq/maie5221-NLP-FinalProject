@@ -33,6 +33,18 @@ class MemberProgressTest(unittest.TestCase):
         obs = Observation(step_id="s", source=tool, ok=ok, content=text, meta=meta or {}, tool_call_id=call_id)
         self.p.observe(StepRecord(step=step, observations=[obs], prompt_tokens=500), state)
 
+    def test_restored_failure_keeps_original_call_without_becoming_a_local_receipt(self):
+        self.observe(args={"code": "assert 1 == 2"}, text="exit_code=1\nstderr:\nAssertionError",
+                     ok=False, meta={"exit_code": 1}, call_id="original")
+        failed = self.p.failed_checks()
+        details = self.p.evidence()["failed_check_details"]
+        successor = MemberProgress(self.root)
+        successor.restore_failed_checks(failed, details)
+        self.assertEqual(successor.evidence()["failed_check_details"], details)
+        self.assertEqual(successor.failed_checks(), failed)
+        self.assertFalse(successor.review_evidence())
+        self.assertFalse(successor.inline_failures())
+
     def test_unrelated_python_assertion_does_not_explain_original_failure(self):
         read = "from pathlib import Path\nvalue=Path('module.py').read_text()\n"
         wrong = read + "assert 'missing' in value"

@@ -10,8 +10,11 @@ def build_checks(paths, criteria):
         raise ValueError("验收规则最多 32 项。")
     if not paths and not criteria:
         return None
+    # Studio's path-only field promises the user a nonempty file. Length,
+    # encoding and substance are separate from existence.
+    delivered = accept_files(*paths, min_bytes=1, min_lines=0) if paths else None
     if not criteria:
-        return accept_files(*paths)
+        return delivered
     checks = []
     for row in criteria:
         if not isinstance(row, dict):
@@ -54,8 +57,8 @@ def build_checks(paths, criteria):
                     return False, "JSON 或字段无效"
                 return equal, "字段符合期望" if equal else "字段与期望不符"
             checks.append((path, matches))
-    if paths:
-        checks.insert(0, ("交付文件", accept_files(*paths)))
+    if delivered:
+        checks.insert(0, ("交付文件", delivered))
 
     def verify(root):
         failures = []

@@ -150,6 +150,39 @@ class CorrectedFileCheckTest(unittest.TestCase):
         self.assertIn(OTHER, signed["preview"])
         self.assertFalse((self.project / PRODUCT).exists())
 
+    def test_named_failure_and_noisy_custom_reporter_reach_independent_adjudication(self):
+        historical = ("import json, sys\nfrom pathlib import Path\n"
+                      "minutes = json.loads(Path('booking.json').read_text())['minutes']\n"
+                      "print('http access ' * 420, file=sys.stderr)\n"
+                      "try:\n    assert minutes == 60\nexcept AssertionError:\n"
+                      "    print('FAIL  allocated reservation duration')\n    sys.exit(1)\n"
+                      "print('PASSED 1/1')\nprint('ALL TESTS PASSED')\n")
+        corrected = historical.replace("minutes == 60", "minutes == 45")
+        steps = [tool("delegate_task", assignee="builder", objective="Deliver the confirmed booking.",
+                      deliverable_paths=[PRODUCT], remaining_roles=["qa"]),
+                 write(PRODUCT, BOOKING), write(CHECK, historical), run_check(CHECK),
+                 tool("edit_file", path=CHECK, old_text="minutes == 60", new_text="minutes == 45"),
+                 run_check(CHECK), {"text":"The assigned booking is ready for independent verification."},
+                 tool("delegate_task", assignee="qa", objective="Verify the disputed reservation duration."),
+                 run_check(CHECK), tool("run_python", code=UNRELATED), {"assessment_for": UNRELATED},
+                 tool("run_python", code=PRODUCT_ASSERTION), {"assessment_for": PRODUCT_ASSERTION},
+                 {"text":"Independently verified the reservation duration."}, {"text":"Delivered the booking."}]
+        detail, reports, trail = self.execute(steps)
+        self.assertEqual(detail["run"]["status"], "completed", [(r["role"], r["remaining_issue"]) for r in reports])
+        author, qa = reports
+        self.assertFalse(author["published"])
+        original, = author["evidence"]["failed_check_details"]
+        self.assertEqual(original["label"], "工具输出 FAIL · allocated reservation duration")
+        receipt, = author["author_probe_review"]["corrected_scripts"]
+        self.assertEqual(receipt["original_calls"], {original["scope_id"]: original["tool_call_id"]})
+        self.assertEqual((receipt["prior_sha256"], receipt["current_sha256"]), (sha(historical), sha(corrected)))
+        self.assertFalse(receipt["asserted"])
+        self.assertTrue(receipt["output_truncated"])
+        self.assertNotEqual(original["tool_call_id"], receipt["tool_call_id"])
+        self.assertEqual([r["ok"] for r in trail if r["kind"] == "tool_result" and r["tool"] == "submit_review"],
+                         [False, True])
+        self.assertEqual((qa["role"], qa["native_review"]["state"], qa["published"]), ("qa", "passed", True))
+
     def test_passing_an_alias_or_removing_the_assertion_does_not_earn_a_private_handoff(self):
         for mode in ("same basename", "removed assertion"):
             with self.subTest(mode=mode):

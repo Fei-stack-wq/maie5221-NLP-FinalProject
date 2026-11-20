@@ -14,6 +14,24 @@ const fixtureDetail=()=>{
  return {run:{...fixtureRun,duration_ms:fixturePolls*1800},tasks:[{task_id:'fixture',objective:'持续运行的任务',status:'running',revision:fixturePolls},{task_id:'fixture:child',parent_id:'fixture',objective:'子任务执行中',status:'running',revision:fixturePolls}],events:fixtureEvents.slice(),artifacts:[],acceptance:[{task_id:'fixture',report:{report_id:'fixture-report',verdict:'unverified',reason:'Fixture only; no execution or acceptance is claimed.'}}],summary:{total_tokens:fixturePolls*10}};
 };
 const roles = [{id:'worker',label:'通用助手'},{id:'reviewer',label:'评审员'}];
+const nativeReview = {target:'deck-task',reviewer:'reviewer',candidate_version:'d'.repeat(64)};
+const assessment = {target:nativeReview.target,candidate_version:nativeReview.candidate_version,
+ evaluator:'reviewer',attempt_id:'review-attempt',verdict:'changes_requested',results:[
+  ...['SRC-1','SRC-2','SRC-4','SRC-6'].map(criterion_id=>({criterion_id,verdict:'passed',reason:'已逐项核对。'})),
+  {criterion_id:'SRC-3',verdict:'changes_requested',cause:'product',action:'补上第 20 页的实际和预测标注。'},
+  {criterion_id:'SRC-5',verdict:'changes_requested',cause:'product',action:'补上敏感性计算。'}]};
+const reviewEvent = (signature,disposition='assessed')=>({kind:'member_report',role:'reviewer',task_id:'review-task',
+ text:'仍未能签署结论。',disposition,published:false,handoff:{role:'reviewer',task_id:'review-task',published:false,
+ native_review:{...nativeReview,assessment:signature}}});
+const signedEvents = [reviewEvent(assessment),reviewEvent({...assessment,verdict:'inconclusive',
+ results:[{criterion_id:'CHECK',verdict:'inconclusive',cause:'verification',action:'重跑失败的检查。'}]}),
+ reviewEvent({...assessment,verdict:'passed',results:assessment.results.slice(0,4)})];
+const publishedReview = reviewEvent(assessment,'published');
+publishedReview.published = publishedReview.handoff.published = true;
+signedEvents.push(publishedReview);
+const unboundEvents = [null,{...assessment,evaluator:'worker'},{...assessment,target:'other-task'},
+ {...assessment,candidate_version:'e'.repeat(64)}].map(s=>reviewEvent(s));
+unboundEvents.push(reviewEvent(assessment,'blocked'));
 const completeThread = {
  id:'demo-project',kind:'group',lead:'worker',members:['worker','reviewer'],head_run_id:'fixture',
  artifact_run_id:'fixture',can_continue:true,
@@ -22,7 +40,8 @@ const completeThread = {
    handoff:{role:'worker',task_id:'dev-check',published:false,remaining_issue:'[BLOCKED] 请复核重复预订。',
     reviewable_candidate:{task_id:'dev-check',candidate_version:'a'.repeat(64),files_total:5}}},
    {kind:'member_report',role:'reviewer',text:'**成果**：证据底座已保存到文件。',disposition:'blocked',artifacts:[],
-   handoff:{published:false,remaining_issue:'项目快照发布失败：项目文件含可识别的服务凭据。「research/research_notes.md」'}}]}]
+   handoff:{published:false,remaining_issue:'项目快照发布失败：项目文件含可识别的服务凭据。「research/research_notes.md」'}},
+   ...signedEvents,...unboundEvents]}]
 };
 window.fetch=async(path, options={})=>{
  let data;
@@ -42,7 +61,7 @@ window.fetch=async(path, options={})=>{
     const [turn]=completeThread.turns;
     data.run.status='failed';
     data.conversation={...completeThread,turns:[
-     {...turn,run_id:'earlier',answer:'',status:'failed'},
+     {...turn,run_id:'earlier',events:turn.events.slice(0,2),answer:'',status:'failed'},
      {...turn,run_id:'no-receipt',events:[],error:'前一轮独立验收未通过。',answer:'',status:'failed'},
      {...turn,events:[],answer:'',status:'failed'}]};
     data.diagnostics={execution_status:'failed',acceptance_status:'failed',issues:[
@@ -93,7 +112,7 @@ window.addEventListener('load',async()=>{
   fixtureChat=true;
   await waitFor(()=>document.querySelector('#tab-chat'));
   document.querySelector('#tab-chat').click();
-  const [candidate,blocked]=document.querySelectorAll('.room-message[data-kind="member_report"]');
+  const [candidate,blocked,changes,unresolved,passed,published,...unbound]=document.querySelectorAll('.room-message[data-kind="member_report"]');
   check('frozen candidate shows its review option and retains original receipt',
    candidate.querySelector('.room-disposition').textContent==='候选已保存 · 可独立复核'&&
    candidate.querySelector('.room-line').textContent.includes('请复核重复预订')&&
@@ -103,6 +122,21 @@ window.addEventListener('load',async()=>{
   const blockedLine=blocked.querySelector('.room-line');
   check('blocked handoff leads with actual publication failure',blockedLine.textContent.includes('项目快照发布失败')&&!blockedLine.textContent.includes('证据底座已保存'));
   check('private file is plain text and original member claim stays in materials',!blockedLine.querySelector('[data-md-path]')&&blocked.querySelector('.room-material-body').textContent.includes('证据底座已保存'));
+  const line=message=>message.querySelector('.room-line').textContent;
+  const badge=message=>message.querySelector('.room-disposition').textContent;
+  check('bound rejection leads with signed counts and both requested repairs',badge(changes)==='评审已签署 · 要求修改'&&
+   ['4 项通过','SRC-3 待修改','补上第 20 页','SRC-5 待修改','敏感性计算'].every(word=>line(changes).includes(word))&&
+   !line(changes).includes('未能签署'));
+  const materials=changes.querySelector('.room-material');
+  check('original member account and full findings are preserved in collapsed review material',!materials.open&&
+   materials.querySelector('summary').textContent==='评审材料'&&materials.querySelector('.prose').textContent.includes('仍未能签署')&&
+   materials.querySelectorAll('.room-review-findings li').length===6);
+  check('inconclusive and passing signed reviews keep their distinct verdicts',badge(unresolved)==='评审已签署 · 暂未定论'&&
+   line(unresolved).includes('CHECK 待补证')&&badge(passed)==='评审已签署 · 通过'&&line(passed).includes('4 项通过')&&!badge(passed).includes('交接'));
+  check('publication is displayed separately when the signed event also published files',badge(published).includes('要求修改 · 本次交接已发布'));
+  check('absent mismatched and blocked receipts never count as a signed assessment',unbound.length===5&&
+   unbound.every(message=>!badge(message).includes('已签署')&&!line(message).includes('4 项通过'))&&
+   unbound.slice(0,4).every(message=>line(message).includes('签署记录待核对')));
   const form=document.querySelector('.reply-form'),draft=form.elements.message;
   draft.value='请解释速度计算。';draft.dispatchEvent(new Event('input',{bubbles:true}));
   form.elements.intent.value='question';form.elements.intent.dispatchEvent(new Event('change',{bubbles:true}));

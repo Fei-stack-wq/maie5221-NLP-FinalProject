@@ -417,6 +417,8 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 
 成员在原文中写了 `[BLOCKED]`，仍可能已交出完整的私有候选。若宿主回执中的角色、任务、版本摘要和文件数量能定位这份候选，聊天显示「候选已保存 · 可独立复核」。已排入独立复核的显示「等待独立复核」。未能保存候选的真实交接失败仍直接显示原因。原文、平台回执与整轮终态均保留。这里沿用上述 A2A 分开传达任务状态与工件的做法。[浏览器状态回归](../tests/web/studio_live_dom.js)
 
+独立评审结束后，聊天从宿主签署记录显示通过项数及待修改、待补证或待明确的标准，并优先展示前两项后续动作。点击「评审材料」可读完整逐项结论和成员原话。该回执要求群事件和交接中的成员及任务一致，且签署的评审者、目标和候选版本与该次评审绑定一致。已签结论属于当时的候选版本。工作区发布和群目标最终验收各有独立回执。[群聊浏览器回归](../tests/web/studio_live_dom.js)
+
 「交付材料」收起长报告、检查和获准公开的附件。「运行记录」保留平台事件和工具调用。打开旧轮次的完整原文或前一页消息时，浏览器按该轮公开日志的序号取回最多 24 条。新旧页之间有缺口时可就地加载。展开较长材料或最终回复时，浏览器按需读取全文。轮询、补载和新消息依靠稳定序号保留已经展开的材料。公开日志和附件继续沿用原有阅读边界。浏览器回归覆盖真实表单发送、派工尚未完成、历史长文补载和 Markdown 附件。[群聊端到端回归](../tests/web/room_workflow.cjs) · [日志分页回归](../tests/test_studio_discussion.py)
 
 消息行身份和手动展开状态参考 Zulip 对长消息的处理。Zulip 按消息 ID 在可见列表中更新相应行，跳过已移除的行，并尊重手动展开。Studio 用运行 ID 和只追加公开日志的序号标识一条消息，采用浏览器原生 disclosure，历史材料按需读取。这里复用交互思路，由 Studio 自行实现。[消息行模板](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/templates/single_message.hbs#L1-L3) · [折叠状态更新](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L81-L113) · [保留手动展开](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L278-L286) · [插入历史消息和移除消息的测试](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/message_list_data.test.cjs#L249-L272)

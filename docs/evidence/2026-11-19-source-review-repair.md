@@ -14,4 +14,8 @@
 
 ## 平台回归
 
+11 月 20 日的单消息复测中，研究员已向 `submit_review` 提交有效退修，随后又在文字里说没有签署工具。自主模式现在直接用该次签署及明确的改法交还原作者。未结的失败执行仍留在报告中，在新版上由独立成员另行签署。进程仍在运行、候选被改动或指定附件缺失时，沿用各自原有的处理。此处参考 LangGraph 把结构化评估直接路由回生成者的实现。[LangGraph 条件路由](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/langgraph/graph/state.py#L982) · [上游条件执行回归](https://github.com/langchain-ai/langgraph/blob/84ced603d3a201ab0f9379936bb35868e243f3f3/libs/langgraph/tests/test_pregel.py#L2924-L2947) · [签署退修后重新验收](../../tests/test_review_revision_routing.py)
+
+对外部来源的比较图，评审读取每个系列的指标、期间和分母，核对这些数字能否支持图中的比较。作者处置涉及数据标签的修改意见时，可以依据原文纠正评审建议。此调整回应同次复测的第一版成稿将「距 52 周高点的跌幅」和「过去一年的涨跌幅」画在同一收益比较图的问题。Data Commons 将指标定义与单次观测分别建模，这里仅采用核对思路。另以来源明确的派送单验证请求修改标签后，作者及复核者收到同一原始依据。[Data Commons 变量和观测](https://docs.datacommons.org/custom_dc/custom_data.html) · [成稿及图注返工回归](../../tests/test_studio_required_source_review.py)
+
 `tests/test_studio_required_source_review.py` 的 `test_source_repair_author_can_substantiate_original_fact_for_independent_resignature` 通过正常 Studio 群聊入口发布一张派送单。评审已打开签发方文件，但提出了错误地址。作者在返工分工中收到查证要求，亲自打开签发方文件，在新版保留正确地址并补上原文位置。原评审再次打开原件、读取新稿，签署新版。用例检查两个角色实际收到的上下文、作者没有签署工具、两次签署版本不同，以及最终签署所绑定的作者工件哈希。此回归使用脚本提供方和模拟原始网页，验证提示能到达具体分工与签署边界；真实模型能否纠正争议仍须以新运行的实际交付核对。

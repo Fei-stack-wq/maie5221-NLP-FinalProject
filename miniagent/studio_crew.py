@@ -1675,6 +1675,10 @@ class RoomCrew:
                         "原文支持修改就更正；原文支持现稿则保留已核实的事实，在新版补上可定位的引文、"
                         "表格行或计算依据及原始链接，并在交接里解释分歧。证据不足就明确标记待核实。"
                         "由原评审者按同一标准独立核查新版并重新签署。")
+                elif changes and review.required_source_paths:
+                    review_instruction += (
+                        "\n修改图例、标签或表述若会改变事实含义，按原始材料核对指标、期间及实绩或预测；"
+                        "保留正确的口径并向评审解释有分歧的建议。")
             objective = (review_instruction +
                          ("\n本次复核线索（仅供核对，验收标准沿用原件）：" + _clip(objective, 1600) if retry_gaps else "") +
                          "\n原目标及标准：" + _clip(_json(review.briefing()), 7000))
@@ -1999,7 +2003,8 @@ class RoomCrew:
             # Only individually bound, fully disclosed author probes may be
             # adjudicated independently. Other failures remain strict.
             delegated = review.probes if private and inspecting else {}
-            progress.restore_failed_checks({k:v for k,v in draft["failed_checks"].items() if k not in delegated})
+            progress.restore_failed_checks({k:v for k,v in draft["failed_checks"].items() if k not in delegated},
+                                           draft.get("evidence", {}).get("failed_check_details", []))
             progress.restore_pending_verification(draft.get("evidence", {}).get("pending_verification", []))
             corrected = ([s for s in review.probe_support if s.get("kind") == "corrected_file_check"]
                          if private and inspecting else [])
@@ -2282,10 +2287,16 @@ class RoomCrew:
                 return ToolCompletion("请独立核对原失败和修订断言，并在冻结候选上复验。",
                     {"original_calls": {scope:p["tool_call_id"] for scope,p in progress.inline_failures().items()},
                      "supporting_calls": [r["tool_call_id"] for r in progress.corrected_probe_support()]})
-            if (not session or not session.assessment or session.assessment["verdict"] != "passed"
-                    or private and not self._bound_probe_conflicts(review, session, progress)
-                    or self.should_cancel() or not record.observations
+            if (not session or not session.assessment or self.should_cancel() or not record.observations
                     or any(not obs.ok for obs in record.observations)):
+                return None
+            assessment = session.assessment
+            # A verified request to change the product is a finished review on
+            # this version. Red results are evidence for the author to act on.
+            repair_requested = (self.settings.interaction_mode == "autonomous"
+                                and bool(review.required_product_changes(assessment)))
+            if not repair_requested and (assessment["verdict"] != "passed"
+                    or private and not self._bound_probe_conflicts(review, session, progress)):
                 return None
             # A signed submission closes the review contract. Later tool actions
             # in that batch can introduce new evidence; never silently ignore it.
@@ -2300,7 +2311,8 @@ class RoomCrew:
             # independent member. The signed assessment can close this member
             # turn without turning it into approval or discarding a failure.
             disputes = self._bound_probe_conflicts(review, session, progress) if progress.failed_checks() else {}
-            if ((progress.failed_checks() and not disputes) or progress.pending_paths() or evidence["pending_verification"]
+            if ((progress.failed_checks() and not (disputes or repair_requested))
+                    or progress.pending_paths() or evidence["pending_verification"]
                     or member.sandbox.command_sessions.pending_reason() or session.snapshot_issue()
                     or preflight_publication()):
                 return None
@@ -2317,11 +2329,12 @@ class RoomCrew:
                             and receipt.get("sha256") == entry.get("current_sha256")
                             and receipt.get("sha256") == review.files.get(entry.get("path"))):
                         return None
-            assessment = session.assessment
             lines = ["宿主依据已签独立评审生成交接；逐项理由与限制保留原文。",
                      "评审者：" + assessment["evaluator"], "候选版本：" + assessment["candidate_version"]]
             for finding in assessment["results"]:
                 lines.append("\n" + finding["criterion_id"] + " [" + finding["verdict"] + "]：" + finding["reason"])
+                if finding.get("action"):
+                    lines.append("下一步：" + finding["action"])
                 lines.extend("证据 " + receipt["ref"] + "：" + (
                     receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt["kind"])
                     for receipt in finding["receipts"])

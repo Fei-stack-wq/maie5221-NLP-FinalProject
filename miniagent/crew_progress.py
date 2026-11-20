@@ -919,14 +919,14 @@ class MemberProgress:
             for scope in related:
                 self._corroborating_runs[scope] = receipt
 
-    def _record_file_correction(self, invocation, obs, step):
+    def _record_file_correction(self, invocation, obs, step, *, asserted):
         failure = self._file_failures.get(invocation.scope)
         if not failure:
             return
         path = invocation.script
         current = self._current.get(path)
         if (current == failure["sha256"] or self._assertive_scripts.get(path) != current
-                or not current or not obs.tool_call_id or _output_truncated(obs)):
+                or not current or not obs.tool_call_id):
             return
         self._corrected_file_runs[invocation.scope] = {
             "kind": "corrected_file_check", "tool": "run_shell", "scope": invocation.scope,
@@ -935,7 +935,8 @@ class MemberProgress:
             "prior_source": failure["code"], "prior_error": failure["error"],
             "prior_input_version": failure["input_version"], "input_version": digest(self._current),
             "original_calls": failure["calls"], "step": step, "tool_call_id": obs.tool_call_id,
-            "exit_code": 0, "output": obs.content[:4000],
+            "exit_code": 0, "asserted": asserted, "output": obs.content[:4000],
+            "output_truncated": _output_truncated(obs) or len(obs.content) > 4000,
         }
 
     def _record_probe(self, scope, probe):
@@ -1125,6 +1126,7 @@ class MemberProgress:
                     # A custom reporter may be silent or use any language.
                     # This receipt proves process completion, never a passed assertion.
                     self._script_exits.pop(invocation.scope, None)
+                    self._corrected_file_runs.pop(invocation.scope, None)
                     if (not signal and not changed and invocation.script in self._current
                             and obs.ok and type(exit_code) is int and exit_code == 0
                             and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
@@ -1132,6 +1134,10 @@ class MemberProgress:
                             "check": invocation.caption, "path": invocation.script,
                             "sha256": self._current[invocation.script], "exit_code": exit_code,
                             "tool_call_id": obs.tool_call_id}
+                        # The process receipt nominates a changed, assertive
+                        # script for an independent rerun. It cannot retire the
+                        # historical failure or sign the candidate's behaviour.
+                        self._record_file_correction(invocation, obs, record.step, asserted=False)
                         if len(self._script_exits) > 32:
                             del self._script_exits[next(iter(self._script_exits))]
                 if (not signal and invocation and invocation.complete and obs.source == "run_shell"
@@ -1202,7 +1208,7 @@ class MemberProgress:
                         if eligible:
                             self._complete_verification[invocation.scope] = invocation.caption
                             if signal.status == "passed" and not changed:
-                                self._record_file_correction(invocation, obs, record.step)
+                                self._record_file_correction(invocation, obs, record.step, asserted=True)
                         prior = self._pending_verification.get(invocation.scope)
                         if eligible and prior and prior.get("at_sha256") == script_digest:
                             del self._pending_verification[invocation.scope]
@@ -1559,7 +1565,7 @@ class MemberProgress:
             failures[_check_key("overflow")] = "更多未解决的失败超出恢复清单容量，需完整复核"
         return failures
 
-    def restore_failed_checks(self, previous: dict[str, str]) -> None:
+    def restore_failed_checks(self, previous: dict[str, str], details=()) -> None:
         if len(previous) > 33 or any(
             not re.fullmatch(r"[0-9a-f]{64}", key) or not isinstance(value, str) or len(value) > 160
             for key, value in previous.items()
@@ -1567,6 +1573,12 @@ class MemberProgress:
             raise ValueError("无效的检查恢复清单")
         self._failures.update(previous)
         self._restored_keys.update(previous)
+        # Historical provenance helps the next member reproduce a failure.
+        # It does not mint evidence from that member's own isolated execution.
+        for detail in details:
+            key = detail.get("scope_id")
+            if key in previous and previous[key] == detail.get("label") and detail.get("tool_call_id"):
+                self._failure_context[key] = dict(detail)
 
     def restore_pending_verification(self, previous):
         for entry in previous:
