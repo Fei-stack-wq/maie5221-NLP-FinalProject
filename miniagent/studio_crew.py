@@ -873,6 +873,10 @@ class RoomCrew:
         files = draft["manifest"]
         corrected = [s for s in support if s.get("kind") == "corrected_file_check"]
         file_scopes = {k for k, p in probes.items() if p.get("kind") == "edited_script"}
+        matched = {scope for receipt in support for scope, call in receipt.get("original_calls", {}).items()
+                   if scope in probes and probes[scope]["tool_call_id"] == call}
+        if not probes.keys() <= matched:
+            return False
         if file_scopes:
             frozen_version = digest(files)
             covered = {key for s in corrected if files.get(s["path"]) == s["current_sha256"] and s["input_version"] == frozen_version
@@ -895,8 +899,8 @@ class RoomCrew:
         # a single product HTML entry the independent browser check can compare
         # the actual HTTP response bytes to that frozen file.
         html = sorted(p for p in files if Path(p).suffix.lower() in {".html", ".htm"})
-        probes = {key: ({**p, "input_paths": html} if p["tool"] == "run_browser" and not p.get("input_paths")
-                        and len(html) == 1 else p) for key, p in probes.items()}
+        probes = {key: ({**p, "input_paths": p.get("investigation_paths") or (html if len(html) == 1 else [])}
+                        if p["tool"] == "run_browser" and not p.get("input_paths") else p) for key, p in probes.items()}
         targets = set(draft["required"])
         targets.update(p for probe in probes.values() for p in probe.get("input_paths", ()))
         product = {p: files[p] for p in targets if p in files}
@@ -918,7 +922,10 @@ class RoomCrew:
                           "candidate_version": review.version, "files_total": len(files)})
         report["author_probe_review"] = {"target": review.target, "reviewer": reviewer,
             "candidate_version": review.version, "original_calls": {k:p["tool_call_id"] for k,p in probes.items()},
-            "corrected_calls": [s["tool_call_id"] for s in support]}
+            "corrected_calls": [s["tool_call_id"] for s in support],
+            "supporting_receipts": [{k:s[k] for k in ("tool_call_id", "original_calls", "input_version")}
+                                    for s in support],
+            "pending_verification": draft["evidence"].get("pending_verification", [])}
         if corrected:
             report["author_probe_review"]["corrected_scripts"] = [
                 {k:v for k,v in s.items() if k not in {"prior_source", "prior_error", "output"}} for s in corrected]
@@ -1906,10 +1913,20 @@ class RoomCrew:
             session.guard_file_tools(registry)
             registry.add(session.tool())
             registry.add(session.catalog_tool())
+        requested_peer = False
+
+        def member_question(payload):
+            nonlocal requested_peer
+            if payload.get("decision_kind") == "internal_routing":
+                requested_peer = bool(author_probe_reviewer())
+                return ("已有原失败和修订断言，由负责人转独立成员复核。" if requested_peer else
+                        "内部派工由群负责人处理。请交接实际进展、缺项和所需的专业角色。")
+            return None
+
         member = Agent(name=role, provider=self.provider, registry=registry,
                        sandbox=Sandbox(workspace, agent_name=role), settings=self.settings, tracer=self.tracer,
                        task_service=self.service, human_handler=self.human_handler(self.run_id, role, deadline=human_deadline),
-                       should_cancel=self.should_cancel)
+                       should_cancel=self.should_cancel, human_request_gate=member_question)
         repair_context = ""
         if recovered:
             # Only individually bound, fully disclosed author probes may be
@@ -1924,7 +1941,7 @@ class RoomCrew:
                               + "。上次真实执行/检查证据：" + _clip(_json(draft["evidence"]), 2000)
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
-            if corrected:
+            if private and inspecting and review.probes and progress.evidence()["pending_verification"]:
                 commands = [entry["check"] for entry in progress.evidence()["pending_verification"]]
                 repair_context = ("请在冻结工作目录逐条独立运行这些原检查：" + _json(commands) +
                                   "。对原失败涉及的产品行为另行执行断言，并把结论与回执逐项签署。\n" + repair_context)
@@ -2068,7 +2085,7 @@ class RoomCrew:
                     return StepPolicy("work", instruction, frozenset({"run_shell"}),
                                       token_reserve=reserve, seconds_reserve=handoff_seconds)
             replays = progress.browser_replays().keys() - closure_replay_offered
-            if (phase == "handoff" and replays and "rerun_browser_check" in work_tools
+            if (phase == "handoff" and replays and not author_probe_reviewer() and "rerun_browser_check" in work_tools
                     and spendable.has_steps(2) and not spendable.exhausted):
                 pending_call = min(replays)
                 closure_replay_offered.add(pending_call)
@@ -2152,7 +2169,8 @@ class RoomCrew:
                 return review.reviewer if review.kind == "product" and not review.probes and review.author == role else None
             # A QA member operating an existing delivery owns the bad check,
             # not the product. Its original publisher cannot arbitrate it either.
-            paths = {p for probe in progress.inline_failures().values() for p in probe.get("input_paths", ())}
+            paths = {p for probe in progress.inline_failures().values()
+                     for p in probe.get("input_paths") or probe.get("investigation_paths", ())}
             if not paths:
                 paths = set(required) or set(original)
             owners = {self.native_reviews.path_candidates[p][0] for p in paths if p in self.native_reviews.path_candidates}
@@ -2165,7 +2183,7 @@ class RoomCrew:
             nonlocal author_handoff
             issue = handoff_issue()
             if issue and (author_handoff := author_probe_reviewer()):
-                return PendingPeerReview("原检查失败，已有后续断言在同一候选上正常完成。保留失败及修订回执，转独立成员裁决。")
+                return PendingPeerReview("原检查和修订断言已留证。请独立复核当前冻结候选及每项待执行的原命令。")
             if issue or private:
                 return issue
             try:
@@ -2182,6 +2200,12 @@ class RoomCrew:
 
         def complete_signed_review(record):
             nonlocal signed_handoff
+            if requested_peer and author_probe_reviewer():
+                # The member explicitly selected internal routing. before_answer
+                # freezes the current files for review without signing or publishing.
+                return ToolCompletion("请独立核对原失败和修订断言，并在冻结候选上复验。",
+                    {"original_calls": {scope:p["tool_call_id"] for scope,p in progress.inline_failures().items()},
+                     "supporting_calls": [r["tool_call_id"] for r in progress.corrected_probe_support()]})
             if (not session or not session.assessment or session.assessment["verdict"] != "passed"
                     or private and not self._bound_probe_conflicts(review, session, progress)
                     or self.should_cancel() or not record.observations

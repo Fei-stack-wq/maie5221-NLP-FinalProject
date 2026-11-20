@@ -37,16 +37,22 @@ class ClosingPeerChecks:
                 if (scope in evidence["complete_verification"]
                         or (receipt.get("path"), receipt.get("sha256"), receipt.get("exit_code")) == (path, digest, 0)):
                     continue
-                # Captions redact arbitrary argv. Recover only a complete plain
-                # interpreter/script pair that round-trips to the actual scope.
-                match = re.fullmatch(r"(python(?:3(?:\.\d+)?)?|node) ([\w./-]+)(?: \(cwd=([\w./-]+)\))?", entry.get("check", ""))
+                # Captions redact arbitrary argv. Keep the actual script option
+                # and require the recovered command to match the frozen scope.
+                caption = entry.get("check", "")
+                if caption == path and re.fullmatch(r"[\w./-]+\.py", path):
+                    # Older direct Python receipts exposed only the script path.
+                    legacy = shell_invocation("python3 " + path + " -v", ".")
+                    if legacy and legacy.scope == scope:
+                        caption = legacy.caption
+                match = re.fullmatch(r"(python(?:3(?:\.\d+)?)?|node) ([\w./-]+)( -v)?(?: \(cwd=([\w./-]+)\))?", caption)
                 if not match:
                     continue
-                interpreter, script, cwd = match.groups()
+                interpreter, script, flags, cwd = match.groups()
                 cwd = cwd or "."
-                if script.startswith("-") or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
+                if script.startswith("-") or (flags and interpreter == "node") or Path(cwd).is_absolute() or ".." in Path(cwd).parts:
                     continue
-                command = interpreter + " " + script
+                command = interpreter + " " + script + (flags or "")
                 invocation = shell_invocation(command, cwd)
                 if not invocation or (invocation.scope, invocation.script) != (scope, path):
                     continue

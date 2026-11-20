@@ -26,12 +26,35 @@ class MemberProgressTest(unittest.TestCase):
         self.p = MemberProgress(self.root)
         self.budget = Budget(steps_left=30, actions_left=100, tokens_left=90_000, seconds_left=120)
 
-    def observe(self, tool="run_python", text="", *, args=None, ok=True, meta=None, call_id="one"):
+    def observe(self, tool="run_python", text="", *, args=None, ok=True, meta=None, call_id="one", step=1):
         message = {"role": "assistant", "tool_calls": [{"id": call_id, "function": {
             "name": tool, "arguments": json.dumps(args or {})}}]}
         state = RAOState(goal="", task_id="t", history=[message])
         obs = Observation(step_id="s", source=tool, ok=ok, content=text, meta=meta or {}, tool_call_id=call_id)
-        self.p.observe(StepRecord(step=1, observations=[obs], prompt_tokens=500), state)
+        self.p.observe(StepRecord(step=step, observations=[obs], prompt_tokens=500), state)
+
+    def test_unrelated_python_assertion_does_not_explain_original_failure(self):
+        read = "from pathlib import Path\nvalue=Path('module.py').read_text()\n"
+        wrong = read + "assert 'missing' in value"
+        right = read + "assert 'initial' in value\nprint('PASS actual value')"
+        self.observe(args={"code":wrong}, ok=False, text="exit_code=1\nstderr:\nAssertionError", meta={"exit_code":1},
+                     call_id="original", step=16)
+        self.observe(args={"code":"assert 4 == 4\nprint('PASS unrelated')"}, text="exit_code=0\nstdout:\nPASS unrelated",
+                     meta={"exit_code":0}, call_id="constant", step=17)
+        self.assertFalse(self.p.corrected_probe_support())
+        self.observe(args={"code":right}, text="exit_code=0\nstdout:\nPASS actual value", meta={"exit_code":0},
+                     call_id="counterexample", step=18)
+        original, = self.p.failed_checks()
+        support, = self.p.corrected_probe_support()
+        self.assertEqual(support["original_calls"], {original:"original"})
+        self.assertEqual(support["tool_call_id"], "counterexample")
+        self.src.write_text("regressed")
+        self.observe("write_file", args={"path":"module.py"}, call_id="edit", step=19)
+        self.observe(args={"code":wrong}, ok=False, text="exit_code=1\nstderr:\nAssertionError", meta={"exit_code":1},
+                     call_id="repeat", step=20)
+        self.assertEqual(self.p.corrected_probe_support(), [support])
+        self.assertTrue(self.p.blocked_reason())
+        self.assertFalse(any(r["kind"] == "passed_check" for r in self.p.review_evidence().values()))
 
     def check(self, text, command="unittest discover", *, duration="1.123"):
         args = {"code": f"r = subprocess.run({command.split()!r}); print(r.stdout)"}

@@ -746,7 +746,7 @@ class MemberProgress:
         self._review_evidence = {}
         self._inline_failures = {}
         self._probe_support = {}
-        self._support_versions = {}
+        self._corroborating_runs = {}
         self._file_failures = {}
         self._corrected_file_runs = {}
         self._undisclosed_probes = {}
@@ -866,6 +866,7 @@ class MemberProgress:
 
     def inline_failures(self):
         self._inline_failures = {k:v for k,v in self._inline_failures.items() if k in self._failures}
+        self._corroborating_runs = {k:v for k,v in self._corroborating_runs.items() if k in self._inline_failures}
         self._undisclosed_probes = {k:v for k,v in self._undisclosed_probes.items() if k in self._failures}
         for scope, failure in list(self._file_failures.items()):
             if not self._inline_failures.keys() & failure["calls"].keys():
@@ -878,7 +879,7 @@ class MemberProgress:
         return list(self._probe_support.values())
 
     def corrected_probe_support(self):
-        """Find later checks on the same bytes while leaving every original failure open."""
+        """Find evidence for a peer investigation. Only the peer can sign the frozen candidate."""
         probes = self.inline_failures()
         if not probes or probes.keys() != self._failures.keys() or self.pending_paths():
             return []
@@ -886,15 +887,11 @@ class MemberProgress:
         native = probes.keys() - file_scopes
         if any(probes[k]["tool"] not in {"run_python", "run_browser"} for k in native):
             return []
-        supporting = []
-        if native:
-            last_failure = max(self._failure_context.get(scope, {}).get("step", 0) for scope in native)
-            supporting = [row for row in self._probe_support.values()
-                          if row["step"] > last_failure and self._support_versions.get(row["scope"]) == self._current]
-            if not supporting:
-                return []
+        if not native <= self._corroborating_runs.keys():
+            return []
+        supporting = {row["tool_call_id"]: row for scope, row in self._corroborating_runs.items() if scope in native}
         if not file_scopes:
-            return [] if self._pending_verification else supporting
+            return list(supporting.values())
         # A corrected script is a reason to ask a peer. Each original call
         # still needs its own signature; the other selected commands travel
         # with the frozen candidate and still gate promotion.
@@ -902,7 +899,24 @@ class MemberProgress:
         corrected = [r for r in self._corrected_file_runs.values() if r["input_version"] == version]
         covered = {key for row in corrected for key, original in row["original_calls"].items()
                    if key in file_scopes and original == self._failure_context[key].get("tool_call_id")}
-        return supporting + corrected if covered == file_scopes else []
+        return [*supporting.values(), *corrected] if covered == file_scopes else []
+
+    def _retain_probe_support(self, row, asserted_inputs):
+        self._probe_support[row["scope"]] = row
+        if len(self._probe_support) > 4:
+            del self._probe_support[next(iter(self._probe_support))]
+        # Link the two actual observations at execution time. A later edit or
+        # replay of the original failure changes what a peer needs to test,
+        # but cannot undo an observed contradiction on those historical bytes.
+        version = digest(self._current)
+        related = {scope: probe["tool_call_id"] for scope, probe in self._inline_failures.items()
+                   if probe.get("tool") == row["tool"] and probe.get("task_id") == row["task_id"]
+                   and probe.get("input_version") == version and probe["step"] < row["step"]
+                   and asserted_inputs.intersection(probe["input_paths"] or probe.get("investigation_paths", ()))}
+        if related:
+            receipt = {**row, "original_calls": related, "input_version": version}
+            for scope in related:
+                self._corroborating_runs[scope] = receipt
 
     def _record_file_correction(self, invocation, obs, step):
         failure = self._file_failures.get(invocation.scope)
@@ -1257,9 +1271,16 @@ class MemberProgress:
                                 inputs = _asserted_inputs(code)
                                 if obs.source == "run_browser":
                                     inputs.update(_observed_browser_files(obs.meta, self._current, self._embedded_html))
+                                earlier_page = obs.meta.get("browser_document_before_failure") if obs.source == "run_browser" else None
+                                investigation_paths = set()
+                                if earlier_page:
+                                    path, sha = earlier_page
+                                    earlier = {"asserted_browser_files": {path:sha}} if path else {"asserted_browser_documents": [sha]}
+                                    investigation_paths = _observed_browser_files(earlier, self._current, self._embedded_html)
                                 probe = {"code":code, "error":failure_obs.content, "exit_code":exit_code,
                                          "display_truncated":_output_truncated(obs), "program_inputs":program_inputs,
-                                         "input_paths":sorted(inputs & self._current.keys()),
+                                         "input_version":digest(self._current), "step":record.step,
+                                         "input_paths":sorted(inputs & self._current.keys()), "investigation_paths":sorted(investigation_paths),
                                          "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id}
                                 # A named FAIL row has its own scope. Such a report
                                 # does not create an aggregate failure receipt.
@@ -1339,14 +1360,9 @@ class MemberProgress:
                                     and 0 < len(code.encode()) <= 32768 and len(obs.content.encode()) <= 8192
                                     and not _output_truncated(obs) and not obs.meta.get("timed_out")
                                     and not obs.meta.get("cancelled")):
-                                self._probe_support[suite_key] = {"scope": suite_key, "code": code,
+                                self._retain_probe_support({"scope": suite_key, "code": code,
                                     "output": obs.content, "exit_code": exit_code, "tool": obs.source,
-                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id, "step": record.step}
-                                self._support_versions[suite_key] = dict(self._current)
-                                if len(self._probe_support) > 4:
-                                    oldest = next(iter(self._probe_support))
-                                    del self._probe_support[oldest]
-                                    del self._support_versions[oldest]
+                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id, "step": record.step}, inputs)
                             if status != "runner_exit":
                                 original_probe = self._inline_failures.get(suite_key, {})
                                 revised_script = (original_probe.get("kind") == "edited_script" and
@@ -1689,6 +1705,11 @@ class MemberProgress:
             return (f"本次分工还需交付 {missing}。与分工起点一致的文件：{unchanged}。"
                     f"请按分工使用常规工具编辑实现、运行验证，再按真实结果补齐说明。{research}"
                     "已有文件可作输入，只有实际修改和检查才构成本轮交付证据。已观察记录：" + facts)
+        if self._corroborating_runs and self.corrected_probe_support():
+            commands = [entry["check"] for entry in self._pending_verification.values()]
+            return ("原失败和后来针对同一产品的断言已在当时版本留证。可直接交接并说明争议；"
+                    "宿主将冻结当前候选，由独立成员实测最新版本、签署并处理这些另外的原命令："
+                    + json.dumps(commands, ensure_ascii=False) + "。已观察记录：" + facts)
         if self.browser_replays():
             return ("原浏览器断言曾失败。修复后用 rerun_browser_check 引用 replayable_browser_call_ids 中的原调用 ID。"
                     "重写脚本检查的是另一个范围。若原断言有误，请说明并交给独立成员复核。已观察记录：" + facts)

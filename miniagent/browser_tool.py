@@ -57,4 +57,9 @@ def run_browser(ctx, args: dict) -> ToolResult:
                     result.meta["asserted_browser_documents"] = loopback
                     if result.ok and len(loopback) == 1:
                         result.meta["loopback_document_sha256"] = loopback[0]
+                if not result.ok and not documents and len(claims["passed"]) == 1:
+                    # A later Python assertion can fail on a local variable.
+                    # Keep its earlier observed page as an investigation hint,
+                    # separate from the document that the failing assertion read.
+                    result.meta["browser_document_before_failure"] = claims["passed"][0]
         return result

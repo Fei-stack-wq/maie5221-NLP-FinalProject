@@ -45,8 +45,8 @@ def _invocation(argv, cwd, complete):
     # Never expose arbitrary argument values/fetch URLs to a peer. The digest
     # still distinguishes interpreters, paths, flags, and selected test cases.
     key = "\0".join((str(Path(cwd)), argv[0], *args))
-    if script and len(args) == 1:
-        caption = shlex.join([argv[0], args[0]]) + (" (cwd=" + str(Path(cwd)) + ")" if Path(cwd) != Path(".") else "")
+    if script and (len(args) == 1 or name.startswith("python") and args[1:] == ["-v"]):
+        caption = shlex.join([argv[0], *args]) + (" (cwd=" + str(Path(cwd)) + ")" if Path(cwd) != Path(".") else "")
     else:
         caption = script or name + (" " + args[1] if args[:1] == ["-m"] else "")
     selection = "\0".join((str(Path(cwd)), *args))
@@ -61,6 +61,9 @@ def _invocation(argv, cwd, complete):
 
 
 def shell_invocation(command, cwd):
+    # project_environment() already sets exactly this value in every shell.
+    # Keep the interpreter, script, all script arguments and cwd in the identity.
+    command = re.sub(r"^[ \t]*PYTHONDONTWRITEBYTECODE=1[ \t]+(?=python(?:\d+(?:\.\d+)*)?[ \t])", "", command, count=1)
     lex = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
     lex.whitespace_split = True
     lex.commenters = ""

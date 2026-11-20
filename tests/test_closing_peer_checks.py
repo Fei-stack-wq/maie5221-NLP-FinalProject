@@ -17,6 +17,36 @@ from tests.test_studio_service import finished, request
 
 
 class ClosingPeerChecksTest(unittest.TestCase):
+    def test_verbose_booking_replay_uses_the_frozen_argv_and_working_directory(self):
+        command = "python3 tests/test_bookings.py -v"
+        expected = shell_invocation(command, ".")
+        env = "PYTHONDONTWRITEBYTECODE=1 "
+        self.assertEqual(expected.scope, "4a331a6c51ef39bdb5591f97faffece28326a4a6e451fa9ab4efea0f8c371488")
+        for suffix in ("", " 2>&1"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(shell_invocation(env + command + suffix, "."), expected)
+        for other in (env + command + " 2>&1 | tail -60", env + command + '; echo "EXIT_CODE=$?"',
+                      env + "PYTHONWARNINGS=ignore " + command, "env " + env + command,
+                      "PYTHONDONTWRITEBYTECODE=0 " + command, "cd . && " + env + command,
+                      env + "node tests/test_bookings.py -v", "python3 tests/test_bookings.py",
+                      env + command + " BookingTests.test_rooms_endpoint"):
+            with self.subTest(other=other):
+                actual = shell_invocation(other, ".")
+                self.assertFalse(actual and actual.complete and actual.scope == expected.scope)
+        self.assertNotEqual(shell_invocation(command, "checks").scope, expected.scope)
+        self.assertEqual(expected.caption, command)
+
+        root = make_temp_dir("legacy-verbose-caption")
+        self.addCleanup(cleanup, root)
+        original = Tool("run_shell", "shell", {"type":"object"}, Mock())
+        files = {expected.script: "frozen"}
+        item = {"task":"author", "candidate":files, "verification":[
+            {"scope":expected.scope, "path":expected.script, "check":expected.script, "current_sha256":"frozen"}]}
+        registry = ToolRegistry([original])
+        closing = ClosingPeerChecks(registry, root, files.copy)
+        self.assertIn(command, closing.offer([item], "author", files, {"complete_verification":{}, "script_exits":{}}))
+        self.assertEqual(registry.get("run_shell").parameters["properties"]["command"]["enum"], [command])
+
     def test_exact_scope_and_version_checked_at_offer_and_execution(self):
         directory = make_temp_dir("recheck-scope")
         self.addCleanup(cleanup, directory)

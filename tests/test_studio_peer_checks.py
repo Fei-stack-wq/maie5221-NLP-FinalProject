@@ -200,13 +200,24 @@ class PeerChecksTest(unittest.TestCase):
         room.record_event.assert_not_called()
 
     def test_normal_entry_routes_reopened_passed_product_to_a_real_independent_run(self):
+        self.exercise_reopened_product()
+
+    def test_one_peer_run_with_the_host_bytecode_setting_closes_the_verbose_unittest(self):
+        old = ("from pathlib import Path\nimport unittest\n"
+               "class LabelTest(unittest.TestCase):\n"
+               "    def test_label(self): self.assertIn('wrong', Path('label.txt').read_text())\n"
+               "if __name__ == '__main__': unittest.main()\n")
+        self.exercise_reopened_product(old=old, command="python3 check.py -v",
+                                       peer_command="PYTHONDONTWRITEBYTECODE=1 python3 check.py -v")
+
+    def exercise_reopened_product(self, old="assert 'wrong' in open('label.txt').read()\nprint('1 passed')\n",
+                                  command="python3 check.py", peer_command="python3 check.py"):
         root = make_temp_dir("peer-check-route")
         self.addCleanup(cleanup, root)
         service = StudioService(root / "runs", Settings(api_key="test-only"))
         self.addCleanup(service.close)
         label = "Shipment destination: confirmed warehouse."
         rule = {"id": "label", "method": "inspect", "description": "Confirm the warehouse label."}
-        old = "assert 'wrong' in open('label.txt').read()\nprint('1 passed')\n"
         new = old.replace("'wrong'", "'confirmed'")
         script = [
             tool("delegate_task", assignee="author", objective="Write label", remaining_roles=["qa"], deliverable_paths=["label.txt"]),
@@ -214,9 +225,9 @@ class PeerChecksTest(unittest.TestCase):
             tool("delegate_task", assignee="qa", objective="Independently inspect label", remaining_roles=[],
                  review={"candidate": "author", "criteria": [rule]}),
             tool("read_file", path="label.txt"), write("check.py", old),
-            tool("run_shell", command='python3 check.py > check.log 2>&1; echo "EXIT=$?"; tail -3 check.log'),
+            tool("run_shell", command=command + ' > check.log 2>&1; echo "EXIT=$?"; tail -3 check.log'),
             tool("edit_file", path="check.py", old_text="'wrong'", new_text="'confirmed'"),
-            tool("run_shell", command="python3 check.py"),
+            tool("run_shell", command=command),
             tool("submit_review", candidate_version=digest({"label.txt": hashlib.sha256(label.encode()).hexdigest()}),
                  results=[{"criterion_id": "label", "verdict": "passed", "reason": "Read the confirmed warehouse label.",
                            "evidence": ["file:label.txt"]}]),
@@ -224,7 +235,7 @@ class PeerChecksTest(unittest.TestCase):
             tool("delegate_task", assignee="qa", objective="Reopen the same full product review",
                  deliverable_paths=["another-full-report.md"], review={"candidate": "label.txt", "criteria": [rule]}),
             tool("read_file", path="check.py"), tool("read_file", path="label.txt"),
-            tool("run_shell", command="python3 check.py"), {"text": "__CHECKED__"}, {"text": "Delivered reviewed label."},
+            tool("run_shell", command=peer_command), {"text": "__CHECKED__"}, {"text": "Delivered reviewed label."},
         ]
 
         class PeerProvider(RecordingProvider):
