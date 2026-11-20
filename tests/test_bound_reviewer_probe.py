@@ -137,8 +137,8 @@ class BoundReviewerProbeTest(unittest.TestCase):
         return detail, reports, provider
 
     @staticmethod
-    def start_bound_review(*, label=LABEL, bad_probe=BAD_PROBE, fixed_probe=FIXED_PROBE):
-        return [
+    def start_bound_review(*, label=LABEL, bad_probe=BAD_PROBE, fixed_probe=FIXED_PROBE, final_reply=True):
+        steps = [
             tool("delegate_task", assignee="builder", objective="Write the ten-unit shipment label.",
                  deliverable_paths=[PATH], remaining_roles=["inspector"]),
             write(PATH, label), {"text": "The label is published."},
@@ -148,8 +148,10 @@ class BoundReviewerProbeTest(unittest.TestCase):
             tool("read_file", path=PATH), write("inspection.md", NOTE),
             tool("run_python", code=bad_probe), tool("run_python", code=fixed_probe),
             bound_submission(label, bad_probe, fixed_probe),
-            {"text": "[BLOCKED] The product finding cites my failed probe; another member must adjudicate it."},
         ]
+        if final_reply:
+            steps.append({"text": "[BLOCKED] The product finding cites my failed probe; another member must adjudicate it."})
+        return steps
 
     @staticmethod
     def peer_steps(*, assignee="arbiter", evidence=None, peer_probe=PEER_PROBE, verdict="passed"):
@@ -680,13 +682,16 @@ class BoundReviewerProbeTest(unittest.TestCase):
             "evidence":["fail:" + scope(bad), "pass:" + PEER_SCOPE],
             "reason":"My own probe added two to the observed quantity.",
             "action":"Read and remeasure the same frozen label in a fresh review assignment."}})
-        steps = self.start_bound_review() + first + [{"text":"The quantity needs remeasurement."}]
+        steps = self.start_bound_review(final_reply=False) + first + [{"text":"The quantity needs remeasurement."}]
         steps += self.peer_steps() + [{"text":"Confirmed the unchanged shipment quantity."}, {"text":"Delivered."}]
         detail, reports, provider = self.run_steps(steps)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         children = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
         pending, completed = children
         self.assertEqual([r["role"] for r in children], ["arbiter", "arbiter"])
+        original = next(r for r in reports if r["role"] == "inspector")
+        self.assertEqual(original["signed_handoff"]["source"], "signed_review")
+        self.assertFalse(original["published"])
         self.assertEqual([r["native_review"]["assessment"]["verdict"] for r in children], ["inconclusive", "passed"])
         self.assertEqual(pending["native_review"]["candidate_version"], completed["native_review"]["candidate_version"])
         failed, = pending["evidence"]["failed_check_details"]
@@ -707,7 +712,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
                        deliverable_paths=["inspection.md"]), write("inspection.md", initial), {"text":"Published."}]
         first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
         first[-1]["_probe_finding"].update(cause="verification", action="Remeasure from the same frozen label.")
-        steps = prefix + self.start_bound_review() + first + [{"text":"The quantity needs independent remeasurement."},
+        steps = prefix + self.start_bound_review(final_reply=False) + first + [{"text":"The quantity needs independent remeasurement."},
             tool("append_file", path="inspection.md", content="Premature coordinator edit."),
             tool("edit_file", path=PATH, old_text="10", new_text="11"), tool("read_file", path="inspection.md")]
         steps += self.peer_steps() + [{"text":"Confirmed the frozen quantity."},
@@ -732,7 +737,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
     def test_changed_public_bytes_keep_probe_blocked_and_identify_the_changed_file(self):
         first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
         first[-1]["_probe_finding"].update(cause="verification", action="Remeasure the frozen label.")
-        steps = self.start_bound_review() + first + [{"text":"The quantity needs remeasurement."},
+        steps = self.start_bound_review(final_reply=False) + first + [{"text":"The quantity needs remeasurement."},
             tool("run_python", code="from pathlib import Path\nPath('inspection.md').write_text('new public text')"),
             tool("delegate_task", assignee="arbiter", objective="Resume original adjudication."),
             {"text":"[BLOCKED] The public review report was changed."}]

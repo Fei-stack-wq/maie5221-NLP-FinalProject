@@ -475,8 +475,26 @@ sys.exit(0 if ok else 1)
         self.assertIn("用户指定验收失败",reports[-1]["remaining_issue"])
         self.assertFalse((self.local/PATH).exists())
 
+    def test_private_reviewer_can_test_in_temp_without_polluting_candidate(self):
+        detail, reports = self.run_steps(initial() + [
+            write("tests/peer_check.py", "print('independent test')"),
+            tool("run_python", code="import tempfile\nfrom pathlib import Path\n"
+                 "with tempfile.TemporaryDirectory() as directory:\n"
+                 "    script = Path(directory, 'peer_check.py')\n"
+                 "    script.write_text('assert 2 + 2 == 4')\n"
+                 "    exec(script.read_text())"),
+            submit(OLD), {"text":"Independently verified the original."}, {"text":"Delivered."}])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        self.assertTrue(reports[-1]["published"])
+        self.assertFalse((self.local / "tests/peer_check.py").exists())
+        self.assertFalse(any(e["kind"] == "human_question" for e in detail["room_events"]))
+        denied = [e for e in detail["events"] if e["kind"] == "tool_result" and e.get("tool") == "write_file" and not e["ok"]]
+        self.assertTrue(any("tempfile" in e["preview"] for e in denied), denied)
+
     def test_reviewer_addition_is_not_part_of_approved_candidate(self):
-        _,reports=self.run_steps(initial()+[write("notes.md","Unexpected file in candidate."),
+        # A subprocess can create files outside the guarded file tools. Signing
+        # must still detect an actual change to the private snapshot.
+        _,reports=self.run_steps(initial()+[tool("run_python", code="from pathlib import Path\nPath('notes.md').write_text('unexpected')"),
             submit(OLD),{"text":"[BLOCKED] Tree changed."},{"text":"[BLOCKED] No reviewed version."}])
         self.assertFalse(reports[-1]["published"])
         self.assertIsNone(reports[-1]["native_review"]["assessment"])

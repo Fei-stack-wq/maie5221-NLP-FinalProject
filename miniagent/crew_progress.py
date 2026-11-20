@@ -20,7 +20,7 @@ from typing import NamedTuple
 
 from .check_provenance import python_check_source, python_invocation, shell_invocation
 from .project_data import PROJECT_CACHE_DIRS
-from .rao import Budget, Observation, RAOState, StepRecord
+from .rao import Budget, ErrorClass, Observation, RAOState, StepRecord
 from .schemas import ToolResult
 from .shell_tool import INLINE_FAILURE_LIMIT
 from .tools import Tool
@@ -156,7 +156,7 @@ def _script_inputs(code: str) -> tuple[set[str], str, int | None, bool]:
     return paths, command, exit_position, reader_seen or output_only
 
 
-def _asserted_inputs(code: str) -> set[str]:
+def _asserted_inputs(code: str, *, process_output=False) -> set[str]:
     """Conservatively bind an executed top-level assertion to literal file inputs.
 
     This is provenance, not a proof that an assertion implements a business rule.
@@ -168,6 +168,8 @@ def _asserted_inputs(code: str) -> set[str]:
     except (SyntaxError, ValueError, RecursionError):
         return set()
     values, dependencies, checked = {}, {}, set()
+    runpy_modules, subprocess_modules = set(), set()
+    processes = {}
 
     def path_value(node):
         if isinstance(node, ast.Name):
@@ -180,13 +182,29 @@ def _asserted_inputs(code: str) -> set[str]:
                 return path_value(node.args[0])
         return None
 
+    def local_process(node):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in subprocess_modules
+                and all(kw.arg not in {None, "cwd", "shell", "executable"} for kw in node.keywords)):
+            return _python_entry_point(node)
+        return None
+
     def inputs(node):
         paths = set()
         for part in ast.walk(node):
             if isinstance(part, ast.Name):
                 paths.update(dependencies.get(part.id, ()))
+            if (isinstance(part, ast.Attribute) and part.attr in {"stdout", "stderr"}
+                    and isinstance(part.value, ast.Name) and (program := processes.get(part.value.id))):
+                paths.add(program)
+            if process_output:
+                continue
             if isinstance(part, ast.Call):
                 name = getattr(part.func, "id", "") or getattr(part.func, "attr", "")
+                if (name == "run_path" and isinstance(part.func, ast.Attribute)
+                        and isinstance(part.func.value, ast.Name) and part.func.value.id in runpy_modules
+                        and part.args and isinstance(part.args[0], ast.Constant) and isinstance(part.args[0].value, str)):
+                    paths.add(part.args[0].value)
                 candidate = (part.args[0] if name == "open" and part.args else
                              part.func.value if name in {"read_text", "read_bytes", "read"}
                              and isinstance(part.func, ast.Attribute) else None)
@@ -196,24 +214,83 @@ def _asserted_inputs(code: str) -> set[str]:
         return paths
 
     for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                runpy_modules.discard(name)
+                subprocess_modules.discard(name)
+                if alias.name == "subprocess":
+                    subprocess_modules.add(name)
+                if alias.name == "runpy":
+                    runpy_modules.add(name)
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 if isinstance(target, ast.Name) and node.value is not None:
-                    values[target.id] = path_value(node.value)
                     dependencies[target.id] = inputs(node.value)
-        elif isinstance(node, ast.Assert):
+                    processes[target.id] = local_process(node.value)
+                    values[target.id] = path_value(node.value)
+                    runpy_modules.discard(target.id)
+                    subprocess_modules.discard(target.id)
+        elif isinstance(node, ast.Assert) and (not process_output or isinstance(node.test, ast.Compare)):
             checked.update(inputs(node.test))
     return checked
 
 
-def _observed_browser_files(meta, versions):
-    """Join driver-observed DOM assertions to unambiguous local HTML bytes."""
+def _python_entry_point(call):
+    """Recognise a directly named Python script in an explicit subprocess argv."""
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"run", "Popen", "check_output", "check_call"} and call.args):
+        return None
+    argv = call.args[0]
+    if isinstance(argv, ast.BinOp) and isinstance(argv.op, ast.Add):
+        argv = argv.left
+    if not isinstance(argv, (ast.List, ast.Tuple)) or len(argv.elts) < 2:
+        return None
+    interpreter, script = argv.elts[:2]
+    python = (isinstance(interpreter, ast.Attribute) and interpreter.attr == "executable"
+              and isinstance(interpreter.value, ast.Name) and interpreter.value.id == "sys"
+              or isinstance(interpreter, ast.Constant) and interpreter.value in ("python", "python3"))
+    if python and isinstance(script, ast.Constant) and isinstance(script.value, str) and script.value.endswith(".py"):
+        return script.value
+    return None
+
+
+def _embedded_html_documents(source: bytes):
+    """Index complete literal documents without importing candidate code."""
+    if len(source) > 1024 * 1024 or b"<html" not in source.lower():
+        return set()
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError, UnicodeError, RecursionError):
+        return set()
+    documents = set()
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        node = statement.value
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, (str, bytes)):
+            continue
+        try:
+            data = node.value.encode("utf-8") if isinstance(node.value, str) else node.value
+        except UnicodeError:
+            continue
+        if (re.match(rb"\s*(?:<!doctype\s+html[^>]*>\s*)?<html(?:\s|>)", data, re.I)
+                and data.rstrip().lower().endswith(b"</html>")):
+            documents.add(hashlib.sha256(data).hexdigest())
+    return documents
+
+
+def _observed_browser_files(meta, versions, embedded=None):
+    """Join real DOM assertions to unique document bytes, including frozen Python literals."""
     digests = set(meta.get("asserted_browser_documents", []))
     matches = {}
     for path, sha in versions.items():
         if sha in digests and Path(path).suffix.lower() in {".html", ".htm"}:
             matches.setdefault(sha, []).append(path)
+        if embedded and path in embedded and embedded[path][0] == sha:
+            for document in digests.intersection(embedded[path][1]):
+                matches.setdefault(document, []).append(path)
     files = {path for path, sha in meta.get("asserted_browser_files", {}).items() if versions.get(path) == sha}
     return files | {paths[0] for paths in matches.values() if len(paths) == 1}
 
@@ -644,6 +721,7 @@ class MemberProgress:
         self.required = set(required_paths)
         self._cache = {}
         self._assertive_scripts = {}
+        self._embedded_html = {}
         self._authored = set()
         self._edited_scripts = set()
         self._check_sources = {}
@@ -755,6 +833,12 @@ class MemberProgress:
                                 del self._source_text[oldest]
                                 self._excerpt_ranges.pop(oldest, None)
                             self._source_text[key] = record["text"]
+                    if key.endswith(".py"):
+                        documents = _embedded_html_documents(data)
+                        if documents:
+                            self._embedded_html[key] = (files[key], documents)
+                        else:
+                            self._embedded_html.pop(key, None)
                     if key.endswith(".py") and len(data) <= 32768:
                         try:
                             self._check_sources[key] = (files[key], data.decode("utf-8"))
@@ -884,6 +968,10 @@ class MemberProgress:
         checked_scope = None
         last_mutation = max((i for i, o in enumerate(record.observations) if o.source in _MUTATORS), default=-1)
         for index, obs in enumerate(record.observations):
+            # Phase and budget denials never reached the product. Keep the
+            # original RAO observation for diagnostics, outside the test ledger.
+            if obs.error_class == ErrorClass.A_SKIPPED:
+                continue
             parameters = args.get(obs.tool_call_id, {})
             replay_of = None
             if obs.source == "rerun_browser_check":
@@ -954,6 +1042,11 @@ class MemberProgress:
                     self._executions += 1
                     invocation = python_invocation(str(parameters.get("code", "")), cwd)
                     paths, command, exit_position, reading = _script_inputs(str(parameters.get("code", "")))
+                    if (invocation and command.startswith("assert ") and invocation.script in self._current
+                            and invocation.script in _asserted_inputs(parameters["code"], process_output=True)):
+                        # The surrounding Python asserts the product's actual output.
+                        # Its own check is independent of assertions in the program.
+                        invocation = None
                     reads.update((p, 0) for p in paths if obs.ok and p in self._current)
                     signal = _check(obs, command, reading, exit_position)
                     if reading and obs.ok and obs.meta.get("exit_code") == 0:
@@ -1086,7 +1179,7 @@ class MemberProgress:
                                 "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
                             if obs.source == "run_browser":
                                 self._review_evidence["fail:" + key]["browser_inputs"] = {
-                                    p: self._current[p] for p in _observed_browser_files(obs.meta, self._current)}
+                                    p: self._current[p] for p in _observed_browser_files(obs.meta, self._current, self._embedded_html)}
                             self._failure_context[key] = {
                                 "scope_id":key, "label":failure, "tool":obs.source,
                                 "tool_call_id":obs.tool_call_id, "step":record.step,
@@ -1107,11 +1200,17 @@ class MemberProgress:
                                     and len(failure_obs.content.encode()) <= error_limit and not _output_truncated(failure_obs)
                                     and type(exit_code) is int and exit_code != 0
                                     and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
+                                program_inputs = {}
+                                if obs.source == "run_python":
+                                    # A named program constrains the peer's subject. This hint
+                                    # cannot mint a passing receipt for the failed invocation.
+                                    entries = {_python_entry_point(call) for call in ast.walk(ast.parse(code))}
+                                    program_inputs = {p:self._current[p] for p in entries if p in self._current}
                                 self._record_probe(suite_key, {"code":code, "error":failure_obs.content,
-                                    "display_truncated":_output_truncated(obs),
+                                    "display_truncated":_output_truncated(obs), "program_inputs":program_inputs,
                                     "browser_inputs":self._review_evidence["fail:" + suite_key].get("browser_inputs", {}),
                                     "exit_code":exit_code,
-                                    "input_paths": sorted((_asserted_inputs(code) | (_observed_browser_files(obs.meta, self._current)
+                                    "input_paths": sorted((_asserted_inputs(code) | (_observed_browser_files(obs.meta, self._current, self._embedded_html)
                                         if obs.source == "run_browser" else set()))
                                         & self._current.keys()),
                                     "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
@@ -1163,7 +1262,7 @@ class MemberProgress:
                             if obs.source in {"run_python", "run_browser"} and status != "runner_exit":
                                 inputs = _asserted_inputs(code)
                                 if obs.source == "run_browser":
-                                    browser_inputs = _observed_browser_files(obs.meta, self._current)
+                                    browser_inputs = _observed_browser_files(obs.meta, self._current, self._embedded_html)
                                     self._review_evidence["pass:" + suite_key]["browser_inputs"] = {
                                         p: self._current[p] for p in browser_inputs if p in self._current}
                                     inputs.update(browser_inputs)

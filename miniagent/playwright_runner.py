@@ -49,6 +49,7 @@ class DocumentWitness:
         self.checked = {"passed": set(), "failed": set()}
         self.reads = set()
         self.expectations = weakref.WeakSet()
+        self.failed_read = None
         page.on("response", self.navigation)
         for target in (page, page.main_frame):
             original = target.set_content
@@ -116,10 +117,17 @@ class DocumentWitness:
             self.record(self.current_digest(), "passed")
         return value
 
-    def read(self, method, *args, **kwargs):
-        value = method(*args, **kwargs)
+    def read(self, checked, method, *args, **kwargs):
         obj = getattr(method, "__self__", None)
-        if obj is self.page or isinstance(obj, self.api.Locator) and obj.page is self.page:
+        on_page = obj is self.page or isinstance(obj, self.api.Locator) and obj.page is self.page
+        document = self.document
+        try:
+            value = method(*args, **kwargs)
+        except self.api.TimeoutError as exc:
+            if on_page and document is self.document:
+                self.failed_read = (exc, self.current_digest())
+            raise
+        if on_page and checked and document is self.document:
             if digest := self.current_digest():
                 self.reads.add(digest)
         return value
@@ -153,8 +161,8 @@ class AssertionCalls(ast.NodeTransformer):
             return ast.copy_location(self.invoke("check", [node.func, *node.args], node.keywords), node)
         if isinstance(node.func, ast.Attribute) and node.func.attr.startswith(("to_", "not_to_")):
             return ast.copy_location(self.invoke("assertion", [node.func, *node.args], node.keywords), node)
-        if self.in_assert and isinstance(node.func, ast.Attribute) and node.func.attr in self.getters:
-            return ast.copy_location(self.invoke("read", [node.func, *node.args], node.keywords), node)
+        if isinstance(node.func, ast.Attribute) and node.func.attr in self.getters:
+            return ast.copy_location(self.invoke("read", [ast.Constant(self.in_assert), node.func, *node.args], node.keywords), node)
         return node
 
     def visit_Assert(self, node):
@@ -204,6 +212,13 @@ def main():
                 with Path(temp_home, "checked-document.sha256").open("xb") as receipt:
                     try:
                         exec(script, scope)
+                    except Exception as exc:
+                        # A failed lookup can occur on the line assigning a value,
+                        # before the script reaches its next assert. Only retain
+                        # the uncaught timeout from this actual page.
+                        if witness.failed_read and exc is witness.failed_read[0]:
+                            witness.record(witness.failed_read[1], "failed")
+                        raise
                     finally:
                         payload = json.dumps({key: sorted(values, key=lambda v: (v[0] or "",v[1])) for key, values in witness.checked.items()},
                                              separators=(",", ":")).encode()

@@ -55,3 +55,9 @@ Microsoft Playwright 的 `Expect.__call__` 按实际对象类型分派，Locator
 ```sh
 python -m unittest tests.test_private_candidate_review tests.test_bound_reviewer_probe tests.test_crew_progress tests.test_browser_tool tests.test_bound_failure_output
 ```
+
+## 已签判断与阻塞状态
+
+公开候选的评审者可以签署业务项，同时明确引用仍有争议的测试。当原失败均可转交、工件版本一致且指定检查与附件已齐备，宿主在签署工具返回后就结束这次成员执行，把争议留给独立成员。签署中的原判断和反例都随交接保存。其他等待中的指定检查、正在运行的命令和发生变化的快照仍须先处理。若最终因证据问题阻塞，负责人和用户看到实际签署项数、通过数和不同回执数，已执行的业务检查不会被概括为“没有新证据”。
+
+私有冻结候选的独立评审只能增加指定的正式报告和有工具回执的外部材料。评审者尝试在产品目录另建临时测试，文件工具会在创建前说明如何使用系统临时目录。由应用或命令实际写入的额外文件仍由最终快照校验发现，宿主不会删除用户文件。两条路径分别从普通群聊入口测试。独立任务完成与由宿主交接的实现参考同目录 [OpenAI Agents SDK 的结果消费与回归](2026-11-19-review-coordination.md)。浏览器交接时保留隔离的输入和原始检查过程。pytest 的 [tmp_path](https://docs.pytest.org/en/stable/how-to/tmp_path.html) 同样为单次检查提供独立的临时路径。

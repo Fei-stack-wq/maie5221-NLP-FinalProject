@@ -538,6 +538,9 @@ sys.exit(bool(errors))
         self.assertEqual([r["role"] for r in reports],["builder","inspector","inspector"])
         self.assertEqual(reports[-1]["native_review"]["state"],"blocked")
         self.assertNotEqual(detail["run"]["status"],"completed")
+        final = (self.root / "runs" / detail["run"]["id"] / "conversation-answer.txt").read_text()
+        self.assertIn("签署 1 项，其中 0 项判为通过", final)
+        self.assertIn("1 条不同回执", final)
         self.assertNotIn("human_question",[e["kind"] for e in detail["room_events"]])
 
     def verification_retry(self, retry_steps):

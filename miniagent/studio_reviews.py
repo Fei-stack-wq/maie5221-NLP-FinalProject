@@ -483,7 +483,7 @@ class ReviewSession:
             return ToolResult.failure(f"独立评审的冻结文件不可修改 {snapshot_location(Path(path), '')}，"
                                       f"原定 {self.frozen[path] or '缺失'}。请在系统临时目录另建检查脚本，"
                                       "评审说明写入新的或宿主指定的附件路径。")
-        if (self.private_snapshot_issue and self.item.kind == "reviewer_probe" and name != "delete_file"
+        if (self.private_snapshot_issue and name != "delete_file"
                 and path not in self.review_notes and path not in self.source_files):
             parts = Path(path).parts
             # copy_project excludes hidden entries and cache directories from
@@ -781,7 +781,7 @@ class ReviewSession:
         references = self.item.probe_reference_inputs.get(rule.id, {})
         probe = self.item.probes.get(rule.id.removeprefix("probe_"), {})
         browser_probe = probe.get("tool") == "run_browser"
-        target_paths = probe.get("browser_inputs") or (probe.get("input_paths", ())
+        target_paths = probe.get("browser_inputs") or probe.get("program_inputs") or (probe.get("input_paths", ())
                       if self.item.kind == "product" or browser_probe else ())
         products = {p: sha for p, sha in self.item.probe_product_files.items()
                     if not target_paths or p in target_paths}
@@ -865,7 +865,7 @@ class ReviewSession:
                 ("。本次仅裁决原评审明确引用的争议检查，不能替换或代签原产品标准。"
                  "保留全部冻结文件，按原 method 核实争议：source 亲自核对新来源和冻结成稿；inspect 阅读原件；"
                  "execute 可用 run_python 读取冻结产品实际数据并断言，或 run_browser 用 "
-                 "打开本地后端页面或冻结文件，对实际业务控件执行 expect/assert。"
+                 "打开本地后端页面或冻结文件，对实际业务控件执行 expect/assert。冻结 Python 中内嵌的完整 HTML 也可绑定界面。后端行为可用 import runpy 加载 api = runpy.run_path('实际模块.py')，调用实际业务函数并断言返回值。涉及启动命令时也从冻结副本运行原命令并实测端点。"
                  "只读文件再 assert True、无关页面 PASS 或另一版本不能代替执行核查。"
                  "原检查错误且业务行为满足原要求才判 passed；真实产品错误判 changes_requested/product；"
                  "证据不足判 inconclusive/verification。其他脚本的 PASS 不能代替对该失败的逐项解释。"

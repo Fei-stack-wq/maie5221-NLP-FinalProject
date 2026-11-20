@@ -770,11 +770,16 @@ class RoomCrew:
         implicated = {finding["criterion_id"] for finding in assessment["results"]
                       if any(r["kind"] == "failed_check" and r["scope"] in probes for r in finding["receipts"])}
         original_rules = [rule for rule in parent.criteria if rule.id in implicated]
-        method = ("execute" if assessment["verdict"] == "inconclusive" or any(r.method == "execute" for r in original_rules) else
-                  "source" if any(r.method == "source" for r in original_rules) else "inspect")
-        rules = [Rule(id="probe_" + scope, method=method, description=(
-            "独立裁决原评审明确引用的失败检查 " + scope + "，说明原断言/真实错误为何与以下原业务标准冲突或一致：" +
-            _clip(_json([rule.model_dump(exclude_none=True) for rule in original_rules]), 950))) for scope in probes]
+        rules = []
+        for scope in probes:
+            ids = {f["criterion_id"] for f in assessment["results"]
+                   if any(r.get("scope") == scope and r["kind"] == "failed_check" for r in f["receipts"])}
+            affected = [rule for rule in original_rules if rule.id in ids]
+            method = ("execute" if assessment["verdict"] == "inconclusive" or any(r.method == "execute" for r in affected) else
+                      "source" if any(r.method == "source" for r in affected) else "inspect")
+            rules.append(Rule(id="probe_" + scope, method=method, description=(
+                "独立裁决原评审明确引用的失败检查 " + scope + "，说明原断言/真实错误为何与以下原业务标准冲突或一致：" +
+                _clip(_json([rule.model_dump(exclude_none=True) for rule in affected]), 950))))
         # Keep the original inspection/source semantics as well as the exact
         # executable counterexample. A passing assertion alone cannot establish
         # an externally sourced product claim.
@@ -798,6 +803,9 @@ class RoomCrew:
                 if receipt["kind"] == "passed_check" and receipt.get("asserted"):
                     product_paths.update(path for path, sha in receipt.get("asserted_inputs", {}).items()
                                          if parent.files.get(path) == sha)
+        for probe in probes.values():
+            product_paths.update(path for path, sha in probe.get("program_inputs", {}).items()
+                                 if parent.files.get(path) == sha)
         product_paths.update(parent.required_source_paths)
         if not product_paths:
             product_paths.update(self.delivery.get("files", []))
@@ -1028,8 +1036,8 @@ class RoomCrew:
         native = self._next_review()
         bound = self._bound_review_handoff(native)
         if native and native.state == "blocked":
-            return StepPolicy("finalize", self._missing_delivery_notice() +
-                              "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
+            return StepPolicy("finalize", self._missing_delivery_notice() + self._blocked_review_record(native) +
+                              "以 [BLOCKED] 说明当前阻塞、已有证据和仍需核实的事项。\n" +
                               _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
         if native and native.state == "awaiting_user":
             return StepPolicy("coordinate", "独立验收遇到需要用户决定的业务歧义。请使用 ask_human 询问这一项：" +
@@ -1113,11 +1121,39 @@ class RoomCrew:
             return ""
         return "宿主核对的公开工作区仍缺少这些约定交付：" + _json(missing) + "。请逐项列为未交付。\n"
 
+    def _blocked_review_record(self, review):
+        if not review or review.state != "blocked":
+            return ""
+        for report in reversed(self.reports):
+            native = report.get("native_review") or {}
+            if native.get("target") != review.target or native.get("candidate_version") != review.version:
+                continue
+            signed = native.get("assessment") or {}
+            if (signed.get("target") != review.target or signed.get("candidate_version") != review.version
+                    or signed.get("evaluator") != review.reviewer):
+                return ""
+            findings = signed["results"]
+            passed = [row["criterion_id"] for row in findings if row["verdict"] == "passed"]
+            receipts = {entry["receipt_id"] for row in findings for entry in row["receipts"]}
+            blockers = [f"{row['criterion_id']}：{row.get('action') or row['reason']}"
+                        for row in findings if row["verdict"] != "passed"]
+            issue = review.host_issue or report.get("remaining_issue") or ""
+            details = list(dict.fromkeys(x for x in [issue, *blockers] if x))
+            return (f"评审者 {review.reviewer} 已对版本 {review.version[:12]} 签署 {len(findings)} 项，"
+                    f"其中 {len(passed)} 项判为通过，共引用 {len(receipts)} 条不同回执。"
+                    + "本次任务仍未通过验收。" + _clip("\n".join(details), 900) + "\n")
+        return ""
+
     def published_answer(self, answer):
-        missing = self.inventory["missing_acceptance_files"]
-        if self.direct or not missing or not answer.lstrip().startswith("[BLOCKED]"):
+        if self.direct or not answer.lstrip().startswith("[BLOCKED]"):
             return answer
-        return ("[BLOCKED] Studio 已核对公开工作区。未交付：" + "、".join(missing) + "。\n\n"
+        missing = self.inventory["missing_acceptance_files"]
+        notice = "未交付：" + "、".join(missing) + "。" if missing else ""
+        if signed := self._blocked_review_record(self._next_review()):
+            return "[BLOCKED] " + signed.rstrip() + ("\n" + notice if notice else "")
+        if not notice:
+            return answer
+        return ("[BLOCKED] Studio 已核对公开工作区。" + notice + "\n\n"
                 + answer.lstrip().removeprefix("[BLOCKED]").lstrip())
 
     def _review_requests(self, role):
@@ -2047,7 +2083,11 @@ class RoomCrew:
             elif not peer_checks.offered or any(obs.source != "run_shell" for obs in record.observations):
                 return None
             evidence = progress.evidence()
-            if (progress.pending_paths() or progress.failed_checks() or evidence["pending_verification"]
+            # Explicitly disputed executable checks belong with the next
+            # independent member. The signed assessment can close this member
+            # turn without turning it into approval or discarding a failure.
+            disputes = self._bound_probe_conflicts(review, session, progress) if progress.failed_checks() else {}
+            if ((progress.failed_checks() and not disputes) or progress.pending_paths() or evidence["pending_verification"]
                     or member.sandbox.command_sessions.pending_reason() or session.snapshot_issue()
                     or preflight_publication()):
                 return None
@@ -2072,6 +2112,8 @@ class RoomCrew:
                 lines.extend("证据 " + receipt["ref"] + "：" + (
                     receipt.get("url") or receipt.get("path") or receipt.get("label") or receipt["kind"])
                     for receipt in finding["receipts"])
+            if disputes:
+                lines.insert(0, "独立成员仍需裁决签署中引用的旧失败，当前候选尚未获准发布。")
             signed_handoff = {"source":"signed_review", "target":review.target,
                               "candidate_version":review.version, "assessment":assessment,
                               "completion_step":record.step,
