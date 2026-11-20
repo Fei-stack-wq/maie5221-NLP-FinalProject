@@ -6,6 +6,7 @@ import shlex
 import sys
 import sysconfig
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -35,6 +36,32 @@ class ShellToolTest(unittest.TestCase):
 
     def run_command(self, command, **options):
         return self.registry.dispatch("run_shell", {"command": command, **options}, self.ctx)
+
+    def test_timeout_waits_for_its_detached_child_to_exit(self):
+        code = (
+            "from pathlib import Path\nimport subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], start_new_session=True)\n"
+            "Path('child.pid').write_text(str(child.pid))\ntime.sleep(10)"
+        )
+        original_kill = psutil.Process.kill
+        stopped = []
+
+        def delayed_kill(proc):
+            self.assertEqual(proc.pid, int((self.root / "child.pid").read_text()))
+            # Deliver this fixture child's signal after the launcher has exited.
+            timer = threading.Timer(0.2, original_kill, args=(proc,))
+            timer.start()
+            self.addCleanup(timer.join)
+            stopped.append(proc)
+
+        with patch.object(psutil.Process, "kill", delayed_kill):
+            result = self.registry.dispatch("run_python", {"code":code, "timeout":1}, self.ctx)
+        self.assertTrue(result.meta["timed_out"], result.content)
+        self.assertEqual(len(stopped), 1)
+        try:
+            self.assertFalse(stopped[0].is_running() and stopped[0].status() != psutil.STATUS_ZOMBIE)
+        except psutil.NoSuchProcess:
+            pass
 
     def test_multifile_command_pipeline_and_failing_test(self):
         app = self.root / "app dir"

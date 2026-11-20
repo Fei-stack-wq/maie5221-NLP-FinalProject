@@ -100,6 +100,12 @@ def _stop_timed_out_process(process):
             child.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    process.wait()
+    # Playwright can place Chromium in a separate process group. Waiting on the
+    # launcher alone may return while a signalled browser helper is still live.
+    # https://psutil.readthedocs.io/stable/#kill-process-tree
+    _, pending = psutil.wait_procs(children, timeout=1)
+    return len(pending)
 
 
 def _drain(process, stdout, stderr, deadline, should_cancel):
@@ -182,6 +188,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     stdout, stderr = _Output(failure_evidence_limit), _Output(failure_evidence_limit)
     timed_out = False
     cancelled = False
+    pending_children = 0
     with subprocess.Popen(
         argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
@@ -192,8 +199,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
             timed_out = True
         finally:
             if timed_out or cancelled:
-                _stop_timed_out_process(process)
-                process.wait()
+                pending_children = _stop_timed_out_process(process)
             else:
                 if process.poll() is None or ctx.sandbox.track_shell_group is None:
                     # Only managed members can own a background server between calls.
@@ -202,10 +208,10 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
                     ctx.sandbox.track_shell_group(process.pid)
     elapsed = round((time.monotonic() - started) * 1000)
     parts = [f"exit_code={process.returncode}"]
-    if timed_out:
-        parts.append(f"命令执行超时（{timeout:g} 秒），已停止。")
-    if cancelled:
-        parts.append("命令已取消，已回收进程。")
+    if timed_out or cancelled:
+        status = f"命令执行超时（{timeout:g} 秒）" if timed_out else "命令已取消"
+        cleanup = f"尚未确认 {pending_children} 个子进程退出" if pending_children else "已停止"
+        parts.append(f"{status}，{cleanup}。")
     for name, stream in [("stdout", stdout), ("stderr", stderr)]:
         if stream.count:
             parts.append(f"{name}:\n{stream.text()}")
@@ -228,6 +234,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
         meta={"exit_code": process.returncode, "elapsed_ms": elapsed, "timeout_s": timeout,
               "timed_out": timed_out, "cancelled": cancelled, "cwd": ctx.sandbox.relative(cwd), "stdout_bytes": stdout.count,
               "stderr_bytes": stderr.count, "truncated": stdout.truncated or stderr.truncated,
+              **({"cleanup_pending_children": pending_children} if pending_children else {}),
               **failure_evidence},
     )
 
