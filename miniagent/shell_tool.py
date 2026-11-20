@@ -23,14 +23,17 @@ if TYPE_CHECKING:
     from .tools import ToolContext
 
 
+INLINE_FAILURE_LIMIT = 32 * 1024
+
+
 class _Output:
     """Keep both the initial diagnostic and final test summary of each stream."""
 
     head_limit = 1400
     tail_limit = 2200
-    evidence_limit = 8192
 
-    def __init__(self):
+    def __init__(self, evidence_limit=8192):
+        self.evidence_limit = evidence_limit
         self.head = bytearray()
         self.tail = bytearray()
         self.count = 0
@@ -161,7 +164,8 @@ def command_timeout(ctx, requested):
     return timeout
 
 
-def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeout=None) -> ToolResult:
+def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeout=None, *,
+                   failure_evidence_limit=8192) -> ToolResult:
     try:
         timeout = command_timeout(ctx, requested_timeout)
     except ValueError as exc:
@@ -175,7 +179,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
         return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
     started = time.monotonic()
-    stdout, stderr = _Output(), _Output()
+    stdout, stderr = _Output(failure_evidence_limit), _Output(failure_evidence_limit)
     timed_out = False
     cancelled = False
     with subprocess.Popen(
@@ -215,7 +219,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
         complete.extend(f"{name}:\n{bytes(stream.complete).decode('utf-8', errors='replace')}"
                         for name, stream in [("stdout", stdout), ("stderr", stderr)] if stream.count)
         output = "\n".join(complete)
-        if len(output.encode()) <= _Output.evidence_limit:
+        if len(output.encode()) <= failure_evidence_limit:
             # Preserve bounded original failure evidence without expanding the
             # model-facing head/tail display or asserting that the check passed.
             failure_evidence["complete_failure_output"] = output

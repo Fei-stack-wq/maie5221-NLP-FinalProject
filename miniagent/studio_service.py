@@ -1697,7 +1697,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     # tool buffers, and credentials out of the transcript.
                     answer_file = path / "conversation-answer.txt"
                     temporary = path / (".reply-" + uuid.uuid4().hex)
-                    temporary.write_text(self._redact(result.answer), encoding="utf-8")
+                    public_answer = crew.published_answer(result.answer) if crew else result.answer
+                    temporary.write_text(self._redact(public_answer), encoding="utf-8")
                     temporary.replace(answer_file)
         render_report(path)
         status = service.store.get(run_id).status

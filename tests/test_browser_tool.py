@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from miniagent.config import Limits
-from miniagent.crew_progress import _browser_asserted_inputs
+from miniagent.crew_progress import _observed_browser_files
 from miniagent.playwright_runner import _launch
 from miniagent.sandbox import Sandbox
 from miniagent.tools import ToolContext, build_default_registry
@@ -73,20 +73,50 @@ class BrowserToolTest(unittest.TestCase):
             start = f"from pathlib import Path\naddress = {url!r}\nresponse = page.goto(address)\n"
             identity = "assert response.body() == Path('booking.html').read_bytes()\n"
             dom = "assert page.get_by_label('Start').input_value() == '09:00'"
-            code = start + identity + dom
-            result = self.browser(code)
-            self.require_installed_browser(result)
-            self.assertTrue(result.ok, result.content)
-            digest = result.meta["loopback_document_sha256"]
-            self.assertEqual(digest, hashlib.sha256(html).hexdigest())
-            self.assertEqual(_browser_asserted_inputs(code,self.member,".",digest),{"booking.html"})
-            for incomplete in (start+identity, start+dom, start+identity+"page.set_content('other')\n"+dom):
-                self.assertFalse(_browser_asserted_inputs(incomplete,self.member,".",digest))
-            self.assertFalse(_browser_asserted_inputs(code,self.member,".","1"*64))
+            # The real assertion can live in a helper/try block and can use
+            # a locator alias. The test has no need to parse the response body.
+            code = start + """def verify():
+    form = page.get_by_label('Start')
+    expect(form).to_have_value('09:00')
+try:
+    verify()
+finally:
+    pass
+"""
+            digest = hashlib.sha256(html).hexdigest()
+            actual = {"booking.html":digest, "wrong.html":"1"*64}
+            for checks in (code, start + dom):
+                result = self.browser(checks)
+                self.require_installed_browser(result)
+                self.assertTrue(result.ok, result.content)
+                self.assertEqual(result.meta["asserted_browser_documents"], [digest])
+                self.assertEqual(_observed_browser_files(result.meta, actual), {"booking.html"})
+                self.assertFalse(_observed_browser_files(result.meta, {"booking.html":"0"*64}))
+            for incomplete in (start + identity + "assert response.status == 200",
+                               start + "def never_called():\n    expect(page.get_by_label('Start')).to_be_visible()",
+                               start + "assert True or page.get_by_label('Start').count()",
+                               start + "page.set_content('<p>replacement</p>')\nexpect(page.locator('p')).to_be_visible()",
+                               start + "other = context.new_page()\nother.set_content('<p>other</p>')\nexpect(other.locator('p')).to_be_visible()"):
+                result = self.browser(incomplete)
+                self.assertTrue(result.ok, result.content)
+                self.assertNotIn("asserted_browser_documents",result.meta)
         finally:
             server.shutdown()
             server.server_close()
             serving.join()
+
+    def test_file_navigation_attributes_the_executed_assertion_to_its_exact_local_path(self):
+        html = b"<label>Guest<input></label>"
+        (self.member / "booking.html").write_bytes(html)
+        (self.member / "other.html").write_bytes(html)
+        start = "from pathlib import Path\npage.goto(Path('booking.html').resolve().as_uri())\n"
+        result = self.browser(start + "expect(page.get_by_label('Guest')).to_be_editable()")
+        self.require_installed_browser(result)
+        self.assertTrue(result.ok, result.content)
+        digest = hashlib.sha256(html).hexdigest()
+        self.assertEqual(result.meta.get("asserted_browser_files"), {"booking.html":digest})
+        self.assertEqual(_observed_browser_files(result.meta,{"booking.html":digest,"other.html":digest}),
+                         {"booking.html"})
 
     def test_script_written_receipt_after_closed_page_cannot_attest_a_document(self):
         result = self.browser("""

@@ -1,6 +1,9 @@
 """Only failures cited by a signed product finding need linked probe review."""
 
+import ast
 import hashlib
+import importlib.util
+import os
 import json
 import unittest
 from unittest.mock import patch
@@ -8,7 +11,7 @@ from unittest.mock import patch
 from miniagent.config import Settings
 from miniagent.crew_progress import _check_key, _script_inputs, _script_layout, _shell_case_suite
 from miniagent.research import Page
-from miniagent.studio_reviews import digest
+from miniagent.studio_reviews import Review, ReviewSession, Rule, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, tool
@@ -122,7 +125,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
             run = self.service.start(request(
                 "team", conversation=roster(*dict.fromkeys([lead, "builder", "inspector", *(["arbiter"] if arbiter else [])])),
                 objective=objective,
-                acceptance_files=[PATH], limits={"max_steps": 90}, **options,
+                acceptance_files=options.pop("acceptance_files", [PATH]), limits={"max_steps": 90}, **options,
             ))
             detail = finished(self.service, run["id"])
             if human_answer is not None:
@@ -303,6 +306,74 @@ class BoundReviewerProbeTest(unittest.TestCase):
                          ["probe_corrected_pending_product_review"])
         self.assertIn("同时取值于绑定的对照原件 " + reference, str(provider.requests))
 
+    @unittest.skipUnless(os.name == "posix" and importlib.util.find_spec("playwright"), "local Playwright required")
+    def test_localhost_form_dispute_without_read_receipts_reaches_independent_recheck_and_resign(self):
+        page_path = "static/index.html"
+        html = '<form data-testid="booking-form"><input id="bookerInput"></form>'
+        version = digest({page_path:hashlib.sha256(html.encode()).hexdigest()})
+        rule = {"id":"startup", "method":"execute", "description":"The local booking form is usable."}
+        def script(check):
+            return ("import functools, threading\nfrom http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer\n"
+                    "handler = functools.partial(SimpleHTTPRequestHandler, directory='static')\n"
+                    "with ThreadingHTTPServer(('127.0.0.1',0),handler) as http:\n"
+                    "    threading.Thread(target=http.serve_forever,daemon=True).start()\n"
+                    "    try:\n        page.goto(f'http://127.0.0.1:{http.server_port}/')\n"
+                    + "\n".join("        " + line for line in check.splitlines()) +
+                    "\n    finally:\n        http.shutdown()\n")
+        bad = script("import sys\nprint('real unabridged error: ' + 'X' * 8500, file=sys.stderr)\n"
+                     "expect(page.locator('#booking-form')).to_be_visible(timeout=100)")
+        corrected = script("form = page.get_by_test_id('booking-form')\nexpect(form).to_be_visible()")
+        peer_test = script("expect(page.locator('#bookerInput')).to_be_editable()")
+        def key(code):
+            return _check_key("browser " + hashlib.sha256((".\0" + ast.dump(ast.parse(code))).encode()).hexdigest())
+        steps = [
+            tool("delegate_task", assignee="builder", objective="Create the booking form.", deliverable_paths=[page_path]),
+            write(page_path, html), {"text":"Delivered booking form."},
+            tool("delegate_task", assignee="inspector", objective="Verify startup and form.", deliverable_paths=["qa.md"],
+                 review={"candidate":"builder", "criteria":[rule]}),
+            write("qa.md", "Examined the live booking form using the wrong and then the real selector."),
+            tool("run_browser", code=bad), tool("run_browser", code=corrected),
+            tool("submit_review", candidate_version=version, results=[{"criterion_id":"startup","verdict":"inconclusive",
+                "cause":"verification","reason":"The assertion for the ID failed, the actual test ID passed.",
+                "action":"Independently check which selector matches the shipped form.",
+                "evidence":["fail:"+key(bad), "pass:"+key(corrected)]}]),
+            {"text":"[BLOCKED] The conflicting form checks need independent adjudication."},
+            tool("delegate_task", assignee="arbiter", objective="Resolve the disputed form check."),
+            tool("run_browser", code=peer_test),
+            {"_probe_finding":{"criterion_id":"probe_"+key(bad), "verdict":"passed",
+                "reason":"Verified the actual frozen booking input accepts text; the guessed form ID was wrong.",
+                "evidence":["pass:"+key(peer_test)]}},
+            {"text":"The form was verified on the frozen page."},
+            tool("delegate_task", assignee="inspector", objective="Sign the original startup criterion."),
+            tool("run_browser", code=corrected),
+            tool("submit_review",candidate_version=version,results=[{"criterion_id":"startup","verdict":"passed",
+                "reason":"I rechecked the actual booking form.", "evidence":["pass:"+key(corrected)]}]),
+            {"text":"The original review has passed."},
+            tool("delegate_task", assignee="lead", objective="Write the promised launch instructions.",
+                 deliverable_paths=["README.md"]),
+            write("README.md","Launch instructions for this checked booking form."),
+            {"text":"Published the launch instructions."},
+            {"text":"Delivered."},
+        ]
+        detail, reports, _ = self.run_steps(steps, acceptance_files=["README.md"],
+            objective="Deliver a working local booking form and launch instructions in README.md.")
+        if any("环境缺少 Chromium/Chrome" in str(r.get("evidence")) for r in reports):
+            self.skipTest("a local Chromium or Chrome is required")
+        self.assertEqual(detail["run"]["status"], "completed", [(r["role"],r["remaining_issue"],r.get("native_review")) for r in reports])
+        signed = [r for r in reports if r.get("native_review")]
+        self.assertEqual([r["role"] for r in signed], ["inspector","arbiter","inspector"])
+        first,peer,last = [r["native_review"] for r in signed]
+        self.assertEqual((first["assessment"]["verdict"],peer["state"],last["state"]),("inconclusive","passed","passed"))
+        pending, = [e for e in detail["room_events"] if e["kind"]=="reviewer_probe_pending"]
+        probe, = pending["probes"].values()
+        self.assertTrue(probe["display_truncated"])
+        self.assertIn("X"*8500, probe["error"])
+        self.assertEqual(probe["code"], bad)
+        receipts = first["assessment"]["results"][0]["receipts"]
+        self.assertEqual({r["kind"] for r in receipts},{"failed_check","passed_check"})
+        self.assertEqual([set(r["browser_inputs"]) for r in receipts],[{page_path},{page_path}])
+        self.assertEqual(first["candidate_version"], last["candidate_version"])
+
     def test_unrelated_passing_probe_cannot_escalate_an_inconclusive_product_finding(self):
         unrelated = "assert 4 == 2 + 2\nprint('PASS arithmetic')\n"
         steps = self.start_bound_review(fixed_probe=unrelated)
@@ -311,12 +382,28 @@ class BoundReviewerProbeTest(unittest.TestCase):
         steps += [{"text":"[BLOCKED] The positive arithmetic result does not validate the actual label."}]
         detail, reports, _ = self.run_steps(steps)
         self.assertNotEqual(detail["run"]["status"], "completed")
+        self.assertIn("冻结产品输入",reports[-1]["probe_review_issue"])
         signed = reports[-1]["native_review"]["assessment"]
         self.assertEqual(signed["verdict"], "inconclusive")
         receipts = signed["results"][0]["receipts"]
         self.assertEqual({r["kind"] for r in receipts}, {"read", "passed_check", "failed_check"})
         self.assertFalse(next(r for r in receipts if r["kind"] == "passed_check").get("asserted_inputs"))
         self.assertFalse(any(e["kind"] == "reviewer_probe_pending" for e in detail["room_events"]))
+
+    def test_unrelated_browser_page_in_same_product_cannot_resolve_other_pages_failure(self):
+        rule = Rule(id="startup",method="execute",description="Verify the booking form.")
+        item = Review("product","builder","inspector","Check startup",[rule],{"form.html":"1"*64,"about.html":"2"*64})
+        session = ReviewSession(item, dict(item.files), None, "attempt-test")
+        finding = {"criterion_id":"startup","verdict":"inconclusive","cause":"verification","receipts":[
+            {"kind":"failed_check", "browser_inputs":{"form.html":"1"*64}},
+            {"kind":"passed_check", "asserted":True,"browser_inputs":{"about.html":"2"*64},
+             "asserted_inputs":{"about.html":"2"*64}}]}
+        self.assertIn("原失败页面",session.verification_conflict_issue([finding]))
+        check = finding["receipts"][1]
+        check.update(browser_inputs={"form.html":"0"*64},asserted_inputs={"form.html":"0"*64})
+        self.assertIn("冻结产品输入",session.verification_conflict_issue([finding]))
+        check.update(browser_inputs={"form.html":"1"*64},asserted_inputs={"form.html":"1"*64})
+        self.assertEqual(session.verification_conflict_issue([finding]), "")
 
     def test_inconclusive_source_without_a_fetched_source_stays_with_original_reviewer(self):
         steps = self.start_bound_review()

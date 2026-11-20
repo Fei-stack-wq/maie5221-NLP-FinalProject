@@ -101,10 +101,12 @@ class PrivateCandidateTest(unittest.TestCase):
             # A deterministic tool double; the normal host still records the
             # script, exit, candidate path, call, actor, and SHA itself.
             self.assertEqual((ctx.sandbox.root / "booking.html").read_text(), html)
+            observed = {"booking.html":hashlib.sha256(html.encode()).hexdigest()}
             if args["code"] == wrong:
-                return ToolResult.failure("exit_code=1\nstderr:\nAssertionError: #startInput missing", exit_code=1)
+                return ToolResult.failure("exit_code=1\nstderr:\nAssertionError: #startInput missing", exit_code=1,
+                                          asserted_browser_files=observed)
             self.assertIn(args["code"], (corrected, peer_code))
-            return ToolResult.success("exit_code=0\nstdout:\nPASS selector",exit_code=0)
+            return ToolResult.success("exit_code=0\nstdout:\nPASS selector",exit_code=0,asserted_browser_files=observed)
         with patch("miniagent.tools.run_browser", side_effect=browser):
             detail, reports = self.run_steps(steps)
         self.assertEqual(detail["run"]["status"], "completed", reports)
@@ -486,7 +488,8 @@ sys.exit(0 if ok else 1)
             with self.subTest(tamper=tamper):
                 publish_original = RoomCrew._publish
                 mutated = []
-                def mutate(crew, assignment, role, original, *, candidate=None):
+                def mutate(crew, assignment, role, original, *, candidate=None, reviewer_probe=False):
+                    self.assertFalse(reviewer_probe)
                     if candidate:
                         self.assertEqual(role, "inspector")
                         # This seam runs after the signed review and before the
@@ -496,7 +499,7 @@ sys.exit(0 if ok else 1)
                                 candidate["checkpoint"]/"agents"/candidate["role"]/PATH)
                         path.write_text("Concurrent edit preserved.")
                         mutated.append(path)
-                    return publish_original(crew, assignment, role, original, candidate=candidate)
+                    return publish_original(crew, assignment, role, original, candidate=candidate, reviewer_probe=reviewer_probe)
                 with patch.object(RoomCrew, "_publish", mutate):
                     _,reports=self.run_steps(initial()+[submit(OLD),{"text":"Verified."},
                                                        {"text":"[BLOCKED] No current version."}])

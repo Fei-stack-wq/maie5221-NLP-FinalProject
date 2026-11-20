@@ -42,6 +42,18 @@ class BoundedFailureOutputTest(unittest.TestCase):
                 self.assertTrue(result.meta["truncated"])
                 self.assertNotIn("complete_failure_output", result.meta)
 
+    def test_inline_python_keeps_complete_error_for_a_peer_with_unchanged_display_size(self):
+        for size, retained in ((9000, True), (34000, False)):
+            with self.subTest(size=size):
+                result = self.registry.dispatch("run_python", {
+                    "code":f"import sys\nprint('X'*{size}, file=sys.stderr)\nassert False, 'receipt marker'"
+                }, self.ctx)
+                self.assertTrue(result.meta["truncated"])
+                self.assertLess(len(result.content.encode()), 4000)
+                self.assertEqual("complete_failure_output" in result.meta, retained)
+                if retained:
+                    self.assertIn("X"*size, result.meta["complete_failure_output"])
+
     def test_interrupted_output_is_not_complete_failure_evidence(self):
         self.ctx.limits.tool_timeout_seconds = 0.15
         result = self.run_code("import time; print('X'*6000, flush=True); time.sleep(4)")

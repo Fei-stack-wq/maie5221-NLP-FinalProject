@@ -17,12 +17,12 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import unquote, urlsplit
 
 from .check_provenance import python_check_source, python_invocation, shell_invocation
 from .project_data import PROJECT_CACHE_DIRS
 from .rao import Budget, Observation, RAOState, StepRecord
 from .schemas import ToolResult
+from .shell_tool import INLINE_FAILURE_LIMIT
 from .tools import Tool
 
 
@@ -207,98 +207,15 @@ def _asserted_inputs(code: str) -> set[str]:
     return checked
 
 
-def _browser_asserted_inputs(code: str, root: Path, cwd: str, document_sha=None) -> set[str]:
-    """Bind direct, successful page expectations to a local frozen entry point.
-
-    Only top-level navigation and assertions qualify. An arbitrary server URL,
-    set_content, another page, or an uncalled helper is not attributed to a file.
-    This narrow provenance path does not decide whether a selector proves the
-    original criterion; that remains the independent reviewer's signed finding.
-    """
-    try:
-        tree = ast.parse(code)
-    except (SyntaxError, ValueError, RecursionError):
-        return set()
-    entry, checked = None, set()
-    response_name = None
-    navigation = {"goto", "set_content", "click", "dblclick", "tap", "press", "type", "fill",
-                  "check", "uncheck", "set_checked", "select_option", "set_input_files", "dispatch_event",
-                  "hover", "drag_to", "evaluate", "evaluate_handle", "add_script_tag", "go_back",
-                  "go_forward", "reload", "on", "once", "wait_for_timeout", "wait_for_url"}
-
-    def local_entry(node):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            url = urlsplit(node.value)
-            return Path(unquote(url.path)) if url.scheme == "file" and url.netloc in {"", "localhost"} else None
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"as_uri", "resolve", "absolute"}):
-            return local_entry(node.func.value)
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path"
-                and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
-            return root / cwd / node.args[0].value
-        return None
-
-    addresses = {}
-    for statement in tree.body:
-        assigned_name = (statement.targets[0].id if isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                         and isinstance(statement.targets[0], ast.Name) else None)
-        expr = statement.value if isinstance(statement, (ast.Expr, ast.Assign)) else None
-        call = expr if isinstance(expr, ast.Call) else None
-        if assigned_name:
-            addresses.pop(assigned_name, None)
-            if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-                addresses[assigned_name] = expr.value
-            if assigned_name == response_name:
-                response_name = None
-        anchored = False
-        if call and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
-            if call.func.value.id == "page" and call.func.attr in {"goto", "set_content"}:
-                path = local_entry(call.args[0]) if call.func.attr == "goto" and call.args else None
-                try:
-                    entry = path.resolve().relative_to(root.resolve()).as_posix() if path else None
-                    anchored = entry is not None
-                except (OSError, ValueError):
-                    entry = None
-        # A successful click/JS action may already be on an external document.
-        # Without host URL telemetry we cannot carry the old file attribution
-        # across it. An explicit direct goto is the only way to re-anchor.
-        if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-               and node.func.attr in navigation for node in ast.walk(statement)):
-            checked.clear()
-            response_name = None
-            if not anchored:
-                entry = None
-            if (assigned_name and call and isinstance(call.func, ast.Attribute) and call.func.attr == "goto"
-                    and isinstance(call.func.value, ast.Name) and call.func.value.id == "page" and call.args):
-                arg = call.args[0]
-                address = arg.value if isinstance(arg, ast.Constant) else addresses.get(arg.id) if isinstance(arg, ast.Name) else None
-                if isinstance(address, str):
-                    url = urlsplit(address)
-                    if url.scheme in {"http", "https"} and url.hostname in {"localhost", "127.0.0.1", "::1"}:
-                        response_name = assigned_name
-        assertion = statement.test if isinstance(statement, ast.Assert) else None
-        if response_name and isinstance(assertion, ast.Compare) and len(assertion.ops) == 1 and isinstance(assertion.ops[0], ast.Eq):
-            pair = (assertion.left, assertion.comparators[0])
-            for response, source in (pair, pair[::-1]):
-                if (isinstance(response, ast.Call) and isinstance(response.func, ast.Attribute) and response.func.attr == "body"
-                        and isinstance(response.func.value, ast.Name) and response.func.value.id == response_name
-                        and not response.args and isinstance(source, ast.Call) and isinstance(source.func, ast.Attribute)
-                        and source.func.attr == "read_bytes" and not source.args):
-                    path = local_entry(source.func.value)
-                    if path and document_sha and path.resolve().is_relative_to(root.resolve()) and path.is_file():
-                        if path.stat().st_size <= 8 * 1024 * 1024 and hashlib.sha256(path.read_bytes()).hexdigest() == document_sha:
-                            entry = path.resolve().relative_to(root.resolve()).as_posix()
-        if (call and isinstance(call.func, ast.Attribute) and call.func.attr.startswith(("to_", "not_to_"))
-                and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)
-                and call.func.value.func.id == "expect"):
-            assertion = call.func.value
-        if (entry and assertion is not None and any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name) and node.func.value.id == "page"
-                and (node.func.attr.startswith("get_by_") or node.func.attr in {"locator","inner_text","text_content",
-                    "get_attribute","input_value","title","content","is_visible","is_enabled","is_checked","query_selector"})
-                for node in ast.walk(assertion))):
-            checked.add(entry)
-    return checked
+def _observed_browser_files(meta, versions):
+    """Join driver-observed DOM assertions to unambiguous local HTML bytes."""
+    digests = set(meta.get("asserted_browser_documents", []))
+    matches = {}
+    for path, sha in versions.items():
+        if sha in digests and Path(path).suffix.lower() in {".html", ".htm"}:
+            matches.setdefault(sha, []).append(path)
+    files = {path for path, sha in meta.get("asserted_browser_files", {}).items() if versions.get(path) == sha}
+    return files | {paths[0] for paths in matches.values() if len(paths) == 1}
 
 
 def _shell_inputs(command: str, cwd: str, files: dict) -> tuple[set, str, bool]:
@@ -595,7 +512,7 @@ def _browser_check(obs: Observation, code: str, cwd: str) -> _Check | None:
                     and isinstance(method.value.func, ast.Name) and method.value.func.id == "expect"):
                 has_expectation = True
                 break
-    if not has_expectation:
+    if not has_expectation and not (obs.meta.get("asserted_browser_documents") or obs.meta.get("asserted_browser_files")):
         return None
     # Include setup, route, selectors and working directory. An unrelated
     # test with the same final 'assert value' must not clear a prior failure.
@@ -1011,7 +928,8 @@ class MemberProgress:
                 reading = False
                 failure_obs = obs
                 archived = obs.meta.get("complete_failure_output")
-                if (obs.source == "run_shell" and isinstance(archived, str) and 0 < len(archived.encode()) <= 8192
+                error_limit = 8192 if obs.source == "run_shell" else INLINE_FAILURE_LIMIT
+                if (isinstance(archived, str) and 0 < len(archived.encode()) <= error_limit
                         and type(obs.meta.get("exit_code")) is int and obs.meta["exit_code"] > 0
                         and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
                     # The display stays marked truncated. Only the separately
@@ -1166,6 +1084,9 @@ class MemberProgress:
                         for key, failure in failures.items():
                             self._review_evidence["fail:" + key] = {
                                 "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
+                            if obs.source == "run_browser":
+                                self._review_evidence["fail:" + key]["browser_inputs"] = {
+                                    p: self._current[p] for p in _observed_browser_files(obs.meta, self._current)}
                             self._failure_context[key] = {
                                 "scope_id":key, "label":failure, "tool":obs.source,
                                 "tool_call_id":obs.tool_call_id, "step":record.step,
@@ -1183,15 +1104,23 @@ class MemberProgress:
                             # full-source/full-error review contract. A browser
                             # probe does not lose its review route at 6,001 bytes.
                             if (obs.tool_call_id and 0 < len(code.encode()) <= 32768
-                                    and len(obs.content.encode()) <= 8192 and not _output_truncated(obs)
+                                    and len(failure_obs.content.encode()) <= error_limit and not _output_truncated(failure_obs)
                                     and type(exit_code) is int and exit_code != 0
                                     and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
-                                self._record_probe(suite_key, {"code":code, "error":obs.content,
+                                self._record_probe(suite_key, {"code":code, "error":failure_obs.content,
+                                    "display_truncated":_output_truncated(obs),
+                                    "browser_inputs":self._review_evidence["fail:" + suite_key].get("browser_inputs", {}),
                                     "exit_code":exit_code,
-                                    "input_paths": sorted((_asserted_inputs(code) | (_browser_asserted_inputs(
-                                        code, self.workspace, parameters.get("cwd", ".")) if obs.source == "run_browser" else set()))
+                                    "input_paths": sorted((_asserted_inputs(code) | (_observed_browser_files(obs.meta, self._current)
+                                        if obs.source == "run_browser" else set()))
                                         & self._current.keys()),
                                     "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
+                            elif suite_key not in self._inline_failures:
+                                self._undisclosed_probes[suite_key] = {
+                                    "scope_id":suite_key, "tool_call_id":obs.tool_call_id,
+                                    "reason":"未取得有界的完整原脚本和错误输出；原失败保留，可用同一检查重新取证。",
+                                    "stdout_bytes":obs.meta.get("stdout_bytes"), "stderr_bytes":obs.meta.get("stderr_bytes"),
+                                    "display_truncated":_output_truncated(obs), "max_error_bytes":error_limit}
                         elif (obs.source == "run_shell" and invocation and invocation.complete
                               and invocation.script in self._edited_scripts and not _output_truncated(failure_obs)
                               and type(exit_code) is int and exit_code != 0
@@ -1234,8 +1163,7 @@ class MemberProgress:
                             if obs.source in {"run_python", "run_browser"} and status != "runner_exit":
                                 inputs = _asserted_inputs(code)
                                 if obs.source == "run_browser":
-                                    browser_inputs = _browser_asserted_inputs(code, self.workspace, parameters.get("cwd", "."),
-                                                                           obs.meta.get("loopback_document_sha256"))
+                                    browser_inputs = _observed_browser_files(obs.meta, self._current)
                                     self._review_evidence["pass:" + suite_key]["browser_inputs"] = {
                                         p: self._current[p] for p in browser_inputs if p in self._current}
                                     inputs.update(browser_inputs)

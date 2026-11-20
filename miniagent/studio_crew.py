@@ -742,7 +742,7 @@ class RoomCrew:
                 or session.snapshot_issue()):
             return {}
         verdict, results = session.assessment["verdict"], session.assessment["results"]
-        unresolved = verdict == "inconclusive" and session.disputed_verification(results)
+        unresolved = verdict == "inconclusive" and not session.verification_conflict_issue(results)
         if verdict != "passed" and not unresolved:
             return {}
         bound, _ = session.reviewer_failures(results, include_verification=unresolved)
@@ -791,6 +791,13 @@ class RoomCrew:
         product_paths = {r["path"] for finding in assessment["results"]
                          if finding["criterion_id"] in implicated for r in finding["receipts"]
                          if r["kind"] == "read" and r.get("extent", 0) > 0}
+        for finding in assessment["results"]:
+            if finding["criterion_id"] not in implicated:
+                continue
+            for receipt in finding["receipts"]:
+                if receipt["kind"] == "passed_check" and receipt.get("asserted"):
+                    product_paths.update(path for path, sha in receipt.get("asserted_inputs", {}).items()
+                                         if parent.files.get(path) == sha)
         product_paths.update(parent.required_source_paths)
         if not product_paths:
             product_paths.update(self.delivery.get("files", []))
@@ -1009,7 +1016,8 @@ class RoomCrew:
                              "按这些文件及标准汇总，仍可说明它们未覆盖的真实限制。\n"
                              + _clip(_json(authenticated), self.close_state_bytes // 2) + "\n")
         closing = StepPolicy("finalize", "请根据成员公开交接汇总交付，说明证据、使用方法和局限。\n"
-                             + _clip(review_header + self._public_state(final=True), self.close_state_bytes),
+                             + _clip(review_header + self._missing_delivery_notice() + self._public_state(final=True),
+                                     self.close_state_bytes),
                              frozenset(), compact=True, reviewed_delivery=authenticated)
         # Fixed upper bound for the final receipt plus the root's actual goal,
         # system message and authenticated human replies, with framing/output.
@@ -1020,14 +1028,16 @@ class RoomCrew:
         native = self._next_review()
         bound = self._bound_review_handoff(native)
         if native and native.state == "blocked":
-            return StepPolicy("finalize", "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
+            return StepPolicy("finalize", self._missing_delivery_notice() +
+                              "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
                               _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
         if native and native.state == "awaiting_user":
             return StepPolicy("coordinate", "独立验收遇到需要用户决定的业务歧义。请使用 ask_human 询问这一项：" +
                               _clip(_json(native.latest.get("results", [])), 2500),
                               frozenset({"ask_human"}), required_tool="ask_human")
         if bound and state.scratch.get("last_host_handoff") == bound and self.last_dispatch_error:
-            return StepPolicy("finalize", "已尝试绑定的下一项分工，未取得新交接。请以 [BLOCKED] 说明："
+            return StepPolicy("finalize", self._missing_delivery_notice() +
+                              "已尝试绑定的下一项分工，未取得新交接。请以 [BLOCKED] 说明："
                               + self.last_dispatch_error, frozenset(), compact=True)
         if self._only_peer_checks_remaining() and not any(r["eligible_roles"] for r in self._pending_check_briefing()):
             return StepPolicy("finalize", "以 [BLOCKED] 说明：待复核检查没有可独立核销的其他成员。"
@@ -1096,6 +1106,19 @@ class RoomCrew:
                           bound_handoff=bound,
                           token_reserve=0 if budget.tokens_left is None else max(self.close_tokens, budget.tokens_left - dispatch_limit),
                           seconds_reserve=self.close_seconds)
+
+    def _missing_delivery_notice(self):
+        missing = self.inventory["missing_acceptance_files"]
+        if not missing:
+            return ""
+        return "宿主核对的公开工作区仍缺少这些约定交付：" + _json(missing) + "。请逐项列为未交付。\n"
+
+    def published_answer(self, answer):
+        missing = self.inventory["missing_acceptance_files"]
+        if self.direct or not missing or not answer.lstrip().startswith("[BLOCKED]"):
+            return answer
+        return ("[BLOCKED] Studio 已核对公开工作区。未交付：" + "、".join(missing) + "。\n\n"
+                + answer.lstrip().removeprefix("[BLOCKED]").lstrip())
 
     def _review_requests(self, role):
         return [item for item in self.pending_check_reviews.values() if role not in {item["author"], item.get("last_editor")}]
@@ -2098,7 +2121,8 @@ class RoomCrew:
         if not issue and publishable:
             try:
                 if promotion:
-                    changes, artifacts = self._publish(assignment, role, original, candidate=draft)
+                    changes, artifacts = self._publish(assignment, role, original, candidate=draft,
+                                                       reviewer_probe=review.kind == "reviewer_probe")
                 else:
                     changes, artifacts = self._publish(assignment, role, original)
             except CandidateAcceptanceError as exc:
@@ -2172,6 +2196,14 @@ class RoomCrew:
                   "summary": text if signed_handoff else _clip(text, 4500), "changed_files": changes[:64], "changes_total": len(changes),
                   "evidence": evidence, "independently_reviewed_tasks": reviewed, "remaining_issue": issue, "deliverable_paths": paths,
                   "recover_from": draft["role"] if recovered else None}
+        if (not disputed and session and not private and review.kind == "product" and assessment
+                and assessment["verdict"] == "inconclusive" and progress.failed_checks()
+                and any(r["kind"] == "failed_check" for f in assessment["results"] for r in f["receipts"])):
+            reason = (session.verification_conflict_issue(assessment["results"]) or
+                      session.reviewer_failures(assessment["results"], include_verification=True)[1])
+            if reason:
+                report["probe_review_issue"] = reason
+                review.host_issue = reason
         if signed_handoff:
             report["signed_handoff"] = signed_handoff
         queued_probe_review = False
@@ -2244,7 +2276,7 @@ class RoomCrew:
                  for e in events if e["kind"] in {"human_question", "human_answer", "question_closed"}]
         return _json(turns[-8:]) if turns else ""
 
-    def _publish(self, assignment, role, original, *, candidate=None):
+    def _publish(self, assignment, role, original, *, candidate=None, reviewer_probe=False):
         staged = assignment / "published"
         source = candidate["checkpoint"] if candidate else assignment
         author = candidate["role"] if candidate else role
@@ -2263,7 +2295,9 @@ class RoomCrew:
                     ok, reason = check(staged)
                     if not ok:
                         raise CandidateAcceptanceError("成员验收失败：" + reason)
-            if self.check_delivery:
+            # An adjudicator closes a disputed check on an already published product.
+            # The coordinator still owns its outstanding delivery requirements.
+            if self.check_delivery and not reviewer_probe:
                 ok, reason = self.check_delivery(staged)
                 if not ok:
                     raise CandidateAcceptanceError("用户指定验收失败：" + reason)

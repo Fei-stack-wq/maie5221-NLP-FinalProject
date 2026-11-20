@@ -799,6 +799,18 @@ class StudioCrewTest(unittest.TestCase):
         self.assertLess(limits[-1]["decision"]["tokens"],limits[-1]["decision"]["max_tokens"])
         self.assertGreaterEqual(limits[-1]["revision"]["tokens"],limits[-1]["revision"]["max_tokens"])
 
+    def test_blocked_public_reply_identifies_missing_required_delivery(self):
+        steps = [assign("writer", "Prepare the release instructions."),
+                 {"text":"[BLOCKED] I could not produce the instructions."},
+                 {"text":"[BLOCKED] README.md is ready, but the check is pending."}]
+        detail, _ = self.execute(steps, roster("lead", "writer"), objective="Deliver release instructions.",
+                                 acceptance_files=["README.md"])
+        folder = self.root / "runs" / detail["run"]["id"]
+        self.assertEqual(detail["run"]["status"], "failed")
+        answer = (folder / "conversation-answer.txt").read_text()
+        self.assertTrue(answer.startswith("[BLOCKED] Studio 已核对公开工作区。未交付：README.md。"))
+        self.assertFalse((folder / "agents/lead/README.md").exists())
+
     def test_lead_handles_routing_decisions_without_sending_them_to_user(self):
         question = "Should I re-delegate to QA or inspect the source myself?"
         script = [tool("ask_human", question=question, decision_kind="user_preference"),

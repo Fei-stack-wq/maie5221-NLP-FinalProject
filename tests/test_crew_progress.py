@@ -178,7 +178,7 @@ class MemberProgressTest(unittest.TestCase):
         self.assertEqual(self.p.inline_failures()[scope]["tool_call_id"],"original-browser")
         for oversized, output, meta in [
                 (code + "#" * 32768, error, {"exit_code":1}),
-                (code, error + "x" * 8192, {"exit_code":1}),
+                (code, error + "x" * 32768, {"exit_code":1}),
                 (code, error, {"exit_code":1,"truncated":True}),
                 (code, error, {"exit_code":1,"timed_out":True}),
                 (code, error, {"exit_code":1,"cancelled":True}),
@@ -730,6 +730,14 @@ class MemberProgressTest(unittest.TestCase):
         self.p.require_handoff("close")
         self.assertIsNone(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["removed_files"],["module.py"])
+
+    def test_incomplete_inline_trace_exposes_unavailable_peer_evidence(self):
+        self.observe("run_browser","truncated",ok=False,args={"code":"assert page.title() == 'Ready'"},
+                     meta={"exit_code":1,"stderr_bytes":40000,"truncated":True},call_id="lost-trace")
+        item, = self.p.evidence()["undisclosed_failure_probes"]
+        self.assertEqual((item["tool_call_id"],item["stderr_bytes"]),("lost-trace",40000))
+        self.assertFalse(self.p.inline_failures())
+        self.assertTrue(self.p.failed_checks())
 
     def test_browser_execution_tracks_project_changes_and_scopes_assertions(self):
         nav = "page.goto('http://localhost:8000')\nprint(page.locator('body').inner_text())"

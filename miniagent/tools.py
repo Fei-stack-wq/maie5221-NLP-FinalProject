@@ -24,7 +24,7 @@ from .config import Limits
 from .project_navigation import find_files, read_lines, search_files
 from .research import http_get as _http_get, read_source, search_sources
 from .sandbox import Sandbox, SandboxError
-from .shell_tool import command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell
+from .shell_tool import INLINE_FAILURE_LIMIT, command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell
 from .schemas import ToolResult, ToolSpec
 from .file_tools import (MAX_READ_CHARS, MAX_WRITE_CHARS, read_file as _read_file,
                          write_file as _write_file, edit_file as _edit_file, append_file as _append_file)
@@ -201,7 +201,7 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 
     argv = ["python", "-I", "-B", "-c", code]
     if os.name == "posix":
-        return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"))
+        return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
 
     # Keep the native Python path on hosts without POSIX process groups.
     timeout = command_timeout(ctx, args.get("timeout"))

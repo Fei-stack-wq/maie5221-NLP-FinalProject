@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import os
 import hmac
-import re
+import json
 import secrets
 import sys
 import tempfile
 from pathlib import Path
 
 from .schemas import ToolResult
-from .shell_tool import run_posix_argv
+from .shell_tool import INLINE_FAILURE_LIMIT, run_posix_argv
 
 
 def _browser_cache() -> str:
@@ -38,12 +38,23 @@ def run_browser(ctx, args: dict) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="miniagent-browser-") as temp_home:
         signing_key = secrets.token_bytes(32)
         Path(temp_home, "document-receipt.key").write_bytes(signing_key)
-        argv = ["python", "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, code]
-        result = run_posix_argv(ctx, argv, cwd, args.get("timeout"))
+        argv = ["python", "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, str(ctx.sandbox.root), code]
+        result = run_posix_argv(ctx, argv, cwd, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
         receipt = Path(temp_home, "checked-document.sha256")
-        if result.ok and receipt.is_file() and not receipt.is_symlink() and receipt.stat().st_size == 96:
+        if (receipt.is_file() and not receipt.is_symlink() and 32 < receipt.stat().st_size <= 160000
+                and not result.meta.get("timed_out") and not result.meta.get("cancelled")):
             raw = receipt.read_bytes()
-            digest, signature = raw[:64], raw[64:]
-            if re.fullmatch(b"[a-f0-9]{64}", digest) and hmac.compare_digest(hmac.digest(signing_key, digest, "sha256"), signature):
-                result.meta["loopback_document_sha256"] = digest.decode("ascii")
+            signature, payload = raw[:32], raw[32:]
+            if hmac.compare_digest(hmac.digest(signing_key, payload, "sha256"), signature):
+                claims = json.loads(payload)
+                status = "passed" if result.ok else "failed"
+                documents = claims[status]
+                loopback = [sha for path, sha in documents if path is None]
+                files = {path:sha for path, sha in documents if path is not None}
+                if files:
+                    result.meta["asserted_browser_files"] = files
+                if loopback:
+                    result.meta["asserted_browser_documents"] = loopback
+                    if result.ok and len(loopback) == 1:
+                        result.meta["loopback_document_sha256"] = loopback[0]
         return result

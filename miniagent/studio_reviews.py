@@ -441,7 +441,7 @@ class ReviewSession:
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
-            "run_browser": "操作冻结页面，在脚本顶层用 assert 或 expect(locator).to_have_text(expected) 核对实际行为。",
+            "run_browser": "操作冻结页面，用 assert 或 expect(locator).to_have_text(expected) 核对实际控件。",
             "run_shell": "运行含相关断言的现有测试套件，保留测试框架的逐项结果和真实退出码。",
         }.items() if name in available_tools}
         self.review_notes = set(review_notes)
@@ -589,7 +589,7 @@ class ReviewSession:
                     return
             self.progress.require_handoff("结构化验收结果已记录")
 
-    def disputed_verification(self, results):
+    def verification_conflict_issue(self, results):
         """Every unresolved required finding must present a checkable conflict on these exact inputs."""
         rules = {r.id:r for r in self.item.criteria if r.required}
         covered_sources = set(self.item.sourced_files(results))
@@ -598,7 +598,7 @@ class ReviewSession:
             if not rule or finding["verdict"] == "passed":
                 continue
             if (finding["verdict"], finding["cause"]) != ("inconclusive", "verification"):
-                return False
+                return f"{rule.id} 尚有与核查方法无关的必需缺项。"
             receipts = finding["receipts"]
             reads = {r["path"]: r["sha256"] for r in receipts if r["kind"] == "read" and r.get("extent", 0) > 0
                      and self.item.files.get(r["path"]) == r["sha256"]}
@@ -606,22 +606,30 @@ class ReviewSession:
                 if not reads.keys() & self.item.compare_with(rule.reference_path) or not any(
                         r["kind"] == "reference" and r["path"] == rule.reference_path
                         and self.original.get(r["path"]) == r["sha256"] for r in receipts):
-                    return False
+                    return f"{rule.id} 缺少产品与对照原件的同版读取回执。"
             if rule.method == "source":
                 if not reads or not any(r["kind"] == "source" for r in receipts):
-                    return False
+                    return f"{rule.id} 缺少来源核查或同版读取回执。"
                 covered_sources.update(reads)
             if (rule.method == "inspect" and not reads) or not any(r["kind"] == "failed_check" for r in receipts):
-                return False
+                return f"{rule.id} 缺少对应的原失败回执或必要的检查记录。"
             targets = self.item.compare_with(rule.reference_path)
-            if not any(r["kind"] == "passed_check" and r.get("asserted")
-                       and any(path in targets and self.item.files.get(path) == sha
-                               for path, sha in r.get("asserted_inputs", {}).items())
-                       and (not rule.reference_path or
-                            r.get("asserted_inputs", {}).get(rule.reference_path) == self.original[rule.reference_path])
-                       for r in receipts):
-                return False
-        return self.item.required_source_paths <= covered_sources
+            passes = [r for r in receipts if r["kind"] == "passed_check" and r.get("asserted")
+                      and any(path in targets and self.item.files.get(path) == sha
+                              for path, sha in r.get("asserted_inputs", {}).items())
+                      and (not rule.reference_path or
+                           r.get("asserted_inputs", {}).get(rule.reference_path) == self.original[rule.reference_path])]
+            if not passes:
+                return f"{rule.id} 缺少在冻结产品输入上实际执行的正面断言；仅访问端口、读文件或退出 0 不足以裁决。"
+            for failed in receipts:
+                if failed["kind"] != "failed_check" or not (documents := failed.get("browser_inputs")):
+                    continue
+                if not any(path in targets and self.item.files.get(path) == sha
+                           and any(r.get("browser_inputs", {}).get(path) == sha for r in passes)
+                           for path, sha in documents.items()):
+                    return f"{rule.id} 的纠正断言尚未在原失败页面的同一冻结版本上实际执行。"
+        missing = self.item.required_source_paths - covered_sources
+        return "缺少原始来源核查：" + ", ".join(sorted(missing)) if missing else ""
 
     def reviewer_failures(self, results, *, include_verification=False):
         """A public product judgment may dispute only explicitly cited, transferable failures."""
@@ -761,17 +769,20 @@ class ReviewSession:
                 if not any(self._product_assertion(r, rule) for r in self.receipts.values()):
                     references = self.item.probe_reference_inputs.get(rule.id, {})
                     needs[rule.id] = [{"tool":"run_python", "paths":sorted(self.item.probe_product_files.keys() | references.keys()),
-                        "reason":"断言须检查冻结产品实际数据。run_browser 可打开冻结 file URL；本地后端应用可先核对 page.goto 返回的 response.body() 与冻结 HTML 字节，再实操功能并断言。"},
+                        "reason":"断言须检查冻结产品实际数据。run_browser 可打开冻结页面，或用本地后端打开原页面并对实际控件执行 expect/assert，宿主会核对响应版本。"},
                         {"tool":"run_browser"}]
         return needs
 
     def _product_assertion(self, receipt, rule):
         references = self.item.probe_reference_inputs.get(rule.id, {})
         probe = self.item.probes.get(rule.id.removeprefix("probe_"), {})
-        target_paths = probe.get("input_paths", ()) if self.item.kind == "product" else ()
+        browser_probe = probe.get("tool") == "run_browser"
+        target_paths = probe.get("browser_inputs") or (probe.get("input_paths", ())
+                      if self.item.kind == "product" or browser_probe else ())
         products = {p: sha for p, sha in self.item.probe_product_files.items()
                     if not target_paths or p in target_paths}
-        inputs = receipt.get("browser_inputs", {}) if self.item.kind == "product" and probe.get("tool")=="run_browser" else receipt.get("asserted_inputs", {})
+        browser_required = browser_probe and (self.item.kind == "product" or target_paths)
+        inputs = receipt.get("browser_inputs" if browser_required else "asserted_inputs", {})
         return (receipt.get("kind") == "passed_check" and receipt.get("asserted")
                 and references.items() <= receipt.get("asserted_inputs", {}).items()
                 and any(path not in references and products.get(path) == sha
@@ -842,7 +853,7 @@ class ReviewSession:
                 ("。本次仅裁决原评审明确引用的争议检查，不能替换或代签原产品标准。"
                  "保留全部冻结文件，按原 method 核实争议：source 亲自核对新来源和冻结成稿；inspect 阅读原件；"
                  "execute 可用 run_python 读取冻结产品实际数据并断言，或 run_browser 用 "
-                 "page.goto(Path('候选路径').resolve().as_uri()) 后对该 page 执行 expect/assert。"
+                 "打开本地后端页面或冻结文件，对实际业务控件执行 expect/assert。"
                  "只读文件再 assert True、无关页面 PASS 或另一版本不能代替执行核查。"
                  "原检查错误且业务行为满足原要求才判 passed；真实产品错误判 changes_requested/product；"
                  "证据不足判 inconclusive/verification。其他脚本的 PASS 不能代替对该失败的逐项解释。"
@@ -850,8 +861,8 @@ class ReviewSession:
                  json.dumps(self.item.probe_support, ensure_ascii=False)
                  if self.item.kind == "reviewer_probe" else "") +
                 ("。作者的后续实测仅供定位，每项 probe 须由你针对其原失败涉及的冻结产物另行执行断言并说明结论。"
-                 "测试本地后端网页时，可在 run_browser 用 response = page.goto(本机地址)，"
-                 "assert response.body() == Path('实际入口.html').read_bytes() 将真实 HTTP 响应绑定到冻结页面，"
+                 "测试本地后端网页时，可在 run_browser 用 page.goto(本机地址) 打开冻结产品页面，"
+                 "宿主自动比对页面字节与冻结版本。"
                  "随后操作原先失败的控件并以 assert/expect 验证业务结果。"
                  "候选文件及后续回执：" + json.dumps({"files": self.item.probe_product_files,
                  "support": self.item.probe_support}, ensure_ascii=False)
