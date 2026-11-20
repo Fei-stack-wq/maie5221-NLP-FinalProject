@@ -125,7 +125,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
             run = self.service.start(request(
                 "team", conversation=roster(*dict.fromkeys([lead, "builder", "inspector", *(["arbiter"] if arbiter else [])])),
                 objective=objective,
-                acceptance_files=options.pop("acceptance_files", [PATH]), limits={"max_steps": 90}, **options,
+                acceptance_files=options.pop("acceptance_files", [PATH]), limits=options.pop("limits", {"max_steps": 90}), **options,
             ))
             detail = finished(self.service, run["id"])
             if human_answer is not None:
@@ -786,7 +786,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
             "evidence":["fail:" + scope(bad), "pass:" + PEER_SCOPE],
             "reason":"My own probe added two to the observed quantity.",
             "action":"Read and remeasure the same frozen label in a fresh review assignment."}})
-        steps = self.start_bound_review(final_reply=False) + first + [{"text":"The quantity needs remeasurement."}]
+        steps = self.start_bound_review(final_reply=False) + first + [{"text":"[BLOCKED] My signed measurement needs independent remeasurement."}]
         steps += self.peer_steps() + [{"text":"Confirmed the unchanged shipment quantity."}, {"text":"Delivered."}]
         detail, reports, provider = self.run_steps(steps)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
@@ -809,6 +809,81 @@ class BoundReviewerProbeTest(unittest.TestCase):
         self.assertTrue(any("同一位裁决者" in m and cited["ref"] in m for m in feedback))
         checks = [e for e in detail["room_events"] if e["kind"] == "reviewer_probe_pending"]
         self.assertEqual(len(checks), 1, "The adjudicator's local probe must not recursively open a new review.")
+
+    def test_signed_blocked_handoff_does_not_bypass_an_unwritten_required_report(self):
+        steps = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        steps[0]["tool_calls"][0]["arguments"]["deliverable_paths"] = ["arbiter-notes.md"]
+        steps[-1]["_probe_finding"].update(cause="verification", action="Remeasure the unchanged label.")
+        detail, reports, _ = self.run_steps(self.start_bound_review(final_reply=False) + steps + [
+            {"text": "[BLOCKED] I have not written the assigned report."},
+            {"text": "[BLOCKED] The required report is absent."}])
+        self.assertEqual(detail["run"]["status"], "failed")
+        [child] = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual(child["native_review"]["assessment"]["verdict"], "inconclusive")
+        self.assertEqual(child["native_review"]["state"], "blocked")
+        self.assertFalse(child["published"])
+        self.assertTrue(child["evidence"]["missing_required_files"])
+
+    def test_cancel_after_inconclusive_signature_does_not_dispatch_a_new_measurement(self):
+        first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="verification", action="Remeasure the unchanged label.")
+        blocker = "[BLOCKED] My measurement is still unresolved."
+        original_chat = ProbeProvider.chat
+
+        def cancel_during_handoff(provider, messages, tools=None, temperature=0):
+            if provider.cursor < len(provider.script) and provider.script[provider.cursor].get("text") == blocker:
+                run, = (self.root / "runs").glob("studio-20*")
+                self.service.cancel(run.name)
+            return original_chat(provider, messages, tools, temperature)
+
+        with patch.object(ProbeProvider, "chat", cancel_during_handoff):
+            detail, reports, _ = self.run_steps(self.start_bound_review(final_reply=False) + first + [{"text": blocker}])
+        self.assertTrue(detail["run"]["cancel_requested"])
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        child, = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual(child["native_review"]["assessment"]["verdict"], "inconclusive")
+        self.assertEqual(child["native_review"]["state"], "blocked")
+        self.assertFalse(child["published"])
+        self.assertFalse(any(e["kind"] == "reviewer_probe_resolved" for e in detail["room_events"]))
+
+    def test_user_token_budget_at_inconclusive_handoff_prevents_new_measurement(self):
+        first = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+        first[-1]["_probe_finding"].update(cause="verification", action="Remeasure the unchanged label.")
+        blocker = "[BLOCKED] A further measurement would consume more tokens."
+        token_limit = 1000000
+        original_chat = ProbeProvider.chat
+
+        def spend_budget_at_handoff(provider, messages, tools=None, temperature=0):
+            response = original_chat(provider, messages, tools, temperature)
+            if response.text == blocker:
+                response.usage.prompt_tokens = token_limit
+                response.usage.source = "reported"
+            return response
+
+        with patch.object(ProbeProvider, "chat", spend_budget_at_handoff):
+            detail, reports, _ = self.run_steps(self.start_bound_review(final_reply=False) + first + [{"text": blocker}],
+                                                limits={"max_steps": 90, "max_total_tokens": token_limit})
+        self.assertNotEqual(detail["run"]["status"], "completed")
+        child, = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual(child["native_review"]["assessment"]["verdict"], "inconclusive")
+        self.assertEqual(child["native_review"]["state"], "blocked")
+        self.assertFalse(child["published"])
+        self.assertFalse(any(e["kind"] == "reviewer_probe_resolved" for e in detail["room_events"]))
+
+    def test_signed_blocked_handoff_with_repeated_verification_gap_stops_on_same_version(self):
+        def unresolved():
+            steps = self.peer_steps(verdict="inconclusive", evidence=["file:" + PATH])
+            steps[-1]["_probe_finding"].update(cause="verification", action="Remeasure the unchanged label.")
+            return steps + [{"text": "[BLOCKED] I cannot complete this measurement."}]
+
+        steps = self.start_bound_review() + unresolved() + unresolved() + [{"text": "[BLOCKED] The same gap persists."}]
+        detail, reports, _ = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "failed")
+        receipts = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertEqual([r["native_review"]["state"] for r in receipts], ["review", "blocked"])
+        self.assertEqual([r["native_review"]["assessment"]["verdict"] for r in receipts], ["inconclusive"] * 2)
+        self.assertTrue(all(not r["published"] for r in receipts))
+        self.assertFalse(any(e["kind"] == "reviewer_probe_resolved" for e in detail["room_events"]))
 
     def test_addressed_lead_resumes_same_adjudicator_before_touching_frozen_report(self):
         initial = "Earlier public inspection report."

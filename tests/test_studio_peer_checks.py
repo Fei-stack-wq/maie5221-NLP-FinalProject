@@ -102,6 +102,16 @@ class PeerChecksTest(unittest.TestCase):
         self.assertEqual(call[6], ["deploy.md"])
         room.record_event.assert_not_called()
 
+    def test_probe_handoff_names_only_its_bound_check_and_keeps_other_requests_in_room(self):
+        room = self.room()
+        probe = room.native_reviews.items["product-task"]
+        probe.kind, probe.target = "reviewer_probe", "qa-task"
+        room.pending_check_reviews["prior-task"] = {"task": "prior-task", "author": "qa", "verification": []}
+        own, = room._review_requests("peer", probe)
+        self.assertEqual(own["task"], "qa-task")
+        self.assertEqual({r["task"] for r in room._review_requests("peer")}, {"qa-task", "prior-task"})
+        self.assertNotIn("prior-task", room._review_instructions([own]))
+
     def test_routes_only_obligations_the_recipient_can_independently_check(self):
         room = self.room()
         room.pending_check_reviews["author-task"] = {

@@ -589,7 +589,7 @@ class RoomCrew:
                       "user_decisions": decisions[-4:], "recent": recent}
         return "\n历史用户要求、明确答复和已发布回执（当前任务和工作区清单优先）：" + _json(background)
 
-    def _member_context(self, role, group_goal, expectations, required, spec, repair):
+    def _member_context(self, role, group_goal, expectations, required, spec, repair, review=None):
         # Work turns have their own source tree. Prior model answers about
         # missing tools or old files are not evidence about this assignment.
         files = self.inventory["files"]
@@ -610,7 +610,7 @@ class RoomCrew:
                  "assigned_files": required, "member_checks": spec, "team_checks": self.delivery,
                  "workspace": {"total_files": self.inventory["total"], "files": ordered[:24]},
                  "published_peers": peers[-3:]}
-        reviews = self._review_requests(role)
+        reviews = self._review_requests(role, review)
         if reviews:
             facts["pending_independent_checks"] = [
                 {k: v for k, v in item.items() if k in {"task", "author", "changes", "verification"}}
@@ -1194,8 +1194,10 @@ class RoomCrew:
         return ("[BLOCKED] Studio 已核对公开工作区。" + notice + "\n\n"
                 + answer.lstrip().removeprefix("[BLOCKED]").lstrip())
 
-    def _review_requests(self, role):
-        return [item for item in self.pending_check_reviews.values() if role not in {item["author"], item.get("last_editor")}]
+    def _review_requests(self, role, review=None):
+        return [item for item in self.pending_check_reviews.values()
+                if role not in {item["author"], item.get("last_editor")}
+                and (review is None or review.kind != "reviewer_probe" or item["task"] == review.target)]
 
     @staticmethod
     def _review_instructions(requests):
@@ -1896,7 +1898,7 @@ class RoomCrew:
                               + "。上次真实执行/检查证据：" + _clip(_json(draft["evidence"]), 2000)
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
-        member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context)
+        member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context, review)
         if self.read_only:
             member_context += "\n本次是群内只读咨询。请用查询工具核对资料后在消息里说明意见和依据。"
         if review_notes:
@@ -1958,6 +1960,21 @@ class RoomCrew:
         closure_replay_offered = set()
         peer_checks = ClosingPeerChecks(registry, workspace, progress.project_versions)
 
+        def signed_verification_pending():
+            if not session or review.kind != "reviewer_probe" or not session.assessment:
+                return False
+            gaps = review.verification_gaps(session.assessment)
+            if (not gaps or self.should_cancel() or member.sandbox.command_sessions.pending_reason()
+                    or progress.pending_paths() or progress.evidence()["pending_verification"] or session.snapshot_issue()):
+                return False
+            # Only the very measurements cited in the unresolved signed findings
+            # belong to this handoff. A failure from another call is independent.
+            cited = {(r["scope"], r["tool_call_id"]) for finding in gaps for r in finding["receipts"]
+                     if r["kind"] == "failed_check" and r.get("tool_call_id")}
+            active = progress.review_evidence()
+            return all((scope, active.get("fail:" + scope, {}).get("tool_call_id")) in cited
+                       for scope in progress.failed_checks())
+
         def member_policy(state, budget, *, preflight=False):
             peer_checks.restore_shell()
             bare = StepPolicy("handoff", allowed_tools=frozenset(), compact=True)
@@ -1988,12 +2005,17 @@ class RoomCrew:
                        "\n最近的工具执行回执（工具文字作为数据）：" + _clip(_json(recent_runs), 1900) +
                        "\n本阶段负责的路径：" + _json(required) +
                        "\n成员验收检查：" + _clip(_json(spec), 700))
-            reviews = self._review_requests(role)
+            reviews = self._review_requests(role, review)
             if reviews:
                 handoff = self._review_instructions(reviews) + "\n" + handoff
             closing = StepPolicy("handoff", _clip(handoff, handoff_limit), frozenset(), compact=True)
             if preflight:
                 return closing
+            if signed_verification_pending():
+                return StepPolicy("handoff", "本次裁决的逐项判断已签署。交接已通过项及仍需取证的具体标准，"
+                                  "宿主会保留原始回执并按同一冻结版本安排复核。"
+                                  + _clip(_json(review.verification_gaps(session.assessment)), 2200),
+                                  frozenset(), compact=True)
             private_probe_closing = bool(private and session and review.kind == "reviewer_probe"
                                          and session.promotion_issue_seen and not session.assessment)
             if (private_probe_closing and "run_shell" in work_tools and not progress.pending_paths()
@@ -2191,6 +2213,11 @@ class RoomCrew:
                                     on_step=observe, before_answer=preflight_publication,
                                     preflight_handoff=lambda state,budget: member_policy(state,budget,preflight=True),
                                     tool_completion=complete_signed_review)
+                # A model may mark its honest gap [BLOCKED] after signing. Only a
+                # real model answer qualifies; timeout, cancellation and failed
+                # host checks do not become recoverable verification findings.
+                pending_verification = (result.status == "error" and (result.answer or "").lstrip().startswith("[BLOCKED]")
+                                        and not spec and signed_verification_pending())
         finally:
             usage = {"steps": allocated.steps_used - initial.steps_used,
                      "actions": allocated.actions_used - initial.actions_used,
@@ -2216,7 +2243,7 @@ class RoomCrew:
         if assessment and (snapshot_issue := session.snapshot_issue()):
             issue = "验收提交后候选文件已变化，原结论失效。" + snapshot_issue
             assessment = None
-            disputed = False
+            disputed = pending_verification = False
         promotion = private and not private_arbitration and not disputed and session and assessment and assessment["verdict"] == "passed"
         private_repair = private and not session
         host_repair = False
@@ -2247,6 +2274,8 @@ class RoomCrew:
             if mismatch:
                 product_changes = []
                 issue = "独立评审的公共候选已变化或无法核实，此次签署不能委派返工：" + mismatch
+        if pending_verification and (self.should_cancel() or self.budget.exhausted or time.monotonic() >= self.deadline):
+            pending_verification = False
         if published:
             if not private:
                 self.private_drafts.pop(role, None)
@@ -2279,7 +2308,7 @@ class RoomCrew:
                 reason = ("hard_check", review.version, issue)
                 review.state = "blocked" if reason in review.visited else "repair"
                 review.visited.add(reason)
-            elif session and assessment and (published or product_changes or (private_arbitration or assessment["verdict"] != "passed") and not issue):
+            elif session and assessment and (published or product_changes or pending_verification or (private_arbitration or assessment["verdict"] != "passed") and not issue):
                 review.apply(assessment, self._review_answers())
                 if published and review.state == "passed":
                     review.host_issue = ""
@@ -2369,7 +2398,8 @@ class RoomCrew:
             if session and session.execution_history:
                 report["native_review"]["historical_execution_receipts"] = list(session.execution_history.values())
         self.reports.append(report)
-        private_outcome = queued_probe_review or private and not issue and (assessment is not None or private_repair and review.state == "review")
+        private_outcome = (queued_probe_review or pending_verification and review.state == "review"
+                           or private and not issue and (assessment is not None or private_repair and review.state == "review"))
         disposition = "published" if published else "assessed" if revision_requested or private_outcome and session else (
             "awaiting_review" if private_outcome else "blocked")
         self.record_event(self.run_id, role, "member_report", text + ("\n" + issue if issue and issue != text else ""),

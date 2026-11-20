@@ -33,6 +33,33 @@ class BoundBrowserProbeTest(unittest.TestCase):
                 "evidence":["file:" + fixture.PATH, "pass:" + browser_scope(code)]}},
         ]
 
+    def test_signed_browser_verification_gap_returns_to_fresh_arbiter_after_blocked_handoff(self):
+        bad = CODE.replace("quantity: 10 units.", "quantity: 99 units.").replace(
+            "to_contain_text('quantity: 99 units.')", "to_contain_text('quantity: 99 units.', timeout=200)")
+        first = self.steps(CODE)
+        first.insert(-1, tool("run_browser", code=bad))
+        finding = first[-1]["_probe_finding"]
+        finding.update(verdict="inconclusive", cause="verification",
+                       action="Recheck the expected count in the original frozen document.",
+                       evidence=["fail:" + browser_scope(bad), "pass:" + browser_scope(CODE)])
+        blocked = "[BLOCKED] I cannot resolve the differing quantities with my current measurement."
+        second = self.steps(CODE)[-4:]
+        steps = first + [{"text": blocked}] + second + [{"text": "Verified the original ten units."},
+                                                        {"text": "Delivered the independently checked label."}]
+        detail, reports, provider = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        first_report, final_report = [r for r in reports if r.get("native_review", {}).get("kind") == "reviewer_probe"]
+        self.assertFalse(first_report["published"])
+        self.assertEqual(first_report["status"], "error")
+        self.assertEqual(first_report["native_review"]["state"], "review")
+        self.assertEqual(final_report["native_review"]["state"], "passed")
+        self.assertEqual(first_report["native_review"]["candidate_version"], final_report["native_review"]["candidate_version"])
+        self.assertTrue(first_report["evidence"]["replayable_browser_call_ids"])
+        trace = [json.loads(l) for l in (self.root / "runs" / detail["run"]["id"] / "trace.jsonl").read_text().splitlines()]
+        member = [e for e in trace if e.get("task_id") == first_report["task_id"]]
+        signed = next(i for i, e in enumerate(member) if e["kind"] == "tool_result" and e.get("ok") and e["tool"] == "submit_review")
+        self.assertEqual([e["offered_tools"] for e in member[signed+1:] if e["kind"] == "step_start"], [[]])
+
     def test_real_browser_expectation_on_frozen_entrypoint_can_close_original_scope(self):
         steps = self.steps(CODE) + [{"text":"Independently resolved the original checker error."},
                                    {"text":"Delivered the independently checked label."}]

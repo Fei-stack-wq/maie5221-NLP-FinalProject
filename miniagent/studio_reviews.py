@@ -153,11 +153,12 @@ class Review:
         return [f["criterion_id"] for f in assessment["results"]
                 if f["criterion_id"] in required and f["verdict"] == "changes_requested" and f["cause"] == "product"]
 
-    def verification_gaps(self):
-        if self.state != "review" or self.latest.get("candidate_version") != self.version:
+    def verification_gaps(self, assessment=None):
+        decision = self.latest if assessment is None else assessment
+        if self.state != "review" or decision.get("candidate_version") != self.version:
             return []
         required = {rule.id for rule in self.criteria if rule.required}
-        gaps = [g for g in self.latest["results"] if g["criterion_id"] in required and g["verdict"] != "passed"]
+        gaps = [g for g in decision["results"] if g["criterion_id"] in required and g["verdict"] != "passed"]
         return gaps if all(g.get("cause") == "verification" for g in gaps) else []
 
     def describe(self):
