@@ -23,6 +23,7 @@ from .project_data import PROJECT_CACHE_DIRS
 from .rao import Budget, ErrorClass, Observation, RAOState, StepRecord
 from .schemas import ToolResult
 from .shell_tool import INLINE_FAILURE_LIMIT
+from .studio_reviews import digest
 from .tools import Tool
 
 
@@ -746,6 +747,8 @@ class MemberProgress:
         self._inline_failures = {}
         self._probe_support = {}
         self._support_versions = {}
+        self._file_failures = {}
+        self._corrected_file_runs = {}
         self._undisclosed_probes = {}
         self._browser_probes = {}
         self._diagnostic_checks = {}
@@ -864,6 +867,10 @@ class MemberProgress:
     def inline_failures(self):
         self._inline_failures = {k:v for k,v in self._inline_failures.items() if k in self._failures}
         self._undisclosed_probes = {k:v for k,v in self._undisclosed_probes.items() if k in self._failures}
+        for scope, failure in list(self._file_failures.items()):
+            if not self._inline_failures.keys() & failure["calls"].keys():
+                del self._file_failures[scope]
+                self._corrected_file_runs.pop(scope, None)
         return dict(self._inline_failures)
 
     def probe_support(self):
@@ -873,12 +880,48 @@ class MemberProgress:
     def corrected_probe_support(self):
         """Find later checks on the same bytes while leaving every original failure open."""
         probes = self.inline_failures()
-        if (not probes or probes.keys() != self._failures.keys() or self.pending_paths()
-                or self._pending_verification or any(p["tool"] not in {"run_python", "run_browser"} for p in probes.values())):
+        if not probes or probes.keys() != self._failures.keys() or self.pending_paths():
             return []
-        last_failure = max(self._failure_context.get(scope, {}).get("step", 0) for scope in probes)
-        return [row for row in self._probe_support.values()
-                if row["step"] > last_failure and self._support_versions.get(row["scope"]) == self._current]
+        file_scopes = {k for k, p in probes.items() if p.get("kind") == "edited_script" and p["tool"] == "run_shell"}
+        native = probes.keys() - file_scopes
+        if any(probes[k]["tool"] not in {"run_python", "run_browser"} for k in native):
+            return []
+        supporting = []
+        if native:
+            last_failure = max(self._failure_context.get(scope, {}).get("step", 0) for scope in native)
+            supporting = [row for row in self._probe_support.values()
+                          if row["step"] > last_failure and self._support_versions.get(row["scope"]) == self._current]
+            if not supporting:
+                return []
+        if not file_scopes:
+            return [] if self._pending_verification else supporting
+        # A corrected script is a reason to ask a peer. Each original call
+        # still needs its own signature; the other selected commands travel
+        # with the frozen candidate and still gate promotion.
+        version = digest(self._current)
+        corrected = [r for r in self._corrected_file_runs.values() if r["input_version"] == version]
+        covered = {key for row in corrected for key, original in row["original_calls"].items()
+                   if key in file_scopes and original == self._failure_context[key].get("tool_call_id")}
+        return supporting + corrected if covered == file_scopes else []
+
+    def _record_file_correction(self, invocation, obs, step):
+        failure = self._file_failures.get(invocation.scope)
+        if not failure:
+            return
+        path = invocation.script
+        current = self._current.get(path)
+        if (current == failure["sha256"] or self._assertive_scripts.get(path) != current
+                or not current or not obs.tool_call_id or _output_truncated(obs)):
+            return
+        self._corrected_file_runs[invocation.scope] = {
+            "kind": "corrected_file_check", "tool": "run_shell", "scope": invocation.scope,
+            "selection": invocation.selection, "check": invocation.caption, "path": path,
+            "prior_sha256": failure["sha256"], "current_sha256": current,
+            "prior_source": failure["code"], "prior_error": failure["error"],
+            "prior_input_version": failure["input_version"], "input_version": digest(self._current),
+            "original_calls": failure["calls"], "step": step, "tool_call_id": obs.tool_call_id,
+            "exit_code": 0, "output": obs.content[:4000],
+        }
 
     def _record_probe(self, scope, probe):
         self.inline_failures()  # Release only scopes whose failure was actually closed.
@@ -1142,6 +1185,8 @@ class MemberProgress:
                                     self._assertive_scripts.get(invocation.script) == script_digest)
                         if eligible:
                             self._complete_verification[invocation.scope] = invocation.caption
+                            if signal.status == "passed" and not changed:
+                                self._record_file_correction(invocation, obs, record.step)
                         prior = self._pending_verification.get(invocation.scope)
                         if eligible and prior and prior.get("at_sha256") == script_digest:
                             del self._pending_verification[invocation.scope]
@@ -1244,6 +1289,7 @@ class MemberProgress:
                                 # the aggregate suite scope. Bind the same frozen
                                 # source to each actual failure so a peer can
                                 # adjudicate it without rewriting the assertion.
+                                inputs = {str(Path(cwd) / path) for path in _asserted_inputs(original[1])}
                                 for scope, failure in failures.items():
                                     self._record_probe(scope, {
                                         "kind":"edited_script", "code":original[1], "error":failure_obs.content,
@@ -1251,14 +1297,23 @@ class MemberProgress:
                                         "path":invocation.script, "sha256":original[0], "exit_code":exit_code,
                                         "check":invocation.caption, "tool":obs.source,
                                         "tool_call_id":obs.tool_call_id, "task_id":state.task_id,
-                                        "case_label":failure,
+                                        "case_label":failure, "input_paths":sorted(inputs & self._current.keys()),
                                     })
+                                if failures.keys() <= self._inline_failures.keys():
+                                    self._corrected_file_runs.pop(invocation.scope, None)
+                                    self._file_failures[invocation.scope] = {
+                                        "sha256": original[0], "code": original[1], "error": failure_obs.content,
+                                        "check": invocation.caption, "path": invocation.script,
+                                        "calls": dict.fromkeys(failures, obs.tool_call_id), "input_version": digest(before),
+                                    }
                         if run:
                             self._failed_runs[(case_suite, run.digest)] = run
                         self._passes.pop(suite, None)
                         self._repeat_pass = False
                     elif status == "clean_exit":
-                        advances |= self._failures.pop(suite_key, None) is not None
+                        previous = self._inline_failures.get(suite_key, {})
+                        if not (previous.get("kind") == "edited_script" and self._current.get(previous["path"]) != previous["sha256"]):
+                            advances |= self._failures.pop(suite_key, None) is not None
                     elif not changed or index >= last_mutation:
                         advances |= suite not in self._passes
                         self._repeat_pass |= self._passes.get(suite) == label
@@ -1637,6 +1692,17 @@ class MemberProgress:
         if self.browser_replays():
             return ("原浏览器断言曾失败。修复后用 rerun_browser_check 引用 replayable_browser_call_ids 中的原调用 ID。"
                     "重写脚本检查的是另一个范围。若原断言有误，请说明并交给独立成员复核。已观察记录：" + facts)
+        if self._file_failures:
+            version = digest(self._current)
+            rerun = [f["check"] for scope, f in self._file_failures.items()
+                     if self._current.get(f["path"]) != f["sha256"]
+                     and self._corrected_file_runs.get(scope, {}).get("input_version") != version]
+            if rerun:
+                return ("文件型检查曾失败，其后候选有改动。在最终版本上直接运行原命令并保留退出码："
+                        + "、".join(rerun) + "。原失败和修订后的实测结果可一同交给其他成员复核。" + facts)
+            if self.corrected_probe_support():
+                return ("已取得最终候选上的修订检查回执，请交接原失败、文件改动及结果。"
+                        "独立成员将核验修订项和其他尚待复验的脚本。" + facts)
         if self._pending_verification and not self._failures:
             if self._pending_verification.keys() & self._script_exits.keys():
                 return ("已取得对应脚本当前版本的正常退出回执。请交接工件，由独立成员复验原始需求。"

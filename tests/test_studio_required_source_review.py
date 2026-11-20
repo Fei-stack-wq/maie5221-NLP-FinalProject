@@ -33,6 +33,19 @@ def submit(manifest, path):
          "reason": "Compared the cited destination against the signed dispatch order."}])
 
 
+class CurrentCandidateProvider(RecordingProvider):
+    def chat(self, messages, tools=None, temperature=0):
+        if self.cursor < len(self.script):
+            for call in self.script[self.cursor].get("tool_calls", []):
+                if call["name"] == "submit_review":
+                    # The author's freshly archived external source is
+                    # also versioned. Read the real candidate ID shown to the reviewer.
+                    versions = re.findall(r'"candidate_version":"([0-9a-f]{64})"',
+                                          "\n".join(m.get("content") or "" for m in messages))
+                    call["arguments"]["candidate_version"] = versions[-1]
+        return super().chat(messages, tools, temperature)
+
+
 class RequiredSourceReviewTest(unittest.TestCase):
     def setUp(self):
         self.root = make_temp_dir("required-sources")
@@ -76,6 +89,44 @@ class RequiredSourceReviewTest(unittest.TestCase):
         receipts = review["assessment"]["results"][0]["receipts"]
         self.assertEqual([(r["path"], r["sha256"]) for r in receipts if r["kind"] == "read"], [(FINAL, files[FINAL])])
         self.assertEqual([r["url"] for r in receipts if r["kind"] == "source"], [URL])
+
+    def test_source_repair_author_can_substantiate_original_fact_for_independent_resignature(self):
+        files = {FINAL: hashed(ARTICLE)}
+        revision = ARTICLE + "\nSigned dispatch order, first sentence: 'This shipment goes to Main Street.' " + URL
+        rejection = tool("submit_review", candidate_version=digest(files), results=[{
+            "criterion_id": "claim", "verdict": "changes_requested", "cause": "product",
+            "reason": "I interpret the dispatch destination as Mill Street.",
+            "action": "Replace Main Street with Mill Street.", "evidence": ["file:" + FINAL, "source:" + URL]}])
+        steps = [
+            tool("delegate_task", assignee="writer", objective="Publish the dispatch.", deliverable_paths=[FINAL],
+                 remaining_roles=["checker"]), write(FINAL, ARTICLE), {"text": "Dispatch published."},
+            tool("delegate_task", assignee="checker", objective="Verify the destination.",
+                 review={"candidate": FINAL, "criteria": [RULE]}),
+            tool("read_file", path=FINAL), tool("http_get", url=URL), rejection, {"text": "Review signed."},
+            tool("delegate_task", assignee="writer", objective="Address the finding."),
+            tool("http_get", url=URL), write(FINAL, revision), {"text": "The issuer confirms Main Street; see its first sentence."},
+            tool("delegate_task", assignee="checker", objective="Verify the revised dispatch."),
+            tool("read_file", path=FINAL), tool("http_get", url=URL), submit(files, FINAL),
+            {"text": "Released the reviewed dispatch."}]
+        detail, provider = self.execute(steps, provider_type=CurrentCandidateProvider)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual([r["role"] for r in reports], ["writer", "checker", "writer", "checker"])
+        initial, rejected, repair, signed = reports
+        self.assertNotIn("评审建议本身", initial["objective"])
+        for phrase in ("评审建议本身不能作为事实依据", "打开原始发布者", "单位和分母", "正负号",
+                       "保留已核实的事实", "可定位的引文", "原评审者", "Mill Street"):
+            self.assertIn(phrase, repair["objective"])
+            self.assertIn(phrase, str(provider.requests[9][0]))
+        self.assertNotIn("submit_review", provider.requests[9][1])
+        self.assertIn("亲自核对其引文和原文上下文", str(provider.requests[13][0]))
+        self.assertEqual(rejected["native_review"]["state"], "repair")
+        self.assertEqual(repair["native_review"]["state"], "review")
+        decision = signed["native_review"]
+        self.assertEqual((decision["state"], decision["reviewer"], decision["files"][FINAL]),
+                         ("passed", "checker", hashed(revision)))
+        self.assertNotEqual(rejected["native_review"]["candidate_version"], decision["candidate_version"])
+        self.assertEqual(decision["assessment"]["candidate_version"], decision["candidate_version"])
 
     def closing_review(self):
         review = {"candidate": "writer", "criteria": [RULE]}
@@ -354,17 +405,6 @@ class RequiredSourceReviewTest(unittest.TestCase):
 
     def test_addressed_worker_gets_work_tools_and_must_obtain_fresh_independent_source_approval(self):
         review = {"candidate": FINAL, "criteria": [RULE]}
-        class CurrentVersion(RecordingProvider):
-            def chat(self, messages, tools=None, temperature=0):
-                if self.cursor < len(self.script):
-                    for call in self.script[self.cursor].get("tool_calls", []):
-                        if call["name"] == "submit_review":
-                            # The author's freshly archived external source is
-                            # also versioned. Read the real candidate ID shown to the reviewer.
-                            versions = re.findall(r'"candidate_version":"([0-9a-f]{64})"',
-                                                  "\n".join(m.get("content") or "" for m in messages))
-                            call["arguments"]["candidate_version"] = versions[-1]
-                return super().chat(messages, tools, temperature)
         detail, provider = self.execute([
             tool("http_get", url=URL), write(FINAL, ARTICLE), {"text": "成稿和原始来源都查过了。"},
             {"text": "仅凭我自己的来源检查，尝试再次收尾。"},
@@ -375,7 +415,7 @@ class RequiredSourceReviewTest(unittest.TestCase):
             tool("read_file", path=FINAL), submit({FINAL: hashed(ARTICLE)}, FINAL),
             tool("http_get", url=URL), submit({FINAL: hashed(ARTICLE)}, FINAL), {"text": "已交付。"}],
             members=("lead", "researcher", "checker"), objective="@researcher 请自己修改成稿，并安排独立核查来源。",
-            provider_type=CurrentVersion)
+            provider_type=CurrentCandidateProvider)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         self.assertEqual(detail["run"]["mode"], "single")
         self.assertTrue({"search_sources", "http_get", "write_file", "edit_file", "delegate_task"} <= set(provider.requests[0][1]))

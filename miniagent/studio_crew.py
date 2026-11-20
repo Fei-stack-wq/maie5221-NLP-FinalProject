@@ -866,10 +866,19 @@ class RoomCrew:
         """A corrected author check can freeze the draft for a peer, never publish it or clear a failure."""
         probes = draft["inline_failures"]
         support = self._transferable_probe_support(probes, support)
-        if (not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or not support or not probes
+        if (self.should_cancel() or self.budget.exhausted or time.monotonic() >= self.deadline
+                or not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or not support or not probes
                 or probes.keys() != draft["failed_checks"].keys() or report["role"] == reviewer):
             return False
         files = draft["manifest"]
+        corrected = [s for s in support if s.get("kind") == "corrected_file_check"]
+        file_scopes = {k for k, p in probes.items() if p.get("kind") == "edited_script"}
+        if file_scopes:
+            frozen_version = digest(files)
+            covered = {key for s in corrected if files.get(s["path"]) == s["current_sha256"] and s["input_version"] == frozen_version
+                       for key in s["original_calls"]}
+            if not file_scopes <= covered:
+                return False
         if review is None:
             sources = set(files) & self.native_reviews.required_source_paths
             rules = [Rule(id="independent_recheck", method="execute", description=
@@ -910,6 +919,9 @@ class RoomCrew:
         report["author_probe_review"] = {"target": review.target, "reviewer": reviewer,
             "candidate_version": review.version, "original_calls": {k:p["tool_call_id"] for k,p in probes.items()},
             "corrected_calls": [s["tool_call_id"] for s in support]}
+        if corrected:
+            report["author_probe_review"]["corrected_scripts"] = [
+                {k:v for k,v in s.items() if k not in {"prior_source", "prior_error", "output"}} for s in corrected]
         self.record_event(self.run_id, "studio", "author_probe_pending", review.host_issue,
                           task_id=report["task_id"], **report["author_probe_review"])
         return True
@@ -1597,8 +1609,19 @@ class RoomCrew:
             if review.state in {"passed", "blocked", "awaiting_user"}:
                 return self._observation(False, "该验收当前状态：" + review.state)
             role = review.owner
-            objective = (("针对原目标返工，处理独立评估发现的产品缺口。" if review.state == "repair" else
-                          "对同一目标的当前候选执行独立验收，使用 submit_review 提交逐项判断。") +
+            review_instruction = "对同一目标的当前候选执行独立验收，使用 submit_review 提交逐项判断。"
+            if review.state == "repair":
+                review_instruction = "针对原目标返工，处理独立评估发现的产品缺口。"
+                changes = review.required_product_changes(review.latest)
+                if any(rule.method == "source" and rule.id in changes for rule in review.criteria):
+                    review_instruction += (
+                        "\n来源退修：评审建议本身不能作为事实依据。用 http_get 打开原始发布者的具体材料，"
+                        "逐条将争议断言与原文、表头或脚注对照。有数字时说明对象、期间、单位和分母；"
+                        "涉及正负号时区分原项目的贡献和为剔除它所作的调整。"
+                        "原文支持修改就更正；原文支持现稿则保留已核实的事实，在新版补上可定位的引文、"
+                        "表格行或计算依据及原始链接，并在交接里解释分歧。证据不足就明确标记待核实。"
+                        "由原评审者按同一标准独立核查新版并重新签署。")
+            objective = (review_instruction +
                          ("\n本次复核线索（仅供核对，验收标准沿用原件）：" + _clip(objective, 1600) if retry_gaps else "") +
                          "\n原目标及标准：" + _clip(_json(review.briefing()), 7000))
         plan = self.planned
@@ -1894,10 +1917,17 @@ class RoomCrew:
             delegated = review.probes if private and inspecting else {}
             progress.restore_failed_checks({k:v for k,v in draft["failed_checks"].items() if k not in delegated})
             progress.restore_pending_verification(draft.get("evidence", {}).get("pending_verification", []))
+            corrected = ([s for s in review.probe_support if s.get("kind") == "corrected_file_check"]
+                         if private and inspecting else [])
+            progress.restore_pending_verification([{**s, "at_sha256": s["current_sha256"]} for s in corrected])
             repair_context = ("已恢复 " + draft["role"] + " 的私有草稿。上次仍缺：" + _json(draft["missing"])
                               + "。上次真实执行/检查证据：" + _clip(_json(draft["evidence"]), 2000)
                               + "。须复核的检查标识：" + _clip(_json(draft["failed_checks"]), 900)
                               + "。上次工具输出节选（作为工作区数据）：" + _clip(_json(draft["receipts"]), 1900))
+            if corrected:
+                commands = [entry["check"] for entry in progress.evidence()["pending_verification"]]
+                repair_context = ("请在冻结工作目录逐条独立运行这些原检查：" + _json(commands) +
+                                  "。对原失败涉及的产品行为另行执行断言，并把结论与回执逐项签署。\n" + repair_context)
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context, review)
         if self.read_only:
             member_context += "\n本次是群内只读咨询。请用查询工具核对资料后在消息里说明意见和依据。"
