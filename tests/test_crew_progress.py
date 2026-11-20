@@ -62,6 +62,20 @@ class MemberProgressTest(unittest.TestCase):
         self.assertTrue(self.p.blocked_reason())
         self.assertEqual(self.p.evidence()["check_signals"], [])
 
+    def test_named_failures_in_one_inline_python_run_can_be_independently_reviewed(self):
+        code = "from pathlib import Path\nvalue = Path('module.py').read_text()\n" \
+               "print('FAIL quantity')\nprint('FAIL date')\nassert value == 'new'"
+        output = "exit_code=1\nstdout:\nPASS opening\nFAIL quantity\nFAIL date\nstderr:\nAssertionError"
+        self.observe(args={"code":code}, text=output, ok=False, meta={"exit_code":1}, call_id="named-failures")
+        failures = self.p.failed_checks()
+        self.assertEqual(len(failures), 2)
+        probes = self.p.inline_failures()
+        self.assertEqual(probes.keys(), failures.keys())
+        self.assertEqual({probe["case_label"] for probe in probes.values()}, {"quantity", "date"})
+        for key, probe in probes.items():
+            self.assertEqual((probe["code"], probe["error"], probe["tool_call_id"]), (code, output, "named-failures"))
+            self.assertEqual(self.p.review_evidence()["fail:" + key]["scope"], key)
+
     def test_subprocess_success_does_not_hide_the_outer_line_count_assertion(self):
         code = ('import subprocess\nfrom pathlib import Path\n'
                 'r = subprocess.run(["python3", "verify.py"], capture_output=True, text=True)\n'

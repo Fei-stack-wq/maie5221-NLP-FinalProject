@@ -28,3 +28,9 @@ pytest 的 `TestReport.from_item_and_call` 根据调用的执行阶段和异常�
 CPython 的 `runpy.run_path` 从给定路径运行脚本并返回命名空间，标准库测试包含对独立脚本与路径对象的执行。这里沿用标准库的模块入口，实际行为仍由评审者调用并断言。[CPython 实现](https://github.com/python/cpython/blob/v3.13.7/Lib/runpy.py#L262-L309) · [脚本执行测试](https://github.com/python/cpython/blob/v3.13.7/Lib/test/test_runpy.py#L659-L682)
 
 运行 `python -m unittest tests.test_embedded_application_review`。用例经过正常 RAO 工具分派、正式签署和第三方争议队列，也覆盖错误文档、重复文档、未执行的读取和单纯检查退出码。
+
+## 同一脚本中的多项失败
+
+基金运行 `studio-20261119-201108-5eff8ee89f1b` 的独立评审在第 30 步执行了一个实际返回 1 的 Python 脚本。脚本给各项输出命名的 FAIL 行，记账器逐项创建回执，却尝试从不存在的整套检查回执上读取输入，触发 `KeyError`。正常群聊因此在签署之前结束。
+
+使用同一冻结演示和原调用 `call_00_nEcynCGR5lWFuZUSFJiP9293` 在隔离副本重放，旧版本抛出相同键错误。修复后脚本仍返回 1，12 项失败各有独立的范围与回执，并共享这一次真实调用的原脚本和输出。回归也覆盖同一调用报告两项不同失败的情况。此改动沿用本项目对文件型测试所采用的逐项作用域。Python 标准库的 [unittest.TestResult.addSubTest](https://docs.python.org/3/library/unittest.html#unittest.TestResult.addSubTest) 同样按实际失败的子测试记录结果。

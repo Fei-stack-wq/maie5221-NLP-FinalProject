@@ -166,6 +166,110 @@ class BoundReviewerProbeTest(unittest.TestCase):
             tool("run_python", code=peer_probe), {"_probe_finding": finding},
         ]
 
+    @staticmethod
+    def private_reviewer_steps():
+        inspector_bad = PEER_PROBE.replace("== 10", "== 20")
+        failed = scope(inspector_bad)
+        def signed(*, dispute, cite=True):
+            evidence = ["pass:" + PEER_SCOPE]
+            if dispute and cite:
+                evidence.append("fail:" + failed)
+            return tool("submit_review", candidate_version=product_version(), results=[
+                {"criterion_id": "independent_recheck", "verdict": "passed", "evidence": evidence,
+                 "reason": "The independent measurement confirms ten. My initial assertion expected twenty."},
+                {"criterion_id": "probe_" + BAD_SCOPE, "verdict": "passed", "evidence": ["pass:" + PEER_SCOPE],
+                 "reason": "The original author added ten in the test calculation."}])
+        original = [
+            tool("delegate_task", assignee="builder", objective="Write and test the ten-unit label.",
+                 deliverable_paths=[PATH], remaining_roles=["inspector", "arbiter"]),
+            write(PATH, LABEL), tool("run_python", code=BAD_PROBE), tool("run_python", code=FIXED_PROBE),
+            {"text": "The original test added ten. The unchanged label records ten."},
+            tool("delegate_task", assignee="inspector", objective="Verify the author's private candidate.",
+                 deliverable_paths=["inspection.md"]),
+            write("inspection.md", NOTE), tool("run_python", code=inspector_bad), tool("run_python", code=PEER_PROBE),
+            signed(dispute=True, cite=False), signed(dispute=True),
+        ]
+        peer = [
+            tool("delegate_task", assignee="arbiter", objective="Independently verify the reviewer's failed assertion."),
+            tool("read_file", path=PATH), tool("read_file", path="inspection.md"), tool("run_python", code=FIXED_PROBE),
+            {"_probe_finding": {"criterion_id": "probe_" + failed, "verdict": "passed", "evidence": ["pass:" + FIXED_SCOPE],
+                                "reason": "The private product records ten, and the reviewer's expected twenty was incorrect."}},
+            {"text": "The reviewer's assertion was independently adjudicated."},
+        ]
+        final = [
+            tool("delegate_task", assignee="inspector", objective="Re-sign the original private product after arbitration."),
+            write("inspection.md", "Final QA. Independent recheck records ten units."),
+            tool("run_python", code=PEER_PROBE), signed(dispute=False),
+            {"text": "The original QA independently approves the private label."}, {"text": "Delivered."},
+        ]
+        return original, peer, final
+
+    def test_private_author_and_reviewer_probe_errors_require_an_arbiter_then_original_reviewer(self):
+        original, peer, final = self.private_reviewer_steps()
+        detail, reports, _ = self.run_steps(original + peer + final)
+        summary = [(r["role"], r["remaining_issue"], (r.get("native_review") or {}).get("state"),
+                    r.get("summary", "")[:350]) for r in reports]
+        self.assertEqual(detail["run"]["status"], "completed", (detail["run"].get("error"), summary))
+        author, qa, arbiter, fresh = reports
+        self.assertEqual([r["role"] for r in reports], ["builder", "inspector", "arbiter", "inspector"])
+        self.assertEqual([r["published"] for r in reports], [False, False, False, True])
+        self.assertNotIn("reviewable_candidate", qa)
+        self.assertNotIn("diagnostics", qa)
+        self.assertNotIn("diagnostics", arbiter)
+        original_review, peer_review, final_review = [r["native_review"] for r in (qa, arbiter, fresh)]
+        self.assertEqual(original_review["state"], "review")
+        self.assertEqual(peer_review["state"], "passed")
+        self.assertEqual(final_review["state"], "passed")
+        self.assertEqual(original_review["candidate_version"], final_review["candidate_version"])
+        self.assertNotEqual(original_review["assessment"]["attempt_id"], final_review["assessment"]["attempt_id"])
+        self.assertEqual(fresh["promoted_candidate"]["source_task"], author["task_id"])
+        self.assertEqual(fresh["promoted_candidate"]["author"], "builder")
+        self.assertEqual([e["text"] for e in detail["room_events"] if e["kind"] == "reviewer_probe_resolved"],
+                         ["probe_corrected_pending_product_review"])
+        public = self.root / "runs" / detail["run"]["id"] / "agents" / "lead"
+        self.assertEqual((public / PATH).read_text(), LABEL)
+        self.assertFalse((public / "inspection.md").exists())
+        trace = [json.loads(line) for line in (public.parents[1] / "trace.jsonl").read_text().splitlines()]
+        self.assertEqual([entry["ok"] for entry in trace if entry.get("kind") == "tool_result" and
+                          entry.get("tool") == "submit_review" and entry.get("task_id") == qa["task_id"]], [False, True])
+
+    def test_changed_original_checkpoint_invalidates_private_arbitration_without_publishing_any_file(self):
+        from miniagent.studio_crew import RoomCrew
+        original, peer, _ = self.private_reviewer_steps()
+        finish = RoomCrew._finish_reviewer_probes
+
+        def tamper(crew, child, *args):
+            item = crew.reviewer_probe_reviews[child.target]
+            product = item["private_product"]
+            (product["checkpoint"] / "agents" / product["role"] / PATH).write_text("A different candidate.")
+            return finish(crew, child, *args)
+
+        with patch.object(RoomCrew, "_finish_reviewer_probes", tamper):
+            detail, reports, _ = self.run_steps(original + peer + [{"text": "[BLOCKED] The candidate changed."}])
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertFalse(any(row["published"] for row in reports))
+        self.assertFalse(any(row.get("diagnostics") for row in reports[1:]))
+        child = reports[-1]["native_review"]
+        self.assertEqual(child["kind"], "reviewer_probe")
+        self.assertEqual(child["state"], "blocked")
+        self.assertIn("已变化", child["host_issue"])
+        public = self.root / "runs" / detail["run"]["id"] / "agents" / "lead"
+        self.assertFalse((public / PATH).exists())
+        self.assertFalse((public / "inspection.md").exists())
+
+    def test_repeating_an_already_adjudicated_private_probe_does_not_spawn_a_fourth_review(self):
+        original, peer, final = self.private_reviewer_steps()
+        # Re-run exactly the first QA's mistaken assertion on the same version
+        # after the arbiter already signed it; a new tool call cannot reopen it.
+        again = final[:2] + original[7:9] + [original[-1], {"text":"[BLOCKED] The disputed test was repeated."},
+                                            {"text":"[BLOCKED] No new product evidence."}]
+        detail, reports, provider = self.run_steps(original + peer + again)
+        self.assertEqual(detail["run"]["status"], "failed")
+        self.assertEqual(sum(e["kind"] == "reviewer_probe_pending" for e in detail["room_events"]), 1)
+        self.assertFalse(any(row["published"] for row in reports))
+        self.assertTrue(any("相同失败检查已有独立裁决" in str(m.get("content"))
+                            for messages, _ in provider.requests for m in messages if m.get("role") == "tool"))
+
     def test_bound_failed_probe_is_independently_adjudicated_then_original_review_resumes(self):
         steps = self.start_bound_review() + self.peer_steps() + [
             {"text": "Independently resolved the reviewer's mistaken probe on the frozen tree."},

@@ -636,9 +636,16 @@ class ReviewSession:
         return "缺少原始来源核查：" + ", ".join(sorted(missing)) if missing else ""
 
     def reviewer_failures(self, results, *, include_verification=False):
-        """A public product judgment may dispute only explicitly cited, transferable failures."""
+        """A product judgment may dispute only explicitly cited, transferable failures."""
         if not self.reviewer_task or not (failed := self.progress.failed_checks()):
             return {}, ""
+        peer = self.item.peer_recheck
+        already = peer.get("adjudicated_scopes", {}) if peer.get("candidate_version") == self.item.version else {}
+        repeated = {scope: already[scope] for scope in failed.keys() & already.keys()}
+        if repeated:
+            return {}, ("原版本的相同失败检查已有独立裁决：" + json.dumps(repeated, ensure_ascii=False) +
+                        "。请核对该次裁决与当前结果。真实产品缺陷签 changes_requested/product；"
+                        "重复了已判有误的探针则签 inconclusive/verification，在干净的原版本上使用纠正方法独立重测。")
         probes = self.progress.inline_failures()
         cited = {e["receipt_id"] for finding in results if finding["verdict"] == "passed" or
                  (include_verification and finding["verdict"] == "inconclusive" and finding["cause"] == "verification")
@@ -835,8 +842,9 @@ class ReviewSession:
         manifest = self.progress.project_versions()
         # Use only authenticated findings on the identical candidate. A
         # source report or review note that disappeared requires a fresh check.
+        fresh = self.item.peer_recheck.get("required_fresh_criteria", ()) if self.item.peer_recheck.get("candidate_version") == self.item.version else ()
         return {g["criterion_id"]: g for g in self.item.latest["results"]
-                if g["verdict"] == "passed" and all(manifest.get(e["path"]) == e["sha256"]
+                if g["verdict"] == "passed" and g["criterion_id"] not in fresh and all(manifest.get(e["path"]) == e["sha256"]
                     for e in g["receipts"] if e["kind"] in {"read", "source", "review_note", "reference"})}
 
     def context(self):
@@ -990,6 +998,10 @@ class ReviewSession:
                         "message":"请在必需的 source 判断中，引用实际读过的成稿和本次打开的原始来源；"
                                   "用 read_lines 读取并引用成稿：" + "、".join(sorted(missing))}
                         for r in self.item.criteria if r.required and r.method == "source"])
+            if verdict == "passed" and self.reviewer_task:
+                _, self.submission_issue = self.reviewer_failures(results)
+                if self.submission_issue:
+                    raise ValueError(self.submission_issue)
             if verdict == "passed" and self.promotion_issue:
                 if not any(r["criterion_id"] in required and any(e["kind"] in {"read","passed_check"} for e in r["receipts"])
                            for r in results):
@@ -999,12 +1011,9 @@ class ReviewSession:
                     self.promotion_issue_seen = True
                     self.submission_issue = problem
                     raise ValueError(problem)
-            if verdict == "passed":
-                _, self.submission_issue = self.reviewer_failures(results)
-                if not self.submission_issue and self.reviewer_task and (missing_paths := self.progress.pending_paths()):
-                    self.submission_issue = "请先交付本次分工指定的附件，再提交全通过签署：" + "、".join(sorted(missing_paths))
-                if self.submission_issue:
-                    raise ValueError(self.submission_issue)
+            if verdict == "passed" and self.reviewer_task and (missing_paths := self.progress.pending_paths()):
+                self.submission_issue = "请先交付本次分工指定的附件，再提交全通过签署：" + "、".join(sorted(missing_paths))
+                raise ValueError(self.submission_issue)
             self.submission_issue = ""
             self.assessment = {"target":self.item.target,"candidate_version":self.item.version,
                                "evaluator":self.item.reviewer,"attempt_id":self.attempt_id,

@@ -1167,9 +1167,12 @@ class MemberProgress:
                     suite_key = _check_key(suite)
                     if status == "failed":
                         failures = {}
+                        case_names = {}
                         for case in cases:
                             caption = run.layout.captions[run.failed[case]] if run and case in run.failed else case
-                            failures[_check_key(versioned, caption)] = "工具输出 FAIL · " + case[:72]
+                            key = _check_key(versioned, caption)
+                            failures[key] = "工具输出 FAIL · " + case[:72]
+                            case_names[key] = caption
                         if not cases:
                             failures[suite_key] = label
                         advances |= not failures.keys() <= self._failures.keys()
@@ -1206,20 +1209,27 @@ class MemberProgress:
                                     # cannot mint a passing receipt for the failed invocation.
                                     entries = {_python_entry_point(call) for call in ast.walk(ast.parse(code))}
                                     program_inputs = {p:self._current[p] for p in entries if p in self._current}
-                                self._record_probe(suite_key, {"code":code, "error":failure_obs.content,
-                                    "display_truncated":_output_truncated(obs), "program_inputs":program_inputs,
-                                    "browser_inputs":self._review_evidence["fail:" + suite_key].get("browser_inputs", {}),
-                                    "exit_code":exit_code,
-                                    "input_paths": sorted((_asserted_inputs(code) | (_observed_browser_files(obs.meta, self._current, self._embedded_html)
-                                        if obs.source == "run_browser" else set()))
-                                        & self._current.keys()),
-                                    "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
-                            elif suite_key not in self._inline_failures:
-                                self._undisclosed_probes[suite_key] = {
-                                    "scope_id":suite_key, "tool_call_id":obs.tool_call_id,
-                                    "reason":"未取得有界的完整原脚本和错误输出；原失败保留，可用同一检查重新取证。",
-                                    "stdout_bytes":obs.meta.get("stdout_bytes"), "stderr_bytes":obs.meta.get("stderr_bytes"),
-                                    "display_truncated":_output_truncated(obs), "max_error_bytes":error_limit}
+                                inputs = _asserted_inputs(code)
+                                if obs.source == "run_browser":
+                                    inputs.update(_observed_browser_files(obs.meta, self._current, self._embedded_html))
+                                probe = {"code":code, "error":failure_obs.content, "exit_code":exit_code,
+                                         "display_truncated":_output_truncated(obs), "program_inputs":program_inputs,
+                                         "input_paths":sorted(inputs & self._current.keys()),
+                                         "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id}
+                                # A named FAIL row has its own scope. Such a report
+                                # does not create an aggregate failure receipt.
+                                for key in failures:
+                                    row = {**probe, "browser_inputs":self._review_evidence["fail:" + key].get("browser_inputs", {})}
+                                    if key in case_names:
+                                        row["case_label"] = case_names[key]
+                                    self._record_probe(key, row)
+                            else:
+                                for key in failures.keys() - self._inline_failures.keys():
+                                    self._undisclosed_probes[key] = {
+                                        "scope_id":key, "tool_call_id":obs.tool_call_id,
+                                        "reason":"未取得有界的完整原脚本和错误输出；原失败保留，可用同一检查重新取证。",
+                                        "stdout_bytes":obs.meta.get("stdout_bytes"), "stderr_bytes":obs.meta.get("stderr_bytes"),
+                                        "display_truncated":_output_truncated(obs), "max_error_bytes":error_limit}
                         elif (obs.source == "run_shell" and invocation and invocation.complete
                               and invocation.script in self._edited_scripts and not _output_truncated(failure_obs)
                               and type(exit_code) is int and exit_code != 0
