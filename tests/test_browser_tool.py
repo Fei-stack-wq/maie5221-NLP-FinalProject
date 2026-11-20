@@ -1,12 +1,17 @@
 import os
+import gzip
+import hashlib
 import shutil
 import tempfile
 import textwrap
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
 from miniagent.config import Limits
+from miniagent.crew_progress import _browser_asserted_inputs
 from miniagent.playwright_runner import _launch
 from miniagent.sandbox import Sandbox
 from miniagent.tools import ToolContext, build_default_registry
@@ -47,6 +52,54 @@ class BrowserToolTest(unittest.TestCase):
     def require_installed_browser(self, result):
         if any(note in result.content for note in ("环境缺少 Playwright", "环境缺少 Chromium/Chrome")):
             self.skipTest("This integration test requires Playwright and a real local Chromium/Chrome.")
+
+    def test_loopback_document_receipt_requires_actual_served_bytes_and_dom_assertion(self):
+        html = b'<label for="startSelect">Start</label><select id="startSelect"><option>09:00</option></select>'
+        (self.member / "booking.html").write_bytes(html)
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type","text/html")
+                self.send_header("Content-Encoding","gzip")
+                self.end_headers()
+                self.wfile.write(gzip.compress(html))
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1",0),Handler)
+        serving = threading.Thread(target=server.serve_forever,daemon=True)
+        serving.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/reverse-proxy/booking"
+            start = f"from pathlib import Path\naddress = {url!r}\nresponse = page.goto(address)\n"
+            identity = "assert response.body() == Path('booking.html').read_bytes()\n"
+            dom = "assert page.get_by_label('Start').input_value() == '09:00'"
+            code = start + identity + dom
+            result = self.browser(code)
+            self.require_installed_browser(result)
+            self.assertTrue(result.ok, result.content)
+            digest = result.meta["loopback_document_sha256"]
+            self.assertEqual(digest, hashlib.sha256(html).hexdigest())
+            self.assertEqual(_browser_asserted_inputs(code,self.member,".",digest),{"booking.html"})
+            for incomplete in (start+identity, start+dom, start+identity+"page.set_content('other')\n"+dom):
+                self.assertFalse(_browser_asserted_inputs(incomplete,self.member,".",digest))
+            self.assertFalse(_browser_asserted_inputs(code,self.member,".","1"*64))
+        finally:
+            server.shutdown()
+            server.server_close()
+            serving.join()
+
+    def test_script_written_receipt_after_closed_page_cannot_attest_a_document(self):
+        result = self.browser("""
+            import os
+            from pathlib import Path
+            page.set_content('<h1>Made up</h1>')
+            assert page.title() == ''
+            page.close()
+            (Path(os.environ['HOME']) / 'checked-document.sha256').write_bytes(b'0'*96)
+        """)
+        self.require_installed_browser(result)
+        self.assertTrue(result.ok,result.content)
+        self.assertNotIn("loopback_document_sha256",result.meta)
 
     def test_registry_and_args(self):
         self.assertIn("run_browser", self.registry.names())

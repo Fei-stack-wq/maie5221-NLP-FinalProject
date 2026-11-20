@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import os
+import hmac
+import re
+import secrets
 import sys
 import tempfile
 from pathlib import Path
@@ -33,5 +36,14 @@ def run_browser(ctx, args: dict) -> ToolResult:
         return ToolResult.failure("浏览器测试目录必须是项目中的目录。")
     runner = Path(__file__).with_name("playwright_runner.py").resolve()
     with tempfile.TemporaryDirectory(prefix="miniagent-browser-") as temp_home:
+        signing_key = secrets.token_bytes(32)
+        Path(temp_home, "document-receipt.key").write_bytes(signing_key)
         argv = ["python", "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, code]
-        return run_posix_argv(ctx, argv, cwd, args.get("timeout"))
+        result = run_posix_argv(ctx, argv, cwd, args.get("timeout"))
+        receipt = Path(temp_home, "checked-document.sha256")
+        if result.ok and receipt.is_file() and not receipt.is_symlink() and receipt.stat().st_size == 96:
+            raw = receipt.read_bytes()
+            digest, signature = raw[:64], raw[64:]
+            if re.fullmatch(b"[a-f0-9]{64}", digest) and hmac.compare_digest(hmac.digest(signing_key, digest, "sha256"), signature):
+                result.meta["loopback_document_sha256"] = digest.decode("ascii")
+        return result

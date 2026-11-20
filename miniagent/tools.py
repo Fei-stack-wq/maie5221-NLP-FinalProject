@@ -415,6 +415,7 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
             name="run_browser",
             description="用真实无头 Chromium 执行一次 Python Playwright 同步测试。已提供 page、context、browser、"
                         "playwright 与 expect。用 page.goto 打开工作区 HTML 或运行中的本地服务，实际操作界面并断言。"
+                        "先查看渲染后的控件、角色和标签，再用 get_by_role 或 get_by_label 定位；按控件类型操作。"
                         "打印检查结果；断言失败返回非零退出码。每次从空白浏览器会话开始。",
             parameters={"type": "object", "properties": {
                 "code": {"type": "string", "description": "Python 源码。可直接使用完整的 Playwright 同步 API"},

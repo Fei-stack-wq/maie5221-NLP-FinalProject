@@ -402,3 +402,9 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 在项目群聊的右栏可以查看成员、打开角色档案，或点 `@` 把角色放到下一条消息的开头。窄屏的成员列表放在对话上方，可以展开。点「管理」可搜索角色、增减成员和交接群负责人。保存时核对名单版本；另一窗口已经更新过名单时，重新载入当前成员供选择。运行中的任务保留接单时的成员，历史消息保留当时的发言角色。
 
 在群聊、私聊或统一对话读到较早的消息时，点「最新消息」或按 End 键可回到最后一条消息末尾。输入消息时 End 仍用于移动文本光标。「最新消息」跟随消息区的位置，滚动到消息末尾或空对话时收起。界面参考 Zulip 按当前频道显示成员和根据消息滚动位置显示跳转按钮的交互，Studio 的成员同时是可被点名执行的角色。[Zulip 成员列表](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/buddy_list.ts#L93-L137) · [跳转按钮](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/scroll_to_bottom_button.ts#L143-L200) · [空会话与当前位置回归](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/scroll_to_bottom_button.test.cjs#L259-L295)
+
+## 从未通过的检查继续交付
+
+作者修正了一条测试后，旧失败及其原始工具回执仍可追溯。另一位成员在冻结的候选上验证原需求并签署后，宿主才能关闭相应失败。产品退修时，作者收到具体标准、证据和候选版本，改稿交回原评审人重新签署。有有效负面签署而评审附件未能公开时，宿主仍可执行退修；该附件留在隔离区。
+
+当前候选、责任人及后续动作已经明确时，负责人由已登记的任务继续分工。预算按剩余时间、步骤、动作与 tokens 重算，给真正需要的独立评审和最终交接留出份额。[错误断言的独立复核](evidence/2026-11-19-independent-check-recovery.md) · [风控退修与隔离](evidence/2026-11-19-review-revision-routing.md) · [负责人调度](evidence/2026-11-19-review-coordination.md) · [返工预算](evidence/2026-11-19-rework-budget.md)

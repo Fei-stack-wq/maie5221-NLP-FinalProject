@@ -1,6 +1,7 @@
 """Exercise provisional candidate selection, peer review and guarded promotion through Studio."""
 import ast
 import hashlib
+import json
 import unittest
 from unittest.mock import patch
 
@@ -66,6 +67,126 @@ class PrivateCandidateTest(unittest.TestCase):
             detail = finished(self.service,run["id"])
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"]=="member_report"]
         return detail,reports
+
+    def test_corrected_selector_on_first_handoff_requires_independent_frozen_product_assertion(self):
+        html = '<label for="startSelect">Start</label><select id="startSelect"><option>09:00</option></select>'
+        page = "from pathlib import Path\npage.goto(Path('booking.html').resolve().as_uri())\n"
+        wrong = page + "assert page.locator('#startInput').count() == 1"
+        corrected = page + "assert page.locator('#startSelect').count() == 1"
+        peer_code = page + "assert page.get_by_label('Start').input_value() == '09:00'"
+        def browser_scope(code):
+            return _check_key("browser " + hashlib.sha256((".\0" + ast.dump(ast.parse(code))).encode()).hexdigest())
+        bad = browser_scope(wrong)
+        unrelated = "from pathlib import Path\nassert 'A101' in Path('records.json').read_text()\nprint('PASS unrelated room')"
+        version = digest({**manifest(NEW), "booking.html": hashlib.sha256(html.encode()).hexdigest()})
+
+        def assessment(check, version=version):
+            def finding(key):
+                return {"criterion_id":key, "verdict":"passed", "reason":"The accessible booking selector has its expected value.",
+                        "evidence":[check]}
+            return tool("submit_review",candidate_version=version,
+                        results=[finding("independent_recheck"),finding("probe_" + bad)])
+
+        steps = [tool("delegate_task", assignee="builder", objective="Deliver a working meeting-room time selector.",
+                      remaining_roles=["inspector"], deliverable_paths=[PATH, "booking.html"]),
+                 write(PATH,NEW), write("booking.html",html),
+                 tool("run_browser",code=wrong), tool("run_browser",code=corrected),
+                 {"text":"Booking is complete; the first script used a guessed selector."},
+                 tool("delegate_task",assignee="inspector",objective="Independently verify booking."),
+                 tool("run_python",code=unrelated), assessment("pass:" + _check_key(_script_inputs(unrelated)[1])),
+                 tool("run_browser",code=peer_code), assessment("pass:" + browser_scope(peer_code),"0"*64),
+                 assessment("pass:" + browser_scope(peer_code)),
+                 {"text":"Independent selector verification passed."},{"text":"Delivered."}]
+        def browser(ctx, args):
+            # A deterministic tool double; the normal host still records the
+            # script, exit, candidate path, call, actor, and SHA itself.
+            self.assertEqual((ctx.sandbox.root / "booking.html").read_text(), html)
+            if args["code"] == wrong:
+                return ToolResult.failure("exit_code=1\nstderr:\nAssertionError: #startInput missing", exit_code=1)
+            self.assertIn(args["code"], (corrected, peer_code))
+            return ToolResult.success("exit_code=0\nstdout:\nPASS selector",exit_code=0)
+        with patch("miniagent.tools.run_browser", side_effect=browser):
+            detail, reports = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", reports)
+        author, independent = reports
+        self.assertFalse(author["published"])
+        self.assertTrue(author["evidence"]["observed_failure"])
+        self.assertEqual(author["author_probe_review"]["candidate_version"], version)
+        self.assertEqual(set(author["author_probe_review"]["original_calls"]), {bad})
+        self.assertEqual(independent["role"], "inspector")
+        self.assertEqual(independent["promoted_candidate"]["source_task"], author["task_id"])
+        self.assertEqual(independent["native_review"]["state"], "passed")
+        self.assertEqual((self.local / "booking.html").read_text(), html)
+        trace_file = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
+        events = [json.loads(line) for line in trace_file.read_text().splitlines()]
+        submits = [e["ok"] for e in events if e["kind"]=="tool_result" and e.get("tool")=="submit_review"]
+        self.assertEqual(submits, [False,False,True])
+        self.assertTrue(any(e["kind"]=="handoff_pending_peer" for e in events))
+
+    def test_repairing_published_candidate_retains_original_business_review_and_old_failure(self):
+        from tests.test_studio_native_review import submit as submit_public
+        read = "from pathlib import Path\nlabel = Path('delivery.txt').read_text()\n"
+        wrong = read + "assert 'Old-id: Start' in label"
+        corrected = read + "assert 'new warehouse' in label\nprint('PASS corrected destination')"
+        verified = read + "assert label.split('.')[0].endswith('new warehouse')\nprint('PASS peer destination')"
+        old_scope = _check_key(_script_inputs(wrong)[1])
+        own_scope = _check_key(_script_inputs(corrected)[1])
+        peer_scope = _check_key(_script_inputs(verified)[1])
+        findings = [{"criterion_id":"content","verdict":"passed","evidence":["file:" + PATH],"reason":"New destination confirmed."},
+                    {"criterion_id":"probe_" + old_scope,"verdict":"passed","evidence":["pass:" + peer_scope],
+                     "reason":"The old test selected an unrelated identifier; the actual destination matches."}]
+        steps = [tool("delegate_task",assignee="builder",objective="Build the label.",remaining_roles=["inspector"],
+                      deliverable_paths=[PATH]), write(PATH,OLD), {"text":"First edition delivered."},
+                 tool("delegate_task",assignee="inspector",objective="Inspect the label.", review={"candidate":"builder","criteria":[RULE]}),
+                 tool("read_lines",path=PATH),submit_public(OLD,"changes_requested",cause="product",action="Use the new warehouse."),
+                 {"text":"Old location must be corrected."},
+                 tool("delegate_task",assignee="builder",objective="Fix the destination."),
+                 write(PATH,NEW), tool("run_python",code=wrong), tool("run_python",code=corrected),
+                 {"text":"Repaired the label; my original check used the wrong selector."},
+                 tool("delegate_task",assignee="inspector",objective="Verify the new candidate."),tool("read_lines",path=PATH),
+                 tool("submit_review",candidate_version=digest(manifest(NEW)),results=[
+                     findings[0],{**findings[1],"evidence":["pass:"+own_scope]}]),
+                 tool("run_python",code=verified),tool("submit_review",candidate_version=digest(manifest(NEW)),results=findings),
+                 {"text":"Verified the product."},{"text":"Delivered."}]
+        detail, reports = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"],"completed",reports)
+        self.assertEqual([r["role"] for r in reports],["builder","inspector","builder","inspector"])
+        first, first_review, repaired, signed = reports
+        self.assertEqual(first_review["native_review"]["state"],"repair")
+        self.assertEqual(repaired["author_probe_review"]["target"],first["task_id"])
+        self.assertFalse(repaired["published"])
+        self.assertEqual([c["id"] for c in signed["native_review"]["criteria"]],["content","probe_"+old_scope])
+        self.assertEqual(signed["promoted_candidate"]["source_task"],repaired["task_id"])
+        self.assertEqual(signed["native_review"]["assessment"]["evaluator"],"inspector")
+        self.assertEqual((self.local / PATH).read_text(),NEW)
+
+    def test_qa_without_deliverables_needs_peer_other_than_product_publisher(self):
+        read = "from pathlib import Path\nvalue = Path('delivery.txt').read_text()\n"
+        wrong = read + "assert 'missing label' in value"
+        fixed = read + "assert 'new warehouse' in value\nprint('PASS actual location')"
+        peer = read + "assert value.startswith('Shipment destination: new warehouse.')\nprint('PASS frozen location')"
+        old = _check_key(_script_inputs(wrong)[1])
+        current = _check_key(_script_inputs(peer)[1])
+        steps = [tool("delegate_task",assignee="builder",objective="Write label.",remaining_roles=["inspector","lead"],
+                      deliverable_paths=[PATH]),write(PATH,NEW),{"text":"Released."},
+                 tool("delegate_task",assignee="inspector",objective="Test the existing label."),
+                 tool("run_python",code=wrong),tool("run_python",code=fixed),{"text":"The corrected location check passed."},
+                 tool("delegate_task",assignee="builder",objective="Check QA's correction."),
+                 tool("run_python",code=peer),
+                 tool("submit_review",candidate_version=digest(manifest(NEW)),results=[
+                     {"criterion_id":key,"verdict":"passed","evidence":["pass:"+current],
+                      "reason":"On the frozen label the original test asked for unrelated text."}
+                     for key in ("independent_recheck","probe_"+old)]),
+                 {"text":"Independently verified the label."},{"text":"Finished."}]
+        detail,reports = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"],"completed",reports)
+        author,qa,arbiter=reports
+        self.assertEqual(qa["deliverable_paths"],[])
+        self.assertEqual(qa["changed_files"],[])
+        self.assertEqual(qa["author_probe_review"]["reviewer"],"lead")
+        self.assertNotIn(arbiter["role"],[author["role"],qa["role"]])
+        self.assertEqual(arbiter["native_review"]["state"],"passed")
+        self.assertEqual(arbiter["changed_files"],[])
 
     def test_wording_edits_with_no_closed_check_are_routed_to_a_frozen_peer_review(self):
         first, second = "10 units confirmed for the warehouse.", "Total: 10 units confirmed for the warehouse."

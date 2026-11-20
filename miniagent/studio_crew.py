@@ -23,7 +23,7 @@ from .crew_progress import MemberProgress, _cover
 from .member_processes import managed_member_processes
 from .peer_recheck import ClosingPeerChecks
 from .project_data import PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, supported_project_file, validate_project_data
-from .rao import Budget, CONTROL_TOOLS, ErrorClass, Observation, StepPolicy, ToolCompletion, policy_messages
+from .rao import BoundHandoff, Budget, CONTROL_TOOLS, ErrorClass, Observation, PendingPeerReview, StepPolicy, ToolCompletion, policy_messages
 from .sandbox import Sandbox
 from .schemas import ToolResult
 from .studio_acceptance import build_checks
@@ -673,6 +673,15 @@ class RoomCrew:
     def _pending_probe(self):
         return next((r for r in getattr(self, "reviewer_probe_reviews", {}).values() if not r["resolved"]), None)
 
+    @staticmethod
+    def _bound_review_handoff(review):
+        if not review or review.state not in {"review", "repair"} or not (review.latest or review.probes):
+            return None
+        objective = ("按原验收反馈修订冻结候选并重新交接。" if review.state == "repair"
+                     else "对绑定的候选和未决标准独立取证并签署。")
+        return BoundHandoff(review.target, review.version, review.state, review.owner, objective,
+                            digest([len(review.visited), review.draft_task, review.peer_recheck]))
+
     def _probe_dispatch_hint(self, pending):
         if not pending:
             for product in self.native_reviews.items.values():
@@ -757,18 +766,7 @@ class RoomCrew:
             return False
         # The reviewer tree and its original product inputs are already frozen
         # by _remember_draft. Never recreate the old assertion from a summary.
-        extra = []
-        remaining = 98304 - sum(len((p["code"] + p["error"]).encode()) for p in probes.values())
-        for row in support:
-            data = _json(row).encode()
-            if len(data) > remaining:
-                continue
-            try:
-                validate_project_data("probe-support.txt", data, secret=self.settings.api_key, reject_credentials=True)
-            except ValueError:
-                continue
-            extra.append(row)
-            remaining -= len(data)
+        extra = self._transferable_probe_support(probes, support)
         implicated = {finding["criterion_id"] for finding in assessment["results"]
                       if any(r["kind"] == "failed_check" and r["scope"] in probes for r in finding["receipts"])}
         original_rules = [rule for rule in parent.criteria if rule.id in implicated]
@@ -829,6 +827,73 @@ class RoomCrew:
                           task_id=report["task_id"], parent_target=parent.target, parent_version=parent.version,
                           candidate_version=child.version, reviewer=child.reviewer, probes=probes,
                           supporting_receipts=extra, accepted_assessment=assessment)
+        return True
+
+    def _transferable_probe_support(self, probes, support):
+        extra = []
+        remaining = 98304 - sum(len((p["code"] + p["error"]).encode()) for p in probes.values())
+        for row in support:
+            data = _json(row).encode()
+            if len(data) > remaining:
+                continue
+            try:
+                validate_project_data("probe-support.txt", data, secret=self.settings.api_key, reject_credentials=True)
+            except ValueError:
+                continue
+            extra.append(row)
+            remaining -= len(data)
+        return extra
+
+    def _queue_author_probes(self, review, report, draft, support, reviewer):
+        """A corrected author check can freeze the draft for a peer, never publish it or clear a failure."""
+        probes = draft["inline_failures"]
+        support = self._transferable_probe_support(probes, support)
+        if (not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or not support or not probes
+                or probes.keys() != draft["failed_checks"].keys() or report["role"] == reviewer):
+            return False
+        files = draft["manifest"]
+        if review is None:
+            sources = set(files) & self.native_reviews.required_source_paths
+            rules = [Rule(id="independent_recheck", method="execute", description=
+                          _clip(report["acceptance_expectation"] or report["objective"], 1200))]
+            if sources:
+                rules.append(Rule(id="required_sources", method="source", description="核对用户指定文件中的核心事实及原始来源。"))
+            review = Review(report["task_id"], report["role"], reviewer, report["objective"], rules, dict(files),
+                            required_source_paths=sources)
+        if (review.kind != "product" or review.author != report["role"] or review.reviewer != reviewer
+                or review.probes or len(review.criteria) + len(probes) > 24
+                or any("probe_" + key == rule.id for key in probes for rule in review.criteria)):
+            return False
+        # A localhost URL does not identify source bytes. When the candidate has
+        # a single product HTML entry the independent browser check can compare
+        # the actual HTTP response bytes to that frozen file.
+        html = sorted(p for p in files if Path(p).suffix.lower() in {".html", ".htm"})
+        probes = {key: ({**p, "input_paths": html} if p["tool"] == "run_browser" and not p.get("input_paths")
+                        and len(html) == 1 else p) for key, p in probes.items()}
+        targets = set(draft["required"])
+        targets.update(p for probe in probes.values() for p in probe.get("input_paths", ()))
+        product = {p: files[p] for p in targets if p in files}
+        if not product:
+            return False
+        review.probes = dict(probes)
+        review.probe_support = support
+        review.probe_product_files = product
+        review.files = dict(files)
+        review.draft_task = report["task_id"]
+        review.state = "review"
+        review.host_issue = "候选已冻结，作者失败与后来检查均已留存，等待独立成员逐项签署。"
+        review.criteria.extend(Rule(id="probe_" + key, method="execute", description=
+            f"对照本次产品要求，独立执行能区分正确与错误行为的断言，核对原失败 {probe['tool_call_id']} 的原因。")
+            for key, probe in probes.items())
+        self.native_reviews.items[review.target] = review
+        draft["reviewable"] = True
+        report.setdefault("reviewable_candidate", {"task_id": report["task_id"],
+                          "candidate_version": review.version, "files_total": len(files)})
+        report["author_probe_review"] = {"target": review.target, "reviewer": reviewer,
+            "candidate_version": review.version, "original_calls": {k:p["tool_call_id"] for k,p in probes.items()},
+            "corrected_calls": [s["tool_call_id"] for s in support]}
+        self.record_event(self.run_id, "studio", "author_probe_pending", review.host_issue,
+                          task_id=report["task_id"], **report["author_probe_review"])
         return True
 
     def _finish_reviewer_probes(self, child, assessment, published, issue, changes, review_task):
@@ -953,6 +1018,7 @@ class RoomCrew:
         if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
             return closing
         native = self._next_review()
+        bound = self._bound_review_handoff(native)
         if native and native.state == "blocked":
             return StepPolicy("finalize", "独立验收未取得新证据或新工件。以 [BLOCKED] 说明尚未通过的标准：" +
                               _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
@@ -960,6 +1026,9 @@ class RoomCrew:
             return StepPolicy("coordinate", "独立验收遇到需要用户决定的业务歧义。请使用 ask_human 询问这一项：" +
                               _clip(_json(native.latest.get("results", [])), 2500),
                               frozenset({"ask_human"}), required_tool="ask_human")
+        if bound and state.scratch.get("last_host_handoff") == bound and self.last_dispatch_error:
+            return StepPolicy("finalize", "已尝试绑定的下一项分工，未取得新交接。请以 [BLOCKED] 说明："
+                              + self.last_dispatch_error, frozenset(), compact=True)
         if self._only_peer_checks_remaining() and not any(r["eligible_roles"] for r in self._pending_check_briefing()):
             return StepPolicy("finalize", "以 [BLOCKED] 说明：待复核检查没有可独立核销的其他成员。"
                               + self._peer_check_instruction(), frozenset(), compact=True)
@@ -1006,6 +1075,11 @@ class RoomCrew:
             allowed |= {"read_handoff_report"}
         if inspect_public and self.role_session and self.lead in self.role_session.saved:
             allowed |= _KNOWLEDGE_READS
+        if bound:
+            allowed = controls
+            instruction += ("\n宿主已登记下一项分工。调用 delegate_task，assignee 填 " + bound.owner
+                            + "，省略 review 和 recover_from。目标 " + bound.target + "，状态 " + bound.state
+                            + "。受委派的成员可查阅资料并核实具体问题。")
         decision = StepPolicy("coordinate", instruction, frozenset(allowed), compact=True)
         message_cost = estimate_tokens(policy_messages(state, decision)) + 768
         def input_cost(names):
@@ -1019,6 +1093,7 @@ class RoomCrew:
             return closing
         dispatch_limit = decision_input + 8192
         return StepPolicy("coordinate", instruction, allowed, compact=True,
+                          bound_handoff=bound,
                           token_reserve=0 if budget.tokens_left is None else max(self.close_tokens, budget.tokens_left - dispatch_limit),
                           seconds_reserve=self.close_seconds)
 
@@ -1129,48 +1204,67 @@ class RoomCrew:
         self.invalid_route = decision
         return self._observation(False, message)
 
-    def _allocation(self, role, planned, *, record_shares=True):
-        # Hold the final report and the remaining dispatches. If each elected
-        # member can still work, report, and correct a malformed report, leave
-        # the lead a correction too. Unused turns stay with the room.
-        peers = planned if planned is not None else set(self.profiles) - {self.lead}
-        count = len((peers | set(self.child_checks) | {role}) - (self.approved_roles - {role}))
+    def _split_budget(self, count, available_seconds):
         b = self.budget
-        available_seconds = min(b.seconds_left, self.deadline - time.monotonic())
         next_dispatch = min(14000, self.close_tokens + 2000)
         lead_retry = int(b.has_steps(4 * count + 1))
-        reserved = Budget(steps_left=None if b.steps_left is None else count + lead_retry,
-                          actions_left=None if b.actions_left is None else count, tokens_left=0 if b.tokens_left is None else self.close_tokens + (count-1)*next_dispatch,
-                          seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count-1))
-        child = Budget(steps_left=None if b.steps_left is None else (b.steps_left-reserved.steps_left)//count,
-                       actions_left=None if b.actions_left is None else (b.actions_left-reserved.actions_left)//count,
-                       tokens_left=None if b.tokens_left is None else (b.tokens_left-reserved.tokens_left)//count,
-                       seconds_left=(available_seconds-reserved.seconds_left)/count)
-        # A repeated assignment cannot borrow from an elected peer who has not
-        # started. Illustrative roles outside the elected plan receive no lease.
-        floors = {"steps_left": 6, "actions_left": 8, "seconds_left": 30}
-        floors = {field: floor for field, floor in floors.items() if getattr(b, field) is not None}
-        if b.tokens_left is not None:
-            floors["tokens_left"] = 28000
-        for peer in ((planned or set()) | set(self.child_checks)) - self.started_roles - {role}:
-            if record_shares and peer not in self.untapped_shares and not child.exhausted:
-                # A meaningful minimum for each elected peer. The unreserved
-                # balance can fund a substantive implementation after discovery.
-                self.untapped_shares[peer] = child.model_copy(update={
-                    f: min(getattr(child, f), max(minimum, math.ceil(.6 * getattr(child, f))))
-                    for f,minimum in floors.items()
-                })
-        unstarted = [v for k, v in self.untapped_shares.items() if k != role]
-        for field in floors:
-            current = available_seconds if field == "seconds_left" else getattr(b, field)
-            protected = sum(getattr(v, field) for v in unstarted)
-            entitlement = getattr(self.untapped_shares[role], field) if role in self.untapped_shares else 0
-            maximum = current - getattr(reserved, field) - protected
-            setattr(child, field, min(max(getattr(child, field), entitlement), maximum))
-        return child, reserved
+        reserved = Budget(
+            steps_left=None if b.steps_left is None else count + lead_retry,
+            actions_left=None if b.actions_left is None else count,
+            tokens_left=0 if b.tokens_left is None else self.close_tokens + (count - 1) * next_dispatch,
+            seconds_left=self.close_seconds + min(self.close_seconds / 2, 15) * (count - 1),
+        )
+        share = Budget(
+            steps_left=None if b.steps_left is None else (b.steps_left - reserved.steps_left) // count,
+            actions_left=None if b.actions_left is None else (b.actions_left - reserved.actions_left) // count,
+            tokens_left=None if b.tokens_left is None else (b.tokens_left - reserved.tokens_left) // count,
+            seconds_left=(available_seconds - reserved.seconds_left) / count,
+        )
+        return share, reserved
 
-    def _dispatch_limit_reached(self):
-        return self.budget.steps_left is not None and len(self.handoffs) >= 16
+    def _allocation(self, role, planned, review=None, recovery=False, *, record_shares=True):
+        available_seconds = min(self.budget.seconds_left, self.deadline - time.monotonic())
+        addressed = set(self.thread.get("addressed_roles", []))
+        if self.direct:
+            addressed.discard(self.lead)
+        required = (set(self.child_checks) | addressed) - self.approved_roles
+        required.add(role)
+        if review and review.state == "repair":
+            # A changed candidate must return to its bound independent reviewer,
+            # even when that reviewer has already published on the old version.
+            required.add(review.reviewer)
+        optional = set(planned or ()) - self.approved_roles - self.covered_roles - required
+        participants = required if review or recovery else required | optional
+        child, reserved = self._split_budget(len(participants), available_seconds)
+        if participants != required and (child.exhausted or not child.has_tokens(1000)):
+            participants = required
+            child, reserved = self._split_budget(len(required), available_seconds)
+
+        # A first estimate is a claim on unused room capacity, not prepaid usage.
+        # Clamp every peer's claim to its share of the CURRENT available balance.
+        waiting = ((participants - self.started_roles) | required) - {role}
+        floors = {"steps_left": 6, "actions_left": 8, "seconds_left": 30, "tokens_left": 28000}
+        finite = {field: floor for field, floor in floors.items() if getattr(child, field) is not None}
+        protected = {}
+        if not child.exhausted and child.has_tokens(1000):
+            for peer in waiting:
+                previous = self.untapped_shares.get(peer)
+                claim = child.model_copy()
+                for field, minimum in finite.items():
+                    share = getattr(child, field)
+                    estimate = getattr(previous, field) if previous else max(minimum, math.ceil(.6 * share))
+                    setattr(claim, field, min(share, estimate))
+                protected[peer] = claim
+
+            entitlement = self.untapped_shares.get(role)
+            if entitlement:
+                for field in finite:
+                    balance = available_seconds if field == "seconds_left" else getattr(self.budget, field)
+                    remaining = balance - getattr(reserved, field) - sum(getattr(v, field) for v in protected.values())
+                    setattr(child, field, min(max(getattr(child, field), getattr(entitlement, field)), remaining))
+        if record_shares:
+            self.untapped_shares = protected
+        return child, reserved
 
     def _eligible_repairs(self, origin):
         elected = list(dict.fromkeys([*self.plan_order, *self.child_checks]))
@@ -1178,7 +1272,7 @@ class RoomCrew:
         for role in elected:
             if role == origin or (self.project_version, origin, role) in self.routed_repairs:
                 continue
-            allocation, _ = self._allocation(role, self.planned, record_shares=False)
+            allocation, _ = self._allocation(role, self.planned, recovery=True, record_shares=False)
             if not allocation.exhausted and allocation.has_tokens(1000):
                 eligible.append(role)
         return sorted(eligible, key=lambda r: r in self.started_roles)
@@ -1187,7 +1281,7 @@ class RoomCrew:
         draft = self.private_drafts.get(role, {})
         paths = draft.get("required") or payload.get("deliverable_paths") or []
         eligible = [peer for peer in self._eligible_repairs(role) if peer != self.lead or paths]
-        if not eligible or self.should_cancel() or self._dispatch_limit_reached():
+        if not eligible or self.should_cancel():
             self.dispatch_ended = reason
             return self._observation(False, reason)
         if role not in self.refused_retry:
@@ -1424,6 +1518,8 @@ class RoomCrew:
             paths = sorted({_relative_name(path) for path in requested_paths})
         except ValueError:
             return self._observation(False, "deliverable_paths 中有无效的相对路径。")
+        if review and review.state == "review" and review.revision_reports:
+            paths = sorted(set(paths) | review.revision_reports)
         for path in paths:
             if (not supported_project_file(path, self.extensions) or any(s.startswith(".") for s in path.split("/"))
                     or any(s in PROJECT_CACHE_DIRS for s in Path(path).parts[:-1])):
@@ -1475,17 +1571,21 @@ class RoomCrew:
                 return self._decline_retry(role, message, payload)
             return self._observation(False, message)
         self.approved_roles.discard(role)
-        allocated, reserved = self._allocation(role, plan)
-        if self._dispatch_limit_reached() or allocated.exhausted or not allocated.has_tokens(1000) or self.should_cancel():
-            if role in self.started_roles and self.untapped_shares and not self._dispatch_limit_reached() and not self.should_cancel():
-                return self._decline_retry(role, "其他计划成员的额度仍被保留。本成员无法继续重试，"
-                                           "请给其他成员分工，需要时使用 recover_from 接手草稿。", payload)
-            self.dispatch_ended = "已无委派预算，或本轮已被取消。"
+        allocated, reserved = self._allocation(role, plan, review, peer_check or draft is not None)
+        if self.should_cancel():
+            self.dispatch_ended = "本轮已取消。"
+            return self._observation(False, self.dispatch_ended)
+        if allocated.exhausted or not allocated.has_tokens(1000):
+            remaining = self.budget.model_dump()
+            remaining["seconds_left"] = max(0, min(remaining["seconds_left"], self.deadline - time.monotonic()))
+            self.dispatch_ended = "已无委派预算。剩余额度无法同时安排这项分工和负责人收尾。"
+            self.record_event(self.run_id, "studio", "dispatch_budget_exhausted", self.dispatch_ended,
+                              task_id=self.run_id, recipient=role, remaining=remaining, reserved=reserved.model_dump(),
+                              allocation=allocated.model_dump(), review_state=review.state if review else None)
             return self._observation(False, self.dispatch_ended)
         self.routing_denied = False
         self.invalid_route = None
         self.started_roles.add(role)
-        self.untapped_shares.pop(role, None)
         dispatch_started = time.monotonic()
         if review:
             if review.publication and review.target not in self.native_reviews.items:
@@ -1871,8 +1971,30 @@ class RoomCrew:
                     return None
             return progress.blocked_reason()
 
+        def author_probe_reviewer():
+            # On an existing repair keep the original owner of the review and
+            # its product standards. Never let an inspector decide their own probe.
+            if (session or self.read_only or progress.pending_paths() or self.should_cancel()
+                    or not progress.project_versions() or not progress.corrected_probe_support()):
+                return None
+            if review:
+                return review.reviewer if review.kind == "product" and not review.probes and review.author == role else None
+            # A QA member operating an existing delivery owns the bad check,
+            # not the product. Its original publisher cannot arbitrate it either.
+            paths = {p for probe in progress.inline_failures().values() for p in probe.get("input_paths", ())}
+            if not paths:
+                paths = set(required) or set(original)
+            owners = {self.native_reviews.path_candidates[p][0] for p in paths if p in self.native_reviews.path_candidates}
+            excluded = {r["role"] for r in self.reports if r["task_id"] in owners}
+            return next((peer for peer in self._eligible_repairs(role) if peer not in excluded), None)
+
+        author_handoff = None
+
         def preflight_publication():
+            nonlocal author_handoff
             issue = handoff_issue()
+            if issue and (author_handoff := author_probe_reviewer()):
+                return PendingPeerReview("原检查失败，已有后续断言在同一候选上正常完成。保留失败及修订回执，转独立成员裁决。")
             if issue or private:
                 return issue
             try:
@@ -1985,6 +2107,19 @@ class RoomCrew:
             except (SnapshotError, OSError) as exc:
                 issue = "项目快照发布失败：" + str(exc)
         published = bool(not issue and publishable)
+        product_changes = review.required_product_changes(assessment) if review and not self.should_cancel() else []
+        if product_changes and not published and not private:
+            # A signed rejection belongs to its frozen product. Failing to
+            # publish the reviewer's separate tree does not revoke that verdict.
+            current = {}
+            try:
+                copy_project(self.path, self.lead, None, self.extensions, secret=self.settings.api_key, manifest=current)
+                mismatch = manifest_issue(review.files, current, secret=self.settings.api_key)
+            except (SnapshotError, OSError) as exc:
+                mismatch = str(exc)
+            if mismatch:
+                product_changes = []
+                issue = "独立评审的公共候选已变化或无法核实，此次签署不能委派返工：" + mismatch
         if published:
             if not private:
                 self.private_drafts.pop(role, None)
@@ -2017,8 +2152,10 @@ class RoomCrew:
                 reason = ("hard_check", review.version, issue)
                 review.state = "blocked" if reason in review.visited else "repair"
                 review.visited.add(reason)
-            elif session and assessment and (published or assessment["verdict"] != "passed" and not issue):
+            elif session and assessment and (published or product_changes or assessment["verdict"] != "passed" and not issue):
                 review.apply(assessment, self._review_answers())
+                if product_changes:
+                    review.revision_reports.update(paths)
             elif not session and published:
                 review.repaired(public_versions, [c["path"] for c in changes])
             elif not session and not private:
@@ -2067,7 +2204,10 @@ class RoomCrew:
                 if disputed:
                     queued_probe_review = self._queue_reviewer_probes(
                         review, report, self.private_drafts[role], assessment, progress.probe_support())
-            if private_repair:
+                elif reviewer := author_handoff or (text.startswith("[BLOCKED]") and author_probe_reviewer()):
+                    queued_probe_review = self._queue_author_probes(
+                        review, report, self.private_drafts[role], progress.corrected_probe_support(), reviewer)
+            if private_repair and not queued_probe_review:
                 replacement = self.private_drafts[role]
                 if not issue and replacement["reviewable"] and replacement["manifest"] != review.files:
                     review.host_issue = ""
@@ -2076,6 +2216,12 @@ class RoomCrew:
                     review.state = "review"
                 else:
                     review.state = "blocked"
+        revision_requested = bool(product_changes and review.state == "repair")
+        if revision_requested:
+            report = {"review_action":{"state":"repair", "target":review.target, "candidate_version":review.version,
+                                       "assignee":review.author, "reviewer":review.reviewer,
+                                       "criteria":product_changes},
+                      **report}
         if review:
             if review.kind == "reviewer_probe":
                 self._finish_reviewer_probes(review, assessment, published, issue, changes, record.task_id)
@@ -2084,13 +2230,13 @@ class RoomCrew:
                 report["native_review"]["historical_execution_receipts"] = list(session.execution_history.values())
         self.reports.append(report)
         private_outcome = queued_probe_review or private and not issue and (assessment is not None or private_repair and review.state == "review")
-        disposition = "published" if published else "assessed" if private_outcome and session else (
+        disposition = "published" if published else "assessed" if revision_requested or private_outcome and session else (
             "awaiting_review" if private_outcome else "blocked")
         self.record_event(self.run_id, role, "member_report", text + ("\n" + issue if issue and issue != text else ""),
                           task_id=record.task_id, status=status, published=published,
                           disposition=disposition, handoff=report, usage=usage, process_cleanup=process_cleanup,
                           artifacts=artifacts)
-        return self._observation(bool(published or private_outcome), _json(report))
+        return self._observation(bool(published or revision_requested or private_outcome), _json(report))
 
     @staticmethod
     def _clarifications(events):

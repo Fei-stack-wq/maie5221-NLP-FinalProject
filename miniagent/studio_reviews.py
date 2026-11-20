@@ -118,6 +118,7 @@ class Review:
     probe_reference_inputs: dict = field(default_factory=dict)
     comparison_targets: set[str] = field(default_factory=set)
     peer_recheck: dict = field(default_factory=dict)
+    revision_reports: set[str] = field(default_factory=set)
 
     def compare_with(self, reference):
         return (self.comparison_targets or {p for p, sha in self.files.items() if sha}) - {reference}
@@ -143,6 +144,15 @@ class Review:
     def owner(self):
         return self.author if self.state == "repair" else self.reviewer
 
+    def required_product_changes(self, assessment):
+        if (not assessment or self.kind != "product" or assessment["verdict"] != "changes_requested"
+                or assessment["target"] != self.target or assessment["candidate_version"] != self.version
+                or assessment["evaluator"] != self.reviewer):
+            return []
+        required = {r.id for r in self.criteria if r.required}
+        return [f["criterion_id"] for f in assessment["results"]
+                if f["criterion_id"] in required and f["verdict"] == "changes_requested" and f["cause"] == "product"]
+
     def verification_gaps(self):
         if self.state != "review" or self.latest.get("candidate_version") != self.version:
             return []
@@ -157,6 +167,7 @@ class Review:
                 "objective":self.objective, "criteria":[c.model_dump(exclude_none=True) for c in self.criteria],
                 "findings":self.latest.get("results", []), "private_candidate_task":self.draft_task,
                 "host_issue":self.host_issue, **({"publication":self.publication} if self.publication else {}),
+                **({"review_report_paths":sorted(self.revision_reports)} if self.revision_reports else {}),
                 **({"peer_recheck":self.peer_recheck} if self.peer_recheck.get("candidate_version") == self.version else {})}
 
     def briefing(self):
@@ -746,20 +757,25 @@ class ReviewSession:
                 missing.append({"tool":"read_lines"})
             if missing:
                 needs[rule.id] = missing
-            if self.item.kind == "reviewer_probe" and rule.id.startswith("probe_") and rule.method == "execute":
+            if self.item.probe_product_files and rule.id.startswith("probe_") and rule.method == "execute":
                 if not any(self._product_assertion(r, rule) for r in self.receipts.values()):
                     references = self.item.probe_reference_inputs.get(rule.id, {})
                     needs[rule.id] = [{"tool":"run_python", "paths":sorted(self.item.probe_product_files.keys() | references.keys()),
-                        "reason":"断言须检查冻结产品实际数据；也可用 run_browser 打开冻结本地 file URL 后对该 page 执行 expect/assert。无关 PASS 不裁决原失败。"},
+                        "reason":"断言须检查冻结产品实际数据。run_browser 可打开冻结 file URL；本地后端应用可先核对 page.goto 返回的 response.body() 与冻结 HTML 字节，再实操功能并断言。"},
                         {"tool":"run_browser"}]
         return needs
 
     def _product_assertion(self, receipt, rule):
         references = self.item.probe_reference_inputs.get(rule.id, {})
+        probe = self.item.probes.get(rule.id.removeprefix("probe_"), {})
+        target_paths = probe.get("input_paths", ()) if self.item.kind == "product" else ()
+        products = {p: sha for p, sha in self.item.probe_product_files.items()
+                    if not target_paths or p in target_paths}
+        inputs = receipt.get("browser_inputs", {}) if self.item.kind == "product" and probe.get("tool")=="run_browser" else receipt.get("asserted_inputs", {})
         return (receipt.get("kind") == "passed_check" and receipt.get("asserted")
                 and references.items() <= receipt.get("asserted_inputs", {}).items()
-                and any(path not in references and self.item.probe_product_files.get(path) == sha
-                        for path, sha in receipt.get("asserted_inputs", {}).items()))
+                and any(path not in references and products.get(path) == sha
+                        for path, sha in inputs.items()))
 
     def guidance(self, *, show_examples=True):
         # Avoid repeatedly projecting every URL or duplicating the raw records.
@@ -833,6 +849,13 @@ class ReviewSession:
                  "原评审后来取得的实际回执（仅供对照，不能代替你的独立断言）：" +
                  json.dumps(self.item.probe_support, ensure_ascii=False)
                  if self.item.kind == "reviewer_probe" else "") +
+                ("。作者的后续实测仅供定位，每项 probe 须由你针对其原失败涉及的冻结产物另行执行断言并说明结论。"
+                 "测试本地后端网页时，可在 run_browser 用 response = page.goto(本机地址)，"
+                 "assert response.body() == Path('实际入口.html').read_bytes() 将真实 HTTP 响应绑定到冻结页面，"
+                 "随后操作原先失败的控件并以 assert/expect 验证业务结果。"
+                 "候选文件及后续回执：" + json.dumps({"files": self.item.probe_product_files,
+                 "support": self.item.probe_support}, ensure_ascii=False)
+                 if self.item.probe_product_files and self.item.kind == "product" else "") +
                 ("。候选为作者的冻结私有版本。请在临时目录放置探针，保留项目文件不变，"
                  "重新验证遗留的指定检查。确认通过后宿主将发布已验收的作者版本。" if self.item.draft_task else ""))
 
@@ -876,7 +899,7 @@ class ReviewSession:
             if (rule.id.removeprefix("probe_") in self.item.probes and rule.method == "execute" and
                     not any(r["kind"] == "passed_check" and r.get("asserted") for r in receipts)):
                 raise ValueError("原临时探针的独立复核需要实际断言结果，进程正常退出只能证明运行完成。")
-            if (self.item.kind == "reviewer_probe" and rule.id.startswith("probe_") and rule.method == "execute"
+            if (self.item.probe_product_files and rule.id.startswith("probe_") and rule.method == "execute"
                     and not any(self._product_assertion(r, rule) for r in receipts)):
                 references = self.item.probe_reference_inputs.get(rule.id, {})
                 hint = "，同时取值于绑定的对照原件 " + "、".join(references) if references else ""

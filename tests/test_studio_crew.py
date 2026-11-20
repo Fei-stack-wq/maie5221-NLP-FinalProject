@@ -343,6 +343,11 @@ class StudioCrewTest(unittest.TestCase):
         self.assertEqual(limited["run"]["status"], "failed")
         self.assertEqual(len(limited["tasks"]), 1)
         self.assertIn("已无委派预算", str(p.requests[1][0]))
+        [denial] = [e for e in limited["room_events"] if e["kind"] == "dispatch_budget_exhausted"]
+        self.assertEqual(denial["recipient"], "dev")
+        self.assertEqual(denial["remaining"]["steps_left"], 1)
+        self.assertEqual(denial["allocation"]["steps_left"], 0)
+        self.assertEqual(denial["reserved"]["steps_left"], 1)
 
     def test_elected_plan_protects_other_members_and_closes_from_public_receipts(self):
         group = roster("lead", "writer", "reviewer", "unused")
@@ -589,7 +594,7 @@ class StudioCrewTest(unittest.TestCase):
                 if published_in_between:
                     self.assertNotIn("draft.md", str(provider.requests[5][0][-1]))
 
-    def test_rephrased_stalled_retries_preserve_peer_lease_and_allow_explicit_repair(self):
+    def test_rephrased_stalled_retries_allow_explicit_peer_repair_and_keep_user_checks_bound(self):
         for role_bound in [False, True]:
             with self.subTest(role_bound=role_bound):
                 script = [tool("delegate_task", assignee="writer", objective="Build source and guide",
@@ -608,7 +613,7 @@ class StudioCrewTest(unittest.TestCase):
                 assignments = [e for e in detail["room_events"] if e["kind"]=="assignment"]
                 self.assertEqual([e["recipient"] for e in assignments], ["writer", "writer", "review"])
                 floor = assignments[0]["protected_peer_shares"]["review"]
-                self.assertEqual(floor, assignments[1]["protected_peer_shares"]["review"])
+                self.assertNotIn("review", assignments[1]["protected_peer_shares"])
                 for dim in ("steps_left","tokens_left","actions_left"):
                     self.assertGreaterEqual(assignments[-1]["allocation"][dim],floor[dim])
                 self.assertEqual(assignments[-1]["recover_from"], "writer")
@@ -640,16 +645,18 @@ class StudioCrewTest(unittest.TestCase):
         self.assertEqual({f["path"] for f in reports[-1]["handoff"]["changed_files"]},
                          {"main.go","view.ts","tsconfig.json","guide.md"})
 
-    def test_runtime_routes_exhausted_worker_to_first_elected_peer_with_real_failed_check(self):
+    def test_author_can_retry_real_failed_check_before_elected_peers_with_finite_steps(self):
         check = "from pathlib import Path\nassert Path('app.py').read_text() == 'print(1)\\n'\nprint('value correct')"
         script = [tool("delegate_task", assignee="dev", objective="Deliver the application",
                        remaining_roles=["verifier","release"], deliverable_paths=["app.py"]),
                   write("app.py", "print(2)\n"), tool("run_python",code=check),
                   tool("read_file",path="app.py"), tool("read_file",path="app.py"),
                   {"text":"[BLOCKED] The actual value assertion failed."},
-                  assign("dev","Fix the actual value"), assign("dev","Please retry the fix"),
+                  assign("dev","Fix the actual value"),
                   write("app.py","print(1)\n"), tool("run_python",code=check),
                   {"text":"The original assertion passed on the repaired application."},
+                  assign("verifier","Inspect the corrected value"), tool("read_file",path="app.py"),
+                  {"text":"Inspected the corrected source."},
                   assign("release","Package the verified application"), tool("read_file",path="app.py"),
                   {"text":"Reusable source available."}, {"text":"Application delivered."}]
         detail,_ = self.execute(script, roster("lead", "dev", "release", "verifier"), objective="Build checked app",
@@ -659,11 +666,10 @@ class StudioCrewTest(unittest.TestCase):
         events = detail["room_events"]
         assignments = [e for e in events if e["kind"]=="assignment"]
         self.assertEqual([(e["role"],e["recipient"]) for e in assignments],
-                         [("lead","dev"),("studio","verifier"),("lead","release")])
-        [reroute] = [e for e in events if e["kind"]=="runtime_reroute"]
-        self.assertEqual([reroute["requested"],reroute["recipient"],reroute["recover_from"]],["dev","verifier","dev"])
-        self.assertEqual([e["published"] for e in events if e["kind"]=="member_report"],[False,True,True])
-        self.assertEqual(len(detail["tasks"]),4)
+                         [("lead","dev"),("lead","dev"),("lead","verifier"),("lead","release")])
+        self.assertEqual(assignments[1]["recover_from"],"dev")
+        self.assertEqual([e["published"] for e in events if e["kind"]=="member_report"],[False,True,True,True])
+        self.assertEqual(len(detail["tasks"]),5)
 
     def test_member_retains_real_source_and_verification_tools_while_writing_survey(self):
         group = roster("lead","writer")
@@ -715,6 +721,7 @@ class StudioCrewTest(unittest.TestCase):
         room = RoomCrew.__new__(RoomCrew)
         room.budget = Budget(steps_left=99,tokens_left=995000,actions_left=395,seconds_left=3590)
         room.child_checks,room.approved_roles,room.started_roles,room.untapped_shares = {},set(),set(),{}
+        room.direct,room.thread,room.covered_roles = False,{},set()
         room.deadline,room.close_tokens,room.close_seconds = time.monotonic()+3590,12000,60
         plan = {"builder","review","release"}
         first,reserve = room._allocation("builder",plan)

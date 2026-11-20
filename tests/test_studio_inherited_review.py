@@ -165,9 +165,12 @@ class InheritedReviewTest(unittest.TestCase):
             "evidence":["file:"+FILE], "cause":"product", "action":"Correct the dispatch day."}])
         prior, _ = self.turn([tool("delegate_task",assignee="checker",objective="Verify dispatch day.",
                 review={"candidate":FILE, "criteria":[rule]}, remaining_roles=[]), tool("read_file", path=FILE),
-            failed, {"text":"The delivery day is incorrect."}, {"text":"[BLOCKED] Awaiting the correction."}],
+            failed, {"text":"The delivery day is incorrect."},
+            tool("delegate_task", assignee="writer", objective="Correct the confirmed dispatch day."),
+            {"text":"[BLOCKED] I could not supply a corrected dispatch."},
+            {"text":"[BLOCKED] No revised version was published."}],
             reply(parent,"lead"))
-        report, = [e["handoff"] for e in prior["room_events"] if e["kind"] == "member_report"]
+        report, = [e["handoff"] for e in prior["room_events"] if e["kind"] == "member_report" and e["role"] == "checker"]
         self.assertEqual(report["native_review"]["state"], "repair")
         last, provider = self.turn([self.review(FILE), {"text":"[BLOCKED] Awaiting the corrected version."}],
                                    reply(prior["run"]["id"], "lead"), required_source_review_paths=[FILE])

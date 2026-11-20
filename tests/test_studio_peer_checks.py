@@ -35,7 +35,6 @@ class PeerChecksTest(unittest.TestCase):
         room.assignment_results, room.untapped_shares = {}, {}
         room.started_roles, room.nested_seconds = set(), 0
         room.should_cancel = lambda: False
-        room._dispatch_limit_reached = lambda: False
         room._allocation = lambda *_: (Budget.from_limits(room.settings.limits), Budget.from_limits(room.settings.limits))
         room._dispatch = Mock(return_value=Observation(step_id="step", source="delegate", ok=True, content="delegated"))
         room.record_event = Mock()

@@ -39,7 +39,7 @@ from .config import Limits
 from .providers import DeepSeekProvider, Provider
 from .sandbox import Sandbox, SandboxError
 from .studio_reviews import REVIEW_REQUEST_SCHEMA
-from .schemas import LLMResponse, RequestAttempts, ToolResult, ToolSpec, Usage, UsageSource
+from .schemas import LLMResponse, RequestAttempts, ToolCall, ToolResult, ToolSpec, Usage, UsageSource
 from .tools import ToolContext, ToolRegistry
 
 
@@ -319,6 +319,13 @@ class RAOState(BaseModel):
 
 
 @dataclass(frozen=True)
+class PendingPeerReview:
+    """End one member's attempt with its work still private pending adjudication."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class ToolCompletion:
     """Host-authorized final text derived from authenticated tool receipts."""
 
@@ -344,6 +351,18 @@ class WorkCheckpoint:
 
 
 @dataclass(frozen=True)
+class BoundHandoff:
+    """A workflow transition whose owner and inputs have already been decided."""
+
+    target: str
+    version: str
+    state: str
+    owner: str
+    objective: str
+    evidence_revision: str
+
+
+@dataclass(frozen=True)
 class StepPolicy:
     """Host-selected request mode. An empty allowlist requires a text response."""
 
@@ -356,8 +375,11 @@ class StepPolicy:
     allowed_write_paths: frozenset[str] | None = None
     required_tool: str | None = None
     reviewed_delivery: tuple[dict, ...] = ()
+    bound_handoff: BoundHandoff | None = None
 
     def __post_init__(self) -> None:
+        if self.bound_handoff and "delegate_task" not in (self.allowed_tools or ()):
+            raise ValueError("a bound handoff must be authorized to delegate")
         if self.required_tool is not None and self.required_tool not in (self.allowed_tools or ()):
             raise ValueError("required_tool must be in the allowed tool set")
         if self.token_reserve < 0:
@@ -420,6 +442,7 @@ class StepRecord(BaseModel):
     request_id: str | None = None
     recoverable_output_length: bool = False
     unstructured_tool_call: bool = False
+    host_handoff: dict[str, str] | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -1053,7 +1076,7 @@ class RAOUnit:
              allowed_tools: frozenset[str] | None = None, token_reserve: int = 0,
              request_seconds: float | None = None,
              allowed_write_paths: frozenset[str] | None = None,
-             required_tool: str | None = None) -> StepRecord:
+             required_tool: str | None = None, bound_handoff: BoundHandoff | None = None) -> StepRecord:
         """完整的一步：Reason → Act → Observe，并把观察追加进历史。"""
         started = time.perf_counter()
         tool_deadline = time.monotonic() + min(budget.seconds_left, request_seconds
@@ -1089,6 +1112,7 @@ class RAOUnit:
         protocol_error = decision.protocol_error or envelope_error
         cancelled = bool(self.should_cancel and self.should_cancel())
         budget_overrun = not budget.has_tokens(0) or budget.seconds_left <= 0
+        host_handoff = None
         if protocol_error or cancelled or budget_overrun:
             terminate = (ErrorClass.T_CANCEL if cancelled else ErrorClass.T_BUDGET
                          if budget_overrun else ErrorClass.T_PROTOCOL)
@@ -1110,14 +1134,44 @@ class RAOUnit:
                 )
                 observations.append(obs)
                 state.history.append(obs.to_message(call["id"]))
+        elif (bound_handoff and "delegate_task" in (allowed_tools or ())
+              and bound_handoff != state.scratch.get("last_host_handoff")
+              and (decision.kind == "answer" or (decision.actions and
+                   any(a.tool not in {"delegate_task", "ask_human"} for a in decision.actions)))):
+            # Keep the provider's actual envelope intact. Pair any superseded
+            # requests before recording a separately identified runtime action.
+            for call in (message or {}).get("tool_calls", []):
+                skipped = Observation(step_id=f"{state.task_id}:s{state.step_index}",
+                                      tool_call_id=call["id"], source=call["function"]["name"],
+                                      ok=False, error_class=ErrorClass.A_SKIPPED,
+                                      content="已有绑定的分工，本次请求由宿主交接取代。")
+                observations.append(skipped)
+                state.history.append(skipped.to_message(call["id"]))
+            action = Action(id="host_" + uuid.uuid4().hex, tool="delegate_task",
+                            arguments={"assignee": bound_handoff.owner, "objective": bound_handoff.objective})
+            host_handoff = {"target": bound_handoff.target, "version": bound_handoff.version,
+                            "state": bound_handoff.state, "owner": bound_handoff.owner, "call_id": action.id}
+            state.scratch["last_host_handoff"] = bound_handoff
+            state.history.append({"role": "user", "content": "[宿主调度] 已登记的验收决定需要下一位成员执行。"})
+            handoff_call = ToolCall(id=action.id, name=action.tool, arguments=action.arguments)
+            state.history.append(LLMResponse(content_is_null=True, reasoning_content="",
+                                             tool_calls=[handoff_call]).to_assistant_message())
+            decision = Decision(kind="act", actions=[action])
+            kind, dispatched, terminate = self.act(state, decision, budget, allowed_tools, token_reserve,
+                                                   allowed_write_paths, tool_deadline)
+            observations.extend(dispatched)
         elif decision.kind != "answer":
             kind, observations, terminate = self.act(state, decision, budget, allowed_tools, token_reserve,
                                                     allowed_write_paths, tool_deadline)
 
-        failed = [obs for obs in observations if not obs.ok]
+        # Superseded proposals stay in the transcript for protocol pairing.
+        # The step verdict belongs to the action that the runtime executed.
+        outcomes = dispatched if host_handoff else observations
+        failed = [obs for obs in outcomes if not obs.ok]
         return StepRecord(
             step=state.step_index,
             decision_kind=kind,
+            host_handoff=host_handoff,
             tool_names=[obs.source for obs in observations],
             observations=observations,
             ok=not failed,

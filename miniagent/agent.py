@@ -29,6 +29,7 @@ from .providers import Provider, ProviderError, provider_configuration
 from .rao import (
     Budget,
     ErrorClass,
+    PendingPeerReview,
     RAO_SYSTEM_SUFFIX,
     RAOState,
     RAOUnit,
@@ -130,7 +131,7 @@ class Agent:
         *,
         conversation_context: str = "",
         system_prompt: str | None = None,
-        before_answer: Callable[[], str | None] | None = None,
+        before_answer: Callable[[], str | PendingPeerReview | None] | None = None,
         step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
         preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
         tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
@@ -449,6 +450,7 @@ class Agent:
                         state, budget, request_history=projection.messages, max_output_tokens=request_output_limit,
                         allowed_tools=policy.allowed_tools, token_reserve=policy.token_reserve,
                         allowed_write_paths=policy.allowed_write_paths, required_tool=policy.required_tool,
+                        bound_handoff=policy.bound_handoff,
                         request_seconds=budget.seconds_left - policy.seconds_reserve if step_policy else None,
                     )
                 except ProviderError as exc:
@@ -596,6 +598,11 @@ class Agent:
                     reason = self.sandbox.command_sessions.pending_reason()
                     if not reason and before_answer is not None:
                         reason = before_answer()
+                    if isinstance(reason, PendingPeerReview):
+                        status, error = "error", reason.reason
+                        if self.tracer:
+                            self.tracer.event("handoff_pending_peer", **identity, step=record.step, reason=error)
+                        break
                     if reason:
                         # An active group worker can correct the reported gate.
                         # A final text-only checkpoint cannot acquire evidence.
@@ -779,6 +786,8 @@ class Agent:
     def _trace_step(self, identity: dict, record: StepRecord, request_output_limit: int) -> None:
         if not self.tracer:
             return
+        if record.host_handoff:
+            self.tracer.event("bound_handoff_dispatched", **identity, step=record.step, **record.host_handoff)
         self.tracer.event(
             "step",
             **identity,

@@ -207,7 +207,7 @@ def _asserted_inputs(code: str) -> set[str]:
     return checked
 
 
-def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
+def _browser_asserted_inputs(code: str, root: Path, cwd: str, document_sha=None) -> set[str]:
     """Bind direct, successful page expectations to a local frozen entry point.
 
     Only top-level navigation and assertions qualify. An arbitrary server URL,
@@ -220,6 +220,7 @@ def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
     except (SyntaxError, ValueError, RecursionError):
         return set()
     entry, checked = None, set()
+    response_name = None
     navigation = {"goto", "set_content", "click", "dblclick", "tap", "press", "type", "fill",
                   "check", "uncheck", "set_checked", "select_option", "set_input_files", "dispatch_event",
                   "hover", "drag_to", "evaluate", "evaluate_handle", "add_script_tag", "go_back",
@@ -237,9 +238,18 @@ def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
             return root / cwd / node.args[0].value
         return None
 
+    addresses = {}
     for statement in tree.body:
-        expr = statement.value if isinstance(statement, ast.Expr) else None
+        assigned_name = (statement.targets[0].id if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                         and isinstance(statement.targets[0], ast.Name) else None)
+        expr = statement.value if isinstance(statement, (ast.Expr, ast.Assign)) else None
         call = expr if isinstance(expr, ast.Call) else None
+        if assigned_name:
+            addresses.pop(assigned_name, None)
+            if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+                addresses[assigned_name] = expr.value
+            if assigned_name == response_name:
+                response_name = None
         anchored = False
         if call and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
             if call.func.value.id == "page" and call.func.attr in {"goto", "set_content"}:
@@ -255,15 +265,38 @@ def _browser_asserted_inputs(code: str, root: Path, cwd: str) -> set[str]:
         if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                and node.func.attr in navigation for node in ast.walk(statement)):
             checked.clear()
+            response_name = None
             if not anchored:
                 entry = None
+            if (assigned_name and call and isinstance(call.func, ast.Attribute) and call.func.attr == "goto"
+                    and isinstance(call.func.value, ast.Name) and call.func.value.id == "page" and call.args):
+                arg = call.args[0]
+                address = arg.value if isinstance(arg, ast.Constant) else addresses.get(arg.id) if isinstance(arg, ast.Name) else None
+                if isinstance(address, str):
+                    url = urlsplit(address)
+                    if url.scheme in {"http", "https"} and url.hostname in {"localhost", "127.0.0.1", "::1"}:
+                        response_name = assigned_name
         assertion = statement.test if isinstance(statement, ast.Assert) else None
+        if response_name and isinstance(assertion, ast.Compare) and len(assertion.ops) == 1 and isinstance(assertion.ops[0], ast.Eq):
+            pair = (assertion.left, assertion.comparators[0])
+            for response, source in (pair, pair[::-1]):
+                if (isinstance(response, ast.Call) and isinstance(response.func, ast.Attribute) and response.func.attr == "body"
+                        and isinstance(response.func.value, ast.Name) and response.func.value.id == response_name
+                        and not response.args and isinstance(source, ast.Call) and isinstance(source.func, ast.Attribute)
+                        and source.func.attr == "read_bytes" and not source.args):
+                    path = local_entry(source.func.value)
+                    if path and document_sha and path.resolve().is_relative_to(root.resolve()) and path.is_file():
+                        if path.stat().st_size <= 8 * 1024 * 1024 and hashlib.sha256(path.read_bytes()).hexdigest() == document_sha:
+                            entry = path.resolve().relative_to(root.resolve()).as_posix()
         if (call and isinstance(call.func, ast.Attribute) and call.func.attr.startswith(("to_", "not_to_"))
                 and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)
                 and call.func.value.func.id == "expect"):
             assertion = call.func.value
-        if entry and assertion is not None and any(isinstance(node, ast.Name) and node.id == "page"
-                                                  for node in ast.walk(assertion)):
+        if (entry and assertion is not None and any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name) and node.func.value.id == "page"
+                and (node.func.attr.startswith("get_by_") or node.func.attr in {"locator","inner_text","text_content",
+                    "get_attribute","input_value","title","content","is_visible","is_enabled","is_checked","query_selector"})
+                for node in ast.walk(assertion))):
             checked.add(entry)
     return checked
 
@@ -717,6 +750,7 @@ class MemberProgress:
         self._review_evidence = {}
         self._inline_failures = {}
         self._probe_support = {}
+        self._support_versions = {}
         self._undisclosed_probes = {}
         self._browser_probes = {}
         self._diagnostic_checks = {}
@@ -834,6 +868,16 @@ class MemberProgress:
     def probe_support(self):
         """Optional later executions, never a waiver of an earlier failure."""
         return list(self._probe_support.values())
+
+    def corrected_probe_support(self):
+        """Find later checks on the same bytes while leaving every original failure open."""
+        probes = self.inline_failures()
+        if (not probes or probes.keys() != self._failures.keys() or self.pending_paths()
+                or self._pending_verification or any(p["tool"] not in {"run_python", "run_browser"} for p in probes.values())):
+            return []
+        last_failure = max(self._failure_context.get(scope, {}).get("step", 0) for scope in probes)
+        return [row for row in self._probe_support.values()
+                if row["step"] > last_failure and self._support_versions.get(row["scope"]) == self._current]
 
     def _record_probe(self, scope, probe):
         self.inline_failures()  # Release only scopes whose failure was actually closed.
@@ -1144,6 +1188,9 @@ class MemberProgress:
                                     and not obs.meta.get("timed_out") and not obs.meta.get("cancelled")):
                                 self._record_probe(suite_key, {"code":code, "error":obs.content,
                                     "exit_code":exit_code,
+                                    "input_paths": sorted((_asserted_inputs(code) | (_browser_asserted_inputs(
+                                        code, self.workspace, parameters.get("cwd", ".")) if obs.source == "run_browser" else set()))
+                                        & self._current.keys()),
                                     "tool":obs.source, "tool_call_id":obs.tool_call_id, "task_id":state.task_id})
                         elif (obs.source == "run_shell" and invocation and invocation.complete
                               and invocation.script in self._edited_scripts and not _output_truncated(failure_obs)
@@ -1187,7 +1234,11 @@ class MemberProgress:
                             if obs.source in {"run_python", "run_browser"} and status != "runner_exit":
                                 inputs = _asserted_inputs(code)
                                 if obs.source == "run_browser":
-                                    inputs.update(_browser_asserted_inputs(code, self.workspace, parameters.get("cwd", ".")))
+                                    browser_inputs = _browser_asserted_inputs(code, self.workspace, parameters.get("cwd", "."),
+                                                                           obs.meta.get("loopback_document_sha256"))
+                                    self._review_evidence["pass:" + suite_key]["browser_inputs"] = {
+                                        p: self._current[p] for p in browser_inputs if p in self._current}
+                                    inputs.update(browser_inputs)
                                 self._review_evidence["pass:" + suite_key]["asserted_inputs"] = {
                                     p: self._current[p] for p in inputs if p in self._current}
                             if (self._inline_failures and status != "runner_exit" and obs.tool_call_id
@@ -1198,9 +1249,12 @@ class MemberProgress:
                                     and not obs.meta.get("cancelled")):
                                 self._probe_support[suite_key] = {"scope": suite_key, "code": code,
                                     "output": obs.content, "exit_code": exit_code, "tool": obs.source,
-                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id}
+                                    "tool_call_id": obs.tool_call_id, "task_id": state.task_id, "step": record.step}
+                                self._support_versions[suite_key] = dict(self._current)
                                 if len(self._probe_support) > 4:
-                                    del self._probe_support[next(iter(self._probe_support))]
+                                    oldest = next(iter(self._probe_support))
+                                    del self._probe_support[oldest]
+                                    del self._support_versions[oldest]
                             if status != "runner_exit":
                                 original_probe = self._inline_failures.get(suite_key, {})
                                 revised_script = (original_probe.get("kind") == "edited_script" and

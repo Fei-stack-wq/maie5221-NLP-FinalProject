@@ -12,7 +12,7 @@ from miniagent.agent import Agent
 from miniagent.config import Limits, Settings
 from miniagent.metrics import Tracer, load_events
 from miniagent.providers import Provider
-from miniagent.rao import Action, Budget, Decision, ErrorClass, RAOState, RAOUnit
+from miniagent.rao import Action, BoundHandoff, Budget, Decision, ErrorClass, Observation, RAOState, RAOUnit
 from miniagent.sandbox import Sandbox
 from miniagent.schemas import LLMResponse, ToolCall, ToolSpec, Usage
 from miniagent.tools import build_default_registry
@@ -201,6 +201,27 @@ class RaoProtocolTest(unittest.TestCase):
         state = self.state()
         self.assertEqual(unit.step(state, Budget()).tool_calls, 1)
         self.assertEqual(unit.step(state, Budget()).answer, "done")
+
+    def test_bound_handoff_pairs_superseded_requests_and_never_repeats_failed_transition(self):
+        seen = []
+        def blocked(payload):
+            seen.append(payload)
+            return Observation(step_id="t1:delegate", source="delegate", ok=False, content="Candidate is unavailable.")
+
+        read = LLMResponse(tool_calls=[ToolCall(id="wrong", name="read_file", arguments={"path":"missing"})])
+        responses = [read.model_copy(update={"finish_reason":"length"}), read, LLMResponse(text="[BLOCKED] Missing candidate.")]
+        unit, _ = self.unit(responses, delegate_handler=blocked, enable_control_tools=True)
+        bound = BoundHandoff("target", "hash", "review", "reviewer", "Check the candidate.", "signed")
+        policy = {"bound_handoff":bound, "allowed_tools":frozenset({"delegate_task"})}
+        state = self.state()
+        self.assertEqual(unit.step(state, Budget(), **policy).terminate_reason, ErrorClass.T_PROTOCOL)
+        self.assertFalse(seen)
+        record = unit.step(state, Budget(), **policy)
+        self.assertFalse(record.ok)
+        self.assertEqual([o.tool_call_id for o in record.observations], ["wrong", record.host_handoff["call_id"]])
+        self.assertEqual(state.history[-1]["tool_call_id"], state.history[-2]["tool_calls"][0]["id"])
+        self.assertTrue(unit.step(state, Budget(), **policy).answer.startswith("[BLOCKED]"))
+        self.assertEqual([payload["assignee"] for payload in seen], ["reviewer"])
 
     def test_invalid_raw_json_remains_unchanged_and_never_executes(self) -> None:
         invalid = ["", " ", "[]", "null", "1", "{", '{"n":NaN}', '{"n":Infinity}',

@@ -390,6 +390,27 @@ sys.exit(bool(errors))
         self.assertIn("shipment label length", retired["prior_failure"])
         self.assertEqual(peer["independently_reviewed_tasks"], [first["task_id"]])
 
+    def test_host_routes_signed_revision_and_recheck_when_lead_rereads_or_stops(self):
+        old = "Shipment destination: old warehouse. Verified dispatch record."
+        new = "Shipment destination: new warehouse. Verified dispatch record."
+        script = self.start_review() + [
+            submit(old, "changes_requested", cause="product", action="Print the confirmed new warehouse."),
+            {"text": "The submitted assessment lists the correction."},
+            tool("read_file", path=PATH),
+            write(PATH, new), {"text": "Fixed the label."},
+            {"text": "[BLOCKED] I cannot independently sign my team's label."},
+            tool("read_file", path=PATH), submit(new, "passed"),
+            {"text": "Checked the corrected candidate."}, {"text": "Here is the reviewed label."}]
+        detail, _ = self.execute(script)
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        transfers = [e for e in detail["events"] if e["kind"] == "bound_handoff_dispatched"]
+        self.assertEqual([(e["state"], e["owner"], e["version"]) for e in transfers],
+                         [("repair", "builder", version(old)), ("review", "inspector", version(new))])
+        self.assertEqual(transfers[0]["target"], transfers[1]["target"])
+        calls = {e.get("tool_call_id") for e in detail["events"]
+                 if e["kind"] == "tool_start" and e.get("tool") == "delegate_task"}
+        self.assertTrue(all(e["call_id"] in calls for e in transfers))
+
     def test_reject_fix_independent_recheck_on_new_bytes(self):
         script = self.start_review()+[
             submit("Shipment destination: old warehouse. Verified dispatch record.","changes_requested",cause="product",action="Print the confirmed new warehouse."),
