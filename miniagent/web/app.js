@@ -905,7 +905,12 @@ function roomMessage(row,index,turn) {
  const reason = handoff?.remaining_issue;
  const disposition = row.disposition || (handoff?.published ? 'published' : reason ? 'blocked' : handoff ? 'unpublished' : '');
  const blocked = report && disposition==='blocked';
- const summary = isUser ? source : blocked ? roomLine(reason || '交接受阻') : roomLine(row.chat_message || source);
+ const candidate = handoff?.reviewable_candidate;
+ const savedCandidate = blocked && handoff?.published===false && handoff.role===row.role
+  && row.task_id && candidate?.task_id===row.task_id && candidate.task_id===handoff.task_id
+  && /^[a-f0-9]{64}$/.test(candidate.candidate_version) && candidate.files_total>0;
+ const issue = savedCandidate ? (reason || source).replace(/^\s*\[BLOCKED\]\s*(?:[—:：-]\s*)?/u,'') : reason;
+ const summary = isUser ? source : blocked ? roomLine(issue || '交接受阻') : roomLine(row.chat_message || source);
  const names = recipient ? [recipient,turn.member_names?.[recipient],roleLabel(recipient)].filter(Boolean) : [];
  const addressed = names.find(name=>summary.startsWith('@'+name)
   && (!summary[name.length+1] || /[\s，,:：、。!！]/u.test(summary[name.length+1])));
@@ -913,6 +918,7 @@ function roomMessage(row,index,turn) {
  const mention = recipient && !(addressed && isUser) ? `<span class="room-mention">@${roomName(turn,recipient)}</span> ` : '';
  const files = row.artifacts || [];
  const receipt = row.kind==='human_review' ? ({passed:'人工评审通过',failed:'人工评审未通过'})[row.verdict]
+  : savedCandidate ? '候选已保存 · 可独立复核'
   : ({published:'已交接',assessed:'已提交评审',awaiting_review:'等待独立复核',blocked:'交接受阻 · 平台回执',unpublished:'尚未发布'})[disposition];
  const paths = (row.deliverable_paths || []).map(path=>`<span>${inlineMarkdown(path,turn,row)}</span>`).join(' ');
  const full = summary!==source || row.text_truncated;

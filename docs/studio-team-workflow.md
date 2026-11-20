@@ -341,6 +341,8 @@ API 诊断项为 `provider_balance_exhausted`。最新群头若有经过校验�
 
 独立脚本可能通过 `ok = identity() and paging(); sys.exit(0 if ok else 1)` 汇总结果。普通退出码没有说明哪些检查实际执行，因此不会仅因这一语法或文件名自动得到 `passed_check`。这条边界保持不变：纯打印、恒真条件、没有进入检查分支、吞掉错误后正常退出都不能自动认证成业务通过。
 
+评审员从 `submit_review` 的工具定义可直接看到版本校验、逐项理由的 1–1500 字限制、每项 1–8 条回执、整次 1–24 项判断和行动说明的 1000 字限制。通过项省略 `cause` 和 `action`；需要修改或无法判定的项填写两者，业务歧义归入 `inconclusive`。宿主从用于实际校验的 `Submission` 和 `Finding` 生成同一份 JSON Schema，并将逐项定义内联给供应商。证据适切性、候选版本、评审者身份和规定方法仍由宿主在签署时核对。回归测试同时检查模型收到的参数和有错误归因时真实签署被拒、修正后才能通过的路径。[Pydantic 字段约束的 JSON Schema 映射](https://github.com/pydantic/pydantic/blob/1a8850d101e67d2744ba8c6286e1172d7cd89d0b/pydantic/json_schema.py#L2355-L2399) · [上游约束生成测试](https://github.com/pydantic/pydantic/blob/1a8850d101e67d2744ba8c6286e1172d7cd89d0b/tests/test_json_schema.py#L2104-L2125) · [Studio 的签署回归](../tests/test_studio_native_review.py)
+
 评审文字和结构化签署的落盘顺序会影响执行证据。先在 Markdown 报告中写好观察、方法和局限，再按最终工作区执行检查，用 `list_review_evidence` 获取当前 `passed_check`，直接提交 `submit_review`。短 ID 随签署保存。修改报告、测试脚本或其他工作区文件后，旧的执行结果进入 `historical_checks`，可以查看它当时的调用、失效原因和变更路径。相同检查真正重跑通过后，历史项的 `current_ref` 会指向新观测。签署可以使用新 E 或唯一有效的 `pass:<scope>`，最终回执记录实际使用的调用 ID。历史条目可用 `history_offset` 翻页，成员交接的 `native_review.historical_execution_receipts` 保留当次记录。这一区分参考 pytest 用稳定 node ID 找回同一检查、由新一轮实际执行更新状态的做法。[pytest 的状态更新](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/src/_pytest/cacheprovider.py#L354-L360) · [不同调用与子集复验回归](https://github.com/pytest-dev/pytest/blob/b55ab2aabb68c0ce94c3903139b062d0c2790152/testing/test_cacheprovider.py#L551-L608) · [Studio 旧回执与重跑签署回归](../tests/test_studio_native_review.py)
 
 检查成稿自身的字数、摘要或章节结构时，使用 `inspect` 并省略 `reference_path`。比较两份材料时，把原始对照文件填入 `reference_path`。指定候选文件路径后，本项证据应包含那份候选的 `read` 和另一份文件的 `reference`。用原作者或任务 ID 选择整包工件时，宿主优先以用户明确指定要核查的成稿作为阅读目标。把同一成稿既填作唯一候选又填作对照，会在派工前收到更正说明。[成稿和附带来源快照的对照回归](../tests/test_studio_required_source_review.py)
@@ -412,6 +414,8 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 ### 群里的派工和交付
 
 负责人调用 `delegate_task` 时可填写 `chat_message`。例如把「查一下隔夜预约会不会冲突」发给测试员，把测试日期、步骤和交付路径写在 `objective`。测试员实际收到这句话和完整要求。消息显示当轮角色名及 @收件人，点「派工材料」可读原任务和验收要求。旧任务直接节选第一句。平台自动转交时沿用实际路由的发件人和任务。成员向本轮负责人回复，交付、待复核和受阻分别显示实际记录的状态。成功交接优先节选报告标明的「一句话成果」。发布失败时，消息优先显示平台回执原有的失败原因，成员自述仍在交付材料中。缺少最终答复时，Studio 以系统记录说明本轮终态。失败原因取自对应运行的诊断、最后交接回执或当轮保存的错误。用户原话完整显示，初始任务只出现一次。
+
+成员在原文中写了 `[BLOCKED]`，仍可能已交出完整的私有候选。若宿主回执中的角色、任务、版本摘要和文件数量能定位这份候选，聊天显示「候选已保存 · 可独立复核」。已排入独立复核的显示「等待独立复核」。未能保存候选的真实交接失败仍直接显示原因。原文、平台回执与整轮终态均保留。这里沿用上述 A2A 分开传达任务状态与工件的做法。[浏览器状态回归](../tests/web/studio_live_dom.js)
 
 「交付材料」收起长报告、检查和获准公开的附件。「运行记录」保留平台事件和工具调用。打开旧轮次的完整原文或前一页消息时，浏览器按该轮公开日志的序号取回最多 24 条。新旧页之间有缺口时可就地加载。展开较长材料或最终回复时，浏览器按需读取全文。轮询、补载和新消息依靠稳定序号保留已经展开的材料。公开日志和附件继续沿用原有阅读边界。浏览器回归覆盖真实表单发送、派工尚未完成、历史长文补载和 Markdown 附件。[群聊端到端回归](../tests/web/room_workflow.cjs) · [日志分页回归](../tests/test_studio_discussion.py)
 

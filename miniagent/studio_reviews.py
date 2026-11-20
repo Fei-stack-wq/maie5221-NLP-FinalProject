@@ -59,18 +59,22 @@ class InheritedCriteriaConflict(ValueError):
 
 class Finding(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    criterion_id: str
-    verdict: Literal["passed", "changes_requested", "inconclusive"]
-    reason: str = Field(min_length=1, max_length=1500)
-    evidence: list[str] = Field(min_length=1, max_length=8)
-    cause: Literal["product", "verification", "business"] | None = None
-    action: str | None = Field(default=None, max_length=1000)
+    criterion_id: str = Field(description="本轮绑定的验收标准 ID。")
+    verdict: Literal["passed", "changes_requested", "inconclusive"] = Field(
+        description="passed 时省略 cause 和 action。changes_requested 或 inconclusive 时两项都必须填写。")
+    reason: str = Field(min_length=1, max_length=1500, description="简述该项依据与结论；长报告留在交接附件。")
+    evidence: list[str] = Field(min_length=1, max_length=8,
+                                description="引用 list_review_evidence 列出的回执 ID 或可唯一解析的别名；按本项方法取证。")
+    cause: Literal["product", "verification", "business"] | None = Field(
+        default=None, description="非通过项的归因。business 仅可搭配 inconclusive。通过项省略。")
+    action: str | None = Field(default=None, max_length=1000,
+                               description="非通过项必须给出具体修改、复验或待澄清事项。通过项省略。")
 
 
 class Submission(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    candidate_version: str = Field(pattern="^[a-f0-9]{64}$")
-    results: list[Finding] = Field(min_length=1, max_length=24)
+    candidate_version: str = Field(pattern="^[a-f0-9]{64}$", description="从本轮验收上下文复制绑定版本的完整摘要。")
+    results: list[Finding] = Field(min_length=1, max_length=24, description="按绑定标准提交逐项结论，每项 ID 只用一次。")
 
 
 # Explicit wire schemas are also consumed by OpenAI-compatible providers.
@@ -85,13 +89,11 @@ REVIEW_REQUEST_SCHEMA = {"type": "object", "description": "独立验收，用候
             "required":{"type":"boolean"}},
         "required":["id","description","method"], "additionalProperties":False}}},
     "required": ["candidate"], "additionalProperties":False}
-SUBMIT_SCHEMA = {"type":"object","properties":{"candidate_version":{"type":"string"},
-    "results":{"type":"array","items":{"type":"object","properties":{
-        "criterion_id":{"type":"string"}, "verdict":{"type":"string","enum":["passed","changes_requested","inconclusive"]},
-        "reason":{"type":"string"}, "evidence":{"type":"array","items":{"type":"string"}},
-        "cause":{"type":"string","enum":["product","verification","business"]},"action":{"type":"string"}},
-        "required":["criterion_id","verdict","reason","evidence"],"additionalProperties":False}}},
-    "required":["candidate_version","results"],"additionalProperties":False}
+# Inline the model's sole nested type for providers that expect the item
+# definition in place. Lengths, version format and optional fields come from
+# the same Pydantic contract used to parse actual submissions.
+SUBMIT_SCHEMA = Submission.model_json_schema()
+SUBMIT_SCHEMA["properties"]["results"]["items"] = SUBMIT_SCHEMA.pop("$defs")["Finding"]
 
 
 @dataclass

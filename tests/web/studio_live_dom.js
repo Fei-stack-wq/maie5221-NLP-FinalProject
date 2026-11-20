@@ -18,7 +18,10 @@ const completeThread = {
  id:'demo-project',kind:'group',lead:'worker',members:['worker','reviewer'],head_run_id:'fixture',
  artifact_run_id:'fixture',can_continue:true,
  turns:[{run_id:'fixture',user:'请制作网页。',recipient:'worker',answer:'已生成网页。',status:'unverified',intent:'edit',
-  events:[{kind:'member_report',role:'reviewer',text:'**成果**：证据底座已保存到文件。',disposition:'blocked',artifacts:[],
+  events:[{kind:'member_report',role:'worker',task_id:'dev-check',text:'[BLOCKED] 请复核重复预订。',disposition:'blocked',
+   handoff:{role:'worker',task_id:'dev-check',published:false,remaining_issue:'[BLOCKED] 请复核重复预订。',
+    reviewable_candidate:{task_id:'dev-check',candidate_version:'a'.repeat(64),files_total:5}}},
+   {kind:'member_report',role:'reviewer',text:'**成果**：证据底座已保存到文件。',disposition:'blocked',artifacts:[],
    handoff:{published:false,remaining_issue:'项目快照发布失败：项目文件含可识别的服务凭据。「research/research_notes.md」'}}]}]
 };
 window.fetch=async(path, options={})=>{
@@ -50,7 +53,9 @@ window.fetch=async(path, options={})=>{
  }
  return {ok,status:ok?200:503,json:async()=>data};
 };
-location.hash='run/fixture';
+// Start on the deep link itself, as when a user opens a saved run. Assigning
+// location.hash here also queues a second navigation after the app has booted.
+history.replaceState(null, '', '#run/fixture');
 window.addEventListener('load',async()=>{
  const result=document.createElement('pre');result.id='regression-results';result.setAttribute('role','status');result.style.cssText='position:fixed;bottom:0;right:0;z-index:9999;background:#fff;color:#111;padding:16px;border:1px solid #888;max-width:580px;font:13px/1.5 monospace;white-space:pre-wrap';document.body.append(result);
  const results=[];
@@ -88,7 +93,13 @@ window.addEventListener('load',async()=>{
   fixtureChat=true;
   await waitFor(()=>document.querySelector('#tab-chat'));
   document.querySelector('#tab-chat').click();
-  const blocked=document.querySelector('.room-message[data-kind="member_report"]');
+  const [candidate,blocked]=document.querySelectorAll('.room-message[data-kind="member_report"]');
+  check('frozen candidate shows its review option and retains original receipt',
+   candidate.querySelector('.room-disposition').textContent==='候选已保存 · 可独立复核'&&
+   candidate.querySelector('.room-line').textContent.includes('请复核重复预订')&&
+   !candidate.querySelector('.room-line').textContent.includes('[BLOCKED]')&&
+   candidate.querySelector('.room-material-body').textContent.includes('[BLOCKED]'));
+  check('unpublished file without candidate retains real blockage',blocked.querySelector('.room-disposition').textContent==='交接受阻 · 平台回执');
   const blockedLine=blocked.querySelector('.room-line');
   check('blocked handoff leads with actual publication failure',blockedLine.textContent.includes('项目快照发布失败')&&!blockedLine.textContent.includes('证据底座已保存'));
   check('private file is plain text and original member claim stays in materials',!blockedLine.querySelector('[data-md-path]')&&blocked.querySelector('.room-material-body').textContent.includes('证据底座已保存'));

@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 from miniagent.config import Settings
 from miniagent.research import Page
-from miniagent.studio_reviews import Review, ReviewQueue, ReviewSession, Rule, digest
+from miniagent.studio_reviews import Finding, Review, ReviewQueue, ReviewSession, Rule, Submission, digest
 from miniagent.studio_service import StudioService
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, tool
@@ -32,6 +32,39 @@ class NativeReviewTest(unittest.TestCase):
         self.service = StudioService(self.root/"runs", Settings(api_key="test-credential"))
         self.addCleanup(cleanup, self.root)
         self.addCleanup(self.service.close)
+
+    def test_submit_review_exposes_the_same_wire_constraints_that_parse_findings(self):
+        session = Mock(spec=ReviewSession)
+        schema = ReviewSession.tool(session).spec().parameters
+        root = Submission.model_json_schema()
+        properties = schema["properties"]
+        self.assertEqual(properties["candidate_version"], root["properties"]["candidate_version"])
+        self.assertEqual(properties["candidate_version"]["pattern"], "^[a-f0-9]{64}$")
+        results = properties["results"]
+        self.assertEqual((results["minItems"], results["maxItems"]), (1, 24))
+        self.assertEqual(results["items"], Finding.model_json_schema())
+        fields = results["items"]["properties"]
+        self.assertEqual((fields["reason"]["minLength"], fields["reason"]["maxLength"]), (1, 1500))
+        self.assertEqual((fields["evidence"]["minItems"], fields["evidence"]["maxItems"]), (1, 8))
+        self.assertIn({"type": "string", "maxLength": 1000}, fields["action"]["anyOf"])
+        self.assertEqual(set(results["items"]["required"]), {"criterion_id", "verdict", "reason", "evidence"})
+        self.assertIn("passed 时省略 cause 和 action", fields["verdict"]["description"])
+        self.assertIn("business 仅可搭配 inconclusive", fields["cause"]["description"])
+
+    def test_passing_finding_with_repair_fields_still_requires_a_corrected_signature(self):
+        label = "Shipment destination: old warehouse. Verified dispatch record."
+        detail, provider = self.execute(self.start_review() + [
+            submit(label, "passed", cause="verification", action="Please recheck."),
+            submit(label, "passed"), {"text":"Checked the candidate."}, {"text":"Delivered."}])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        feedback = [message.get("content", "") for messages, _ in provider.requests
+                    for message in messages if message["role"] == "tool"]
+        self.assertTrue(any("通过项不应分派修复" in message for message in feedback))
+        submissions = [row for row in detail["room_events"] if row["kind"] == "member_report"
+                       and row["role"] == "inspector"]
+        finding = submissions[0]["handoff"]["native_review"]["assessment"]["results"][0]
+        self.assertEqual(finding["verdict"], "passed")
+        self.assertIsNone(finding["action"])
 
     def execute(self, steps, *others, objective="Build and independently verify the shipment label.", **options):
         provider = RecordingProvider(steps)
