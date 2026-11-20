@@ -21,3 +21,9 @@ LangGraph 的 `Branch._finish` 将节点返回的结构化结果解析为后继�
 `python -m unittest tests.test_review_revision_routing` 从 Studio 普通群聊入口覆盖两种交接。一次由来源缓存的凭据检测拒绝整树发布，另一次由风控在实际签署后主动报告阻塞。两者都按作者、风控、作者、风控的次序运行，公开工作区收到修订产品和新版报告，问题缓存没有被发布。独立负例在签署同批次改变评审副本，验证该签署不能成为对当前候选有效的返工指令。
 
 这些是本机平台回归。上面列出的真实运行仍保留原来的失败结果。
+
+## 实际成稿与来源之间的核对
+
+11 月 19 日的新一轮风控发现，同一张图把不同期间的增速并列成了上半年实绩。资料文件和来源链接都存在。冻结版本的来源评审现在提示评审员先选影响结论的断言，标明成稿位置，查原始发布者的数字、期间、单位与当时已发布的版本。推算值从原始端点复算，政策事件区分公告与生效。正文矛盾沿用已有的产品退修，证据不足沿用已有的未决状态。取证方法由评审者按实际材料选择。
+
+Anthropic 的投资演示质检 skill 要求沿页码抽取数字，统一单位和期间并复算增长率。其脚本的 `extract_numbers` 保留数字附近的文字与所在页，`find_inconsistencies` 标记同指标的潜在差异；缺失输入文件会以非零状态退出。Studio 在来源评审提示中采用这项工作方法，由评审者取原文并判断；外部事实、HTML 表现与数字含义仍分别核实。本仓库的 `test_source_review_requires_both_candidate_and_independently_fetched_source` 通过正常群聊入口检查指导可见，并验证签署同时引用工件与来源。[上游 skill](https://github.com/anthropics/financial-services/blob/3e32c2287dcb637c184c01cc0ad82d6af7e9bb0f/plugins/vertical-plugins/financial-analysis/skills/ib-check-deck/SKILL.md) · [上游抽取与一致性检查](https://github.com/anthropics/financial-services/blob/3e32c2287dcb637c184c01cc0ad82d6af7e9bb0f/plugins/vertical-plugins/financial-analysis/skills/ib-check-deck/scripts/extract_numbers.py#L100-L219)

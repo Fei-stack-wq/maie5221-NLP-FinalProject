@@ -53,6 +53,50 @@ class BrowserToolTest(unittest.TestCase):
         if any(note in result.content for note in ("环境缺少 Playwright", "环境缺少 Chromium/Chrome")):
             self.skipTest("This integration test requires Playwright and a real local Chromium/Chrome.")
 
+    def test_projection_clipping_and_scrollable_content_use_different_viewport_checks(self):
+        (self.member / "deck.html").write_text("""
+            <style>
+            body { margin: 0 }
+            main { position: fixed; inset: 0; overflow: hidden }
+            article { position: relative; width: 960px; height: 640px }
+            footer { position: absolute; bottom: 12px }
+            </style>
+            <main><article><h1>Schedule</h1><p>Opening session</p><footer>Source notes</footer>
+            <button onclick="document.querySelector('h1').textContent='Results'">Next</button>
+            </article></main>""")
+        result = self.browser("""
+            from pathlib import Path
+            for width, height in [(800, 480), (620, 540)]:
+                page.set_viewport_size({"width": width, "height": height})
+                page.goto(Path("deck.html").resolve().as_uri())
+                page.get_by_role("button", name="Next").click()
+                expect(page.get_by_role("heading", name="Results")).to_be_in_viewport(ratio=1)
+                assert page.evaluate("document.documentElement.scrollWidth === innerWidth")
+                notes = page.get_by_text("Source notes")
+                expect(notes).to_be_visible()
+                assert notes.bounding_box()["y"] >= height
+                expect(notes).not_to_be_in_viewport()
+            expect(notes).to_be_in_viewport(ratio=1, timeout=200)
+        """)
+        self.require_installed_browser(result)
+        self.assertFalse(result.ok, result.content)
+        self.assertIn("viewport ratio 0", result.content)
+        self.assertIn("deck.html", result.meta["asserted_browser_files"])
+
+        (self.member / "article.html").write_text(
+            "<h1>Schedule</h1><p style='height:150vh'>Opening session</p><footer>Source notes</footer>")
+        result = self.browser("""
+            from pathlib import Path
+            page.set_viewport_size({"width": 620, "height": 540})
+            page.goto(Path("article.html").resolve().as_uri())
+            notes = page.get_by_text("Source notes")
+            expect(notes).not_to_be_in_viewport()
+            page.keyboard.press("End")
+            expect(notes).to_be_in_viewport(ratio=1)
+        """)
+        self.assertTrue(result.ok, result.content)
+        self.assertIn("article.html", result.meta["asserted_browser_files"])
+
     def test_loopback_document_receipt_requires_actual_served_bytes_and_dom_assertion(self):
         html = b'<label for="startSelect">Start</label><select id="startSelect"><option>09:00</option></select>'
         (self.member / "booking.html").write_bytes(html)

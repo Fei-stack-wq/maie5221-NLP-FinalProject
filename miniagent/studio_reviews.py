@@ -441,7 +441,11 @@ class ReviewSession:
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
-            "run_browser": "操作冻结页面，用 assert 或 expect(locator).to_have_text(expected) 核对实际控件。",
+            "run_browser": ("操作冻结页面，用 assert 或 expect 核对实际控件。涉及布局时按交付要求设置视口，并记录实测尺寸。"
+                            "单屏投影在正常翻页后、未滚动时检查当前页的标题、正文、图表标签和页脚；"
+                            "用 bounding_box() 记录边界，用 to_be_in_viewport(ratio=1) 验证须完整显示的区域。"
+                            "可滚动页面按用户实际路径滚动并验证可达。文字遮挡或字号可读性可结合当前视口截图核对；"
+                            "若无法查看截图或实测某个尺寸，在结论里注明未核实的部分。"),
             "run_shell": "运行含相关断言的现有测试套件，保留测试框架的逐项结果和真实退出码。",
         }.items() if name in available_tools}
         self.review_notes = set(review_notes)
@@ -837,9 +841,17 @@ class ReviewSession:
 
     def context(self):
         retained = list(self.retained_findings())
+        source_guidance = ""
+        if any(rule.method == "source" for rule in self.item.criteria):
+            source_guidance = (
+                "用 read_lines 或 read_file 读冻结成稿，从影响结论的具体断言出发，用 http_get 打开原始发布者的材料。"
+                "在 reason 写出成稿位置、原文支持的事实及两者的差异，引用 list_review_evidence 中的 read 和 source。"
+                "有数字时对齐单位、期间、分母及实绩或预测，按原始端点独立复算影响结论的推算。"
+                "有时间截点时分别核实公告日、生效日与当时已公开的版本；引用二手转述时注明实际查证范围。"
+                "原文与核心断言矛盾应签 changes_requested/product；缺少可核实证据时如实记录未决。")
         return (("同一版本沿用已通过项及原始回执 " + json.dumps(retained, ensure_ascii=False)
                  + "。只须提交其余逐项结论。先找可独立核验的新资料；同一来源仍不可访问则如实判证据不足。"
-                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件；标准包含 reference_path 时用 read_lines 或 read_file 分别读成稿和指定本地原始记录，逐项对照实际内容，并在该项同时引用 read 和 reference 短 ID。execute 须执行检查。source 核对稿件中的具体论断和亲自打开的外部网页，用 read_lines 或 read_file 打开冻结成稿。用 http_get 打开来源，以 list_review_evidence 的 read 和 source 短 ID 引用两者并说明支持范围。检索不到只能记录查证范围或证据不足。"
+                 if retained else "") + "本轮作为独立验收者，按绑定版本逐项检查。inspect 可读候选工件；标准包含 reference_path 时用 read_lines 或 read_file 分别读成稿和指定本地原始记录，逐项对照实际内容，并在该项同时引用 read 和 reference 短 ID。execute 须执行检查。" + source_guidance +
                 "评审期间候选及其他继承的输入均保持原字节，包括旧检查脚本。将临时脚本放入系统临时目录。"
                 + ("本次分派允许直接更新你已发布的评审报告：" + "、".join(sorted(self.editable_reports)) + "。"
                    if self.editable_reports else "") +

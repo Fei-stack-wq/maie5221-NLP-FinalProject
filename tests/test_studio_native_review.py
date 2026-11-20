@@ -450,6 +450,8 @@ sys.exit(bool(errors))
             detail, provider = self.execute(steps)
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         self.assertTrue(any("本次亲自打开的来源" in str(request[0]) for request in provider.requests))
+        self.assertTrue(any("原始端点独立复算" in str(messages) and "submit_review" in str(tools)
+                            for messages, tools in provider.requests))
         report = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"][-1]
         receipts = report["native_review"]["assessment"]["results"][0]["receipts"]
         evidence = next(r for r in receipts if r["kind"] == "source")

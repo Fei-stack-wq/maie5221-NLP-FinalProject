@@ -72,6 +72,8 @@ class ExecuteReviewGuidanceTest(unittest.TestCase):
         actions = catalog["execute"]["actions"]
         self.assertIn("顶层 assert", actions["run_python"])
         self.assertIn("expect", actions["run_browser"])
+        self.assertIn("to_be_in_viewport(ratio=1)", actions["run_browser"])
+        self.assertIn("滚动并验证可达", actions["run_browser"])
         self.assertEqual(set(actions), {option["tool"] for option in catalog["needs"]["quantity"]})
         correction = str(provider.requests[8][0])
         self.assertIn('"passed_checks": []', correction)
