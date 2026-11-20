@@ -10,12 +10,17 @@ const roomPanel = (() => {
  const dialog = () => document.getElementById('membership-dialog');
  const endpoint = id => '/api/directory/channels/' + encodeURIComponent(id) + '/members';
 
+ function avatar(id,name) {
+  const marker = Array.from((name || id || '').trim())[0] || '@';
+  const tone = Array.from(id || '').reduce((n,c)=>(n+c.codePointAt(0))%3,0);
+  return `<span class="roster-avatar" data-tone="${tone}" aria-hidden="true">${e(marker)}</span>`;
+ }
+
  function rail(thread, composeAvailable) {
   const members = thread.members;
   const rows = members.map(id => {
    const name = thread.profiles?.find(profile => profile.id === id)?.name || roleLabel(id);
-   const marker = Array.from(name.trim())[0] || '@';
-   return `<li data-key="room-person-${e(id)}"><span class="roster-avatar" aria-hidden="true">${e(marker)}</span>
+   return `<li data-key="room-person-${e(id)}">${avatar(id,name)}
     <div class="roster-identity"><strong>${memberLink(thread,id)}</strong><small>@${e(id)}</small></div>
     ${id === thread.lead ? '<small class="roster-lead">负责人</small>' : ''}
     ${composeAvailable ? `<button class="mention-member" type="button" data-mention-id="${e(id)}" aria-label="点名 ${e(name)}" title="点名 ${e(name)}">@</button>` : ''}</li>`;
@@ -185,5 +190,5 @@ const roomPanel = (() => {
   jump();
  });
  dialog().addEventListener('close', () => {opening++; editor=null;});
- return {rail,jumpButton,endMarker,scheduleScrollCheck};
+ return {rail,avatar,jumpButton,endMarker,scheduleScrollCheck};
 })();

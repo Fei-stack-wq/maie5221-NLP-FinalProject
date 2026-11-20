@@ -263,7 +263,9 @@ class RoomCrew:
                 "由另一成员独立检查现版。无需先让作者改写原件或重复交接。"
                 "独立评估已交付的候选或带 reviewable_candidate 的完整私有草稿时，使用 delegate_task.review 引用原任务或作者角色，填写逐项标准；"
                 "检查运行行为用 execute；审阅文件用 inspect。按本地原始记录核对成稿时用 inspect，并把原记录工作区路径写入每项相应标准的 reference_path。只有核实外部网页事实才用 source，需要评审员亲自打开网页。要求独立调查时，评审者可打开其他原始资料；检索未命中只说明已查范围。宿主会将返工转回适当成员。"
-                "每次只委派给一人。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
+                "每次只委派给一人。用 chat_message 给对方说一句具体的派工消息，完整说明写入 objective。按成员职责划出本阶段可以独立完成的范围。把本阶段必须落盘的产品或用户指定文件放在 deliverable_paths。宿主自动保存检查与交接回执；团队内部汇报直接写入交接消息。"
+                "以用户要使用的成品决定分工范围。调研时说清要支持哪项判断、何种证据足以交接；关键事实有冲突或重要风险未覆盖，再继续取证。"
+                "来源篇数、额外应用入口和内部报告只有在用户要求或确实解决交付缺口时才列入验收。"
                 "验收只列该成员负责的工作。其他成员的独立验证、交付说明和打包工作请留给其实际负责人，"
                 "不要把整个项目的全部最终验收原样转给执行第一阶段的人。下一人的分工基于实际交接。"
                 "分派分析、审阅或测试报告时，用 deliverable_paths 指定报告。即使交接受阻，也可读其诊断并按实证分工。"
@@ -272,7 +274,9 @@ class RoomCrew:
                 "团队内选谁、补交、返工、是否由负责人读源码，均由你自主决定。"
                 "开始委派前可核实公开项目中影响选人和分工的必要细节。收到成功交接后根据公开报告安排后续工作。"
                 "工具回执中的调用次数只表示已经执行的次数。查询平台工具配置属于 runtime_capability。"
-                "仅当用户掌握的业务需求、偏好、数据或权限确实缺失时 ask_human，并说明 decision_kind。"
+                + ("在自主完成模式下，执行成员自行选定可逆业务假设并留下理由；只使用已有权限。"
+                   if self.settings.interaction_mode == "autonomous" else
+                   "仅当用户掌握的业务需求、偏好、数据或权限确实缺失时 ask_human，并说明 decision_kind。")
                 + ("\n用户要求独立核查指定成稿。继承的成稿可直接引用路径。若为本轮新增或修订，作者用 deliverable_paths 列出最终文件。委派另一成员，"
                  "用 delegate_task.review 引用作者的最新候选，列出必需的 source 标准。逐条核对重要主张，主动找反证；"
                  "区分正式规则和建议，注明研究样本与结论适用范围。核对笔记或旧版本不能代替对成稿的评审。"
@@ -514,6 +518,11 @@ class RoomCrew:
         properties = dict(original.parameters["properties"])
         properties["assignee"] = {"type": "string", "description": "本次分工的角色 ID，须取枚举中的一个。",
                                   "enum": self.delegate_recipients}
+        properties["chat_message"] = {
+            "type": "string", "maxLength": 300,
+            "description": ("像同事发消息一样，一句话交代动作和真正影响决定的限制。比如对档案员说“把这周的会议记录整理一下，发我确认。”"
+                            "系统会显示 @成员。技术栈、路径、背景和验收清单放在 objective 或对应的材料字段里。"),
+        }
         remaining = properties["remaining_roles"]
         properties["remaining_roles"] = {**remaining, "items": {"type": "string", "enum": self.delegate_recipients}}
         description = "将明确的子任务交给指定群成员。负责人承担文件交付时，用自己的 ID 和具体交付路径认领。"
@@ -638,7 +647,7 @@ class RoomCrew:
                 "手动下载供解析的原始 PDF、压缩包及工具缓存须放在项目外的系统临时目录，"
                 "例如在同一次 run_python 调用中使用 tempfile.TemporaryDirectory()。项目中保留交付物和来源记录。"
                 "当前分工来自群负责人。如果分工指定的测试方法与验证要求冲突，向负责人交接冲突和证据；用户只决定业务偏好或外部授权。"
-                "请按实际文件和测试结果交接成果与限制，仍有阻塞时以 [BLOCKED] 说明原因。"
+                "给负责人的交接先用一句话说清成果或阻塞，再列实际文件、测试结果与限制。仍有阻塞时以 [BLOCKED] 说明原因。"
                 "\n当前分工资料：" + _json(facts) + "\n本轮真实用户答复：" + _json(current)
                 + self._diagnostic_context() + self._prior_context(include_model_answers=False) + ("\n" + repair if repair else ""))
 
@@ -1062,6 +1071,10 @@ class RoomCrew:
         self.close_tokens = estimate_tokens(policy_messages(state, bare_close)) + self.close_state_bytes + 2304
         probe_hint = self._probe_dispatch_hint(self._pending_probe())
         if self.direct:
+            native = self._next_review()
+            if native and native.state == "blocked" and self.settings.interaction_mode == "autonomous":
+                return StepPolicy("finalize", "以 [BLOCKED] 说明未通过的独立验收条件及已有交付。\n" +
+                                  _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
             recovery = self.direct_progress.recovery_feedback()
             instruction = self.direct_instructions() + "\n" + self.direct_progress.steering()
             if probe_hint:
@@ -1775,8 +1788,15 @@ class RoomCrew:
                               task_id=self.run_id, requested=original_recipient, recipient=role, candidate_task=review.target,
                               candidate_version=review.version, pending_criteria=[g["criterion_id"] for g in retry_gaps],
                               bound_criteria=[r.model_dump(exclude_none=True) for r in review.criteria])
+        # A host reroute may replace both the intended recipient and the job.
+        # Only attribute the coordinator's words to its actual assignment.
+        chat_message = payload.get("chat_message")
+        if not (isinstance(chat_message, str) and chat_message.strip() and len(chat_message) <= 300
+                and not routed_from and role == payload.get("assignee")):
+            chat_message = None
         try:
-            outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review)
+            outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths,
+                                     draft, routed_from, review, chat_message=chat_message)
         finally:
             self.nested_seconds += time.monotonic() - dispatch_started
         self.assignment_results[identity] = (self.project_version, outcome, input_revision)
@@ -1812,7 +1832,7 @@ class RoomCrew:
                 editable.add(path)
         return editable
 
-    def _dispatch(self, role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review=None):
+    def _dispatch(self, role, objective, expectations, action, allocated, reserved, paths, draft, routed_from, review=None, *, chat_message=None):
         assignments = self.path / "assignments"
         assignments.mkdir(exist_ok=True)
         assignment = Path(tempfile.mkdtemp(dir=assignments, prefix="member-"))
@@ -1844,6 +1864,7 @@ class RoomCrew:
                                      objective=objective, owner=self.lead, assignee=role,
                                      project_id=parent.project_id)
         self.record_event(self.run_id, "studio" if routed_from else self.lead, "assignment", objective,
+                          **({"chat_message": chat_message} if chat_message else {}),
                           recipient=role, task_id=record.task_id, routed_from=routed_from,
                           expectation=expectations, allocation=allocated.model_dump(), reserved=reserved.model_dump(),
                           planned=sorted(self.planned) if self.planned is not None else None,
@@ -1983,12 +2004,18 @@ class RoomCrew:
                 repair_context = ("请在冻结工作目录逐条独立运行这些原检查：" + _json(commands) +
                                   "。对原失败涉及的产品行为另行执行断言，并把结论与回执逐项签署。\n" + repair_context)
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context, review)
+        if chat_message:
+            member_context += "\n负责人发给你的群消息：" + chat_message
         if self.read_only:
             member_context += "\n本次是群内只读咨询。请用查询工具核对资料后在消息里说明意见和依据。"
         if review_notes:
             member_context += "\n本轮单独交接的评审附件（委派名称对应写入路径），保留旧版及产品原件：" + _json(review_notes)
         if session:
             member_context += "\n" + session.context()
+            if self.settings.interaction_mode == "autonomous":
+                member_context += ("\n本轮由团队决定可逆业务偏好和模拟参数。依照交接标明的假设核实产品；"
+                                   "若需调整交付物，按实际证据签署产品返工。对必须由本人授权或只有本人掌握、"
+                                   "且缺少证据的条件，签 inconclusive/business 并准确说明限制。")
 
         if self.role_session:
             personal = self.role_session.context(role, objective)
@@ -2407,7 +2434,8 @@ class RoomCrew:
                 review.state = "blocked" if reason in review.visited else "repair"
                 review.visited.add(reason)
             elif session and assessment and (published or product_changes or pending_verification or (private_arbitration or assessment["verdict"] != "passed") and not issue):
-                review.apply(assessment, self._review_answers())
+                review.apply(assessment, self._review_answers(),
+                             allow_user_input=self.settings.interaction_mode == "interactive")
                 if published and review.state == "passed":
                     review.host_issue = ""
                 if product_changes:
@@ -2503,7 +2531,7 @@ class RoomCrew:
         disposition = "published" if published else "assessed" if revision_requested or private_outcome and session else (
             "awaiting_review" if private_outcome else "blocked")
         self.record_event(self.run_id, role, "member_report", text + ("\n" + issue if issue and issue != text else ""),
-                          task_id=record.task_id, status=status, published=published,
+                          task_id=record.task_id, recipient=self.lead, status=status, published=published,
                           disposition=disposition, handoff=report, usage=usage, process_cleanup=process_cleanup,
                           artifacts=artifacts)
         return self._observation(bool(published or revision_requested or private_outcome), _json(report))

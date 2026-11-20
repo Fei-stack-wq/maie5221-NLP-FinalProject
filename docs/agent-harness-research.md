@@ -34,6 +34,16 @@
 
 **Magentic-One 使用两份账本。** 任务账本保存事实、待查项与计划，进展账本评估是否完成、是否重复、下一位成员应做什么，停滞可以触发重新规划。对应到工作室，成员已公开交付且全部必需检查通过时，负责人可以直接收尾。需要返工时，应引用失败的具体检查、恢复的版本及负责角色，再从总预算中分配额度。模型对“有进展”的判断适合辅助路由，业务判定仍由宿主持有的结果决定。[微软论文](https://www.microsoft.com/en-us/research/wp-content/uploads/2024/11/MagenticOne.pdf) · [AutoGen 协调器](https://github.com/microsoft/autogen/blob/8390985108cb1e3881f5f7297765758d8ad2540c/python/packages/autogen-agentchat/src/autogen_agentchat/teams/_group_chat/_magentic_one/_magentic_one_orchestrator.py)
 
+### 一条消息执行到结果
+
+Studio 的 `POST /api/runs` 和 `POST /api/superagent/messages` 接受本轮的 `interaction_mode`。采用 `autonomous` 时，负责人、执行成员、复核员和 Superagent 下派的会话共用这个模式。可逆偏好和模拟情景由承办角色决定，在交接中写明重要假设和理由。工具表移除 `ask_human`，执行器在整批动作生效前拒绝对未开放工具的调用。需要批准的动作仍需真实许可。必需的外部权限、私有数据或独立评审条件缺失时，负责人收回可交付的部分，陈述具体缺口，保留未通过的验收结果。
+
+新任务的 API 调用缺省按 `interactive` 处理。续聊缺省沿用所回复那一轮的模式，显式传值可以切换。运行详情的 `run.interaction_mode` 返回实际模式，旧运行显示为 `interactive`。同一请求重试须匹配生效的模式。互动运行继续使用已有的问答队列和真实回复。
+
+这个设计参考 AutoGen 的 `check_termination_and_human_reply`。该方法依据 `human_input_mode` 分派，在 `NEVER` 遇到终止条件时跳过人工通道。上游测试用两个角色验证消息交接及停止。Studio 在此基础上按整轮透传模式，在宿主的工具分派和独立签署两个位置分别落实许可与验收。回归包括负责人及成员实际尝试提问后写出交付物、删除申请缺少授权时保留文件，以及独立评审无法核实必需条件时结束任务。[AutoGen 输入与终止逻辑](https://github.com/microsoft/autogen/blob/3b4c0170b058a3629bfc58a75e1bc22e2b9a29eb/autogen/agentchat/conversable_agent.py#L1675-L1716) · [AutoGen 双角色回归](https://github.com/microsoft/autogen/blob/3b4c0170b058a3629bfc58a75e1bc22e2b9a29eb/test/agentchat/test_conversable_agent.py#L346-L374)
+
+真实基金题的首轮派工额外要求至少二十条来源，收集了二十五个已打开的来源后，研究稿因一条公开新闻网址触发交接检查。这两个环节都会增加耗时。负责人现在按成品需要定义研究问题和足够的证据，缺口或证据冲突再触发追加调研。来源数量、额外界面和内部报告需能对应用户要求或具体交付缺口。这是规划提示，宿主继续按实际产物验收。此做法参考 Anthropic 对研究负责人区分调查深度、逐项判断子任务必要性的实现。[上游负责人提示](https://github.com/anthropics/anthropic-cookbook/blob/main/patterns/agents/prompts/research_lead_agent.md) · [多智能体研究系统的工程验证](https://www.anthropic.com/research/multi-agent-research-system)
+
 ## 本仓库的实现边界
 
 | 能力 | 已有实现 | 下一项验证或实验 |

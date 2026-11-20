@@ -107,11 +107,12 @@ def _scan(fd, extensions, secret):
             if data is None:
                 raise WorkspaceError("读取期间文件已被移走。")
             _check_database_idle(parent, name)
-            validate_project_data(name, data, secret=secret, reject_credentials=True)
+            relative = (Path(directory) / name).as_posix()
+            validate_project_data(relative, data, secret=secret, reject_credentials=True)
             total += len(data)
             if len(result) >= 1000 or total > 20 * 1024**2:
                 raise WorkspaceError("工作区超过 1000 个项目文件或总量 20 MiB。")
-            result[(Path(directory) / name).as_posix()] = data
+            result[relative] = data
     return result
 
 

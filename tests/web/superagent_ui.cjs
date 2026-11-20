@@ -67,6 +67,9 @@ async function verify(page,url) {
  const input=page.getByLabel('给工作室助手发消息');
  const send=page.getByRole('button',{name:'发送消息'});
  await page.getByRole('heading',{name:'今天想完成什么？'}).waitFor();
+ const interaction=page.locator('#assistant-form [name=interaction_mode]');
+ assert.equal(await interaction.inputValue(),'autonomous');
+ await interaction.selectOption('interactive');
  assert(await send.isDisabled());
  await page.getByRole('button',{name:/创建角色.*培养/}).click();
  assert.match(await input.inputValue(),/创建一个/);
@@ -84,6 +87,7 @@ async function verify(page,url) {
  await send.click();
  await page.locator('.assistant-user').waitFor();
  assert.equal(requests[0].request_id,requests[1].request_id);
+ assert.equal(requests[1].interaction_mode,'interactive');
  assert.equal(requests[1].workspace_path,'/tmp/project');
  assert.equal(requests[1].parent_run_id,null);
  const pendingInput=await input.elementHandle();

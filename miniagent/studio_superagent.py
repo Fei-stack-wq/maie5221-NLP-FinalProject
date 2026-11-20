@@ -72,7 +72,7 @@ class StudioAssistant(StudioChannels):
     def send_superagent(self, payload):
         from .studio_service import StudioError
         if (not isinstance(payload, dict) or not {"request_id", "message"} <= payload.keys()
-                <= {"request_id", "message", "parent_run_id", "workspace_path"}):
+                <= {"request_id", "message", "parent_run_id", "workspace_path", "interaction_mode"}):
             raise StudioError("请提供消息、请求 ID 和当前对话末轮。")
         parent = payload.get("parent_run_id")
         if parent is not None and (not isinstance(parent, str) or not parent):
@@ -86,6 +86,8 @@ class StudioAssistant(StudioChannels):
                    "conversation": turn}
         if "workspace_path" in payload:
             request["workspace_path"] = payload["workspace_path"]
+        if "interaction_mode" in payload:
+            request["interaction_mode"] = payload["interaction_mode"]
         return self.start(request, superagent=True)
 
     def studio_routing_group(self, source_meta, group_id):

@@ -457,6 +457,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         return {"conversation_id": thread["id"] if thread else None,
                 "conversation_kind": thread["kind"] if thread else None,
                 "recipient": thread["recipient"] if thread else None,
+                "interaction_mode": meta.get("request", {}).get("interaction_mode", "interactive"),
                 "id": path.name, "title": title, "mode": meta.get("mode", "imported"),
                 "status": status, "created_at": created, "finished_at": ended,
                 "duration_ms": None if status in {"interrupted", "ready"} else round(duration, 2),
@@ -620,9 +621,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 if remaining < 1:
                     events_truncated = True
                     break
-                excerpt = event["text"][:min(2000, remaining)]
+                excerpt = (event["text"] if event["role"] == "user"
+                           else event["text"][:min(2000, remaining)])
                 events_truncated |= len(excerpt) < len(event["text"])
-                events.append({**event, "text": excerpt})
+                events.append({**event, "text": excerpt,
+                               **({"text_truncated": True} if len(excerpt) < len(event["text"]) else {})})
                 remaining -= len(excerpt) + 128
             attachments = []
             if with_answers and thread["intent"] == "edit" and state in _TERMINAL:
@@ -640,12 +643,15 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                           "workspace_member_delivery": meta.get("workspace_member_delivery"),
                           "recovery_source": thread.get("recovery_source"),
                           "run_id": directory.name, "user": meta.get("title", ""),
+                          "base_run_id": thread.get("base_run_id"),
                           "events": list(reversed(events)), "events_truncated": events_truncated,
+                          "events_start": len(public_events) - len(events),
                           "mode": meta.get("mode"),
                           "member_names": {role: p["name"] for role, p in member_profiles(thread).items()},
                           "role_keys": self.directory_role_keys(thread, linked, saved=saved),
                           "recipient": thread["recipient"], "answer": answer_text, "answer_truncated": truncated,
-                          "intent": thread["intent"], "status": state})
+                          "intent": thread["intent"], "status": state,
+                          **({"error": meta["error"]} if state in {"failed", "blocked", "error"} and meta.get("error") else {})})
         head = turns[-1] if turns else {"run_id": previous, "status": "ready"}
         can_continue = head.get("status") in _TERMINAL or (anchor is not None and not turns)
         if initial.get("superagent") and head.get("status") == "interrupted":
@@ -822,7 +828,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             return self._redact(self._summary(path))
 
     def _request(self, payload: Any) -> dict:
-        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path", "required_source_review_paths"}:
+        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "interaction_mode", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path", "required_source_review_paths"}:
             raise StudioError("任务参数无效。")
         identity = payload.get("request_id")
         try:
@@ -843,6 +849,9 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         scheduler = payload.get("scheduler", "serial")
         if type(scheduler) is not str or scheduler not in {"serial", "parallel", "evented"} or (mode in {"demo", "team-demo"} and scheduler != "serial"):
             raise StudioError("离线演示仅支持串行调度；调度方式须为 serial/parallel/evented。")
+        interaction_mode = payload.get("interaction_mode", "interactive")
+        if interaction_mode not in ("interactive", "autonomous"):
+            raise StudioError("interaction_mode 必须为 interactive 或 autonomous。")
         thinking = payload.get("thinking", self.settings.thinking)
         if type(thinking) is not str or thinking not in {"disabled", "enabled"}:
             raise StudioError("thinking 必须为 disabled 或 enabled。")
@@ -903,6 +912,9 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             raise StudioError("预算无效：轮数 1–1000、累计 token 0–100000000（0 表示不限）、时限 1–86400 秒。") from None
         result = {"request_id": identity, "mode": mode, "objective": objective,
                   "scheduler": scheduler, "thinking": thinking, "acceptance_files": files}
+        # Existing interactive requests keep their idempotency fingerprint.
+        if interaction_mode == "autonomous":
+            result["interaction_mode"] = interaction_mode
         if "workspace_path" in payload:
             if mode == "team-demo" or mode == "team" and "conversation" not in payload:
                 raise StudioError("请选择私聊或群聊来绑定本地工作区。")
@@ -954,19 +966,33 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             request["superagent"] = True
         if routed:
             request["studio_dispatch"] = routed
-        fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         with self._lock, self._admission():
             if self._closed:
                 raise StudioError("工作室正在关闭。", "unavailable", 503)
+            # Resolve a default against the original parent, even on replay after
+            # the room head moved. A missing parent is checked by admission below.
+            inherit_from = (request.get("conversation", {}).get("parent_run_id")
+                            if "interaction_mode" not in payload else None)
+            replay = None
             for path in self._directories():
                 try:
                     meta = self._meta(path)
                 except StudioError:
                     continue
+                if path.name == inherit_from:
+                    if meta.get("request", {}).get("interaction_mode") == "autonomous":
+                        request["interaction_mode"] = "autonomous"
+                    inherit_from = None
                 if meta.get("request_id") == request["request_id"]:
-                    if meta.get("fingerprint") != fingerprint:
-                        raise StudioError("同一次提交不能改成不同的任务。", "conflict", 409)
-                    return self._redact(self._summary(path))
+                    replay = (path, meta)
+                if replay and not inherit_from:
+                    break
+            fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            if replay:
+                path, meta = replay
+                if meta.get("fingerprint") != fingerprint:
+                    raise StudioError("同一次提交不能改成不同的任务。", "conflict", 409)
+                return self._redact(self._summary(path))
             if superagent and self.superagent_head()["head_run_id"] != request["conversation"].get("parent_run_id"):
                 raise StudioError("统一对话已更新，请读取最新消息后再发送。", "stale_head", 409)
             if request["mode"] in {"single", "team"} and not self.settings.api_key.strip():
@@ -1564,6 +1590,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         path = self._directory(run_id)
         saved_limits = self._meta(path).get("effective_limits", request.get("limits", {}))
         settings = replace(self.settings, thinking=request["thinking"],
+                           interaction_mode=request.get("interaction_mode", "interactive"),
                            limits=configured_limits(self.settings.limits, saved_limits))
         should_cancel = self._cancellations[run_id].is_set
         mode = request["mode"]
@@ -1581,6 +1608,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         with Tracer(path) as tracer:
             tracer.event("studio_configuration", task_id=run_id,
                          configuration={"model": settings.model, "thinking": settings.thinking,
+                                        "interaction_mode": settings.interaction_mode,
                                         "max_output_tokens": settings.max_output_tokens,
                                         "request_timeout_seconds": settings.request_timeout_seconds,
                                         "request_deadline_seconds": settings.request_deadline_seconds,

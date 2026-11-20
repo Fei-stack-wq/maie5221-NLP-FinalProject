@@ -166,11 +166,15 @@ class StudioDispatchTest(unittest.TestCase):
         team = RecordingProvider([tool('delegate_task', assignee='reviewer', objective='审阅说明。'),
                                   {'text': '我已审阅。'}, {'text': '已收到审阅。'}])
         with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[parent,team]):
-            source = self.service.send_superagent(message('让开发组进行审阅。', creator))['id']
+            source = self.service.send_superagent({**message('让开发组进行审阅。', creator),
+                                                  'interaction_mode': 'autonomous'})['id']
             child, = self.settled(source)
         native = self.service.detail(child['child_run_id'])
         self.assertEqual(child['conversation_id'], group)
         self.assertEqual((native['run']['mode'], native['run']['recipient']), ('team', 'maintainer'))
+        self.assertEqual(native['run']['interaction_mode'], 'autonomous')
+        self.assertEqual(self.service.detail(source)['run']['interaction_mode'], 'autonomous')
+        self.assertTrue(all('ask_human' not in tools for _, tools in parent.requests + team.requests))
         self.assertIn(child['status'], {'completed', 'unverified'}, child)
         self.assertEqual(native['conversation']['head_run_id'], child['child_run_id'])
         self.assertTrue(any(e['kind'] == 'assignment' and e['recipient'] == 'reviewer' for e in native['room_events']))

@@ -6,6 +6,8 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#faf9f6">
   <title>Agent Studio · 本地工作室</title>
+  <script src="/markdown-it.min.js" defer></script>
+  <script src="/markdown-reader.js" defer></script>
   <script src="/activity.js" defer></script>
   <script src="/superagent.js" defer></script>
   <link rel="icon" href="data:,">
@@ -16,6 +18,7 @@
   <script src="/directory.js" defer></script>
   <link rel="stylesheet" href="/room-panel.css">
   <script src="/room-panel.js" defer></script>
+  <link rel="stylesheet" href="/markdown-reader.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -55,6 +58,11 @@
   <dialog id="role-dialog" class="task-dialog role-dialog" aria-labelledby="role-dialog-title"><div class="dialog-header"><h2 id="role-dialog-title"></h2><button type="button" class="icon-button" data-role-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="role-editor"></div></dialog>
   <dialog id="channel-dialog" class="task-dialog" aria-labelledby="channel-dialog-title"><div class="dialog-header"><h2 id="channel-dialog-title"></h2><button type="button" class="icon-button" data-channel-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="channel-editor"></div></dialog>
   <dialog id="membership-dialog" class="task-dialog roster-dialog" aria-labelledby="membership-title"><div class="dialog-header"><h2 id="membership-title">管理群成员</h2><button type="button" class="icon-button" data-dismiss-members aria-label="关闭成员管理"><span data-icon="x"></span></button></div><div id="membership-content"></div></dialog>
+  <dialog id="markdown-reader" class="md-reader" aria-labelledby="md-title">
+    <header><button type="button" class="text-button" data-md-back hidden>返回</button><div><span class="md-origin"></span><h2 id="md-title"></h2><span class="md-path"></span></div>
+    <a class="text-button" download>下载原文</a><button type="button" class="icon-button" data-md-close aria-label="关闭文件预览" autofocus>×</button></header>
+    <article class="prose" aria-live="polite"></article>
+  </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript>请启用 JavaScript 使用本地工作室。</noscript>
 </body>

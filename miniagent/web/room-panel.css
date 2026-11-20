@@ -12,8 +12,8 @@
 .room-rail ul {list-style:none;margin:11px 0 0;padding:0;max-height:65dvh;overflow:auto;scrollbar-width:thin}
 .room-rail li {display:flex;align-items:center;gap:8px;min-height:48px}
 .roster-avatar {display:grid;place-items:center;width:30px;height:30px;border-radius:9px;flex:none;background:#e6e8dc;color:#536048;font-weight:600;font-size:14px}
-.room-rail li:nth-child(3n+2) .roster-avatar {background:#efe1d8;color:#835b48}
-.room-rail li:nth-child(3n) .roster-avatar {background:#e2e6ea;color:#4a6170}
+.roster-avatar[data-tone="1"] {background:#efe1d8;color:#835b48}
+.roster-avatar[data-tone="2"] {background:#e2e6ea;color:#4a6170}
 .roster-identity {min-width:0;flex:1}
 .roster-identity strong,.roster-identity small {display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 .roster-identity strong,.roster-identity a.member-profile {color:var(--ink);font-size:13px;font-weight:550;text-decoration:none}

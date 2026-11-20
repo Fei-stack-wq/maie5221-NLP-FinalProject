@@ -37,8 +37,8 @@ class ReworkBudgetTest(unittest.TestCase):
         ]
         dispatch = RoomCrew._dispatch
 
-        def simulate_elapsed_time(room, role, *args):
-            result = dispatch(room, role, *args)
+        def simulate_elapsed_time(room, role, *args, **kwargs):
+            result = dispatch(room, role, *args, **kwargs)
             if role == "qa" and room._next_review() and room._next_review().state == "repair":
                 # Original room budget was one hour, with 693 s forecast for release.
                 # At the second rejected real attempt only ~425 s remained.

@@ -62,6 +62,8 @@ async function room(page, url) {
   await form.locator('[name="recipient"]').selectOption('lead');
   assert.equal(await form.locator('[name="dispatch"]').inputValue(), 'team');
   await form.getByRole('button',{name:'选项',exact:true}).click();
+  assert.equal(await form.locator('[name="interaction_mode"]').inputValue(), 'autonomous');
+  await form.locator('[name="interaction_mode"]').selectOption('interactive');
   assert.equal(await form.locator('[name="max_total_tokens"]').inputValue(), '0');
   assert.equal(await form.locator('[name="max_steps"]').inputValue(), '0');
   await form.locator('[name="max_steps"]').fill('37');
@@ -71,11 +73,20 @@ async function room(page, url) {
   await form.locator('[name="required_source_review_paths"]').fill('');
   await form.getByRole('button', {name:'发送'}).click();
   const human = page.locator('.human-form');
+  const underway = page.locator('.chat-turn').first();
+  const liveAssignment = underway.locator('.room-message[data-kind="assignment"]');
+  const liveMaterial = liveAssignment.locator('details.room-material');
+  await liveMaterial.locator(':scope > summary').click();
+  assert.equal(await liveMaterial.locator('.prose').getByText(/材料末尾。/).isVisible(), true);
+  assert.equal(await underway.locator('[data-kind="member_report"]').count(), 0);
+  await page.waitForResponse(response => /\/api\/runs\/[^/?]+$/.test(new URL(response.url()).pathname));
+  assert.equal(await liveMaterial.evaluate(node=>node.open), true);
   await human.locator('textarea').fill('两年');
   await human.getByRole('button', {name:'答复并继续'}).click();
   const reply = page.locator('.reply-form');
   await reply.locator('textarea[name="message"]').fill('接着未完成的文件修订。');
   assert.equal(requests[0].mode, 'team');
+  assert.equal(requests[0].interaction_mode, 'interactive');
   assert.equal(requests[0].workspace_path, project);
   assert.deepEqual(requests[0].conversation.members.sort(), ['lead','reviewer','worker']);
   assert.equal(requests[0].conversation.profiles, undefined);
@@ -109,12 +120,31 @@ async function room(page, url) {
   assert.equal(requests[1].conversation.recover_failed, true);
   await page.locator('.thread-workspace code').getByText(project, {exact:true}).waitFor();
   const firstTurn = page.locator('.chat-turn').first();
-  await firstTurn.getByText('已交接给负责人').waitFor();
+  const assignment = firstTurn.locator('.room-message[data-kind="assignment"]');
+  assert.equal(await assignment.locator('.speaker a').innerText(), '项目负责人');
+  const assignmentLine = await assignment.locator('.room-line').innerText();
+  assert.match(assignmentLine, /^@[^@]+问清时间范围，再把结果记下来。$/);
+  assert.equal(await firstTurn.locator('.chat-user p').innerText(), '请协作写一份模拟说明。');
+  assert.equal(await firstTurn.locator('[data-kind="goal"]').count(), 0);
+  const material = assignment.locator('details.room-material');
+  assert.equal(await material.evaluate(node=>node.open), false);
+  await material.locator(':scope > summary').click();
+  await material.locator('.prose').getByText(/材料末尾。/).waitFor();
+  assert.equal(await material.evaluate(node=>node.open), true);
+  const report = firstTurn.locator('.room-message[data-kind="member_report"]');
+  assert.match(await report.locator('.room-mention').innerText(), /@项目负责人/);
+  assert.match(await report.locator('.room-line').innerText(), /已记录两年期限。/);
+  assert.equal(await report.locator('.room-disposition').innerText(), '已交接');
+  const reportDetails = report.locator('details.room-material');
+  assert.equal(await reportDetails.evaluate(node=>node.open), false);
+  assert.equal(await firstTurn.locator('details.room-records').evaluate(node=>node.open), false);
+  await reportDetails.locator(':scope > summary').click();
   const receiptFile = firstTurn.locator('.member-files a').filter({hasText:'working.md'});
+  assert.match(await receiptFile.getAttribute('data-md-path'), /^handoffs\/[a-f0-9]{32}\/working\.md$/);
   await receiptFile.click();
-  assert.match(await page.locator('.artifact-button.active').getAttribute('data-file'), /^handoffs\/[a-f0-9]{32}\/working\.md$/);
-  await page.locator('.file-content.prose').getByText('Unpublished working version of the proposal.').waitFor();
-  await page.goBack();
+  const reader = page.getByRole('dialog', {name:'working.md'});
+  await reader.getByText('Unpublished working version of the proposal.').waitFor();
+  await reader.getByRole('button', {name:'关闭文件预览'}).click();
   await page.waitForURL('**/#run/' + latest + '/chat');
   const files = firstTurn.locator('.chat-agent > .turn-files');
   await files.evaluate(details => details.open = true);
@@ -161,10 +191,10 @@ async function room(page, url) {
   await screenshot.close();
   const historicLink = files.locator('a').filter({hasText:'agents/lead/working.md'});
   await historicLink.click();
-  await page.locator('.file-content.prose').getByText('Unpublished working version of the proposal.').waitFor();
-  assert.equal(await page.locator('.artifact-button.active').getAttribute('data-file'), 'agents/lead/working.md');
-  assert.equal(await page.locator('.file-content').getByText('follow-up revision', {exact:false}).count(),0);
-  await page.goBack();
+  assert.equal(await historicLink.getAttribute('data-md-path'), 'agents/lead/working.md');
+  await reader.getByText('Unpublished working version of the proposal.').waitFor();
+  assert.equal(await reader.getByText('follow-up revision', {exact:false}).count(),0);
+  await reader.getByRole('button', {name:'关闭文件预览'}).click();
   await page.waitForURL('**/#run/' + latest + '/chat');
   const delivery = await page.request.get(url + 'api/runs/' + latest + '/artifact?path=agents/lead/working.md');
   assert.match((await delivery.json()).content, /Unpublished working version[\s\S]*follow-up revision/);
@@ -172,6 +202,24 @@ async function room(page, url) {
   const download = page.waitForEvent('download');
   await exportLink.click();
   assert.equal((await download).suggestedFilename(), latest + '-room.zip');
+  // Old material is open when a burst of later notes pushes it beyond the preview window.
+  const token = (await (await page.request.get(url+'api/bootstrap')).json()).csrf_token;
+  const origin = new URL(url).origin;
+  const audit = url+'api/runs/'+detail.run.id+'/review';
+  for (let i=0; i<51; i++) {
+    const response = await page.request.post(audit, {headers:{Origin:origin,'X-Studio-Token':token},
+      data:{verdict:'passed',note:'追加复查记录 '+i}});
+    assert.equal(response.status(),200);
+  }
+  const gap = firstTurn.getByRole('button',{name:'查看此处更早的消息'});
+  await gap.waitFor();
+  assert.equal(await material.evaluate(node=>node.open),true);
+  await gap.click();
+  await firstTurn.getByText('追加复查记录 15',{exact:true}).waitFor();
+  await gap.click();
+  await firstTurn.getByText('追加复查记录 0',{exact:true}).waitFor();
+  assert.equal(await firstTurn.locator('[data-kind="human_review"]').count(),51);
+  assert.equal(await material.evaluate(node=>node.open),true);
   assert.deepEqual(errors, []);
   console.log('Persistent role, team assignment, human reply, failed workspace recovery and budget, download passed.');
 }
@@ -189,5 +237,6 @@ async function stability(page, url) {
     withFixture('serve_stability_fixture', stability, ['--port', '0']),
     withFixture('serve_room_fixture', room)
   ]);
-  for (const outcome of outcomes) if (outcome.status === 'rejected') throw outcome.reason;
+  const failures = outcomes.filter(outcome=>outcome.status==='rejected');
+  if (failures.length) throw new AggregateError(failures.map(outcome=>outcome.reason),'Room browser regressions failed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

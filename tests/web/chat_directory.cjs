@@ -23,6 +23,12 @@ async function verify(page, url) {
  await page.getByRole('heading',{name:'机房运维组',exact:true}).waitFor();
  const jump = page.getByRole('button',{name:'跳到最新消息'});
  await page.emulateMedia({reducedMotion:'reduce'});
+ // The fixture's long report now starts folded. Open it to exercise a feed
+ // with off-screen messages before checking the jump control and End key.
+ const reportSummary = page.getByText('完整回复',{exact:true});
+ await reportSummary.click();
+ assert(await reportSummary.evaluate(node=>node.closest('details').open));
+ await page.evaluate(()=>window.scrollTo(0,0));
  await jump.click();
  await page.waitForFunction(()=>document.querySelector('[data-chat-end]').getBoundingClientRect().bottom<=innerHeight);
  await jump.waitFor({state:'hidden'});

@@ -673,6 +673,24 @@ sys.exit(bool(errors))
         self.assertNotEqual(detail["run"]["status"],"completed")
         self.assertEqual(self.close_events(detail), [])
 
+    def test_autonomous_review_closes_with_signed_gap_when_private_authority_is_required(self):
+        manuscript = "Shipment destination: old warehouse. Verified dispatch record."
+        missing = submit(manuscript, "inconclusive", cause="business",
+                         action="Only the owner can authorize the shipment destination.")
+        detail, provider = self.execute(
+            self.start_review() + [missing, {"text": "Owner authorization is unavailable."},
+                                   {"text": "[BLOCKED] Cannot certify destination without owner authorization."}],
+            interaction_mode="autonomous")
+        self.assertEqual(detail["run"]["status"], "failed", detail["run"])
+        self.assertFalse(detail["pending_questions"])
+        self.assertFalse({event["kind"] for event in detail["room_events"]} & {"human_question", "human_answer"})
+        review, = [event["handoff"]["native_review"] for event in detail["room_events"]
+                   if "native_review" in event.get("handoff", {})]
+        self.assertEqual(review["state"], "blocked")
+        self.assertEqual(review["findings"][0]["cause"], "business")
+        self.assertIn("authorize the shipment", detail["conversation"]["turns"][-1]["answer"])
+        self.assertFalse(provider.requests[-1][1])
+
     def test_business_question_waits_for_authenticated_input_and_does_not_repeat(self):
         rule=Rule.model_validate(RULE)
         item=Review("target","builder","inspector","Deliver.",[rule],{PATH:"before"})

@@ -218,7 +218,8 @@ class StudioDispatch:
             payload = {'request_id': row['id'], 'mode': 'team' if row['target_kind'] == 'group' else 'single',
                        'objective': row['objective'], 'acceptance_files': json.loads(row['acceptance']),
                        'conversation': message, 'thinking': source['request'].get('thinking', self.settings.thinking),
-                       'limits': source['request'].get('limits', {})}
+                       'limits': source['request'].get('limits', {}),
+                       'interaction_mode': source['request'].get('interaction_mode', 'interactive')}
             if source.get('workspace_path'):
                 payload['workspace_path'] = source['workspace_path']
             group = ({'group_id': row['target_id'], 'participants': json.loads(row['participants'] or '[]')}

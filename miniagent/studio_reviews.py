@@ -201,7 +201,7 @@ class Review:
                                         if finding["cause"] == "business")
             self.state = "review"
 
-    def apply(self, assessment, human_state):
+    def apply(self, assessment, human_state, *, allow_user_input=True):
         previous = {g["criterion_id"] for g in self.verification_gaps()}
         self.covered_failed_sites.update(self._covered_sites(self.latest))
         new_sites = self._covered_sites(assessment) - self.covered_failed_sites
@@ -225,7 +225,7 @@ class Review:
             self.state = "repair"
         elif any(g["cause"] == "business" for g in gaps):
             questions = {(self.version, g["criterion_id"]) for g in gaps if g["cause"] == "business"}
-            if questions <= self.answered_issues:
+            if not allow_user_input or questions <= self.answered_issues:
                 self.state = "blocked"
                 return
             self.state = "awaiting_user"

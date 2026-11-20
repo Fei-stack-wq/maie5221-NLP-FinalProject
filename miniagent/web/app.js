@@ -134,17 +134,19 @@ function artifactLink(runId, file) {
  const binary = databaseFile(path);
  const href = preview || binary ? fileURL(runId, path, preview ? 'preview' : 'download')
   : '#run/' + encodeURIComponent(runId) + '/artifacts?' + new URLSearchParams({path});
+ const markdownFile = /\.md$/i.test(path);
+ const attrs = markdownFile ? StudioMarkdown.attributes({run:runId, path, size:file.size, kind:file.kind}) : `href="${e(href)}"`;
  const action = preview ? '预览' : binary ? '下载' : '查看';
- return `<a class="turn-file" href="${e(href)}" ${preview?'target="_blank" rel="noopener noreferrer"':binary?'download':''}
+ return `<a class="turn-file" ${attrs} ${preview?'target="_blank" rel="noopener noreferrer"':binary?'download':''}
   title="${e(file.project_path||path)}${file.sha256?' · SHA-256 '+e(file.sha256):''}">${icon(binary?'download':preview?'link':'file')}<span>${e(file.project_path || path)}</span><small>${action} · ${e(sizeText(file.size))}</small></a>${window.StudioActivity?.preview(runId,file)||''}`;
 }
-function turnFiles(turn) {
+function turnFiles(turn, collapsed=false) {
  const files = turn.artifacts || [];
  const delivered = turn.workspace_delivery;
  const status = delivered?.status==='published' ? `已写入本地工作区 · ${delivered.files.length} 个文件`
   : delivered?.status==='failed' ? delivered.message : '';
  if (!files.length && !status) return '';
- return `<details class="turn-files" ${files.length <= 5 ? 'open' : ''}><summary>本轮文件 · ${files.length}</summary>
+ return `<details class="turn-files" ${!collapsed && files.length <= 5 ? 'open' : ''}><summary>本轮文件 · ${files.length}</summary>
   ${status ? `<p class="muted-note">${e(status)}</p>` : ''}
   <div>${files.map(file=>artifactLink(turn.run_id,file)).join('')}</div></details>`;
 }
@@ -156,6 +158,14 @@ function roleOptions(ids, selected) {
 function intentOptions(intent) {
  return `<option value="edit" ${intent === 'edit' ? 'selected' : ''}>执行或修改</option>
          <option value="question" ${intent === 'question' ? 'selected' : ''}>只读问答</option>`;
+}
+
+function interactionOptions(selected='autonomous') {
+ return `<option value="autonomous" ${selected==='autonomous'?'selected':''}>自动完成</option>
+         <option value="interactive" ${selected==='interactive'?'selected':''}>允许中途询问</option>`;
+}
+function interactionField(selected='autonomous') {
+ return `<label class="field-label">执行方式<select name="interaction_mode">${interactionOptions(selected)}</select></label>`;
 }
 
 function dispatchField(selected='team') {
@@ -582,6 +592,7 @@ function conversationComposer(thread,run) {
       <input name="acceptance_files" ${intent === 'question' ? 'disabled' : ''} placeholder="例如 snake/game.js" value="${e(draft.files || '')}"></label>
     </div>
     <details class="studio-disclosure"><summary>本轮选项与预算</summary>
+     ${interactionField(draft.interactionMode || (last ? run.interaction_mode || 'interactive' : 'autonomous'))}
      ${intent==='edit'?`<label class="field-label">项目文件<select name="base">
        <option value="published" ${draft.base==='published'?'selected':''}>沿用最近发布版本</option>
        ${run.status==='failed' && last?.intent==='edit'?`<option value="failed" ${draft.base==='failed'?'selected':''}>接着本轮未完成文件</option>`:''}
@@ -600,25 +611,27 @@ function conversationComposer(thread,run) {
 function conversationPanel(detail) {
  const thread = detail.conversation;
  if (!thread) return empty('当前运行没有项目对话','可从“对话”发起私聊或群聊。');
+ if (historyThread !== thread.id) {
+  roomHistory.clear();
+  historyThread = thread.id;
+ }
+ const group = thread.kind==='group';
  const latestVersion = thread.artifact_run_id;
- const history = thread.turns.map(turn => {
+ const history = thread.turns.map(entry => {
+  const turn = roomPage(entry,detail);
   const link = turn.run_id === detail.run.id
    ? '<button class="text-button" data-tab="overview">本轮详情</button>'
    : `<a class="text-button" href="#run/${encodeURIComponent(turn.run_id)}">查看本轮</a>`;
-  const note = runActive(turn) ? '正在处理…' : '本轮没有保存回复正文，可在运行详情查看产物和记录。';
   return `<article class="chat-turn" data-key="turn-${e(turn.run_id)}">
    <div class="chat-user"><div class="speaker">你 <small>发给 ${e(turn.member_names?.[turn.recipient] || roleLabel(turn.recipient))}</small></div>
-   <p>${e(turn.user)}</p></div>
-   ${roomMessages(turn.events||[],turn.run_id,turn.member_names)}
-   ${window.StudioActivity?.renderTurn(turn,detail)||''}
-   <div class="chat-agent"><div class="speaker">${icon('cpu')} ${memberLink(turn.role_keys?turn:thread,turn.recipient)} ${link}</div>
-    ${turn.answer ? `<div class="chat-answer prose">${markdown(turn.answer)}</div>` : `<p class="muted-note">${e(note)}</p>`}
-    ${turn.answer_truncated ? '<small>这里只展示回复节选。</small>' : ''}${turnFiles(turn)}</div></article>`;
+   <p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p></div>
+   ${roomMessages(turn,detail,group)}
+   <div class="chat-agent">${turn.answer ? `<div class="speaker">${group?roomAvatar(turn,turn.recipient):icon('cpu')} ${memberLink(turn.role_keys?turn:thread,turn.recipient)} ${link}</div>
+    ${roomReply(turn,group)}` : roomStatus(turn,detail,link)}${turnFiles(turn,group)}</div></article>`;
  }).join('');
  const versionLink = latestVersion === detail.run.id
   ? '<button class="text-button" data-tab="artifacts">查看当前产物</button>'
   : latestVersion ? `<a class="text-button" href="#run/${encodeURIComponent(latestVersion)}/artifacts">查看项目产物</a>` : '';
- const group = thread.kind==='group';
  return `<div class="${group?'group-chat-layout':'private-chat-layout'}"><section class="chat-thread" data-key="thread-${e(thread.id)}">
    <header class="thread-head"><div><h2>${thread.kind === 'group' ? '项目群聊' : '项目私聊'}</h2>
     ${group?'':`<p>${thread.members.map(id=>memberLink(thread,id)).join('、')}</p>`}
@@ -630,7 +643,7 @@ function conversationPanel(detail) {
 
 function rememberReply(form) {
  const fields = form.elements;
- const draft = {message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
+ const draft = {interactionMode:fields.interaction_mode.value,message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
   sourcePaths:fields.required_source_review_paths?.value ?? chatDrafts.get(form.dataset.thread)?.sourcePaths,
   rules:fields.acceptance_checks?.value,children:fields.child_checks?.value,base:fields.base?.value,dispatch:fields.dispatch?.value,
   limits:Object.fromEntries(runLimitFields.map(k=>[k.name, Number(fields[k.name].value)]))};
@@ -647,7 +660,7 @@ async function sendReply(form) {
   render();
   return;
  }
- const payload = {mode:draft.intent==='edit'&&draft.dispatch==='team'?'team':'single',limits:draft.limits,objective:draft.message.trim(),conversation:{
+ const payload = {interaction_mode:draft.interactionMode,mode:draft.intent==='edit'&&draft.dispatch==='team'?'team':'single',limits:draft.limits,objective:draft.message.trim(),conversation:{
   parent_run_id:form.dataset.parent,recipient:draft.recipient,intent:draft.intent
  }};
  if (draft.intent === 'edit') {
@@ -727,6 +740,7 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
     <button type="button" class="secondary" data-action="pick-workspace">${icon('folder')}选择文件夹</button></div>
    <small>已有文件会作为项目输入，成功交付的修改会写回这里。</small></div>` : ''}
   <div class="advanced" id="${prefix}-advanced" hidden>
+   ${!demo ? interactionField() : ''}
    ${mode==='team' ? '<label class="field-label">调度方式<select name="scheduler"><option value="serial">串行 · 按依赖执行</option><option value="parallel">分层并发</option><option value="evented">事件驱动</option></select></label>' : ''}
    <label class="field-label">模型思考<select name="thinking" ${demo?'disabled':''}><option value="disabled">关闭</option>
      <option value="enabled" ${state.config?.thinking==='enabled'?'selected':''}>开启</option></select></label>
@@ -759,9 +773,27 @@ function eventLabel(event){const names={step_start:'开始一轮决策与执行'
 function summaryStats(detail){const s=detail.summary||{},r=detail.run;return `<div class="panel summary-panel"><h3>运行摘要</h3><div class="stat-line"><span>执行模式</span><strong>${e(runModeLabel(r, detail.conversation?.kind))}</strong></div><div class="stat-line"><span>完成任务</span><strong>${r.completed_count||0} / ${r.task_count||0}</strong></div><div class="stat-line"><span>运行耗时</span><strong>${duration(r.duration_ms)}</strong></div><div class="stat-line"><span>生成产物</span><strong>${detail.artifacts?.length||0} 个</strong></div><div class="stat-line"><span>${detail.summary_incomplete?'部分 token 记录':'已记录 token'}</span><strong>${Number(s.total_tokens||0).toLocaleString()}</strong></div><div class="summary-rule"></div><div class="summary-callout">${icon('shield')}${r.status==='completed'?'结果已通过独立验收。你可以在验收页查看检查项与证据。':endedWithoutChecks(detail)?'执行已结束。本轮未配置独立验收，可以查看产物或继续对话。':r.status==='unverified'?'独立验收尚未确认本轮结果，具体原因可在验收页查看。':r.status==='interrupted'?'当前服务未持有执行权，无法判断原执行者是否仍在运行。历史状态保留。':'每个任务的状态与验收记录会持续保存。'}</div><p class="muted-note">${r.mode?.includes('demo')?'离线演示的 token 为估算值。':'token 按已有记录汇总，不代表完整费用账单。'}</p></div>`;}
 function overview(detail){const events=eventEntries(detail.events||[]).slice(-6).reverse();return `<div class="overview-grid"><div class="panel"><div class="panel-heading"><span>${icon('branch')}任务树</span><small>点击任务查看详情</small></div><div class="task-tree">${taskNodes(detail.tasks||[])}</div></div>${summaryStats(detail)}</div><div class="panel activity-panel"><div class="panel-heading"><span>${icon('clock')}最近动态</span><button class="text-button" data-tab="logs">查看完整日志 ${icon('arrow')}</button></div><div class="activity-list">${events.map(({event,key})=>`<div class="activity-row" data-key="${e(key)}"><span class="activity-time">${e(clockText(event.ts?event.ts*1000:event.iso))}</span>${icon(event.kind?.includes('end')?'check':'circle')}<span class="activity-label">${e(eventLabel(event))}</span></div>`).join('')||'<p class="muted-note">等待第一条执行记录…</p>'}</div></div>`;}
 function logs(detail){const all=detail.events||[];const list=eventEntries(all).filter(({event})=>state.logFilter==='all'||(state.logFilter==='tools'?event.kind==='tool_result':state.logFilter==='acceptance'?event.kind==='acceptance':(event.kind?.includes('error')||['context_limit','output_recovery_exhausted'].includes(event.kind)||event.error_class||event.error||event.ok===false)));return `<div class="log-toolbar"><select id="log-filter" class="filter-select" aria-label="筛选日志">${[['all','全部事件'],['tools','工具调用'],['acceptance','验收事件'],['errors','错误事件']].map(([v,t])=>`<option value="${v}" ${state.logFilter===v?'selected':''}>${t}</option>`).join('')}</select><p>${detail.events_truncated?'仅展示最近部分日志 · ':''}${list.length} 条事件 · 点击展开详情</p></div>${list.length?`<div class="log-list">${list.map(({event,key})=>`<details class="log-entry ${event.error_class||event.ok===false||event.kind?.includes('error')||['context_limit','output_recovery_exhausted'].includes(event.kind)?'error':''}" data-key="${e(key)}" data-log="${e(key)}" ${state.logOpen.has(key)?'open':''}><summary><span class="activity-time">${e(clockText(event.ts?event.ts*1000:event.iso))}</span><span class="event-kind">${e(event.kind)}</span><span class="log-caption">${e(eventLabel(event))}${event.error||event.error_class||event.finish_reason==='length'?`<small>${e(event.finish_reason==='length'?'输出截断 (length) · '+event.completion_tokens+' token':event.error||event.preview||event.error_class)}</small>`:''}</span>${icon('chevron')}</summary><pre>${e(JSON.stringify(event,null,2))}</pre></details>`).join('')}</div>`:empty('这里还没有事件','执行日志会在任务运行时更新。')}`;}
-function inlineMarkdown(text){return e(text).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');}
-function markdown(source){const lines=String(source).split('\n');let result='',list=false,code=false,table=false,buffer=[];const closeList=()=>{if(list){result+='</ul>';list=false;}};const closeTable=()=>{if(table){result+='</tbody></table>';table=false;}};for(let i=0;i<lines.length;i++){const line=lines[i];if(line.startsWith('```')){closeList();closeTable();if(code){result+=`<pre><code>${e(buffer.join('\n'))}</code></pre>`;buffer=[];}code=!code;continue;}if(code){buffer.push(line);continue;}if(/^\|.+\|\s*$/.test(line)){closeList();const cells=line.trim().slice(1,-1).split('|').map(s=>s.trim());if(cells.every(c=>/^:?-+:?$/.test(c)))continue;if(!table){result+='<table><tbody>';table=true;}result+='<tr>'+cells.map(c=>`<td>${inlineMarkdown(c)}</td>`).join('')+'</tr>';continue;}closeTable();const heading=line.match(/^(#{1,3})\s+(.+)$/);if(heading){closeList();result+=`<h${heading[1].length}>${inlineMarkdown(heading[2])}</h${heading[1].length}>`;continue;}if(/^[-*] /.test(line)){if(!list){result+='<ul>';list=true;}result+=`<li>${inlineMarkdown(line.slice(2))}</li>`;continue;}closeList();if(line.trim())result+=`<p>${inlineMarkdown(line)}</p>`;}closeList();closeTable();if(code)result+=`<pre>${e(buffer.join('\n'))}</pre>`;return result;}
-function filePreview(){if(!state.selectedFile)return empty('选择一个产物','在左侧选择文件，预览实际生成的内容。');if(!state.fileData)return '<div class="initial-loading"><span class="spinner"></span>正在读取产物…</div>';if(state.fileData.error)return `<div class="error-panel">${e(state.fileData.error)}</div>`;const f=state.fileData;if(f.media_type==='image/png')return `<div class="file-header"><span>${e(f.path.split('/').pop())}</span><a class="text-button" href="${e(fileURL(state.runId,f.path,'download'))}" download>${icon('download')}下载截图</a></div><img class="project-screenshot" src="${e(fileURL(state.runId,f.path,'preview'))}" alt="${e(f.path)}">`;if(f.binary) return `<div class="file-header"><span>${e(f.path.split('/').pop())}</span><a class="text-button" href="${e(fileURL(state.runId,f.path,'download'))}" download>${icon('download')}下载数据库</a></div><p class="binary-note">SQLite 数据库，可下载后在本机打开。</p>`;return `<div class="file-header"><span>${e(f.path.split('/').pop())}</span>${f.path.toLowerCase().endsWith('.html')?`<a class="text-button" href="/api/runs/${encodeURIComponent(state.runId)}/preview?path=${encodeURIComponent(f.path)}" target="_blank" rel="noopener noreferrer">打开交互预览</a>`:''}<a class="text-button" href="${e(fileURL(state.runId,f.path,'download'))}" download>${icon('download')}下载文件</a></div>${f.truncated?'<div class="run-warning">仅预览前 256 KiB。下载可获取完整文件。</div>':''}<div class="file-content ${f.path.endsWith('.md')?'prose':''}">${f.path.endsWith('.md')?markdown(f.content):`<pre>${e(f.content)}</pre>`}</div>`;}
+function inlineMarkdown(source, turn, row) { return StudioMarkdown.render(source, turn, row, true); }
+function markdown(source, turn, row) { return StudioMarkdown.render(source, turn, row); }
+function filePreview() {
+ if (!state.selectedFile) return empty('选择一个产物','在左侧选择文件，预览实际生成的内容。');
+ const f=state.fileData;
+ if (!f) return '<div class="initial-loading"><span class="spinner"></span>正在读取产物…</div>';
+ if (f.error) return `<div class="error-panel">${e(f.error)}</div>`;
+ const run=state.runId, name=e(f.path.split('/').pop());
+ const size=state.detail?.artifacts?.find(file=>file.path===f.path)?.size;
+ const download=label=>StudioMarkdown.overDownloadLimit(size)?'':
+  `<a class="text-button" href="${e(fileURL(run,f.path,'download'))}" download>${icon('download')}${label}</a>`;
+ if (f.media_type==='image/png') return `<div class="file-header"><span>${name}</span>${download('下载截图')}</div>
+  <img class="project-screenshot" src="${e(fileURL(run,f.path,'preview'))}" alt="${e(f.path)}">`;
+ if (f.binary) return `<div class="file-header"><span>${name}</span>${download('下载数据库')}</div>
+  <p class="binary-note">SQLite 数据库，可在本机打开。</p>`;
+ const preview=/\.html$/i.test(f.path)?`<a class="text-button" href="${e(fileURL(run,f.path,'preview'))}" target="_blank" rel="noopener noreferrer">打开交互预览</a>`:'';
+ const md=/\.md$/i.test(f.path);
+ return `<div class="file-header"><span>${name}</span>${preview}${download('下载文件')}</div>
+  ${f.truncated?`<div class="run-warning">${StudioMarkdown.truncationNotice(size)}</div>`:''}
+  <div class="file-content ${md?'prose':''}">${md?StudioMarkdown.documentHTML(f.content, {run, path:f.path}):`<pre>${e(f.content)}</pre>`}</div>`;
+}
 function artifacts(detail) {
  let files = detail.artifacts || [];
  if (state.selectedFile?.startsWith('handoffs/')) {
@@ -785,22 +817,179 @@ function diagnosis(detail){
  const title=cancelling?'正在取消任务':active?(activity.length?activity.some(a=>a.phase==='planning')?'正在规划任务':'正在执行 Agent 步骤':'正在执行任务'):issue.title;
  return `<section class="diagnosis ${active?'running':issue?.severity==='warning'&&!endedWithoutChecks(detail)?'warning':''}" data-key="diagnosis"><div class="diagnosis-header"><h2>${e(title)}</h2><button class="secondary" data-action="download-diagnostics">${icon('download')}导出诊断</button></div>${active?`<p class="activity-live"><span class="dot"></span>${activity.length?activity.map(a=>`${e(({coordinate:'负责人分工',work:'执行任务',deliver:'写入分工文件',handoff:'成员交接',finalize:'负责人收尾',planning:'规划任务'})[a.phase]||a.task_id?.split(':').pop()||'整体目标')}${a.step?' 第 '+e(a.step)+' 轮':''}，已用时 ${duration(typeof a.started_ts==='number'?Date.now()-a.started_ts*1000:null)}`).join('；'):'任务状态会自动更新。'}</p>`:`<p>${task?`${e(task.assignee_profile_id||'Agent')}${issue.step?' 第 '+e(issue.step)+' 轮':''}：`:''}${e(issue.message)}</p>`}<div class="diagnosis-facts"><span>执行 <strong>${e(cancelling?'正在取消':execution[d.execution_status]||d.execution_status)}</strong></span><span>验收 <strong>${e(verification[d.acceptance_status]||d.acceptance_status)}</strong></span>${d.configuration?.max_steps!=null?`<span>轮数上限 <strong>${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps)}</strong></span>`:''}${d.configuration?.max_total_tokens!=null?`<span>累计 token 预算 <strong>${d.configuration.max_total_tokens===0?'不限':Number(d.configuration.max_total_tokens).toLocaleString()}</strong></span>`:''}${d.blocked_tasks?.length?`<span>后续受阻 <strong>${d.blocked_tasks.length} 个任务</strong></span>`:''}${issue?.completion_tokens!=null?`<span>本轮输出 <strong>${Number(issue.completion_tokens).toLocaleString()} token</strong></span>`:''}</div>${!active&&issue?.suggestion?`<p class="next-step">下一步：${e(issue.suggestion)}</p>`:''}${!active&&d.acceptance_status==='not_configured'&&issue?.code!=='no_acceptance'?'<p>此外，本次未配置独立验收，不能判定目标已达成。</p>':''}${detail.run.status==='unverified'&&d.execution_status==='failed'?'<p>旧版总状态保存为“未验证”；日志确认存在执行失败。原始记录保持不变。</p>':''}<details data-key="diagnostic-evidence"><summary>查看失败证据、阻塞链与运行配置</summary>${issue?.request_id?`<p>模型请求 <code>${e(issue.request_id)}</code></p>`:''}${issue?.finish_reason?`<p>结束原因 <code>${e(issue.finish_reason)}</code>；输出上限 ${e(issue.max_output_tokens??'旧记录未保存')}；耗时 ${duration(issue.latency_ms)}</p>`:''}${(d.blocked_tasks||[]).map(t=>`<p>${e(t.task_id?.split(':').pop())} / ${e(t.assignee)}：${e(t.reason)}</p>`).join('')}<p>${Object.keys(d.configuration||{}).length?`模型 ${e(d.configuration.model)}；thinking ${e(d.configuration.thinking)}；单次输出上限 ${e(d.configuration.max_output_tokens)} token；执行轮数上限 ${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps??'未记录')}；累计 token 预算 ${e(d.configuration.max_total_tokens??'未记录')}；任务时限 ${e(d.configuration.max_task_seconds??d.configuration.max_seconds??'未记录')} 秒。`:'旧运行没有保存配置快照；当前服务配置不代表当时配置。'}</p>${d.incomplete?'<p>日志已截断，此诊断只基于保留的记录。</p>':''}</details></section>`;
 }
-function roomMessages(events,runId,names={}) {
- const kinds={goal:'任务',assignment:'分工',member_report:'成员交付',runtime_reroute:'平台转交返工',human_question:'询问',human_answer:'用户答复',question_closed:'等待结束',human_review:'人工评审'};
- return events.map(row=>{
-  const reserve = row.reserved;
-  const handoff = row.handoff;
-  const checks = handoff?.evidence?.check_signals || [];
-  const receipt = handoff ? `<div class="handoff-receipt"><strong>${handoff.published?'已交接给负责人':'交接受阻'}</strong>
-   <span>变更 ${e(handoff.changes_total??0)} 个文件</span>
-   ${handoff.remaining_issue?`<p>${e(handoff.remaining_issue)}</p>`:''}
-   ${checks.map(check=>`<p>${e(check)}</p>`).join('')}
-   ${row.artifacts?.length ? `<details class="turn-files member-files" ${row.artifacts.length<=5?'open':''}>
-    <summary>${handoff.published?'成员交付文件':'成员诊断报告'} · ${row.artifacts.length}</summary><div>${row.artifacts.map(file=>artifactLink(runId,file)).join('')}</div></details>` : ''}</div>` : '';
-  return `<div class="room-event"><strong>${e(kinds[row.kind]||row.kind)} · ${e(row.role==='user'?'你':(names?.[row.role] || roleLabel(row.role)))}</strong>${row.recipient?` → ${e(names?.[row.recipient] || roleLabel(row.recipient))}`:''}
-   <p>${e(row.text)}</p>${receipt}${reserve?`<small>后续委派与收尾预留 · ${reserve.steps_left==null?'不限轮数':e(reserve.steps_left)+' 步'} · ${reserve.tokens_left==null?'不限 token':e(Number(reserve.tokens_left).toLocaleString())+' token'}</small>`:''}</div>`;
- }).join('');
+const roomHistory = new Map();
+let historyThread;
+
+function roomPage(turn, detail) {
+ if (turn.run_id === detail.run.id && Array.isArray(detail.room_events))
+  return {...turn, events:detail.room_events, events_start:0};
+ const saved = roomHistory.get(turn.run_id);
+ if (!saved?.events.size) return turn;
+ // A historical turn can receive more journal entries after we fetch a page.
+ // Merge by absolute position and leave explicit gaps between disjoint pages.
+ const rows = new Map(saved.events);
+ (turn.events || []).forEach((row,i)=>{
+  const id = (turn.events_start || 0)+i;
+  if (!rows.has(id) || !row.text_truncated) rows.set(id,row);
+ });
+ const ids = [...rows.keys()].sort((a,b)=>a-b);
+ return {...turn,events:ids.map(id=>rows.get(id)),event_indices:ids,events_start:ids[0] || 0};
 }
+
+function historyState(id) {
+ let saved = roomHistory.get(id);
+ if (!saved) {
+  saved = {events:new Map(),pending:new Set(),errors:new Map()};
+  roomHistory.set(id,saved);
+ }
+ return saved;
+}
+
+function historyButton(runId, before, label) {
+ const saved = roomHistory.get(runId);
+ const pending = saved?.pending.has(before);
+ const error = saved?.errors.get(before);
+ return `<button type="button" class="text-button room-load" data-room-history="${e(runId)}"
+  data-before="${e(before)}" ${pending?'disabled':''}>${e(pending?'正在读取…':label)}</button>${error?`<small role="alert">${e(error)}</small>`:''}`;
+}
+
+async function loadRoomPage(button) {
+ const id = button.dataset.roomHistory;
+ const before = button.dataset.before==='answer'?'answer':Number(button.dataset.before);
+ const saved = historyState(id);
+ if (saved.pending.has(before)) return;
+ saved.pending.add(before);
+ saved.errors.delete(before);
+ render();
+ try {
+  const url = '/api/runs/'+encodeURIComponent(id);
+  if (before==='answer') saved.answer = (await api(url+'/room-answer')).answer;
+  else {
+   const page = await api(url+'/room-events?before='+before);
+   page.events.forEach((row,i)=>saved.events.set(page.start+i,row));
+  }
+ } catch (err) { saved.errors.set(before,err.message); }
+ finally {
+  saved.pending.delete(before);
+  if (state.detail?.conversation?.id===historyThread && roomHistory.get(id)===saved) render();
+ }
+}
+
+function roomLine(source) {
+ const text = String(source || '').trim();
+ if (text.length<=145 && !text.includes('\n')) return text;
+ const lines = text.split(/\n+/).map(line=>line.trim()).filter(Boolean);
+ const summaryHeading = lines.findIndex(line=>/^#{1,6}\s+(一句话(?:成果|交接|总结)|摘要|结论|summary)(?:[：:]|$)/i.test(line));
+ const paragraphs = summaryHeading>=0 ? lines.slice(summaryHeading+1) : lines;
+ const first = paragraphs.find(line=>!/^#{1,6}\s|^\x60\x60\x60|^\|/.test(line)) || lines[0] || '';
+ const clean = first.replace(/^#{1,6}\s+|^[-*]\s+/, '');
+ const sentence = clean.match(/^.{1,144}?[。！？]|^.{1,144}?[.!?](?=\s|$)/u)?.[0];
+ return sentence || (clean.length>145?Array.from(clean).slice(0,140).join('')+'…':clean);
+}
+
+function roomAvatar(turn,id) {
+ return roomPanel.avatar(id,id==='user'?'你':id==='studio'?'Studio':turn.member_names?.[id] || roleLabel(id));
+}
+
+function roomName(turn,id) {
+ return id==='user'?'你':id==='studio'?'Studio':memberLink(turn,id);
+}
+
+function roomMessage(row,index,turn) {
+ const isUser = row.role==='user';
+ const assignment = row.kind==='assignment';
+ const report = row.kind==='member_report';
+ const recipient = row.recipient || (report ? turn.recipient : row.kind==='human_question'?'user':'');
+ const source = String(row.text || '');
+ const handoff = row.handoff;
+ const reason = handoff?.remaining_issue;
+ const disposition = row.disposition || (handoff?.published ? 'published' : reason ? 'blocked' : handoff ? 'unpublished' : '');
+ const blocked = report && disposition==='blocked';
+ const summary = isUser ? source : blocked ? roomLine(reason || '交接受阻') : roomLine(row.chat_message || source);
+ const names = recipient ? [recipient,turn.member_names?.[recipient],roleLabel(recipient)].filter(Boolean) : [];
+ const addressed = names.find(name=>summary.startsWith('@'+name)
+  && (!summary[name.length+1] || /[\s，,:：、。!！]/u.test(summary[name.length+1])));
+ const body = addressed && !isUser ? summary.slice(addressed.length+1).trimStart() : summary;
+ const mention = recipient && !(addressed && isUser) ? `<span class="room-mention">@${roomName(turn,recipient)}</span> ` : '';
+ const files = row.artifacts || [];
+ const receipt = row.kind==='human_review' ? ({passed:'人工评审通过',failed:'人工评审未通过'})[row.verdict]
+  : ({published:'已交接',assessed:'已提交评审',awaiting_review:'等待独立复核',blocked:'交接受阻 · 平台回执',unpublished:'尚未发布'})[disposition];
+ const paths = (row.deliverable_paths || []).map(path=>`<span>${inlineMarkdown(path,turn,row)}</span>`).join(' ');
+ const full = summary!==source || row.text_truncated;
+ const hasMaterials = assignment || report || full && !isUser;
+ const label = assignment?'派工材料':report?'交付材料':'完整消息';
+ const more = row.text_truncated?historyButton(turn.run_id,index+1,'读取完整原文'):'';
+ const checks = handoff?.evidence?.check_signals || [];
+ const materials = hasMaterials ? `<details class="room-material" data-key="materials"><summary>${label}${files.length?` · ${files.length} 个文件`:''}</summary>
+  <div class="room-material-body">${source && (full || assignment || report)?`<div class="prose">${markdown(source,turn,row)}</div>`:''}${more}
+  ${row.expectation?`<p><b>验收要求</b> ${inlineMarkdown(row.expectation,turn,row)}</p>`:''}
+  ${paths?`<p><b>交付路径</b> ${paths}</p>`:''}
+  ${handoff?.remaining_issue?`<p><b>待处理</b> ${inlineMarkdown(handoff.remaining_issue,turn,row)}</p>`:''}
+  ${checks.length?`<ul>${checks.map(check=>`<li>${e(check)}</li>`).join('')}</ul>`:''}
+  ${files.length?`<div class="member-files">${files.map(file=>artifactLink(turn.run_id,file)).join('')}</div>`:''}
+  <details class="room-raw" data-key="raw"><summary>原始事件</summary><pre>${e(JSON.stringify(row,null,2))}</pre></details></div></details>`:'';
+ return `<div class="room-message" data-kind="${e(row.kind)}" data-key="message-${index}">
+  ${roomAvatar(turn,row.role)}<div class="speaker">${roomName(turn,row.role)}${row.at?`<time datetime="${e(row.at)}" title="${e(row.at)}">${e(clockText(row.at).slice(0,5))}</time>`:''}</div>
+  <p class="room-line">${mention}${inlineMarkdown(body,turn,row)}</p>
+  ${receipt?`<small class="room-disposition">${e(receipt)}</small>`:''}${materials}</div>`;
+}
+
+function roomMessages(turn,detail,group) {
+ const events = turn.events || [];
+ const start = turn.events_start || 0;
+ const conversation = [], records = [];
+ for (const [offset,row] of events.entries()) {
+  const index = turn.event_indices?.[offset] ?? start+offset;
+  if (offset && turn.event_indices && index>turn.event_indices[offset-1]+1)
+   conversation.push(historyButton(turn.run_id,index,'查看此处更早的消息'));
+  // The goal is already displayed as the user's message at the top of the turn.
+  if (row.kind==='goal') continue;
+  if (['assignment','member_report','human_question','human_answer','human_review'].includes(row.kind)) {
+   conversation.push(roomMessage(row,index,turn));
+  } else {
+   records.push(`<details data-key="record-${index}"><summary>${e(row.kind)} · ${e(roomLine(row.text))}</summary>
+    <pre>${e(JSON.stringify(row,null,2))}</pre>${row.text_truncated?historyButton(turn.run_id,index+1,'读取完整原文'):''}</details>`);
+  }
+ }
+ const activity = window.StudioActivity?.renderTurn(turn,detail) || '';
+ const diagnostics = records.length || group && activity ? `<details class="room-records" data-key="room-records">
+  <summary>运行记录</summary>${records.join('')}${group?activity:''}</details>`:'';
+ return (start?historyButton(turn.run_id,start,'查看更早消息'):'') + conversation.join('') + diagnostics + (group?'':activity);
+}
+
+function roomStatus(turn,detail,link) {
+ if (runActive(turn)) return `<div class="turn-status"><span>${turn.status==='waiting_user'?'等待你的答复…':'正在处理…'}</span>${link}</div>`;
+ const current = turn.run_id===detail.run.id;
+ const failed = ['failed','error','blocked'].includes(turn.status);
+ let message;
+ if (failed) {
+  const issues = current ? (detail.diagnostics?.issues || []).filter(issue=>issue.severity==='error' && issue.message) : [];
+  const specific = issues.find(issue=>!['execution_failed','studio_error'].includes(issue.code));
+  // A later assignment/receipt supersedes an older failed handoff as a possible cause.
+  const last = (turn.events || []).findLast(row=>['assignment','member_report','direct_delivery'].includes(row.kind));
+  const handoff = last?.kind==='member_report' && (last.disposition==='blocked' || (!last.disposition && last.handoff?.published===false))
+   ? last.handoff?.remaining_issue : '';
+  const cause = specific?.message || handoff || issues[0]?.message || turn.error || (current && detail.run.error);
+  message = cause ? roomLine(cause).split(/(?<=[。！？])/u)[0] : '本轮执行失败，未收到负责人的最终答复。';
+ } else {
+  message = ({cancelled:'本轮已取消。',interrupted:'本轮执行状态待核实。',unverified:'本轮已结束，验收状态为未验证。',
+   completed:'本轮已完成。'})[turn.status] || '本轮没有保存最终答复。';
+ }
+ return `<div class="turn-system" data-origin="studio"><div class="speaker">Studio <small>系统记录</small> ${link}</div>
+  <p class="room-line">${e(message)}</p></div>`;
+}
+
+function roomReply(turn,group) {
+ const loaded = roomHistory.get(turn.run_id)?.answer;
+ const answer = loaded ?? turn.answer;
+ if (!answer) return '';
+ const line = roomLine(answer);
+ const excerpt = loaded==null && turn.answer_truncated ? historyButton(turn.run_id,'answer','读取完整回复') : '';
+ if (!group || line===answer) return `<div class="chat-answer prose">${markdown(answer,turn)}</div>${excerpt}`;
+ return `<p class="room-line">${inlineMarkdown(line,turn)}</p><details class="room-material" data-key="final-answer">
+  <summary>完整回复</summary><div class="room-material-body prose">${markdown(answer,turn)}${excerpt}</div></details>`;
+}
+
 function humanQuestions(detail) {
  return (detail.pending_questions||[]).map(q=>`<form class="human-form" data-question="${e(q.request_id)}" data-run="${e(detail.run.id)}">
   <label class="field-label"><strong>${e(roleLabel(q.role))} 正在等你回答</strong><span>${e(q.text)}</span>
@@ -826,11 +1015,20 @@ async function submitDiscussion(form) {
   if(state.route==='assistant')await studioAssistant.refresh(true);else await refreshDetail();
  }catch(error){toast(error.message);}finally{button.disabled=false;}
 }
+function chatDiagnostics(detail) {
+ if (endedWithoutChecks(detail)) return '';
+ const content = diagnosis(detail);
+ if (!content) return '';
+ const issue = detail.diagnostics?.issues?.find(item => !item.resolved && item.severity === 'error');
+ const label = issue?.title || '查看运行状态';
+ return `<details class="chat-diagnostics" data-key="chat-diagnostics"><summary>${e(label)}</summary>${content}</details>`;
+}
+
 function detailContent(){if(!state.detail)return '<div class="initial-loading"><span class="spinner"></span>正在读取任务…</div>';const d=state.detail,r=d.run;
  const room=chatDirectory.find(d.conversation?.id);
  const title=state.tab==='chat' && d.conversation?.kind==='group' && (room?.title || d.conversation.title) || r.title;
  const back = state.tab==='chat' ? ['#chats','返回最近对话'] : ['#runs','返回全部任务'];
- const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page"><div class="detail-top"><a class="back-link" href="${back[0]}">${icon('left')}${back[1]}</a><div class="detail-heading"><h1>${e(title)}</h1><div class="detail-actions"><span id="thread-pin">${chatDirectory.managementButton(room)}</span>${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'&&endedWithoutChecks(d)?'':diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
+ const tabs=[...(d.conversation?[['chat','users','项目对话',d.conversation.turns.length]]:[]),['overview','branch','任务概览',d.tasks?.length],['logs','terminal','执行日志',d.events?.length],['artifacts','folder','产物',d.artifacts?.length],['acceptance','shield','验收',d.acceptance?.length]];return `<section class="page ${state.tab==='chat'?'conversation-page':''}"><div class="detail-top"><a class="back-link" href="${back[0]}">${icon('left')}${back[1]}</a><div class="detail-heading"><h1>${e(title)}</h1><div class="detail-actions"><span id="thread-pin">${chatDirectory.managementButton(room)}</span>${detailBadge(d)}${d.conversation&&state.tab!=='chat'?'<button class="secondary" data-tab="chat">进入对话</button>':''}${runActive(r)?`<button class="secondary" data-action="cancel-run" ${runStatus(r)==='cancel_requested'?'disabled':''}>${icon('x')}${runStatus(r)==='cancel_requested'?'正在取消…':'取消任务'}</button>`:''}</div></div><div class="detail-meta"><span>${icon('layers')}${e(runModeLabel(r, d.conversation?.kind))}</span><span>${icon('clock')}${e(dateText(r.created_at))}</span><span>${icon('file')}${d.artifacts?.length||0} 个产物</span></div></div>${runStatus(r)==='cancel_requested'?'<p class="run-warning" role="status">已请求停止后续执行；当前模型请求或工具调用可能需要先返回。保存的产物和日志会保留。</p>':''}${r.error&&!d.diagnostics?.issues?.length?`<div class="run-warning">${e(r.error)}</div>`:''}${r.status==='interrupted'?'<div class="run-warning">当前服务未持有这次执行。已保存的任务状态可查看；刷新不会自动继续执行或重放工具。</div>':''} ${humanQuestions(d)}${state.tab==='chat'?chatDiagnostics(d):diagnosis(d)}<div class="tabbar" data-key="detail-tabs" role="tablist" aria-label="任务视图">${tabs.map(([id,i,label,count])=>`<button class="tab ${state.tab===id?'active':''}" data-tab="${id}" role="tab" aria-selected="${state.tab===id}" id="tab-${id}" aria-controls="detail-panel" tabindex="${state.tab===id?0:-1}">${icon(i)}${label}<span class="tab-count">${count||0}</span></button>`).join('')}</div><div id="detail-panel" role="tabpanel" aria-labelledby="tab-${state.tab}">${state.tab==='chat'?conversationPanel(d):state.tab==='overview'?overview(d):state.tab==='logs'?logs(d):state.tab==='artifacts'?artifacts(d):acceptance(d)+reviewForm(d)}</div></section>`;}
 function render({reset=false}={}){document.body.classList.toggle('assistant-view',state.route==='assistant');const html=state.route==='assistant'?studioAssistant.page():state.route==='home'?home():state.route==='runs'?runsPage():state.route==='chats'?chatDirectory.page():state.route==='roles'?rolePage():detailContent();if(reset)main.innerHTML=html;else patchHTML(main,html);updateSidebar();roomPanel.scheduleScrollCheck();}
 function parseRoute() {
  const [hash, query=''] = location.hash.slice(1).split('?');
@@ -901,7 +1099,22 @@ async function refreshDetail() {
 async function refresh(){if(state.polling)return;state.polling=true;try{if(!state.config)state.config=await api('/api/bootstrap');const data=await api('/api/runs');state.runs=data.runs||[];setOnline(true);if(!state.initialized){state.initialized=true;await route();}updateSidebar();if(state.route==='home'&&$('#home-runs')){patchHTML($('#home-runs'),state.runs.length?`<div class="run-list">${state.runs.slice(0,5).map(runRow).join('')}</div>`:empty('工作室已经准备好了','运行上方演示，你的第一个任务会出现在这里。'));const count=$('.section-title .count-badge');setText(count,state.runs.length);}if(state.route==='runs'&&$('#all-runs'))patchHTML($('#all-runs'),runList());if(state.route==='detail')await refreshDetail();if(state.route==='assistant')await studioAssistant.refresh();await chatDirectory.refresh();await refreshRoleIfNeeded();}catch{setOnline(false);}finally{state.polling=false;}}
 function formTitle(mode){return mode==='group'?'新建群聊':mode==='single'?'新建私聊':'开始一个新任务';}
 function openForm(mode=state.config?.provider_ready?'single':'team-demo',objective=''){ $('#dialog-title').textContent=formTitle(mode); $('#dialog-form').innerHTML=formHTML('dialog',mode,objective);$('#task-dialog').showModal();setTimeout(()=>$('#dialog-objective').focus(),0);}
-function swapMode(form,mode,objective=''){const savedWorkspace=form.elements.workspace_path?.value||'';const savedLimits=runLimitFields.map(field=>[field.name,form.querySelector(`[name="${field.name}"]`)?.value]);const prefix=form.dataset.prefix;if(prefix==='dialog')$('#dialog-title').textContent=formTitle(mode);const advanced=!form.querySelector('.advanced').hidden;const custom=objective || (!form.elements.objective.readOnly?form.elements.objective.value:'');form.outerHTML=formHTML(prefix,mode,custom);const replacement=document.querySelector(`form[data-prefix="${prefix}"]`);if(replacement.elements.workspace_path)replacement.elements.workspace_path.value=savedWorkspace;for(const [name,value] of savedLimits){if(value!==undefined)replacement.querySelector(`[name="${name}"]`).value=value;}if(advanced){replacement.querySelector('.advanced').hidden=false;replacement.querySelector('[data-action="advanced"]').setAttribute('aria-expanded','true');}}
+function swapMode(form, mode, objective='') {
+ const {prefix} = form.dataset;
+ const saved = new FormData(form);
+ const advanced = !form.querySelector('.advanced').hidden;
+ const prompt = objective || (form.elements.objective.readOnly ? '' : form.elements.objective.value);
+ if (prefix === 'dialog') $('#dialog-title').textContent = formTitle(mode);
+ form.outerHTML = formHTML(prefix, mode, prompt);
+ const replacement = document.querySelector(`form[data-prefix="${prefix}"]`);
+ for (const name of ['workspace_path', 'interaction_mode', ...runLimitFields.map(field => field.name)]) {
+  if (saved.has(name) && replacement.elements[name]) replacement.elements[name].value = saved.get(name);
+ }
+ if (advanced) {
+  replacement.querySelector('.advanced').hidden = false;
+  replacement.querySelector('[data-action="advanced"]').setAttribute('aria-expanded','true');
+ }
+}
 async function pickWorkspace(button) {
  const form = button.closest('form');
  const input = form.elements.workspace_path;
@@ -935,6 +1148,7 @@ async function submit(form) {
  }
  errorBox.hidden = true;
  if (chat || mode === 'team') {
+  payload.interaction_mode = fields.get('interaction_mode');
   if (!state.config?.provider_ready) return showError('请先配置本机 DeepSeek API key 并重启服务，或使用离线演示。');
   if (!payload.objective) return showError('请填写消息内容。');
   payload.limits={};
@@ -983,7 +1197,20 @@ async function submit(form) {
   if (button.isConnected) {button.disabled=false;button.innerHTML=text;}
  }
 }
-async function selectFile(path){const runId=state.runId;state.selectedFile=path;state.fileData=null;render();if(databaseFile(path)){state.fileData={path,binary:true};render();return;}try{const data=await api(`/api/runs/${encodeURIComponent(runId)}/artifact?path=${encodeURIComponent(path)}`);if(state.runId!==runId||state.selectedFile!==path)return;state.fileData=data;}catch(error){if(state.runId!==runId||state.selectedFile!==path)return;state.fileData={error:error.message};}if(state.tab==='artifacts')render();}
+let fileRequest=0;
+async function selectFile(path) {
+ const run=state.runId, request=++fileRequest;
+ state.selectedFile=path;
+ state.fileData=null;
+ render();
+ if (databaseFile(path)) { state.fileData={path,binary:true}; render(); return; }
+ let data;
+ try { data=await api(fileURL(run,path,'artifact')); }
+ catch(error) { data={error:error.message}; }
+ if (request!==fileRequest || state.runId!==run || state.selectedFile!==path) return;
+ state.fileData=data;
+ if (state.tab==='artifacts') render();
+}
 function download(name,content,type='text/plain'){const url=URL.createObjectURL(new Blob([content],{type:`${type};charset=utf-8`}));const a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 async function cancelRun(){
  const id=state.runId;if(!id||!state.detail||!runActive(state.detail.run)||runStatus(state.detail.run)==='cancel_requested')return;
@@ -1012,8 +1239,16 @@ document.addEventListener('change',event=>{const form=event.target.closest('form
 document.addEventListener('input',event=>{
  if(event.target.id==='role-search'){roleView.search=event.target.value;patchHTML($('#directory-sections'),roleSections());return;}
  const reply=event.target.closest('.reply-form');if(reply)rememberReply(reply);if(event.target.id==='run-search'){state.search=event.target.value;patchHTML($('#all-runs'),runList());}});
+document.addEventListener('toggle',event=>{
+ const disclosure = event.target;
+ if (!disclosure.open || !disclosure.matches?.('.room-material')) return;
+ const button = disclosure.querySelector('button[data-room-history]');
+ if (button && !button.disabled && !disclosure.querySelector('[role="alert"]')) loadRoomPage(button);
+},true);
 document.addEventListener('toggle',event=>{if(event.target.matches?.('[data-log]')){const key=event.target.dataset.log;if(event.target.open)state.logOpen.add(key);else state.logOpen.delete(key);}},true);
 document.addEventListener('click',event=>{
+ const historyButton = event.target.closest('[data-room-history]');
+ if(historyButton){loadRoomPage(historyButton);return;}
  if(event.target.closest('.skip-link')){event.preventDefault();main.focus();return;}
  const roleButton=event.target.closest('[data-role-action]');
  if(roleButton){runRoleAction(roleButton);return;}

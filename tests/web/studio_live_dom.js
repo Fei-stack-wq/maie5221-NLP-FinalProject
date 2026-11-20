@@ -3,7 +3,7 @@
  * and read the PASS/FAIL list. The real app.js and stylesheet are used.
  */
 'use strict';
-let fixturePolls=0,fixtureTrim=false,fixtureChat=false;
+let fixturePolls=0,fixtureTrim=false,fixtureChat=false,fixtureStop=false;
 const fixturePosts=[];
 const fixtureEvents=Array.from({length:40},(_,i)=>({kind:'step',ts:1700000000+i,task_id:'fixture:child',step:i+1,message:`Event ${i+1}: immutable execution evidence for selection testing.`}));
 const fixtureRun={id:'fixture',title:'持续运行：界面稳定性回归',mode:'single',status:'running',created_at:'2026-11-17T12:00:00Z',task_count:2,completed_count:0,artifact_count:0,duration_ms:0};
@@ -17,7 +17,9 @@ const roles = [{id:'worker',label:'通用助手'},{id:'reviewer',label:'评审�
 const completeThread = {
  id:'demo-project',kind:'group',lead:'worker',members:['worker','reviewer'],head_run_id:'fixture',
  artifact_run_id:'fixture',can_continue:true,
- turns:[{run_id:'fixture',user:'请制作网页。',recipient:'worker',answer:'已生成网页。',status:'unverified',intent:'edit'}]
+ turns:[{run_id:'fixture',user:'请制作网页。',recipient:'worker',answer:'已生成网页。',status:'unverified',intent:'edit',
+  events:[{kind:'member_report',role:'reviewer',text:'**成果**：证据底座已保存到文件。',disposition:'blocked',artifacts:[],
+   handoff:{published:false,remaining_issue:'项目快照发布失败：项目文件含可识别的服务凭据。「research/research_notes.md」'}}]}]
 };
 window.fetch=async(path, options={})=>{
  let data;
@@ -33,6 +35,17 @@ window.fetch=async(path, options={})=>{
   if(fixtureChat){
    data.run.status='unverified';data.conversation=completeThread;
    data.diagnostics={execution_status:'finished',acceptance_status:'not_configured',issues:[{code:'no_acceptance'}]};
+   if(fixtureStop){
+    const [turn]=completeThread.turns;
+    data.run.status='failed';
+    data.conversation={...completeThread,turns:[
+     {...turn,run_id:'earlier',answer:'',status:'failed'},
+     {...turn,run_id:'no-receipt',events:[],error:'前一轮独立验收未通过。',answer:'',status:'failed'},
+     {...turn,events:[],answer:'',status:'failed'}]};
+    data.diagnostics={execution_status:'failed',acceptance_status:'failed',issues:[
+     {severity:'warning',code:'output_truncated',message:'此前截断已恢复。'},
+     {severity:'error',code:'provider_balance_exhausted',message:'DeepSeek 返回 HTTP 402（额度不足），本轮模型调用受阻。'}]};
+   }
   }
  }
  return {ok,status:ok?200:503,json:async()=>data};
@@ -75,6 +88,10 @@ window.addEventListener('load',async()=>{
   fixtureChat=true;
   await waitFor(()=>document.querySelector('#tab-chat'));
   document.querySelector('#tab-chat').click();
+  const blocked=document.querySelector('.room-message[data-kind="member_report"]');
+  const blockedLine=blocked.querySelector('.room-line');
+  check('blocked handoff leads with actual publication failure',blockedLine.textContent.includes('项目快照发布失败')&&!blockedLine.textContent.includes('证据底座已保存'));
+  check('private file is plain text and original member claim stays in materials',!blockedLine.querySelector('[data-md-path]')&&blocked.querySelector('.room-material-body').textContent.includes('证据底座已保存'));
   const form=document.querySelector('.reply-form'),draft=form.elements.message;
   draft.value='请解释速度计算。';draft.dispatchEvent(new Event('input',{bubbles:true}));
   form.elements.intent.value='question';form.elements.intent.dispatchEvent(new Event('change',{bubbles:true}));
@@ -91,6 +108,12 @@ window.addEventListener('load',async()=>{
   check('failed send retains draft and idempotency key',draft.value==='请解释速度计算。'&&one.request_id===two.request_id);
   check('question submits to a single chosen member',one.conversation.parent_run_id==='fixture'&&one.conversation.recipient==='reviewer'&&one.conversation.intent==='question'&&!one.acceptance_files);
   check('finished execution explicitly reports missing checks',document.querySelector('.detail-actions').textContent.includes('执行已结束 · 未配置验收'));
+  fixtureStop=true;
+  await waitFor(()=>document.querySelectorAll('.turn-system').length===3);
+  const [past,ownMeta,current]=document.querySelectorAll('.turn-system');
+  check('terminal provider error is identified as a Studio system record',current.dataset.origin==='studio'&&current.querySelector('.speaker').textContent.includes('系统记录')&&current.querySelector('.room-line').textContent.includes('HTTP 402'));
+  check('old turn takes its own blocked receipt and never the selected run diagnosis',past.textContent.includes('项目快照发布失败')&&!past.textContent.includes('HTTP 402'));
+  check('old turn without receipt uses its own saved error',ownMeta.textContent.includes('前一轮独立验收未通过')&&!ownMeta.textContent.includes('HTTP 402'));
   location.hash='chats';await waitFor(()=>document.querySelector('#chat-list a'));
   document.querySelector('[data-action="new-group"]').click();
   const group=document.querySelector('#dialog-form form');

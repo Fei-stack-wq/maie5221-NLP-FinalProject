@@ -69,6 +69,31 @@ class DiscussionHTTPTest(unittest.TestCase):
             self.assertEqual(bundle.read("turn-001/artifacts/plan.json"), b'{"portfolio":{"horizon":2}}')
             self.assertTrue(json.loads(bundle.read("manifest.json"))[0]["files"][0]["sha256"])
 
+    def test_read_full_public_reply_when_turn_preview_is_bounded(self):
+        answer = "报告。\n" * 30_000 + "原文最后一句。"
+        run = self.start_chat([{"text": answer}])
+        turn = self.detail_at(run, {"unverified", "completed"})["conversation"]["turns"][-1]
+        self.assertTrue(turn["answer_truncated"])
+        self.assertNotIn("原文最后一句。", turn["answer"])
+        self.assertEqual(self.get("/api/runs/" + run + "/room-answer"), {"answer": answer})
+
+    def test_public_history_pages_do_not_clip_journal_or_user_text(self):
+        run = self.start_chat([{"text": "Ready."}])
+        self.detail_at(run, {"unverified", "completed"})
+        base = "/api/runs/" + run
+        self.assertEqual(self.get(base + "/room-answer"), {"answer":"Ready."})
+        notes = [f"Review {i}" for i in range(26)] + ["完整意见" * 1000]
+        for note in notes:
+            self.assertEqual(self.exchange("POST", base + "/review", {"verdict":"passed", "note":note})[0], 200)
+        latest = self.get(base + "/room-events")
+        self.assertEqual(len(latest["events"]), 24)
+        earlier = self.get(base + "/room-events?before=" + str(latest["start"]))
+        self.assertEqual(earlier["start"], 0)
+        self.assertEqual([e["text"] for e in earlier["events"] + latest["events"]], notes)
+        self.assertEqual(self.get(base)["conversation"]["turns"][-1]["events"][-1]["text"], notes[-1])
+        for query in ("before=NaN", "before=-1", "before=1&before=2", "other=1"):
+            self.assertEqual(self.exchange("GET", base + "/room-events?" + query)[0], 400)
+
     def test_cancel_wakes_a_waiting_worker_and_rejects_late_reply(self):
         identity = self.start_chat([tool("ask_human", question="Which range?"), {"text":"unused"}])
         base = "/api/runs/"+identity

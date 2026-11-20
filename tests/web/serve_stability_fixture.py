@@ -25,6 +25,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path in {f'/{asset.name}' for asset in WEB.iterdir() if asset.suffix in {'.js', '.css'}}:
             data = (WEB / self.path[1:]).read_bytes()
             content_type = 'text/css' if self.path.endswith('css') else 'text/javascript'
+        elif self.path == '/markdown-it.min.js':
+            data = (WEB / 'vendor' / 'markdown-it.min.js').read_bytes()
+            content_type = 'text/javascript'
         elif self.path == '/studio_live_dom.js':
             data = Path(__file__).with_name('studio_live_dom.js').read_bytes()
             content_type = 'text/javascript'

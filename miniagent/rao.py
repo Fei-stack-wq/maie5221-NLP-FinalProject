@@ -546,6 +546,7 @@ class RAOUnit:
         action_recorder: Callable[[RAOState, list[Action]], list[str]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         human_request_gate: Callable[[dict[str, Any]], str | None] | None = None,
+        autonomous: bool = False,
     ) -> None:
         self.name = name
         self.provider = provider
@@ -553,8 +554,9 @@ class RAOUnit:
         self.sandbox = sandbox
         self.limits = limits
         self.temperature = temperature
-        self.approve = approve
-        self.human_handler = human_handler
+        self.autonomous = autonomous
+        self.approve = None if autonomous else approve
+        self.human_handler = None if autonomous else human_handler
         self.human_request_gate = human_request_gate
         self.delegate_handler = delegate_handler
         self.max_actions_per_step = max_actions_per_step
@@ -571,7 +573,8 @@ class RAOUnit:
                    allowed_write_paths: frozenset[str] | None = None) -> list[ToolSpec]:
         specs = self.registry.specs()
         if self.enable_control_tools:
-            specs += [self.delegate_spec if name == "delegate_task" else spec for name, spec in CONTROL_TOOLS.items()]
+            specs += [self.delegate_spec if name == "delegate_task" else spec
+                      for name, spec in CONTROL_TOOLS.items() if not (self.autonomous and name == "ask_human")]
         if allowed_tools is not None:
             specs = [spec for spec in specs if spec.name in allowed_tools]
         if allowed_write_paths is None:
@@ -780,12 +783,14 @@ class RAOUnit:
         for i, action in enumerate(actions):
             parsed, error = self._arguments(action.raw_arguments, action.arguments, action.parse_error)
             actions[i] = action.model_copy(update={"arguments": parsed, "parse_error": error})
-        if allowed_tools is not None or allowed_write_paths is not None:
+        if self.autonomous or allowed_tools is not None or allowed_write_paths is not None:
             offered = {spec.name for spec in self.tool_specs(allowed_tools, allowed_write_paths)}
             if any(action.tool not in offered for action in actions):
                 unavailable = sorted({action.tool for action in actions} - offered)
                 batch_denial = ("本批次含当前阶段未开放的工具，全部未执行。收到：" + ", ".join(unavailable)
                                 + "。当前可调用：" + (", ".join(sorted(offered)) or "无；请给出最终文字交接") + "。")
+                if self.autonomous and "ask_human" in unavailable:
+                    batch_denial += "本轮由团队自行决定可逆偏好并注明假设；缺少外部授权不能执行，交付可完成部分并说明限制。"
             elif allowed_write_paths is not None:
                 for action in actions:
                     path = action.arguments.get("path")

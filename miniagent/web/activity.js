@@ -122,7 +122,9 @@
           const lines = data.content.split('\n');
           const excerpt = lines.slice(0, 12).join('\n').slice(0, 1200);
           const clipped = data.truncated || lines.length > 12 || excerpt.length < data.content.length;
-          entry.html = `<pre class="activity-preview-text">${escape(excerpt || '（空文件）')}</pre>${clipped ?
+          const snippet = /\.md$/i.test(path) ? `<div class="activity-md prose">${StudioMarkdown.documentHTML(excerpt, {run,path})}</div>` :
+            `<pre class="activity-preview-text">${escape(excerpt || '（空文件）')}</pre>`;
+          entry.html = `${snippet}${clipped ?
             '<p class="activity-note">显示内容节选，可从文件链接查看全文。</p>' : ''}`;
         }
       }

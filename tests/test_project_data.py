@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import unittest
 import zipfile
+from pathlib import Path
 
 from miniagent.config import Settings
 from miniagent.studio_conversations import SnapshotError, copy_project
@@ -127,6 +128,75 @@ class ProjectDataTest(unittest.TestCase):
         from miniagent.project_data import validate_project_data
         with self.assertRaisesRegex(ValueError, "服务凭据"):
             validate_project_data("factcheck.md", task.encode(), secret=task[2:], reject_credentials=True)
+
+    def test_published_manufacturer_news_title_in_handoff(self):
+        from miniagent.project_data import validate_project_data
+        title = "sk-hynix-ships-samples-of-12-layer-next-gen-hbm4e-2"
+        url = "https://news.skhynix.com/en/" + title + "/"
+        other_url = "https://news.skhynix.com/en/sk-hynix-ships-world-first-12-layer-hbm4-samples-to-customers/"
+        notes = self.agent / "research_notes.md"
+        content = ("# Research notes\n\nSource: `" + url + "`\n\n[Manufacturer]( " + url +
+                   "?utm_source=newsletter#press )\nSecond source: " + other_url + "\n").encode()
+        notes.write_bytes(content)
+        self.assertEqual((self.copy() / notes.name).read_bytes(), content)
+        synthetic = "sk-" + "z" * 36
+        for value in (title, "https://example.org/" + title + "/", url.replace("/en/", "/other/"),
+                      "https://example.org/?redirect=" + url, "https://example.org/?redirect=(" + url + ")", url.replace("samples", "ab12cd34ef56ab12cd34"),
+                      url.replace("samples", "SAMPLES"), url.replace("samples", "samples_of"),
+                      url.replace("hbm4e", synthetic), url.replace("next-gen", "sk-proj-next-generation-samples-for-advanced-memory"), url + "?access=" + synthetic,
+                      url + "#section-" + synthetic, url + " " + synthetic, url + " " + title):
+            with self.subTest():
+                with self.assertRaisesRegex(ValueError, "服务凭据.*第 3 行") as rejected:
+                    validate_project_data(notes.name, ("One\nTwo\n" + value).encode(), reject_credentials=True)
+                self.assertNotIn(synthetic, str(rejected.exception))
+                self.assertNotIn(value, str(rejected.exception))
+        with self.assertRaisesRegex(ValueError, "第 3 行"):
+            validate_project_data(notes.name, content, secret=title, reject_credentials=True)
+        # The exception belongs to text citations. Binary SQLite still scans
+        # the complete image (including source URLs saved in records).
+        connection = sqlite3.connect(self.file)
+        with connection:
+            connection.execute("INSERT INTO bookings VALUES(?,0,0)", (url,))
+        connection.close()
+        with self.assertRaisesRegex(SnapshotError, "数据库含可识别的服务凭据"):
+            self.copy()
+
+    def test_only_corroborated_title_words_in_source_receipt_url_fields(self):
+        from miniagent.project_data import validate_project_data
+
+        def archive(record):
+            data = json.dumps(record, ensure_ascii=False, indent=2).encode()
+            return "sources/" + hashlib.sha256(data).hexdigest() + ".json", data
+
+        def discovery(title, url, **extra):
+            return {"kind":"source_discovery", "results":[{"title":title, "url":url}], **extra}
+
+        title = "Memory Runs Dry: Samsung and SK Hynix Drop Below 10-Day Supply as HBM4 Devours Capacity"
+        url = "https://www.techtimes.com/articles/326859/memory-runs-dry-samsung-sk-hynix-drop-below-10-day-supply-hbm4-devours-capacity.htm"
+        source = discovery(title,url)
+        name, data = archive(source)
+        validate_project_data(name, data, reject_credentials=True)
+        # The government API embeds title/html_url pairs inside a fetched JSON body.
+        city = "https://www.federalregister.gov/documents/azur-air-krasnoyarsk-russia-660020-order-renewing-temporary-denial-of"
+        fetched = {"kind":"fetched_source", "content_type":"application/json", "text":json.dumps({"results":[
+            {"title":"Azur Air, Krasnoyarsk, Russia 660020; Order Renewing Temporary Denial of Export Privileges",
+             "html_url":city}]})}
+        validate_project_data(*archive(fetched), reject_credentials=True)
+        synthetic = "sk-" + "x" * 40
+        for record in (discovery("Some other story",url), discovery(title,url+"?token="+synthetic),
+                       discovery(title,url,notes=url), discovery(title,url,other={"url":url}),
+                       discovery(title,url,token=synthetic),
+                       discovery("SK Hynix and Investment Risk",url.replace("capacity.htm",synthetic+".htm")),
+                       discovery(" ".join(url.split("/")[-1].split("-")),
+                                 url.replace("sk-hynix-", "sk-proj-")),
+                       {**fetched,"text":fetched["text"].replace("krasnoyarsk","mansiysk")}):
+            with self.subTest(), self.assertRaisesRegex(ValueError,"服务凭据"):
+                validate_project_data(*archive(record), reject_credentials=True)
+        for path in (Path(name).name, "other/"+Path(name).name, "sources/"+"0"*64+".json"):
+            with self.subTest(), self.assertRaisesRegex(ValueError,"服务凭据"):
+                validate_project_data(path, data, reject_credentials=True)
+        with self.assertRaisesRegex(ValueError,"服务凭据"):
+            validate_project_data(name, data, secret=url[url.index("sk-"):], reject_credentials=True)
 
     def test_member_or_legacy_text_snapshot_rejects_credentials_before_transfer(self):
         project_file = self.agent / "settings.txt"

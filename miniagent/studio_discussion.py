@@ -20,6 +20,14 @@ class RoomDiscussion:
                 raise StudioError("本轮公开对话超过导出上限。", "room_too_large", 413)
             return [json.loads(line) for line in data.splitlines() if line]
 
+    def room_answer(self, run_id):
+        from .studio_service import StudioError, _read_file
+        with self._lock:
+            data, truncated = _read_file(self._directory(run_id), "conversation-answer.txt", 16 * 1024**2)
+            if truncated:
+                raise StudioError("回复超过公开对话读取上限。", "room_too_large", 413)
+            return self._redact({"answer": data.decode("utf-8", errors="replace")})
+
     def _record_room_event(self, run_id, role, kind, text, **fields):
         from .studio_service import _now
         row = self._redact({**fields, "role": role, "kind": kind, "text": text, "at": _now()})

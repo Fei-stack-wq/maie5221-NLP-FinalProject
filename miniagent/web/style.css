@@ -482,7 +482,7 @@ main{padding:28px 18px}
 .workspace-choice>div{display:flex;align-items:stretch;gap:8px;margin:7px 0}
 .workspace-choice input{min-width:0;flex:1;padding:8px 10px;border:1px solid var(--line);border-radius:6px;font:inherit;font-size:13px}
 .workspace-choice button{white-space:nowrap}
-.workspace-choice small,.handoff-receipt span,.room-event>small{font-size:12px;color:var(--muted)}
+.workspace-choice small{font-size:12px;color:var(--muted)}
 .thread-workspace{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
 .thread-workspace svg,.turn-file svg{width:15px;height:15px;flex:none;align-self:center}
 .thread-workspace code,.turn-file span{overflow-wrap:anywhere}
@@ -492,8 +492,6 @@ main{padding:28px 18px}
 .turn-file{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:13px}
 .turn-file:focus-visible,.turn-file:hover{text-decoration:underline}
 .turn-file small{color:var(--muted);white-space:nowrap;margin-left:auto}
-.handoff-receipt{margin:8px 0;padding:8px 12px;border-left:2px solid var(--accent);background:var(--sidebar);font-size:12px}
-.handoff-receipt span{margin-left:8px}
 .binary-note{padding:20px;color:var(--muted);font-size:14px}
 .reply-form{border:1px solid var(--line);margin:20px 0;border-radius:8px}
 .reply-form:focus-within{border-color:#cdd8fc}
@@ -515,8 +513,31 @@ main{padding:28px 18px}
 .studio-disclosure[open]>summary{margin-bottom:12px}
 .profile-form,.review-form,.human-form,.role-library{display:grid;gap:12px}
 .profile-form button,.review-form button,.human-form button{justify-self:start}
-.room-event{margin:8px 0;padding:8px 14px;border-left:2px solid var(--line,#c7d6de)}
-.room-event p,.human-form span{white-space:pre-wrap;overflow-wrap:anywhere}
+.human-form span{white-space:pre-wrap;overflow-wrap:anywhere}
+.room-message{display:grid;grid-template-columns:30px minmax(0,1fr);column-gap:10px;padding:0 2px;margin:20px 0;min-width:0}
+.room-message>*{grid-column:2;min-width:0}
+.room-message>.roster-avatar{grid-column:1;grid-row:1/5;align-self:start}
+.chat-agent .speaker>.roster-avatar{display:inline-grid;vertical-align:middle;margin-right:4px}
+.room-message .speaker{display:flex;align-items:baseline;gap:9px}
+.room-message time,.room-disposition,.turn-status{font-size:12px;font-weight:400;color:var(--muted)}
+.room-line{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.7;margin:4px 0}
+.room-mention{color:var(--accent-dark);background:var(--accent-soft);border-radius:4px;padding:1px 4px;box-decoration-break:clone}
+.room-mention .member-profile{color:inherit}
+.room-material,.room-raw,.room-records{font-size:13px;max-width:100%;margin:6px 0;min-width:0}
+.room-material>summary,.room-raw>summary,.room-records summary{cursor:pointer;width:fit-content;color:var(--muted);line-height:1.65}
+.room-material[open]>summary,.room-material>summary:hover,.room-records summary:hover{color:var(--ink)}
+.room-material-body,.room-records[open]{padding:8px 12px;border-left:2px solid var(--line);overflow-wrap:anywhere}
+.room-material-body .prose{font-size:14px;line-height:1.7;overflow:auto}
+.room-material-body p{margin:6px 0}
+.room-material-body b{font-size:12px}
+.room-material pre,.room-records pre{max-width:100%;max-height:32rem;overflow:auto;white-space:pre-wrap;font-size:12px}
+.room-records{margin:14px 0}
+.room-records>details{margin:4px 0 4px 8px}
+.room-load{margin:8px 0}
+.turn-status{display:flex;gap:12px;align-items:baseline;justify-content:space-between}
+.turn-system{border-left:2px solid var(--line);padding-left:10px}
+.turn-system .speaker{display:flex;align-items:baseline;gap:6px}
+.turn-system .room-line{font-size:13px}
 .studio-disclosure textarea,.human-form textarea{box-sizing:border-box;width:100%;font:inherit}
 
 .project-screenshot { display: block; max-width: 100%; height: auto; }
@@ -591,3 +612,16 @@ main{padding:28px 18px}
  .directory-section .role-card-activity i{display:none}.directory-section .role-card-activity>svg{width:12px;height:12px}
  .role-sections{gap:8px}.role-task-row{padding:12px;gap:7px}.role-task-row>svg{display:none}
 }
+
+.conversation-page .detail-heading h1 {
+ display:-webkit-box;
+ -webkit-line-clamp:2;
+ -webkit-box-orient:vertical;
+ overflow:hidden;
+ font-size:clamp(18px,1.6vw,23px);
+ line-height:1.4;
+}
+.conversation-page .detail-meta { display:none }
+.chat-diagnostics { margin:0 0 10px;color:var(--muted);font-size:12px }
+.chat-diagnostics > summary { width:fit-content;cursor:pointer }
+.chat-diagnostics .diagnosis { margin:10px 0;color:var(--ink) }

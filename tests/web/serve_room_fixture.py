@@ -28,10 +28,11 @@ def main():
         service = StudioService(Path(scratch) / "runs", Settings(api_key="offline-fixture-key"))
         server = create_server(service, port=0)
         first = ScriptedProvider([
-            call("delegate_task", assignee="reviewer", objective="确认报告时间范围。", remaining_roles=[]),
+            call("delegate_task", assignee="reviewer", chat_message="@reviewer 问清时间范围，再把结果记下来。",
+                 objective="确认报告时间范围。\n" + ("输出说明与期限依据。" * 235) + "材料末尾。", remaining_roles=[]),
             call("ask_human", question="报告的时间范围是多少？"),
             call("write_file", path="working.md", content="Unpublished working version of the proposal."),
-            {"text": "已记录两年期限。"},
+            {"text": "交接完成，下面是给负责人的交接说明。\n\n## 一句话成果\n已记录两年期限。\n\n## 工作记录\n已保存 working.md。"},
             {"error": "intentional fixture interruption"},
         ])
         followup = ScriptedProvider([

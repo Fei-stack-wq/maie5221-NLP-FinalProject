@@ -157,8 +157,11 @@ class Settings:
     """初次请求之外的额外重试次数；0 表示不重试。"""
     context_window_tokens: int = 1_000_000
     max_output_recovery_attempts: int = 2
+    interaction_mode: Literal["interactive", "autonomous"] = "interactive"
 
     def __post_init__(self) -> None:
+        if self.interaction_mode not in ("interactive", "autonomous"):
+            raise ValueError("interaction_mode must be interactive or autonomous")
         if type(self.api_key) is not str:
             raise ValueError("api_key must be a string")
         _integer("context_window_tokens", self.context_window_tokens, 1024, 1_000_000)

@@ -114,7 +114,9 @@ class StudioCrewTest(unittest.TestCase):
               "cancel(rows, 0)\nassert book(rows, 'A', '10:00')\n"
               "with open('bookings.json', 'w') as f: json.dump(rows, f)\n"
               "print('conflict blocked and slot available after cancellation')")
-        script = [assign("dev", "implement booking"), write("booking.py", booking_module),
+        brief = "Please build the booking operations, then hand them to QA."
+        script = [tool("delegate_task", assignee="dev", objective="implement booking", chat_message=brief),
+                  write("booking.py", booking_module),
                   {"text": "Saved booking.py."}, assign("qa", "check conflict and cancellation"),
                   tool("run_python", code=qa), {"text": "Verified the slot was freed; bookings.json is attached."},
                   assign("release", "package the runnable deliverable"),
@@ -125,6 +127,11 @@ class StudioCrewTest(unittest.TestCase):
                                     child_checks={"qa": {"checks": [{"kind": "json_equals", "path": "bookings.json",
                                                                     "pointer": "/0/2", "expected": "cancelled"}]}})
         self.assertEqual(first["run"]["status"], "completed", first["diagnostics"])
+        self.assertIn(brief, str(calls.requests[1][0]))
+        dispatch = next(e for e in first["room_events"] if e["kind"] == "assignment")
+        self.assertEqual((dispatch["chat_message"], dispatch["text"], dispatch["recipient"]),
+                         (brief, "implement booking", "dev"))
+        self.assertTrue(all(e["recipient"] == "lead" for e in first["room_events"] if e["kind"] == "member_report"))
         self.assertEqual({row["assignee_profile_id"] for row in first["tasks"]}, set(members["members"]))
         self.assertEqual([e["role"] for e in first["room_events"] if e["kind"] == "member_report"],
                          ["dev", "qa", "release"])
@@ -847,6 +854,25 @@ class StudioCrewTest(unittest.TestCase):
         self.assertFalse(next(e for e in detail["room_events"] if e["kind"] == "member_report")["published"])
         self.assertGreaterEqual(sum(e["kind"] == "step_start" and e["level"] == "goal" for e in detail["events"]), 2)
         self.assertFalse(any(e["kind"] == "cancel_observed" for e in detail["events"]))
+
+    def test_autonomous_team_reaches_delivery_after_lead_and_member_attempt_to_ask(self):
+        question = tool("ask_human", decision_kind="user_preference", question="Which time slot should the demo use?")
+        decision = "团队选择 15 分钟一档，与本机已有日程一致。"
+        detail, provider = self.execute(
+            [question, assign("builder", "设置预约时间档，交付说明。"), question,
+             write("booking.md", decision), {"text": decision}, {"text": "已按团队假设完成。"}],
+            roster("lead", "builder"), interaction_mode="autonomous", objective="交付测试用的预约说明。",
+            acceptance_files=["booking.md"], limits={"max_seconds": 8})
+        self.assertEqual(detail["run"]["status"], "completed", detail["run"])
+        self.assertEqual(detail["run"]["interaction_mode"], "autonomous")
+        self.assertTrue(all("ask_human" not in offered for _, offered in provider.requests))
+        self.assertTrue(all("自主完成模式" in messages[0]["content"] for messages, _ in provider.requests))
+        self.assertFalse(detail["pending_questions"])
+        self.assertFalse({e["kind"] for e in detail["room_events"]} & {"human_question", "human_answer"})
+        attempts = [e for e in detail["events"] if e["kind"] == "tool_result" and e["tool"] == "ask_human"]
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(all(not e["ok"] for e in attempts))
+        self.assertIn(decision, self.service.artifact(detail["run"]["id"], "agents/lead/booking.md")["content"])
 
     def test_member_human_reply_reaches_lead_and_subsequent_member(self):
         group = roster("fund_manager","research","risk","marketing")

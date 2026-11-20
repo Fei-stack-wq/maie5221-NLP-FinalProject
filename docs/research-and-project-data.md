@@ -41,3 +41,11 @@ HTML 提取同时返回可见正文和可追踪链接。工具会在来源记录
 若普通成员提交时，项目内仍有不支持的格式，宿主会在当前草稿中提示可安全显示的相对路径。成员可以移出自行下载的临时副本并再次交接。用户要求交付原件时，应保留原文件并报告格式限制。包含凭据或控制字符的路径会隐藏。正式发布仍会在子进程收尾后校验完整快照。
 
 Pi 的输出文件实现将工作目录内的工件与工具的系统临时文件分开，临时文件独占创建且权限为 0600，其回归覆盖完成与取消两种状态。Studio 沿用现有的 Python 临时文件和来源记录机制。[Pi 临时文件实现](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/utils/output-files.ts#L1-L34) · [Pi 临时工件回归](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/bash-executor-truncation.test.ts#L6-L45)
+
+### 企业新闻引用的凭据误报
+
+SK hynix 官方英文新闻中心会把品牌名写在文章路径开头。Studio 在精确的 HTTPS 来源、正文里的 URL 边界和由短词组成的新闻标题同时成立时，识别开头的品牌标记。判断可以同时处理产品新闻和季度财务公告。识别后，扫描器从标记内部之后继续检查，路径其余位置、查询、片段、邻接文本和以完整原始字节匹配的实际配置密钥都保留检查。拒绝时反馈物理行号，诊断里不回显命中的值。[制造商产品新闻](https://news.skhynix.com/en/sk-hynix-ships-samples-of-12-layer-next-gen-hbm4e-2/) · [制造商财务公告](https://news.skhynix.com/en/sk-hynix-announces-3q25-financial-results/)
+
+搜索结果和部分公开 JSON 接口同时提供可读标题与文章链接。对于 Studio 自身格式的 `sources/<sha256>.json`，校验器核对相对路径、完整内容摘要、JSON 编码及来源记录种类。文章的 HTTPS 链接必须出现在相应 URL 字段内，最后一级路径中，从歧义单词开始的各个短词须按顺序出现在可见标题中，品牌的两个词还须相邻。这能识别品牌写法和 Krasnoyarsk 等地名的词尾。重复值缺少对应标题、附带凭据的参数、字符转义导致无法定位以及其他不能确认的候选，都会保留拒绝。内容摘要只证明字节一致；成员也能生成相同格式的归档，因此仍要逐个检查标记与原始字节。二进制数据库与 PNG 继续扫描完整字节。[联邦公报标题与永久链接](https://www.federalregister.gov/documents/2026/09/17/2026-19021/azur-air-office-29-vzletnaya-st-57-krasnoyarsk-russia-660020-order-renewing-temporary-denial-of)
+
+这种做法采用 Gitleaks 按单个检测值并结合多个条件判断误报的思路。Studio 为带标题的出版物链接另外核对文内位置和词序。2026 年 11 月 20 日第六题首次研究成员的原始目录经 `copy_project` 完整回放，52 个文件合计 1,091,513 字节，其中研究底稿 61,306 字节。独立复验逐文件比较了原件、输出和清单摘要。此回放验证的是成员交接。[Gitleaks 条件和检测值作用域](https://github.com/gitleaks/gitleaks/blob/v8.24.2/config/allowlist.go#L26-L52) · [Gitleaks 正反例](https://github.com/gitleaks/gitleaks/blob/v8.24.2/detect/detect_test.go#L883-L925) · [Studio 交接回归](../tests/test_project_data.py)

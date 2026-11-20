@@ -110,6 +110,7 @@ class Agent:
             temperature=settings.temperature,
             approve=approve,
             human_handler=human_handler,
+            autonomous=settings.interaction_mode == "autonomous",
             human_request_gate=human_request_gate,
             delegate_handler=delegate_handler,  # type: ignore[arg-type]
             max_actions_per_step=limits.max_tool_calls_per_step,
@@ -215,7 +216,14 @@ class Agent:
         limits = self.settings.limits
         started = time.perf_counter()
 
-        history = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT.format(agent=self.name)}]
+        instructions = system_prompt or SYSTEM_PROMPT.format(agent=self.name)
+        if self.unit.autonomous:
+            instructions += ("\n本轮采用自主完成模式。用户的一条任务消息即为本轮输入。直接执行到最终交付，"
+                             "分工、可逆偏好、模拟任务的情景参数由团队决定，在交接和最终答复中注明重要假设与理由。"
+                             "查证事实，实际风险、缺少的私有数据和对外操作所需的授权均不能假定。"
+                             "完成获准部分；若必需条件仍无法满足，以 [BLOCKED] 开头列明已完成工作和具体限制。"
+                             "不要提出等待用户回复的问题，或把团队选择写成用户的答复。")
+        history = [{"role": "system", "content": instructions}]
         if conversation_context:
             # Past public turns are background. The new request remains the durable objective.
             history.append({"role": "user", "content": conversation_context})
@@ -578,7 +586,8 @@ class Agent:
 
                 # ② 模型给出最终答复 → 必须过验收
                 if record.decision_kind == "answer" or completion is not None:
-                    if completion is None and step_policy is not None and record.answer.lstrip().startswith("[BLOCKED]"):
+                    if (completion is None and (step_policy is not None or self.unit.autonomous)
+                            and record.answer.lstrip().startswith("[BLOCKED]")):
                         if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
                             retry = (not reviewed_close_retried and budget.has_steps(1)
                                      and budget.has_tokens(1) and budget.seconds_left > 0)

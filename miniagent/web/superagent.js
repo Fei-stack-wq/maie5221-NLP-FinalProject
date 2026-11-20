@@ -8,11 +8,12 @@ const studioAssistant = (() => {
  ];
  const indexedRoles = new Set();
  let detail=null, head=null, loaded=false, sending=false, reading=false, choosing=false;
- let epoch=0, loadError='', sendError='', request=null, draft='', workspace='';
+ let epoch=0, loadError='', sendError='', request=null, draft='', workspace='', selectedInteraction='';
  const active = () => Boolean(detail && runActive(detail.run));
  const onPage = () => state.route === 'assistant';
  const messages = () => detail?.conversation?.turns || [];
  const field = () => document.getElementById('assistant-message');
+ const interactionMode = () => selectedInteraction || (head ? detail?.run?.interaction_mode || 'interactive' : 'autonomous');
 
  function entityLinks(events) {
   const entities = new Map();
@@ -43,7 +44,7 @@ const studioAssistant = (() => {
     ${room ? `<a href="${e(latestChatLink(room))}">${group?'进入群聊':'进入私聊'} ${icon('chevron')}</a>` : ''}</div>
    <p class="dispatch-objective">${e(dispatch.objective)}</p>
    ${dispatch.error ? `<p class="dispatch-error">${e(dispatch.error)}</p>` : ''}
-   ${dispatch.answer ? `<div class="dispatch-answer prose">${markdown(dispatch.answer)}</div>` : ''}
+   ${dispatch.answer ? `<div class="dispatch-answer prose">${markdown(dispatch.answer,{run_id:dispatch.child_run_id, artifacts:dispatch.artifacts})}</div>` : ''}
    ${dispatch.answer_truncated ? '<small class="assistant-note">此处显示答复节选，可进入对话查看全文。</small>' : ''}
    ${dispatch.child_run_id ? turnFiles({run_id:dispatch.child_run_id,artifacts:dispatch.artifacts}) + questions : ''}</section>`;
  }
@@ -59,10 +60,10 @@ const studioAssistant = (() => {
   const status = waiting ? '<p class="assistant-note">等待你的答复</p>' : pending ? '<p class="assistant-pending" role="status"><i></i>正在处理…</p>' :
    failed || (!turn.answer && !entities && !dispatches) ? `<p class="assistant-note">${e(labels[turn.status] || '本轮已结束')}${error ? ' · '+e(error) : ''} · <a href="#run/${encodeURIComponent(turn.run_id)}">查看运行记录</a></p>` : '';
   return `<article class="assistant-turn" data-key="assistant-turn-${e(turn.run_id)}">
-   <div class="assistant-user"><span class="prompt-sign" aria-hidden="true">›</span><div><span class="sr-only">你</span><p>${e(turn.user)}</p></div></div>
+   <div class="assistant-user"><span class="prompt-sign" aria-hidden="true">›</span><div><span class="sr-only">你</span><p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p></div></div>
    <div class="assistant-reply"><div class="assistant-byline"><span class="small-terminal" aria-hidden="true">${icon('terminal')}</span><strong>工作室助手</strong><a href="#run/${encodeURIComponent(turn.run_id)}" title="查看本轮运行详情">本轮详情 ${icon('chevron')}</a></div>
    ${activity}
-   ${turn.answer ? `<div class="assistant-answer prose">${markdown(turn.answer)}</div>` : ''}
+   ${turn.answer ? `<div class="assistant-answer prose">${markdown(turn.answer,turn)}</div>` : ''}
    ${turn.answer_truncated?'<small class="assistant-note">此处显示回复节选，完整记录见本轮详情。</small>':''}
    <div class="assistant-entities">${entities}</div>${dispatches}${turnFiles(turn)}${status}</div></article>`;
  }
@@ -83,6 +84,7 @@ const studioAssistant = (() => {
    <div class="assistant-input-row"><span class="prompt-sign" aria-hidden="true">›</span><textarea id="assistant-message" name="message" rows="2" maxlength="8000" placeholder="描述你的目标，也可以点名角色或群聊…" required></textarea></div>
    <div class="assistant-tools"><div class="assistant-context">
    <button type="button" class="assistant-folder" data-assist-pick aria-label="选择工作区" title="${e(path || '选择本机项目文件夹')}" ${choosing||sending||active()?'disabled':''}>${icon('folder')}<span>${e(choosing?'正在选择…':folder)}</span></button>
+   <select name="interaction_mode" class="assistant-interaction" aria-label="执行方式" ${sending||active()?'disabled':''}>${interactionOptions(interactionMode())}</select>
    ${ready && state.config.model ? `<span class="assistant-model" title="当前模型"><i></i>${e(state.config.model)}</span>`:''}
    </div><div class="assistant-send-tools">${runningId?'<span class="assistant-state">运行中</span>':'<span class="assistant-shortcut">Shift + Enter 换行</span>'}
    <button class="assistant-send" type="submit" aria-label="发送消息" title="发送消息（Enter）" ${locked || !draft.trim()?'disabled':''}>${icon('arrow')}</button></div></div>
@@ -156,19 +158,20 @@ const studioAssistant = (() => {
   const message=form.elements.message.value.trim();
   if (!message) return;
   const path = workspace;
-  if (!request || request.message!==message || request.workspace!==path) {
-   request={id:crypto.randomUUID(),message,workspace:path,parent:head};
+  const mode=form.elements.interaction_mode.value;
+  if (!request || request.message!==message || request.workspace!==path || request.interactionMode!==mode) {
+   request={id:crypto.randomUUID(),message,workspace:path,parent:head,interactionMode:mode};
   }
-  const payload={request_id:request.id,message,parent_run_id:request.parent};
+  const payload={request_id:request.id,message,parent_run_id:request.parent,interaction_mode:request.interactionMode};
   if (request.workspace) payload.workspace_path=request.workspace;
   epoch++; sending=true; sendError=''; draw();
   try {
    const data=await api('/api/superagent/messages',{method:'POST',body:JSON.stringify(payload)});
    if (draft.trim()===message) draft='';
-   request=null; head=data.run.id;
+   request=null; head=data.run.id; selectedInteraction='';
    // Keep earlier turns and display the accepted message while the first poll arrives.
    const turns=messages().filter(turn=>turn.run_id!==head);
-   detail={run:data.run,conversation:{...detail?.conversation,workspace_path:workspace || detail?.conversation?.workspace_path,
+   detail={run:{interaction_mode:mode,...data.run},conversation:{...detail?.conversation,workspace_path:workspace || detail?.conversation?.workspace_path,
     turns:[...turns,{run_id:head,user:message,status:data.run.status,events:[],artifacts:[]}]}};
    workspace=''; loaded=false;
    draw(true);
@@ -197,6 +200,11 @@ const studioAssistant = (() => {
  document.addEventListener('submit',event=>{
   if (event.target.id==='assistant-form') { event.preventDefault(); send(event.target); }
  });
+ document.addEventListener('change',event=>{
+  if (event.target.name==='interaction_mode' && event.target.form?.id==='assistant-form') {
+   selectedInteraction=event.target.value;
+  }
+ });
  document.addEventListener('input',event=>{
   if (event.target.id!=='assistant-message') return;
   draft=event.target.value;
@@ -223,5 +231,5 @@ const studioAssistant = (() => {
    finally { choosing=false;draw(); }
   }
  });
- return {page,refresh,enter};
+ return {page,refresh,enter,turns:messages};
 })();

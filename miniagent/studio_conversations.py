@@ -273,7 +273,7 @@ def copy_project(source: Path, recipient: str, target: Path | None, extensions: 
                             or after.st_mtime_ns != opened.st_mtime_ns):
                         raise SnapshotError("读取项目时文件已变化" + snapshot_location(name, secret) + "。")
                 try:
-                    validate_project_data(child.name, data, secret=secret, reject_credentials=True)
+                    validate_project_data(name.as_posix(), data, secret=secret, reject_credentials=True)
                 except ValueError as exc:
                     raise SnapshotError(str(exc) + snapshot_location(name, secret)) from None
                 if target is not None:

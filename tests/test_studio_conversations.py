@@ -49,6 +49,40 @@ class ConversationTest(unittest.TestCase):
         self.runs = self.root / "runs"
         self.service = StudioService(self.runs, Settings(api_key="studio-test-sentinel"))
 
+    def test_turn_inherits_mode_and_explicit_interactive_restores_questions_and_replays(self):
+        first, _ = self.run_turn(msg("第一轮", fresh(), interaction_mode="autonomous"), [{"text": "一"}])
+        inherited = msg("继续", reply(first["run"]["id"]))
+        second, model = self.run_turn(inherited, [{"text": "二"}])
+        self.assertEqual(second["run"]["interaction_mode"], "autonomous")
+        self.assertNotIn("ask_human", model.requests[0][1])
+        changed = msg("本次可以询问", reply(second["run"]["id"]), interaction_mode="interactive")
+        third, model = self.run_turn(changed, [{"text": "三"}])
+        self.assertEqual(third["run"]["interaction_mode"], "interactive")
+        self.assertIn("ask_human", model.requests[0][1])
+        self.assertEqual(self.service.start(inherited)["id"], second["run"]["id"])
+        self.assertEqual(self.service.start({**inherited, "interaction_mode": "autonomous"})["id"], second["run"]["id"])
+        with self.assertRaises(StudioError):
+            self.service.start({**inherited, "interaction_mode": "interactive"})
+        fourth, _ = self.run_turn(msg("最新回合", reply(third["run"]["id"])), [{"text": "四"}])
+        self.assertEqual(fourth["run"]["interaction_mode"], "interactive")
+
+    def test_autonomous_dm_denies_real_permission_and_reports_partial_delivery(self):
+        script = [tool("write_file", path="record.txt", content="Keep this local copy."),
+                  tool("ask_human", decision_kind="external_permission", question="May I delete this record?"),
+                  tool("delete_file", path="record.txt"), {"text": "[BLOCKED] 未获删除许可，保留了本地记录。"}]
+        provider = RecordingProvider(script)
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+            run = self.service.start(msg("准备记录并根据实际授权删除。", fresh(), interaction_mode="autonomous",
+                                         acceptance_files=["record.txt"], limits={"max_seconds": 5}))
+            detail = finished(self.service, run["id"])
+        self.assertEqual(detail["run"]["status"], "failed", detail["run"])
+        self.assertIn("未获删除许可", detail["conversation"]["turns"][-1]["answer"])
+        self.assertFalse(detail["pending_questions"])
+        self.assertFalse({e["kind"] for e in detail["room_events"]} & {"human_question", "human_answer"})
+        denied = [e for e in detail["events"] if e["kind"] == "tool_result" and e["tool"] == "delete_file"]
+        self.assertEqual([e["ok"] for e in denied], [False])
+        self.assertEqual((self.runs / run["id"] / "agents/worker/record.txt").read_text(), "Keep this local copy.")
+
     def tearDown(self):
         self.service.close()
         cleanup(self.root)

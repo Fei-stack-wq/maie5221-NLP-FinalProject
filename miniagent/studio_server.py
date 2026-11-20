@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,9 @@ _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
            "/superagent.js": ("superagent.js", "text/javascript; charset=utf-8"),
            "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
            "/activity.css": ("activity.css", "text/css; charset=utf-8"),
+           "/markdown-reader.js": ("markdown-reader.js", "text/javascript; charset=utf-8"),
+           "/markdown-reader.css": ("markdown-reader.css", "text/css; charset=utf-8"),
+           "/markdown-it.min.js": ("vendor/markdown-it.min.js", "text/javascript; charset=utf-8"),
            "/app.js": ("app.js", "text/javascript; charset=utf-8"),
            "/style.css": ("style.css", "text/css; charset=utf-8")}
 _CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
@@ -170,6 +174,19 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "activity":
             self._json(200, service.tool_activity(parts[3]))
+            return
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room-answer":
+            self._json(200, service.room_answer(parts[3]))
+            return
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room-events":
+            params = parse_qs(url.query, keep_blank_values=True)
+            if params and (set(params) != {"before"} or len(params["before"]) != 1
+                           or not re.fullmatch(r"[0-9]{1,12}", params["before"][0])):
+                raise StudioError("消息分页位置无效。")
+            rows = service.room_events(parts[3])
+            end = min(len(rows), int(params["before"][0])) if params else len(rows)
+            start = max(0, end - 24)
+            self._json(200, service._redact({"start": start, "events": rows[start:end]}))
             return
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room.zip":
             self._send(200, service.room_bundle(parts[3]), "application/zip", filename=f"{parts[3]}-room.zip")

@@ -142,6 +142,18 @@ class StudioServiceTest(unittest.TestCase):
             finished(self.service, second["id"])
         self.assertEqual(len(calls), 2)
 
+    def test_interaction_mode_validates_and_preserves_existing_interactive_replay(self):
+        payload = request()
+        run = self.service.start(payload)
+        detail = finished(self.service, run["id"])
+        self.assertEqual(detail["run"]["interaction_mode"], "interactive")
+        self.assertEqual(self.service.start({**payload, "interaction_mode": "interactive"})["id"], run["id"])
+        with self.assertRaises(StudioError):
+            self.service.start({**payload, "interaction_mode": "autonomous"})
+        for invalid in (False, None, [], "always_approve"):
+            with self.subTest(invalid=invalid), self.assertRaises(StudioError):
+                self.service.start(request(interaction_mode=invalid))
+
     def test_missing_provider_configuration_rejects_before_dispatch(self):
         with self.assertRaises(StudioError):
             self.service.start(request("single", objective="write a report"))

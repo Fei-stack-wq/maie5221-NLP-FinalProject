@@ -408,3 +408,13 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 作者修正了一条测试后，旧失败及其原始工具回执仍可追溯。另一位成员在冻结的候选上验证原需求并签署后，宿主才能关闭相应失败。产品退修时，作者收到具体标准、证据和候选版本，改稿交回原评审人重新签署。有有效负面签署而评审附件未能公开时，宿主仍可执行退修；该附件留在隔离区。
 
 当前候选、责任人及后续动作已经明确时，负责人由已登记的任务继续分工。预算按剩余时间、步骤、动作与 tokens 重算，给真正需要的独立评审和最终交接留出份额。[错误断言的独立复核](evidence/2026-11-19-independent-check-recovery.md) · [风控退修与隔离](evidence/2026-11-19-review-revision-routing.md) · [负责人调度](evidence/2026-11-19-review-coordination.md) · [返工预算](evidence/2026-11-19-rework-budget.md)
+
+### 群里的派工和交付
+
+负责人调用 `delegate_task` 时可填写 `chat_message`。例如把「查一下隔夜预约会不会冲突」发给测试员，把测试日期、步骤和交付路径写在 `objective`。测试员实际收到这句话和完整要求。消息显示当轮角色名及 @收件人，点「派工材料」可读原任务和验收要求。旧任务直接节选第一句。平台自动转交时沿用实际路由的发件人和任务。成员向本轮负责人回复，交付、待复核和受阻分别显示实际记录的状态。成功交接优先节选报告标明的「一句话成果」。发布失败时，消息优先显示平台回执原有的失败原因，成员自述仍在交付材料中。缺少最终答复时，Studio 以系统记录说明本轮终态。失败原因取自对应运行的诊断、最后交接回执或当轮保存的错误。用户原话完整显示，初始任务只出现一次。
+
+「交付材料」收起长报告、检查和获准公开的附件。「运行记录」保留平台事件和工具调用。打开旧轮次的完整原文或前一页消息时，浏览器按该轮公开日志的序号取回最多 24 条。新旧页之间有缺口时可就地加载。展开较长材料或最终回复时，浏览器按需读取全文。轮询、补载和新消息依靠稳定序号保留已经展开的材料。公开日志和附件继续沿用原有阅读边界。浏览器回归覆盖真实表单发送、派工尚未完成、历史长文补载和 Markdown 附件。[群聊端到端回归](../tests/web/room_workflow.cjs) · [日志分页回归](../tests/test_studio_discussion.py)
+
+消息行身份和手动展开状态参考 Zulip 对长消息的处理。Zulip 按消息 ID 在可见列表中更新相应行，跳过已移除的行，并尊重手动展开。Studio 用运行 ID 和只追加公开日志的序号标识一条消息，采用浏览器原生 disclosure，历史材料按需读取。这里复用交互思路，由 Studio 自行实现。[消息行模板](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/templates/single_message.hbs#L1-L3) · [折叠状态更新](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L81-L113) · [保留手动展开](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L278-L286) · [插入历史消息和移除消息的测试](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/message_list_data.test.cjs#L249-L272)
+
+群消息的来源身份和工作输入参考 AutoGen 的 `BaseGroupChatAgent.handle_message`，它让实际参与者收到带来源的正文。Studio 将派工短句交给接收成员本轮上下文，并继续通过既有调度执行完整任务。[AutoGen 群聊消息协议与接收器](https://microsoft.github.io/autogen/stable/user-guide/core-user-guide/design-patterns/group-chat.html#base-group-chat-agent)

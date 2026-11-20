@@ -1,0 +1,20 @@
+.md-file { color:var(--accent,#345c8a); text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:3px; overflow-wrap:anywhere }
+.md-file code { color:inherit }
+.md-unavailable { text-decoration:underline dotted; text-underline-offset:3px }
+.md-reader { color:inherit; width:min(760px,calc(100% - 28px)); max-width:100%; max-height:min(84dvh,900px); padding:0; border:1px solid #cfcac1; border-radius:14px; background:#fffefa; box-shadow:0 24px 96px #26241f40 }
+.md-reader[open] { display:flex; flex-direction:column }
+.md-reader::backdrop { background:#1f252965 }
+.md-reader header { display:flex; align-items:center; gap:14px; padding:18px 24px; border-bottom:1px solid #e4e0d9 }
+.md-reader h2 { margin:1px 0; font-size:18px; overflow-wrap:anywhere }
+.md-reader header > div { flex:1; min-width:0 }
+.md-reader .md-origin,.md-reader .md-path { color:#625f5a; font-size:12px; overflow-wrap:anywhere }
+.md-reader .md-origin { display:block }
+.md-reader article { overflow:auto; padding:10px clamp(16px,4vw,38px) 28px; line-height:1.7; overflow-wrap:anywhere; min-height:72px }
+.md-reader article pre,.activity-md pre { overflow-x:auto; white-space:pre }
+.md-reader article pre code { background:transparent; padding:0 }
+.md-reader article blockquote { margin:12px 0; padding:1px 14px; border-left:3px solid #c7c0b5; color:#64605a }
+.md-reader article table,.activity-md table { display:block; overflow:auto; border-collapse:collapse }
+.md-reader article a { text-underline-offset:3px }
+.md-reader [hidden] { display:none }
+.md-reader [data-md-close] { font-size:23px }
+@media(max-width:520px){.md-reader header{gap:8px;padding:12px}.md-reader .md-path{display:none}}
