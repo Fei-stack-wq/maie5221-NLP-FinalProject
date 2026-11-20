@@ -484,7 +484,7 @@ def manifest_issue(expected, actual, *, exact=False, secret=""):
 class ReviewSession:
     """The member proposes judgments; the host supplies all evidence identifiers."""
     def __init__(self, item, original, progress, attempt_id, *, private_snapshot_issue=None, promotion_issue=None,
-                 review_notes=(), available_tools=(), editable_reports=(), report_outputs=(), reviewer_task=None):
+                 review_notes=(), review_scripts=None, available_tools=(), editable_reports=(), report_outputs=(), reviewer_task=None):
         self.item = item
         self.execution_actions = {name: instruction for name, instruction in {
             "run_python": "从冻结工件取得实际值，执行顶层 assert actual == expected；通过后用 print('PASS 检查名称') 报告这一项。",
@@ -496,6 +496,7 @@ class ReviewSession:
             "run_shell": "运行含相关断言的现有测试套件，保留测试框架的逐项结果和真实退出码。",
         }.items() if name in available_tools}
         self.review_notes = set(review_notes)
+        self.review_scripts = dict(review_scripts or {})
         self.reference_paths = {r.reference_path for r in item.criteria if r.reference_path}
         self.private_snapshot_issue = private_snapshot_issue
         self.promotion_issue = promotion_issue
@@ -527,12 +528,14 @@ class ReviewSession:
 
     def _guard_write(self, name, original_tool, ctx, args):
         path = ctx.sandbox.relative(ctx.sandbox.resolve(args["path"]))
+        if path in self.review_scripts:
+            return ToolResult.failure("这是独立检查程序。请在单独的评审附件路径编写并执行：" + self.review_scripts[path])
         if path in self.frozen:
             return ToolResult.failure(f"独立评审的冻结文件不可修改 {snapshot_location(Path(path), '')}，"
                                       f"原定 {self.frozen[path] or '缺失'}。请在系统临时目录另建检查脚本，"
                                       "评审说明写入新的或宿主指定的附件路径。")
         if (self.private_snapshot_issue and name != "delete_file"
-                and path not in self.review_notes and path not in self.source_files):
+                and path not in self.review_notes and path not in self.review_scripts.values() and path not in self.source_files):
             parts = Path(path).parts
             # copy_project excludes hidden entries and cache directories from
             # the frozen manifest. Existing tool-authored source receipts are

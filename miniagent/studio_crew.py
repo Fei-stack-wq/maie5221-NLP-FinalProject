@@ -18,7 +18,7 @@ from pathlib import Path
 from .acceptance import _relative_name
 from .agent import Agent
 from .context_window import estimate_tokens
-from .crew_diagnostics import RoomDiagnostics
+from .crew_diagnostics import REVIEW_SCRIPT_SUFFIXES, RoomDiagnostics
 from .crew_progress import MemberProgress, _cover
 from .member_processes import managed_member_processes
 from .peer_recheck import ClosingPeerChecks
@@ -1890,19 +1890,25 @@ class RoomCrew:
         # artifacts count as inputs, not as writes made by the reviewer.
         baseline = review.files if private and inspecting else original
         review_notes = {}
+        review_scripts = {}
         if private and inspecting:
             # The selected parent may already contain a previous round's QA
             # report. Leave that version at its original path during every probe.
             directory = "review-notes"
-            while any(p == directory or p.startswith(directory + "/") for p in baseline):
+            while any(p == directory or p.startswith(directory + "/") for p in (*baseline, *required)):
                 directory += "-new"
             for path in required:
-                if path not in draft["required"] and Path(path).suffix.lower() in {".md", ".rst", ".txt"}:
-                    if path not in baseline:
-                        review_notes[path] = path
-                    elif baseline[path] == original.get(path):
-                        review_notes[path] = directory + "/" + path
-            required = sorted(review_notes.get(p, p) for p in required)
+                if path in draft["required"] or (path in baseline and baseline[path] != original.get(path)):
+                    continue
+                suffix = Path(path).suffix.lower()
+                if suffix in {".md", ".rst", ".txt"}:
+                    review_notes[path] = path if path not in baseline else directory + "/" + path
+                elif suffix in REVIEW_SCRIPT_SUFFIXES:
+                    # Never place reviewer code on an original import path, or
+                    # promote it alongside the author's frozen product.
+                    review_scripts[path] = directory + "/" + path
+            review_outputs = {**review_notes, **review_scripts}
+            required = sorted(review_outputs.get(p, p) for p in required)
         progress = MemberProgress(workspace, required_paths=required, public_baseline=baseline)
         progress.register_browser_replay(registry)
         session = None
@@ -1915,7 +1921,7 @@ class RoomCrew:
                     copy_project(assignment, role, None, self.extensions, secret=self.settings.api_key, manifest=manifest)
                 except SnapshotError as exc:
                     return str(exc)
-                additional_evidence = set(review_notes.values())
+                additional_evidence = set(review_outputs.values())
                 if session:
                     additional_evidence.update(p for p, sha in session.source_files.items()
                                                if p not in review.files and manifest.get(p) == sha)
@@ -1923,6 +1929,8 @@ class RoomCrew:
                 return manifest_issue(review.files, products, exact=True, secret=self.settings.api_key)
 
             def promotion_issue():
+                if issue := self.diagnostics.missing_review_script(assignment, role, review_scripts.values()):
+                    return issue
                 evidence = progress.evidence()
                 exits = evidence.get("script_exits", {})
                 for entry in evidence["pending_verification"]:
@@ -1967,7 +1975,8 @@ class RoomCrew:
                                     report_outputs=fresh_reports if not private else (),
                                     available_tools={spec.name for spec in registry.specs()},
                                     private_snapshot_issue=private_snapshot_issue if private else None,
-                                    promotion_issue=promotion_issue if private else None, review_notes=review_notes.values())
+                                    promotion_issue=promotion_issue if private else None, review_notes=review_notes.values(),
+                                    review_scripts=review_scripts)
             session.guard_file_tools(registry)
             registry.add(session.tool())
             registry.add(session.catalog_tool())
@@ -2008,6 +2017,9 @@ class RoomCrew:
             member_context += "\n负责人发给你的群消息：" + chat_message
         if self.read_only:
             member_context += "\n本次是群内只读咨询。请用查询工具核对资料后在消息里说明意见和依据。"
+        if review_scripts:
+            member_context += ("\n独立检查程序请在下列映射右侧的路径编写，并从项目根用该路径执行。原程序保持冻结；"
+                               "检查程序另外作为只读附件交接，签署依据须来自实际检查结果。映射：" + _json(review_scripts))
         if review_notes:
             member_context += "\n本轮单独交接的评审附件（委派名称对应写入路径），保留旧版及产品原件：" + _json(review_notes)
         if session:
@@ -2481,11 +2493,14 @@ class RoomCrew:
                 # The next root edit must be compared to the bytes the peer
                 # handed back, preserving ownership of its output.
                 self.direct_baseline = public_versions.copy()
-        if (not published or review_notes) and not (private and disputed or private_arbitration):
-            documents = sorted(review_notes.values()) if private and session else required
+        if (not published or review_notes or review_scripts) and not (private and disputed or private_arbitration):
+            documents = sorted(review_outputs.values()) if private and session else required
             if review_notes:
                 report["review_documents"] = review_notes
-            notes = self.diagnostics.capture(assignment, role, documents, baseline, record.task_id)
+            if review_scripts:
+                report["review_scripts"] = review_scripts
+            notes = self.diagnostics.capture(assignment, role, documents, baseline, record.task_id,
+                                             review_scripts=review_scripts.values())
             if notes:
                 report["diagnostics"] = [{"path": a["project_path"], "excerpt": a.pop("excerpt")} for a in notes]
                 artifacts.extend(notes)

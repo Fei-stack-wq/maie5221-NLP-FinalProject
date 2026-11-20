@@ -22,6 +22,7 @@ from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 from .file_tools import MAX_WRITE_CHARS, write_file
+from .project_data import validate_project_data
 from .schemas import ToolResult
 
 MAX_HTTP_BYTES = 200_000
@@ -240,26 +241,42 @@ class _VisibleText(HTMLParser):
         if not self.hidden_depth and data.strip():
             self.parts.append(data.strip())
 
-    def links(self):
+    def links(self, ctx):
         # Bound both count and bytes. Prefer main/article anchors so that a
         # large navigation menu does not crowd the primary evidence out.
         remaining = 36_000
         result = []
+        withheld = 0
         for url, (_, label) in sorted(self.targets.items(), key=lambda row: not row[1][0]):
             item = {"title": label, "url": url}
-            size = len(json.dumps(item, ensure_ascii=False).encode())
-            if size <= remaining:
+            material = json.dumps(item, ensure_ascii=False)
+            if _source_issue(ctx, "link.json", material):
+                withheld += 1
+                continue
+            size = len(material.encode())
+            if len(result) < 160 and size <= remaining:
                 result.append(item)
                 remaining -= size
-            if len(result) == 160:
-                break
-        return result
+        return result, withheld
+
+
+def _source_issue(ctx, path: str, material: str) -> str:
+    if ctx.contains_configured_secret and ctx.contains_configured_secret(material):
+        return "来源中含已配置的服务凭据。"
+    try:
+        validate_project_data(path, material.encode(), reject_credentials=True)
+    except ValueError as exc:
+        return str(exc)
+    return ""
 
 
 def _save(ctx, record: dict) -> tuple[str, ToolResult]:
     material = json.dumps(record, ensure_ascii=False, indent=2)
     identity = hashlib.sha256(material.encode()).hexdigest()
     path = f"sources/{identity}.json"
+    issue = _source_issue(ctx, path, material)
+    if issue:
+        return path, ToolResult.failure("无法保存公开来源：" + issue)
     return path, write_file(ctx, {"path": path, "content": material})
 
 
@@ -356,6 +373,9 @@ def http_get(ctx, args: dict) -> ToolResult:
     number = args.get("pdf_page")
     if number is not None and (type(number) is not int or number < 1):
         return ToolResult.failure("pdf_page 必须为从 1 开始的页码。")
+    issue = _source_issue(ctx, "request-url.txt", args["url"])
+    if issue:
+        return ToolResult.failure("无法请求该公开来源：" + issue)
     page = fetch(args["url"], timeout=timeout)
     mime = page.content_type.lower().split(";", 1)[0].strip()
     is_pdf = mime == "application/pdf" or page.body.startswith(b"%PDF-")
@@ -387,13 +407,16 @@ def http_get(ctx, args: dict) -> ToolResult:
         record.update(extractor="pdftotext", pdf_page=number, text_truncated=text_truncated)
     links = []
     if parser is not None:
-        links = parser.links()
-        record.update(links=links, links_truncated=len(links) < len(parser.targets))
+        links, withheld = parser.links(ctx)
+        record.update(links=links, links_truncated=len(links) + withheld < len(parser.targets),
+                      links_withheld=withheld)
     path, saved = _save(ctx, record)
     if not saved.ok:
         return saved
     excerpt = source[:4400 if links else 6000]
     clipped = page.truncated or text_truncated or len(source) > len(excerpt)
+    if record.get("links_withheld"):
+        excerpt += f"\n已省略 {record['links_withheld']} 条可能含凭据的页面链接。"
     if links:
         excerpt += "\n页面链接（未经独立核实；已提取列表见资料文件 links）："
         remaining = 1400

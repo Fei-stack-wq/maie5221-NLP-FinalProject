@@ -12,28 +12,47 @@ from .schemas import ToolResult
 from .tools import Tool
 
 
+# An explicitly commissioned reviewer program is delivered as a read-only
+# attachment. Arbitrary source files from a failed author remain private.
+REVIEW_SCRIPT_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".go", ".rs", ".java", ".c", ".cc", ".cpp"}
+
+
 class RoomDiagnostics:
     def __init__(self, root: Path, secret: str):
         self.root = root
         self.secret = secret
         self.files = {}
 
-    def capture(self, assignment, role, assigned, original, task_id, *, checkpoint=None):
+    def _attachment_bytes(self, assignment, role, path):
+        from .studio_service import _read_file
+        data, clipped = _read_file(assignment, f'agents/{role}/{path}', 256 * 1024)
+        if clipped or not data.strip():
+            raise ValueError("附件须为非空文本且不超过 256 KiB。")
+        validate_project_data(path, data, secret=self.secret, reject_credentials=True)
+        return data
+
+    def missing_review_script(self, assignment, role, paths):
+        for path in paths:
+            try:
+                self._attachment_bytes(assignment, role, path)
+            except (ValueError, OSError):
+                return f"尚未取得声明的独立检查附件 {path}。请在该路径保存可交接的非空文本（最多 256 KiB）。"
+        return None
+
+    def capture(self, assignment, role, assigned, original, task_id, *, checkpoint=None, review_scripts=()):
         from .studio_service import _read_file
         attachments = []
-        # Only text documents named in the delegation can leave the private workspace.
+        # Allow named reports and only the separately assigned review programs.
         for path in assigned:
-            if Path(path).suffix.lower() not in {'.md', '.rst', '.txt'}:
+            if (Path(path).suffix.lower() not in {'.md', '.rst', '.txt'}
+                    and not (path in review_scripts and Path(path).suffix.lower() in REVIEW_SCRIPT_SUFFIXES)):
                 continue
             try:
-                data, clipped = _read_file(assignment, f'agents/{role}/{path}', 256 * 1024)
-                if clipped or not data.strip():
-                    continue
+                data = self._attachment_bytes(assignment, role, path)
                 if checkpoint:
                     saved, incomplete = _read_file(checkpoint, f'agents/{role}/{path}', 256 * 1024)
                     if incomplete or saved != data:
                         continue
-                validate_project_data(path, data, secret=self.secret, reject_credentials=True)
                 sha = hashlib.sha256(data).hexdigest()
                 if sha == original.get(path):
                     continue

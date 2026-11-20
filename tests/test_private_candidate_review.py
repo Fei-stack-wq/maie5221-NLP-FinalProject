@@ -449,6 +449,37 @@ sys.exit(0 if ok else 1)
         self.assertEqual((self.local/"qa_report.md").read_text(),prior)
         self.assertFalse((self.local/name).exists())
 
+    def test_named_peer_check_runs_and_attaches_without_changing_the_authors_candidate(self):
+        path = "qa_e2e_check.py"
+        attachment = "review-notes/" + path
+        check = "import json\nfrom pathlib import Path\n" + (
+            "rooms = json.loads(Path('records.json').read_text())['bookings']\n"
+            "assert rooms[0]['room'] == 'A101'\nprint('PASS independently read the reservation')\n")
+        steps = initial()
+        steps[3]["tool_calls"][0]["arguments"]["deliverable_paths"] = [path]
+        steps.extend([submit(OLD), write(path, check), write(attachment, check),
+                      tool("run_shell", command="python3 " + attachment),
+                      submit(OLD), {"text": "Checked the label and attached the independent program."},
+                      {"text": "Delivered."}])
+        detail, reports = self.run_steps(steps)
+        self.assertEqual(detail["run"]["status"], "completed", reports)
+        self.assertEqual(reports[-1]["promoted_candidate"]["candidate_version"], digest(manifest(OLD)))
+        self.assertEqual(reports[-1]["review_scripts"], {path: attachment})
+        trace = self.root / "runs" / detail["run"]["id"] / "trace.jsonl"
+        checks = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertTrue(any(r["kind"] == "tool_result" and r.get("tool") == "run_shell" and r["ok"]
+                            and "PASS independently read the reservation" in r.get("preview", "") for r in checks))
+        self.assertTrue(any(r["kind"] == "tool_result" and r.get("tool") == "write_file" and not r["ok"]
+                            and attachment in r.get("preview", "") for r in checks))
+        row = [e for e in detail["room_events"] if e["kind"] == "member_report"][-1]
+        receipt = next(a for a in row["artifacts"] if a.get("project_path") == attachment)
+        self.assertEqual(receipt["kind"], "diagnostic")
+        self.assertEqual(receipt["sha256"], hashlib.sha256(check.encode()).hexdigest())
+        self.assertFalse((self.local / path).exists())
+        self.assertTrue(any(r["kind"] == "tool_result" and r.get("tool") == "submit_review" and not r["ok"]
+                            and attachment in r.get("preview", "") for r in checks))
+        self.assertFalse((self.local / attachment).exists())
+
     def test_known_failed_check_cannot_be_overridden_by_reading_a_file(self):
         steps=initial()
         steps[2:2]=[write("test_label.py","import unittest\nclass Label(unittest.TestCase):\n"

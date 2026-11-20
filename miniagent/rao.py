@@ -547,6 +547,7 @@ class RAOUnit:
         should_cancel: Callable[[], bool] | None = None,
         human_request_gate: Callable[[dict[str, Any]], str | None] | None = None,
         autonomous: bool = False,
+        contains_configured_secret: Callable[[str], bool] | None = None,
     ) -> None:
         self.name = name
         self.provider = provider
@@ -555,6 +556,7 @@ class RAOUnit:
         self.limits = limits
         self.temperature = temperature
         self.autonomous = autonomous
+        self.contains_configured_secret = contains_configured_secret
         self.approve = None if autonomous else approve
         self.human_handler = None if autonomous else human_handler
         self.human_request_gate = human_request_gate
@@ -882,6 +884,7 @@ class RAOUnit:
                     ToolContext(
                         sandbox=self.sandbox, limits=self.limits, approve=self.approve,
                         deadline=tool_deadline, should_cancel=self.should_cancel,
+                        contains_configured_secret=self.contains_configured_secret,
                     ),
                 )
                 obs = self._observe(result, action, step_id)

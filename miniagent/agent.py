@@ -111,6 +111,7 @@ class Agent:
             approve=approve,
             human_handler=human_handler,
             autonomous=settings.interaction_mode == "autonomous",
+            contains_configured_secret=(lambda text: settings.api_key in text) if settings.api_key else None,
             human_request_gate=human_request_gate,
             delegate_handler=delegate_handler,  # type: ignore[arg-type]
             max_actions_per_step=limits.max_tool_calls_per_step,

@@ -18,3 +18,11 @@ QA 在尝试 `attempt-4c4633db6f1c4d92b21493d07184a4ef` 有四次实际执行失
 OpenAI Agents SDK 的 `RunState._approval_items_match` 优先核对决定的所有者和工具调用身份。`_find_current_approval_item` 向当前待处理集合匹配，并对无法区分的当前调用与嵌套调用抛出异常。其 `test_get_interruptions_returns_detached_item_snapshots` 修改已传出的对象、参数及内层列表后，断言真正待决的对象仍保持原值。Studio 借用这两个设计约束，另外校验文件清单和各层签署权限。实现未复制上游代码。[匹配及异常处理](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_state.py#L1146-L1220) · [独立快照回归](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_run_state.py#L1460-L1509)
 
 `tests.test_bound_reviewer_probe` 的群聊测试走 `StudioService.start`，使用脚本化模型、真实 Python 子进程和任务仓库。它验证开发先错、QA 再错、漏引失败被驳回、第三人签署仅关闭争议，以及原 QA 重签后才发布。另两例在第三人签署时替换原作者私有文件，或由原 QA 在同一版本重做已裁决的错误断言，检查原稿仍未发布。真实模型盲测的最终表现应以对应运行的验收材料为准。
+
+## 冻结的产品与独立成员提交的检查程序
+
+11 月 20 日运行 `studio-20261120-013306-664d181a18a7` 的 QA 同时接到两个要求，保留开发版本的清单，以及提交新文件 `qa_e2e_check.py`。旧宿主只允许附带文本报告。工具拒绝写入七次，经 shell 在项目根写入又破坏冻结清单，最终没有公开交付。
+
+现在，受委派的检查脚本保存在独立评审工作副本的附件目录。宿主在给成员的任务中提供原名与实际路径的对应关系。成员从项目根运行该路径，读取检查程序自身不能获得产品验证回执。签署通过前，程序必须能安全地作为非空文本附件保存。作者原始快照按原摘要发布，脚本在成员交接中使用自己的只读文件地址与 SHA-256。未委派的私稿仍属于成员；对产品源码的保护、旧失败的独立裁决及真实运行检查继续生效。
+
+此设计参考 Playwright 的 `TestInfo.outputPath` 和 `attach`。上游把测试输出限制在指定目录，另行复制、命名并提供附件。Studio 在成员签署和项目发布之间绑定各自的文件版本。[目录边界与 attach](https://github.com/microsoft/playwright/blob/a018f24a4fc76e2120d3b35d2415f1e5bd4b073e/packages/playwright/src/worker/testInfo.ts) · [输出目录测试](https://github.com/microsoft/playwright/blob/a018f24a4fc76e2120d3b35d2415f1e5bd4b073e/tests/playwright-test/test-output-dir.spec.ts) · [附件回归](https://github.com/microsoft/playwright/blob/a018f24a4fc76e2120d3b35d2415f1e5bd4b073e/tests/playwright-test/reporter-attachment.spec.ts)

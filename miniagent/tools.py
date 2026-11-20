@@ -95,6 +95,7 @@ class ToolContext:
     """返回 False 即拒绝。默认 None = 一律拒绝危险操作。"""
     deadline: float | None = None
     should_cancel: Callable[[], bool] | None = None
+    contains_configured_secret: Callable[[str], bool] | None = None
 
 
 @dataclass

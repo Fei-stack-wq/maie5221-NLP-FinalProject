@@ -7,7 +7,9 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from miniagent.config import Limits
+from miniagent.agent import Agent
+from miniagent.config import Limits, Settings
+from miniagent.providers import ScriptedProvider
 from miniagent.research import Page, _public_socket, fetch
 from miniagent.sandbox import Sandbox
 from miniagent.tools import ToolContext, build_default_registry
@@ -68,6 +70,69 @@ class ResearchTest(unittest.TestCase):
         self.assertFalse(evidence["links_truncated"])
         self.assertIn("https://campus.example/final/press/launch", result.content)
         self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(page.body).hexdigest())
+
+    def test_one_unpublishable_navigation_link_does_not_block_the_article(self):
+        # The official article's sidebar produced the first URL in the real run.
+        side = "https://news.skhynix.com/en/series/sk-hynix-social-contribution-series"
+        secret = "fixture-account-secret"
+        self.ctx.contains_configured_secret = lambda value: secret in value
+        html = (f'<a href="{side}">SK hynix Social Value in Action</a>'
+                f'<a href="/hidden?t={secret}">Extra</a>'
+                f'<a href="/labeled" aria-label="{secret}"></a>'
+                '<article>Verified headline <a href="/press">Earnings release</a></article>')
+        page = Page("https://news.skhynix.com/en/", "text/html", html.encode(), False)
+        with patch("miniagent.research.fetch", return_value=page):
+            result = self.registry.dispatch("http_get", {"url":page.url}, self.ctx)
+        self.assertTrue(result.ok, result.content)
+        path = result.meta["path"]
+        raw = (self.root / path).read_bytes()
+        record = json.loads(raw)
+        self.assertEqual(record["links"], [{"url":"https://news.skhynix.com/press", "title":"Earnings release"}])
+        self.assertEqual(record["links_withheld"], 3)
+        self.assertFalse(record["links_truncated"])
+        self.assertEqual(record["text"], "SK hynix Social Value in Action\nExtra\nVerified headline\nEarnings release")
+        self.assertEqual(record["url"], page.url)
+        self.assertEqual(record["observed_bytes_sha256"], hashlib.sha256(page.body).hexdigest())
+        self.assertEqual(path, "sources/" + hashlib.sha256(raw).hexdigest() + ".json")
+        for rejected in (secret, side):
+            self.assertNotIn(rejected, raw.decode())
+            self.assertNotIn(rejected, result.content)
+        self.assertIn("已省略 3 条", result.content)
+        retrieved = self.registry.dispatch("read_source", {"path":path}, self.ctx)
+        self.assertTrue(retrieved.ok)
+        self.assertIn(record["text"], retrieved.content)
+
+    def test_agent_passes_its_configured_secret_filter_to_the_source_tool(self):
+        key = "test-account-specific-value"
+        page = Page("https://campus.example/start", "text/html",
+                    f'<article>Evidence</article><a href="/nav?ticket={key}">Menu</a>'.encode(), False)
+        provider = ScriptedProvider([{"tool_calls":[{"name":"http_get","arguments":{"url":page.url}}]},
+                                     {"text":"Source archived."}])
+        agent = Agent("researcher", provider, self.registry, self.ctx.sandbox, Settings(api_key=key))
+        with patch("miniagent.research.fetch", return_value=page):
+            result = agent.run("Retrieve the public article.")
+        self.assertIn(result.status, {"completed", "unverified"})
+        files = list((self.root / "sources").glob("*.json"))
+        self.assertEqual(len(files), 1)
+        record = json.loads(files[0].read_text())
+        self.assertEqual(record["links_withheld"], 1)
+        self.assertEqual(record["links"], [])
+
+    def test_sensitive_requested_url_response_url_or_primary_text_is_not_returned_or_saved(self):
+        secret = "fixture-account-secret"
+        self.ctx.contains_configured_secret = lambda value: secret in value
+        public = "https://campus.example/press"
+        for requested, final, body in ((public+"?t="+secret, public, "story"),
+                                       (public, public+"?t="+secret, "story"),
+                                       (public, public, f'<article>{secret}</article>')):
+            with self.subTest(requested=requested == public, final=final == public), patch(
+                    "miniagent.research.fetch", return_value=Page(final, "text/html", body.encode(), False)) as fetch:
+                result = self.registry.dispatch("http_get", {"url":requested}, self.ctx)
+                if secret in requested:
+                    fetch.assert_not_called()
+                self.assertFalse(result.ok)
+                self.assertNotIn(secret, result.content)
+                self.assertFalse((self.root / "sources").exists())
 
     def test_link_index_is_bounded_and_primary_content_survives_a_long_menu(self):
         html = ''.join(f'<a href="/nav/{i}">Menu {i}</a>' for i in range(450))
