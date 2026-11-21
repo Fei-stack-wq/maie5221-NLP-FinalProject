@@ -41,12 +41,16 @@ class RoleProvider:
         self.requests = []
         self.calls = Counter()
 
-    def chat(self, messages, tools=None, temperature=0):
+    def role_for(self, messages):
         system = next(m["content"] for m in messages if m["role"] == "system")
         match = re.search(r"你是「([^」]+)」", system)
-        role = "lead" if system == COORDINATOR_PROMPT else match[1] if match else None
+        role = "lead" if system.startswith(COORDINATOR_PROMPT) else match[1] if match else None
         if role not in self.providers:
             raise AssertionError("Missing an authenticated role in the system prompt")
+        return role
+
+    def chat(self, messages, tools=None, temperature=0):
+        role = self.role_for(messages)
         self.requests.append((role, messages.copy(), sorted(t.name for t in tools or [])))
         self.calls[role] += 1
         return self.providers[role].chat(messages, tools, temperature)

@@ -25,11 +25,14 @@ def request(mode="demo", **changes):
     return {"request_id": str(uuid.uuid4()), "mode": mode, **changes}
 
 
-def finished(service, run_id):
+def finished(service, run_id, *, stop_on_question=False):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         value = service.detail(run_id)
-        if value["run"]["status"] not in {"queued", "running", "created", "ready", "verifying"}:
+        status = value["run"]["status"]
+        if status in {"completed", "unverified", "failed", "cancelled", "interrupted", "blocked"}:
+            return value
+        if stop_on_question and status == "waiting_user":
             return value
         time.sleep(0.01)
     raise AssertionError("studio execution did not finish")

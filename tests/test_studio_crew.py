@@ -333,16 +333,19 @@ class StudioCrewTest(unittest.TestCase):
                 result = super().chat(messages, tools, temperature)
                 return result.model_copy(update={"usage":Usage(prompt_tokens=500,completion_tokens=100)})
         provider = Metered([assign("dev","design it"), {"text":"Design provided."}, {"text":"Summary."}])
+        # Cover the child's complete tool schema so this fixture measures the
+        # three reported debits, independent of small changes to tool descriptions.
+        initial_budget = 40_000
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
             run = self.service.start(request("team", conversation=roster("lead","dev"),
-                                     objective="Budgeted room", limits={"max_total_tokens":20000,"max_steps":6}))
+                                     objective="Budgeted room", limits={"max_total_tokens":initial_budget,"max_steps":6}))
             detail = finished(self.service,run["id"])
         calls = [e for e in detail["events"] if e["kind"] == "step_start"]
         [lease] = [e for e in detail["room_events"] if e["kind"] == "assignment"]
         child_tokens = lease["allocation"]["tokens_left"]
-        self.assertEqual(child_tokens + lease["reserved"]["tokens_left"], 19400)
+        self.assertEqual(child_tokens + lease["reserved"]["tokens_left"], initial_budget - 600)
         self.assertGreater(lease["reserved"]["tokens_left"], 1000)
-        self.assertEqual([e["tokens_remaining"] for e in calls], [20000, child_tokens, 18800])
+        self.assertEqual([e["tokens_remaining"] for e in calls], [initial_budget, child_tokens, initial_budget - 1200])
         self.assertEqual(calls[-1]["offered_tools"], [])
         self.assertEqual([e["level"] for e in calls], ["goal", "subtask", "goal"])
         self.assertEqual(detail["run"]["status"], "unverified")

@@ -1,12 +1,10 @@
 """Execute real frozen Boolean checks, then cite the host's observed E receipt."""
 import hashlib
 import json
-import re
 import unittest
 from copy import deepcopy
 from unittest.mock import patch
 
-from miniagent.agent import COORDINATOR_PROMPT
 from miniagent.config import Limits, Settings
 from miniagent.crew_progress import MemberProgress
 from miniagent.rao import Observation, RAOState, StepRecord
@@ -51,9 +49,7 @@ class CatalogProvider(RoleProvider):
         self.submitted_refs = []
 
     def chat(self, messages, tools=None, temperature=0):
-        system = next(m['content'] for m in messages if m['role'] == 'system')
-        match = re.search(r'你是「([^」]+)」', system)
-        role = 'lead' if system == COORDINATOR_PROMPT else match[1] if match else None
+        role = self.role_for(messages)
         stream = self.providers[role]
         if stream.cursor < len(stream.script) and any(
                 key in stream.script[stream.cursor] for key in ('_submit_catalog', '_run_catalog_template')):

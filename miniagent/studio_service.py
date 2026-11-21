@@ -380,6 +380,9 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
         # never become artifacts, even if a user guesses their URL.
         if meta is None:
             meta = self._meta(path)
+        if meta.get("mode") == "room":
+            # An empty channel has no run, executing role or workspace.
+            return []
         classify = None if project else output_classifier(self, path, meta)
         workspaces = []
         agents = path / "agents"

@@ -127,7 +127,7 @@ class BoundReviewerProbeTest(unittest.TestCase):
                 objective=objective,
                 acceptance_files=options.pop("acceptance_files", [PATH]), limits=options.pop("limits", {"max_steps": 90}), **options,
             ))
-            detail = finished(self.service, run["id"])
+            detail = finished(self.service, run["id"], stop_on_question=human_answer is not None)
             if human_answer is not None:
                 self.assertEqual(detail["run"]["status"], "waiting_user")
                 question, = detail["pending_questions"]
