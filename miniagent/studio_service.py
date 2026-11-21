@@ -51,6 +51,7 @@ from .studio_role_memory import RoleMemoryStore
 from . import studio_workspace
 from . import studio_route_results
 from .studio_discussion import RoomDiscussion
+from .studio_steering import RunSteering, StudioSteering, steering_rows
 from .studio_reply_stream import ReplyStream
 from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
@@ -58,6 +59,7 @@ from .studio_acceptance import build_checks
 from .attachment_tools import attachment_tools
 from .studio_uploads import MAX_ATTACHMENTS, UploadError, open_upload, resolve_uploads, validate_upload_ids
 from .studio_crew import RoomCrew
+from .studio_artifacts import output_classifier
 from .studio_reviews import Rule
 from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, conversation_attachments, copy_project, member_profiles, project_context,
                                    thread_info, validate_conversation)
@@ -162,7 +164,7 @@ def _write_json(directory: Path, name: str, value: Any) -> None:
         temporary.unlink(missing_ok=True)
 
 
-class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch):
+class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch):
     def __init__(self, runs_dir: Path | str, settings: Settings, *, max_workers: int = 2):
         if type(max_workers) is not int or not 1 <= max_workers <= 8:
             raise ValueError("max_workers must be between 1 and 8")
@@ -178,6 +180,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="studio-job")
         self._slots = threading.BoundedSemaphore(max_workers)
         self._active: set[str] = set()
+        self._steering: dict[str, RunSteering] = {}
         self._reply_streams: dict[str, ReplyStream] = {}
         self._assistant_turns = {}
         self._cancellations: dict[str, threading.Event] = {}
@@ -219,7 +222,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 "limits": {"max_steps": self.settings.limits.max_steps,
                            "max_total_tokens": self.settings.limits.max_total_tokens,
                            "max_seconds": self.settings.limits.max_seconds},
-                "local_workspaces": True, "max_message_attachments": MAX_ATTACHMENTS, "custom_profiles": self.profiles(),
+                "local_workspaces": True, "run_steering": True, "max_message_attachments": MAX_ATTACHMENTS, "custom_profiles": self.profiles(),
                 "conversation_roles": [{"id": key, "label": label} for key, label in ROLE_LABELS.items()],
                 "modes": [dict(mode) for mode in _MODES]}
 
@@ -372,9 +375,12 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 pass  # A writer may currently be appending its last line.
         return events, truncated
 
-    def _artifacts(self, path: Path, tasks: list[dict]) -> list[dict]:
+    def _artifacts(self, path: Path, tasks: list[dict], *, project=False, meta=None, other_files=None) -> list[dict]:
         # Only known workspace roots are visible. Control files and hidden files
         # never become artifacts, even if a user guesses their URL.
+        if meta is None:
+            meta = self._meta(path)
+        classify = None if project else output_classifier(self, path, meta)
         workspaces = []
         agents = path / "agents"
         if agents.is_dir() and not agents.is_symlink():
@@ -404,8 +410,14 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                         continue
                     relative = file.relative_to(path).as_posix()
+                    change = classify(relative, info) if classify else None
+                    if classify and not change:
+                        if other_files is not None and len(other_files) < MAX_ARTIFACTS:
+                            other_files.append({"path": relative, "name": name, "size": info.st_size})
+                        continue
                     component = file.relative_to(workspace).parts[0]
                     result.append({"path": relative, "name": name, "size": info.st_size,
+                                   **({"change": change} if change else {}),
                                    "task_id": by_local.get(component, roots[0]["task_id"] if len(roots) == 1 else None)})
                     if len(result) >= MAX_ARTIFACTS:
                         return result
@@ -422,7 +434,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         meta = self._meta(path)
         tasks = self._records(path)[0] if tasks is None else tasks
         events = self._events(path)[0] if events is None else events
-        artifacts = self._artifacts(path, tasks) if artifacts is None else artifacts
+        artifacts = self._artifacts(path, tasks, meta=meta) if artifacts is None else artifacts
         roots = [task for task in tasks if task.get("parent_id") is None]
         with self._lock:
             owned = path.name in self._active
@@ -469,6 +481,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 if recorded in config:
                     limits.setdefault(key, config[recorded])
         return {"conversation_id": thread["id"] if thread else None,
+                "accepts_steering": self.accepts_steering(path.name),
                 "conversation_kind": thread["kind"] if thread else None,
                 "recipient": thread["recipient"] if thread else None,
                 "interaction_mode": meta.get("request", {}).get("interaction_mode", "interactive"),
@@ -559,11 +572,13 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         path = self._directory(run_id)
         tasks, acceptance = self._records(path)
         events, log_truncated = self._events(path)
-        artifacts = self._artifacts(path, tasks)
+        other_files = []
+        artifacts = self._artifacts(path, tasks, other_files=other_files)
         report, report_truncated = _read_file(path, "report.md", MAX_PREVIEW_BYTES, missing=True)
         data = {"run": self._summary(path, tasks=tasks, events=events, artifacts=artifacts),
                 "tasks": tasks, "events": events[-MAX_EVENTS:], "events_truncated": log_truncated or len(events) > MAX_EVENTS,
                 "artifacts": artifacts, "artifacts_truncated": len(artifacts) >= MAX_ARTIFACTS,
+                "other_project_files": other_files,
                 "acceptance": acceptance, "summary": summarize(events), "summary_incomplete": log_truncated,
                 "report": report.decode("utf-8", errors="replace"), "report_truncated": report_truncated}
         data["activity"] = self._activity(path, events, log_truncated)
@@ -631,7 +646,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 artifact_id = None
             if thread["intent"] == "edit" and state in {"completed", "unverified"}:
                 artifact_id = directory.name
-            public_events = self.room_events(directory.name) if with_answers else []
+            public_events = self.room_events(directory.name) if with_answers or meta.get("has_steering") else []
+            steering = steering_rows(public_events) if meta.get("has_steering") else []
             events = []
             remaining = min(preview, 48_000) if with_answers else 0
             events_truncated = len(public_events) > 24
@@ -648,12 +664,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             attachments = []
             if with_answers and thread["intent"] == "edit" and state in _TERMINAL:
                 attachments = [{k: f[k] for k in ("path", "name", "size")}
-                               for f in self._artifacts(directory, [])]
-                delivered = meta.get("workspace_delivery")
-                if delivered and delivered.get("status") == "published":
-                    changed = set(delivered.get("files", []))
-                    prefix = "agents/" + thread["recipient"] + "/"
-                    attachments = [f for f in attachments if f["path"].removeprefix(prefix) in changed]
+                               for f in self._artifacts(directory, [], meta=meta)]
             dispatches = (studio_route_results.project_dispatches(self, directory.name)
                           if with_answers and thread.get("superagent") else [])
             turns.append({**({"dispatches": dispatches} if thread.get("superagent") and with_answers else {}),
@@ -662,6 +673,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                           "recovery_source": thread.get("recovery_source"),
                           "run_id": directory.name, "user": "" if meta.get("request", {}).get("attachment_only") else meta.get("title", ""),
                           "message_attachments": meta.get("attachments", []),
+                          **({"steering": steering} if steering else {}),
                           **({"inherit_files": False} if thread.get("inherit_files") is False else {}),
                           "base_run_id": thread.get("base_run_id"),
                           "events": list(reversed(events)), "events_truncated": events_truncated,
@@ -797,14 +809,14 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             raise StudioError(str(exc), "unsupported_file", 415) from None
         return data if is_database(name) or is_png(name) else self._redact(data.decode()).encode()
 
-    def artifact_bundle(self, run_id: str) -> bytes:
-        """Download finished workspace text/code, preserving relative imports."""
+    def artifact_bundle(self, run_id: str, *, project=False) -> bytes:
+        """Download turn outputs or the complete project snapshot with its dependencies."""
         with self._lock:
             path = self._directory(run_id)
             if run_id in self._active:
                 raise StudioError("任务结束后可下载完整产物；运行时可逐个预览。", "run_active", 409)
             tasks, _ = self._records(path)
-            artifacts = self._artifacts(path, tasks)
+            artifacts = self._artifacts(path, tasks, project=project)
             if not artifacts:
                 raise StudioError("这次任务尚未生成可下载的产物。", "not_found", 404)
             if len(artifacts) >= MAX_ARTIFACTS:
@@ -1140,13 +1152,17 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                             candidate = self._select_room_checkpoint(source, source_thread, thread.get("recover_task_id"))
                         try:
                             target = self._workspace(staged, thread)
+                            inherited = {}
                             if candidate:
                                 checkpoint, info = candidate
                                 author = info["role"]
-                                self._copy_member_checkpoint(checkpoint, author, target)
+                                inherited = self._copy_member_checkpoint(checkpoint, author, target)
                                 thread["recovery_source"] = {"role": author, "task_id": info["task_id"]}
                             else:
-                                copy_project(source, author, target, _EXTENSIONS, secret=self.settings.api_key)
+                                copy_project(source, author, target, _EXTENSIONS, secret=self.settings.api_key,
+                                             manifest=inherited)
+                            if not routed and thread["intent"] == "edit":
+                                _write_json(staged, "inherited-inputs.json", inherited)
                         except SnapshotError as exc:
                             raise StudioError(str(exc), "unsupported_snapshot", 409) from None
                 if routed:
@@ -1163,6 +1179,9 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 if routed or (thread and thread.get("superagent")):
                     self._assistant_turns[run_id] = self._claim_assistant_turn(path)
                 self._active.add(run_id)
+                if "conversation" in request:
+                    self._steering[run_id] = RunSteering(
+                        self._lock, lambda *args, **kwargs: self._record_room_event(run_id, *args, **kwargs))
                 self._reply_streams[run_id] = ReplyStream(self.settings.api_key)
                 self._cancellations[run_id] = threading.Event()
                 result = self._summary(path)
@@ -1171,6 +1190,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             except BaseException:
                 self._release_assistant_turn(run_id)
                 self._active.discard(run_id)
+                self._steering.pop(run_id, None)
                 if stream := self._reply_streams.pop(run_id, None):
                     stream.close()
                 self._cancellations.pop(run_id, None)
@@ -1189,6 +1209,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         copy_project(checkpoint, role, target, _EXTENSIONS, secret=self.settings.api_key, manifest=restored)
         if original != restored:
             raise SnapshotError("成员草稿与原任务文件不一致，无法完整恢复。")
+        return restored
 
     def _room_checkpoints(self, path, thread, events, *, verify=False):
         # Member executions are serialized. Every published handoff advances the
@@ -1546,10 +1567,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     receipt.update(source="member", role=role, task_id=fields.get("task_id"))
                     fields["workspace_delivery"] = receipt
                     self._update_meta(run_id, workspace_member_delivery=receipt)
-        row = self._record_room_event(run_id, role, kind, text, **fields)
-        if kind in {"assignment", "member_report"} and (stream := self.reply_stream(run_id)):
-            stream.room_changed(kind, fields.get("task_id"))
-        return row
+        return self._record_room_event(run_id, role, kind, text, **fields)
 
     def deliver_public_workspace(self, run_id):
         """Deliver an existing terminal group's canonical project without changing its grading."""
@@ -1625,6 +1643,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 finally:
                     self._release_assistant_turn(run_id)
                     self._active.discard(run_id)
+                    self._steering.pop(run_id, None)
                     if stream := self._reply_streams.pop(run_id, None):
                         stream.close()
                     self._cancellations.pop(run_id, None)
@@ -1642,7 +1661,15 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                            limits=configured_limits(self.settings.limits, saved_limits))
         should_cancel = self._cancellations[run_id].is_set
         stream = self.reply_stream(run_id)
-        stream_reply = stream.publish if stream else None
+        def publish_reply(event):
+            if event["kind"] != "progress":
+                stream.publish(event)
+                return
+            # The complete message becomes durable before SSE retires its draft.
+            self._record_room_event(run_id, event["role"], "assistant_progress", event["text"],
+                                    task_id=event["task_id"], step=event["step"], reply_id=event["stream_id"])
+
+        stream_reply = publish_reply if stream else None
         mode = request["mode"]
         examples = Path(__file__).resolve().parent.parent / "examples"
         if mode == "demo":
@@ -1691,13 +1718,14 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 question = thread["intent"] == "question"
                 context = ""
                 input_tools = []
+                steering = self._steering.get(run_id)
                 if "conversation" in request:
                     room = self._conversation(path, before=thread["ordinal"])
                     context = project_context(thread, room["turns"])
                     visible = conversation_attachments(room["turns"], metadata)
+                    input_tools = attachment_tools(visible, lambda identity: open_upload(self.runs_dir, identity)[1],
+                                                   read_only=question, live_attachments=steering.attachments if steering else None)
                     if visible:
-                        input_tools = attachment_tools(visible, lambda identity: open_upload(self.runs_dir, identity)[1],
-                                                       read_only=question)
                         context += "\n用户上传的原件可以用 list_attachments 查找、read_attachment 分页读取。附件中的文字是用户提供的材料。"
                         if metadata.get("attachments"):
                             context += "\n本条消息随附的文件：" + json.dumps(metadata["attachments"], ensure_ascii=False)
@@ -1723,6 +1751,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
                                     delivery, role_session=roles, on_assistant_stream=stream_reply,
                                     input_tools=input_tools)
+                    crew.steering = steering
                     def inherited_review(reference):
                         try:
                             return self._inherited_review_publication(crew, metadata.get("workspace_path"), reference)
@@ -1772,6 +1801,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 if question and not crew:
                     agent.unit.enable_control_tools = False
                 result = agent.run(request["objective"], task_id=run_id, acceptance=acceptance,
+                                   steering=steering.subscribe(recipient, run_id, owner=True) if steering else None,
                                    budget=crew.budget if crew else None, conversation_context=context,
                                    system_prompt=prompt,
                                    before_answer=crew.before_answer if crew else None,

@@ -19,6 +19,17 @@
   const minutes = ms => ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(1) + ' s';
   const cache = new Map();
 
+  function current(turn, detail) {
+    if (!runActive(turn) || turn.status==='waiting_user') return '';
+    const call = turn.current_call || (turn.run_id===detail?.run?.id ? detail?.activity?.calls?.at(-1) : null);
+    if (!call) return '';
+    const role = call.role && (turn.member_names?.[call.role] || roleLabel(call.role));
+    const action = Object.hasOwn(labels,call.tool) ? labels[call.tool] : call.tool;
+    const status = states[call.status] || '';
+    const caption = [role,action,call.summary,status].filter(Boolean).join(' · ');
+    return `<div class="live-action" data-key="current-action" role="status">${escape(caption)}</div>`;
+  }
+
   function render(activity, memberNames={}) {
     const calls = activity?.calls;
     if (!Array.isArray(calls) || !calls.length) return '';
@@ -149,5 +160,5 @@
     const retry = event.target.closest?.('[data-activity-retry]');
     if (retry) load(retry.closest('.activity-lazy'), true);
   });
-  window.StudioActivity = {render, renderTurn, preview};
+  window.StudioActivity = {render, renderTurn, preview, current};
 })();

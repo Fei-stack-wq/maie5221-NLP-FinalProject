@@ -72,14 +72,16 @@ class ReplyStream:
         if self._drafts.pop(identity, None) is not None:
             self._frame("remove", {"id":identity})
 
-    def room_changed(self, kind, task_id):
+    def room_changed(self, kind, task_id, *, reply_id=None):
         with self._condition:
             if self._closed:
                 return
             if kind == "member_report":
                 for key in [key for key, draft in self._drafts.items() if draft.task_id == task_id]:
                     del self._drafts[key]
-            self._frame("room", {"kind":kind, "task_id":task_id})
+            if reply_id:
+                self._drafts.pop(reply_id, None)
+            self._frame("room", {"kind":kind, "task_id":task_id, **({"reply_id":reply_id} if reply_id else {})})
 
     def close(self):
         with self._condition:

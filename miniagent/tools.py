@@ -104,6 +104,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     fn: Callable[[ToolContext, dict[str, Any]], ToolResult]
+    available: Callable[[], bool] | None = None
 
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
@@ -122,13 +123,14 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
-    def specs(self) -> list[ToolSpec]:
-        return [self._tools[name].spec() for name in self.names()]
+    def specs(self, *, available_only=False) -> list[ToolSpec]:
+        tools = (self._tools[name] for name in self.names())
+        return [tool.spec() for tool in tools if not available_only or tool.available is None or tool.available()]
 
     def dispatch(self, name: str, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """执行工具。**任何情况下都返回 ToolResult，不向外抛异常。**"""
         tool = self._tools.get(name)
-        if tool is None:
+        if tool is None or (tool.available is not None and not tool.available()):
             return ToolResult.failure(
                 f"未知工具 {name!r}。可用工具：{', '.join(self.names())}"
             )

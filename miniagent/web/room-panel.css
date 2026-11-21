@@ -36,6 +36,11 @@
 .roster-dialog .muted-note {margin-top:12px}
 .chat-end {display:block;height:1px;outline:none;scroll-margin-bottom:24px}
 .reply-stream:empty {display:none}
+.chat-update {margin:12px 0;overflow-wrap:anywhere}
+.chat-update-byline,.live-action {font-size:12px;color:var(--muted);line-height:1.6}
+.chat-update .prose {margin-top:3px}
+.chat-update .prose>:first-child {margin-top:0}
+.chat-update-user {margin-left:auto;border-left:2px solid var(--line);padding-left:10px}
 .live-reply {min-width:0;margin:12px 0;padding-left:12px;border-left:2px solid var(--line)}
 .live-reply-byline {color:var(--muted);font-size:12px;line-height:1.6;margin-bottom:5px}
 .live-reply-text {white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.7;color:var(--ink)}

@@ -124,6 +124,26 @@ class ConversationTest(unittest.TestCase):
             {"text": "初版使用速度 2。"},
         ])[0]["run"]["id"]
 
+    def test_same_assistant_presents_only_the_selected_turns_deliverables(self):
+        first = self.seed()
+        second, _ = self.run_turn(msg("另写一份操作说明", reply(first)), [
+            tool("write_file", path="guide.md", content="Start the application."), {"text": "说明已交付。"}])
+        run = second["run"]["id"]
+        self.assertEqual([(f["name"], f["change"]) for f in second["artifacts"]], [("guide.md", "added")])
+        self.assertEqual(second["run"]["artifact_count"], 1)
+        self.assertEqual([f["name"] for f in second["other_project_files"]], ["game.js"])
+        self.assertEqual([[f["name"] for f in t["artifacts"]] for t in second["conversation"]["turns"]],
+                         [["game.js"], ["guide.md"]])
+        for project, names in [(False, {"guide.md"}), (True, {"guide.md", "snake/game.js"})]:
+            with zipfile.ZipFile(BytesIO(self.service.artifact_bundle(run, project=project))) as packet:
+                self.assertEqual(set(packet.namelist()), names)
+        # Historical unbound DMs can be projected from their original parent.
+        (self.runs / run / "inherited-inputs.json").unlink()
+        self.assertEqual(self.service.detail(run)["artifacts"], second["artifacts"])
+        same, _ = self.run_turn(msg("再交这一份说明", reply(run), acceptance_files=["guide.md"]),
+                                [{"text": "沿用现有说明。"}])
+        self.assertEqual([(f["name"], f["change"]) for f in same["artifacts"]], [("guide.md", "declared")])
+
     def test_group_turns_pin_responder_and_publish_edits_separately_from_questions(self):
         first = self.seed(["worker", "reviewer", "writer"])
         question, provider = self.run_turn(msg("现在有多快？", reply(first, "reviewer", "question")), [

@@ -60,12 +60,12 @@ class _AssistantPreview:
     def _send(self, kind, text=""):
         if self.emit is None:
             return
-        if kind == "delta" and not self.stream_id:
+        if kind in {"delta", "progress"} and not self.stream_id:
             self.stream_id = uuid.uuid4().hex
         if self.stream_id:
             try:
                 self.emit({**self.identity, "stream_id": self.stream_id, "kind": kind,
-                           **({"text": text} if kind == "delta" else {})})
+                           **({"text": text} if kind in {"delta", "progress"} else {})})
             except Exception:
                 # An unavailable preview consumer must not repeat or stop tools.
                 self.emit = None
@@ -73,6 +73,14 @@ class _AssistantPreview:
     def receive(self, kind, text):
         if kind == "discard":
             self.close()
+            return
+        if kind == "progress":
+            # The validated completion is authoritative, including for a
+            # provider which delivered no transport deltas.
+            self._send("progress", text)
+            self.stream_id = None
+            self.tail = ""
+            self.deferred.clear()
             return
         if self.deferred:
             self.deferred.append(text)
@@ -193,6 +201,7 @@ class Agent:
         preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
         tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
         on_assistant_stream: Callable[[dict], None] | None = None,
+        steering=None,
     ) -> RunResult:
         """跑完一个任务。
 
@@ -200,7 +209,7 @@ class Agent:
         不传则按 ``settings.limits`` 新建。
         ``on_step`` 是给调度器的钩子：每步结束立刻回调，用于写黑板、检查依赖。
         ``on_assistant_stream`` 接收临时正文事件。每项带 stream_id、role、task_id 与 step；
-        delta 的 text 是新增文字，end 与 discard 分别结束与撤销预览，正式结果以 RunResult 为准。
+        delta 的 text 是新增文字，progress 是经过协议校验的整段工具回合正文。end 与 discard 分别结束与撤销预览。
         """
         task_id = task_id or (execution.task.task_id if execution else f"task-{uuid.uuid4().hex}")
         durable_task = None
@@ -276,8 +285,14 @@ class Agent:
         started = time.perf_counter()
 
         instructions = system_prompt or SYSTEM_PROMPT.format(agent=self.name)
+        if on_assistant_stream:
+            instructions += ("\n多步任务开始、取得重要结果或改变安排时，在调用工具的同一条消息中用一两句公开正文"
+                             "告诉用户你正在做什么或已经确认什么。")
+        if steering is not None:
+            instructions += ("\n执行中收到用户追问时，在公开回复里简短回答并继续当前任务。"
+                             "收到新要求时调整后续行动，任务完成或用户要求结束时再给最终答复。")
         if self.unit.autonomous:
-            instructions += ("\n本轮采用自主完成模式。用户的一条任务消息即为本轮输入。直接执行到最终交付，"
+            instructions += ("\n本轮采用自主完成模式。直接执行到最终交付，同时遵循用户在执行中主动发来的新要求。"
                              "分工、可逆偏好、模拟任务的情景参数由团队决定，在交接和最终答复中注明重要假设与理由。"
                              "查证事实，实际风险、缺少的私有数据和对外操作所需的授权均不能假定。"
                              "完成获准部分；若必需条件仍无法满足，以 [BLOCKED] 开头列明已完成工作和具体限制。"
@@ -294,6 +309,20 @@ class Agent:
         )
         if conversation_context:
             state.scratch["work_context"] = conversation_context
+
+        def receive_steering(*, finishing=False):
+            if steering is None:
+                return False
+            additions = steering.take(finishing=finishing)
+            if additions:
+                if preview:
+                    preview.close()
+                messages = [{"role": "user", "content": text} for text in additions]
+                state.history.extend(messages)
+                state.scratch.setdefault("live_user_messages", []).extend(messages)
+            return bool(additions)
+
+        self.unit.steering_pending = steering.pending if steering else None
         budget = budget or Budget.from_limits(limits)
         initial_seconds = budget.capped_seconds(limits.max_seconds or None)
 
@@ -379,6 +408,7 @@ class Agent:
                 if cancellation_observed():
                     status, error = "aborted", "用户请求停止"
                     break
+                receive_steering()
                 policy = step_policy(state, budget) if step_policy else StepPolicy(phase="work")
                 offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
                 text_only = step_policy is not None and not offered
@@ -488,6 +518,8 @@ class Agent:
                 if not budget.has_time(policy.seconds_reserve):
                     error = budget_reason() if not budget.has_time() else "本轮请求已无可用时间，剩余时间已预留给收尾。"
                     break
+                if steering is not None and steering.pending():
+                    continue
                 budget.spend(steps=1)
                 step_started = time.perf_counter()
                 history_start = len(state.history)
@@ -523,7 +555,7 @@ class Agent:
                         input_estimate_source=projection.estimate_source,
                     )
                 state.scratch.pop("tool_protocol_feedback", None)
-                if (on_assistant_stream and policy.phase in {"work", "handoff", "finalize"}
+                if (on_assistant_stream and policy.phase in {"work", "coordinate", "handoff", "finalize"}
                         and not policy.required_tool and not policy.bound_handoff):
                     preview = _AssistantPreview(on_assistant_stream, self.name, task_id, state.step_index + 1)
                 try:
@@ -565,6 +597,9 @@ class Agent:
                           source="unknown" if record.request_attempts > 1 else record.usage_source)
                 )
                 tool_calls += record.tool_calls
+                if (steering is not None and len(state.history) > history_start
+                        and state.history[history_start].get("role") == "assistant"):
+                    steering.acknowledge()
                 self._trace_step(identity, record, request_output_limit)
                 if (record.usage_source == "reported" and record.terminate_reason is None
                         and len(state.history) > history_start
@@ -659,6 +694,8 @@ class Agent:
 
                 # ② 模型给出最终答复 → 必须过验收
                 if record.decision_kind == "answer" or completion is not None:
+                    if receive_steering():
+                        continue
                     if (completion is None and (step_policy is not None or self.unit.autonomous)
                             and record.answer.lstrip().startswith("[BLOCKED]")):
                         if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
@@ -675,6 +712,8 @@ class Agent:
                                     "请根据下列版本回执重新汇总。如果另有真实阻塞，请保留 [BLOCKED] "
                                     "并具体说明超出这些标准的哪项请求尚未满足。")
                                 continue
+                        if receive_steering(finishing=True):
+                            continue
                         answer = record.answer
                         status, error = "error", answer
                         break
@@ -711,6 +750,14 @@ class Agent:
                         acceptance, self.sandbox.root, task_id=task_id,
                         attempt_id=attempt_id, objective=task,
                     )
+                    verdict = evaluation.report.verdict
+                    if verdict in {"passed", "unverified", "error"} and receive_steering(finishing=True):
+                        if durable_task is not None:
+                            durable_task = self.task_service.transition(
+                                task_id, expected_revision=durable_task.revision, status="running",
+                            )
+                        answer = ""
+                        continue
                     acceptance_spec = evaluation.spec
                     acceptance_report = evaluation.report
                     payload = evaluation.trace_payload()
@@ -721,7 +768,6 @@ class Agent:
                             spec=acceptance_spec, report=acceptance_report,
                             receipts=acceptance_evidence,
                         )
-                    verdict = acceptance_report.verdict
                     why = acceptance_report.reason or "验收通过"
                     if self.tracer:
                         self.tracer.event(
@@ -798,6 +844,8 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
             status, error = "error", f"{type(exc).__name__}: {exc}"
         finally:
+            if steering is not None:
+                steering.close()
             if preview:
                 preview.close()
             if owned_commands:

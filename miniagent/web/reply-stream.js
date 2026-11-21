@@ -6,12 +6,40 @@ const studioReplyStreams = (() => {
  const channels = new Map();
  const paintedReplies = new WeakMap();
 
+ function message(row,turn) {
+  const user = row.kind==='user_steer';
+  const receipt = user && (turn.steering || []).find(item=>item.request_id===row.request_id);
+  const seen = receipt?.seen_by;
+  const name = user ? '你' : turn.member_names?.[row.role] || roleLabel(row.role);
+  const caption = user ? (seen ? '已送达 '+(turn.member_names?.[seen] || roleLabel(seen)) :
+   runActive(turn) ? '等待角色接收' : '本轮未送达') : '进度';
+  const text = receipt?.text ?? row.text;
+  const files = user ? studioAttachments.history({...turn,message_attachments:row.message_attachments}) : '';
+  return `<div class="chat-update ${user?'chat-update-user':''}" data-kind="${e(row.kind)}" data-key="update-${e(row.reply_id || row.request_id)}">
+   <div class="chat-update-byline">${e(name)} · ${e(caption)}</div>${text?`<div class="prose">${markdown(text,turn,row)}</div>`:''}${files}</div>`;
+ }
+
+ function timeline(turn, withHistory=false) {
+  const start=turn.events_start || 0, indices=turn.event_indices;
+  const rows=withHistory && start ? [historyButton(turn.run_id,start,'查看更早消息')] : [];
+  for (const [offset,row] of (turn.events || []).entries()) {
+   const index=indices?.[offset] ?? start+offset;
+   if (withHistory && offset && indices && index>indices[offset-1]+1)
+    rows.push(historyButton(turn.run_id,index,'查看此处更早的消息'));
+   if (row.kind!=='assistant_progress' && row.kind!=='user_steer') continue;
+   rows.push(message(row,turn));
+   if (withHistory && row.text_truncated) rows.push(historyButton(turn.run_id,index+1,'读取完整原文'));
+  }
+  return rows.join('');
+ }
+
  function slot(turn, showSpeaker=true) {
   const id = turn.run_id || turn.id;
   if (!id || !runActive(turn) || turn.answer) return '';
-  const archived = (turn.events || []).filter(row=>row.kind==='member_report' && row.task_id).map(row=>row.task_id);
+  const archived = turn.archived_tasks || (turn.events || []).filter(row=>row.kind==='member_report' && row.task_id).map(row=>row.task_id);
+  const committed = (turn.events || []).filter(row=>row.kind==='assistant_progress').map(row=>row.reply_id);
   return `<div class="reply-stream" data-key="reply-stream-${e(id)}" data-live-run="${e(id)}"
-   data-archived="${e(JSON.stringify(archived))}" data-speakers="${e(JSON.stringify(turn.member_names || {}))}"
+   data-archived="${e(JSON.stringify(archived))}" data-committed="${e(JSON.stringify(committed))}" data-speakers="${e(JSON.stringify(turn.member_names || {}))}"
    data-show-speaker="${showSpeaker}" aria-label="正在生成的回复"></div>`;
  }
 
@@ -21,6 +49,7 @@ const studioReplyStreams = (() => {
  }
 
  function paint(channel) {
+  const archivedOnAll = new Set(channel.replies.keys());
   for (const slot of channel.slots) {
    const feed = slot.closest('.assistant-feed, .chat-history');
    const innerFeed = feed?.classList.contains('assistant-feed');
@@ -29,11 +58,13 @@ const studioReplyStreams = (() => {
    const pinned = innerFeed ? before-feed.scrollTop-feed.clientHeight<64
     : before>=0 && before<=innerHeight+8;
    const archived = new Set(JSON.parse(slot.dataset.archived));
+   const committed = new Set(JSON.parse(slot.dataset.committed));
    const names = JSON.parse(slot.dataset.speakers);
    const previous = new Map([...slot.children].map(el=>[el.dataset.replyId,el]));
    let after = null;
    for (const reply of channel.replies.values()) {
-    if (!reply.text || archived.has(reply.task_id)) continue;
+    if (!reply.text || archived.has(reply.task_id) || committed.has(reply.id)) continue;
+    archivedOnAll.delete(reply.id);
     let row = previous.get(reply.id);
     if (!row) {
      row = document.createElement('div');
@@ -63,6 +94,9 @@ const studioReplyStreams = (() => {
    if (pinned && innerFeed && feed.scrollHeight>before) feed.scrollTop=feed.scrollHeight;
    else if (pinned && !innerFeed && bottom.getBoundingClientRect().bottom>innerHeight+8)
     window.scrollBy(0,bottom.getBoundingClientRect().bottom-innerHeight);
+  }
+  if (channel.slots.length) {
+   for (const id of archivedOnAll) channel.replies.delete(id);
   }
   roomPanel.scheduleScrollCheck();
  }
@@ -104,15 +138,10 @@ const studioReplyStreams = (() => {
    if (state.route==='assistant') return studioAssistant.refresh(true);
    if (state.route==='detail') return refreshDetail();
   }
-  listen('room',data=>{
-   // Fetch the committed handoff before retiring its preview to avoid a gap.
-   Promise.resolve(refreshCommitted()).then(()=>{
-    if (channels.get(id)!==channel || data?.kind!=='member_report') return;
-    for (const [key,reply] of channel.replies) {
-     if (reply.task_id===data.task_id) channel.replies.delete(key);
-    }
-    schedule();
-   });
+  listen('room',()=>{
+   // The view may already be fetching, or temporarily offline. Retire the
+   // preview only when paint sees the committed row in every visible slot.
+   Promise.resolve(refreshCommitted()).then(schedule);
    return false;
   });
   source.onerror=()=>{ channel.ready=false; }; // EventSource reconnects and receives a fresh snapshot.
@@ -151,5 +180,5 @@ const studioReplyStreams = (() => {
  window.addEventListener('pagehide',()=>{ for (const [id,channel] of channels) close(id,channel); });
  window.addEventListener('pageshow',sync);
  document.addEventListener('visibilitychange',sync);
- return {slot,sync};
+ return {slot,sync,message,timeline};
 })();

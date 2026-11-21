@@ -79,6 +79,8 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(second["run"]["status"], "completed", (second["run"], second["acceptance"]))
 
         self.assertEqual(second["conversation"]["workspace_path"], str(self.local))
+        self.assertEqual([a["name"] for a in second["artifacts"]], ["new.md"])
+        self.assertIn("notes.md", [a["name"] for a in second["other_project_files"]])
         self.assertEqual([a["name"] for a in second["conversation"]["turns"][-1]["artifacts"]], ["new.md"])
         self.assertEqual((self.local / "new.md").read_text(), "second turn, with a new project document")
         self.assertEqual((self.local / "notes.md").read_text(), "edited locally")

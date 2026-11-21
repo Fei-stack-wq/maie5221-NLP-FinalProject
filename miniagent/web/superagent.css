@@ -40,6 +40,8 @@ body {--canvas:#faf9f6;--surface:#fffefa;--sidebar:#f1f0ea;--ink:#2b2b25;--line:
 .is-new .assistant-compose-area {margin-top:26px}
 .assistant-composer {background:#fffefa;border:1px solid #d1cec2;border-radius:14px;box-shadow:0 1px 2px #51472e09,0 5px 18px #51472e07;transition:border-color .18s ease,box-shadow .18s ease}
 .assistant-composer:focus-within {border-color:#b58b75;box-shadow:0 0 0 2px #a563411a,0 5px 18px #51472e07}
+.assistant-destination {display:flex;align-items:center;gap:8px;margin:12px 16px 0;min-width:0;color:#64655a;font-size:13px}
+.assistant-destination select {flex:1;min-width:0;max-width:100%;padding:4px 6px;color:#443e38;background:transparent;border:1px solid #d1cec2;border-radius:5px;font:inherit;text-overflow:ellipsis}
 .assistant-input-row {display:flex;align-items:flex-start;gap:12px;padding:17px 18px 4px}
 .prompt-sign {display:inline-block;font:500 26px/1 ui-monospace,monospace;color:#a2553c}
 .assistant-input-row textarea {display:block;border:0;outline:0;box-shadow:none;resize:vertical;min-height:64px;max-height:20dvh;flex:1;min-width:0;background:transparent;color:#302f29;font-size:15px;line-height:1.65;padding:0}

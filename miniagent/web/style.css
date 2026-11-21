@@ -224,6 +224,12 @@ main{flex:1;padding:32px 36px 40px;min-width:0}
 .log-entry pre{margin:0;padding:15px 18px;background:#f5f6f8;border-top:1px solid #edf0f5;font-size:12px;line-height:1.9;color:#5f6775;overflow:auto;max-height:400px;white-space:pre-wrap;overflow-wrap:anywhere}
 .artifact-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:16px}
 .artifact-list{display:flex;flex-direction:column;gap:6px}
+.artifact-list .section-title{display:flex;align-items:center;gap:8px}
+.artifact-toolbar .field-label{flex:1;min-width:0}
+.artifact-toolbar select{max-width:100%}
+.artifact-project{border-top:1px solid var(--line);padding:10px 0;margin-top:8px}
+.artifact-project summary{font-size:12px;color:var(--muted);cursor:pointer}
+.artifact-project .artifact-button{width:100%}
 .artifact-button{display:flex;gap:10px;align-items:flex-start;padding:14px 12px;text-align:left;border-radius:7px;border:1px solid transparent;min-width:0}
 .artifact-button:hover,.artifact-button.active{background:#eef2ff;border-color:#e0e4ec}
 .artifact-button svg{color:#7b8496;flex-shrink:0;width:16px;height:16px}
@@ -306,7 +312,7 @@ main{padding:36px 30px}
 .starter small{margin-top:1px}
 .starter-icon{width:30px}
 .artifact-layout{grid-template-columns:1fr}
-.artifact-list{flex-direction:row;overflow-x:auto;gap:5px}
+.artifact-list{gap:5px;max-height:340px;overflow:auto}
 .artifact-button{min-width:160px}
 .run-time{display:none}
 .home-heading h1{font-size:26px}

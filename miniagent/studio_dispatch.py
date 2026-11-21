@@ -78,7 +78,7 @@ class StudioDispatch:
 
     def request_studio_dispatch(self, source_run_id, *, target_kind, target_id, objective,
                                 acceptance_files=None, input_files=None, required_participants=None, attachment_ids=None):
-        from .studio_conversations import conversation_attachments
+        from .studio_conversations import conversation_attachments, turn_attachments
         from .studio_route_results import bind_inputs
         from .studio_service import StudioError, _relative
         from .studio_uploads import UploadError, validate_upload_ids
@@ -96,15 +96,18 @@ class StudioDispatch:
             if (thread.get('superagent') is not True or source_run_id not in self._active
                     or self._cancellations[source_run_id].is_set()):
                 raise StudioError('派工只能由正在执行的统一对话发起。', 'inactive_source', 409)
-            current_ids = [item['id'] for item in source.get('attachments', [])]
+            inbox = self._steering.get(source_run_id)
+            current = turn_attachments({'message_attachments': source.get('attachments', []),
+                                        'steering': inbox.rows if inbox else []})
+            current_ids = [item['id'] for item in current]
             try:
-                attached = current_ids if attachment_ids is None else validate_upload_ids(attachment_ids)
+                attached = validate_upload_ids(current_ids if attachment_ids is None else attachment_ids)
             except UploadError as exc:
                 raise StudioError(str(exc), exc.code, exc.status) from None
             if set(attached) - set(current_ids):
                 history = self._conversation(self._directory(source_run_id), before=thread['ordinal'], with_answers=False)
                 visible = conversation_attachments(history['turns'], source)
-                if set(attached) - {item['id'] for item in visible}:
+                if set(attached) - set(current_ids) - {item['id'] for item in visible}:
                     raise StudioError('只能转交当前项目对话中可见的附件。', 'invalid_attachment')
             participants = [] if required_participants is None else required_participants
             name, _ = self._dispatch_target(source, target_kind, target_id, participants)
@@ -118,6 +121,11 @@ class StudioDispatch:
             scope = self._dispatch_scope(source)
             with self._dispatch_db(write=True) as db:
                 row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
+                if row is not None and row['state'] == 'cancelled' and inbox and inbox.rows:
+                    # A revised instruction can keep the objective while changing
+                    # inputs. Keep the cancelled receipt and deduplicate its replacement.
+                    identity = str(uuid.uuid5(uuid.UUID(identity), inbox.rows[-1]['request_id']))
+                    row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 if row is not None:
                     if (json.loads(row['attachment_ids']) != attached or set(json.loads(row['inputs'])) != set(inputs)
                             or set(json.loads(row['acceptance'])) != set(acceptance)
@@ -134,6 +142,19 @@ class StudioDispatch:
                             json.dumps(attached)))
                     row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 return self._dispatch_receipt(row)
+
+    def cancel_queued_dispatch(self, source_run_id, dispatch_id):
+        from .studio_service import StudioError
+        with self._lock, self._dispatch_db(write=True) as db:
+            row = db.execute("SELECT * FROM dispatches WHERE id=? AND source=?",
+                             (dispatch_id, source_run_id)).fetchone()
+            if source_run_id not in self._active or row is None:
+                raise StudioError("本轮没有此派工回执。", "unknown_dispatch")
+            if row["state"] not in {"queued", "cancelled"}:
+                raise StudioError("派工已离开队列，请在接手方的对话中补充要求。", "dispatch_started", 409)
+            db.execute("UPDATE dispatches SET state='cancelled', error=? WHERE id=? AND state='queued'",
+                       ("统一助手已撤回排队中的派工。", dispatch_id))
+            return self._dispatch_receipt(db.execute("SELECT * FROM dispatches WHERE id=?", (dispatch_id,)).fetchone())
 
     def _dispatch_receipt(self, row):
         from .studio_service import StudioError

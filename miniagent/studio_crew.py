@@ -86,6 +86,7 @@ class RoomCrew:
         self.role_session = role_session
         self.on_assistant_stream = on_assistant_stream
         self.input_tools = tuple(input_tools)
+        self.steering = None
         self.input_reads = frozenset(t.name for t in self.input_tools if t.name != "materialize_attachment")
         self.inherited_review = None
         self.run_id = run_id
@@ -1108,7 +1109,13 @@ class RoomCrew:
         # system message and authenticated human replies, with framing/output.
         self._prepare_inspection(budget)
         plan_finished = self.planned is not None or set(self.profiles) - {self.lead} <= self.approved_roles
-        if self.dispatch_ended or (plan_finished and not self.before_answer() and not self.delivery_issue):
+        message_count = len(state.scratch.get("live_user_messages", ()))
+        if message_count > state.scratch.get("coordinator_steer_count", 0):
+            state.scratch.update(coordinator_steer_count=message_count, replan_after_reports=len(self.reports))
+        # The lead can answer the interjection immediately or delegate revised
+        # work. A new handoff restores normal closure for the updated plan.
+        reconsider = state.scratch.get("replan_after_reports") == len(self.reports)
+        if self.dispatch_ended or (plan_finished and not reconsider and not self.before_answer() and not self.delivery_issue):
             return closing
         native = self._next_review()
         bound = self._bound_review_handoff(native)
@@ -1165,7 +1172,9 @@ class RoomCrew:
             instruction += "\n已达到本次勘察的建议用量。请核对剩余预算，优先查明影响分工的缺口。"
         elif inspect_public and len(self.navigation_recent) >= 3:
             instruction += "\n已收集多项背景信息。只补足直接影响分工的缺口，否则现在进行委派。"
-        allowed = controls | self.input_reads
+        input_reads = {tool.name for tool in self.input_tools if tool.name in self.input_reads
+                       and (tool.available is None or tool.available())}
+        allowed = controls | input_reads
         if inspect_public:
             allowed |= _PROJECT_READS
         if inspect_reports:
@@ -2038,7 +2047,7 @@ class RoomCrew:
                                   "。对原失败涉及的产品行为另行执行断言，并把结论与回执逐项签署。\n" + repair_context)
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context, review)
         if self.input_tools:
-            member_context += "\n本次任务附有用户提供的原始资料。用 list_attachments 查看可访问的文件和 ID，再用 read_attachment 读取。"
+            member_context += "\n需要用户附件时，用 list_attachments 查看文件和 ID，再用 read_attachment 读取。"
         if chat_message:
             member_context += "\n负责人发给你的群消息：" + chat_message
         if self.read_only:
@@ -2060,8 +2069,7 @@ class RoomCrew:
             if personal:
                 member_context += "\n" + personal
 
-        work_tools = frozenset(s.name for s in member.unit.tool_specs() if s.name != "delegate_task")
-        work_schemas = [s.to_api() for s in member.unit.tool_specs(work_tools)]
+        work_tools = frozenset(s.name for s in member.unit.tool_specs(include_unavailable=True) if s.name != "delegate_task")
         recent_runs = []
         recent_reads = []
         changed_versions = {}
@@ -2237,6 +2245,7 @@ class RoomCrew:
                 # receipt survives when the provider drops older batches.
                 steering += "\n宿主工作记录（文件版本、已读位置、真实检查）：" + _clip(_json(work_receipt), 2200)
             work = StepPolicy("work", steering, work_tools, compact=bool(recovery))
+            work_schemas = [s.to_api() for s in member.unit.tool_specs(work_tools)]
             minimum = estimate_tokens(work_schemas) + 768 + estimate_tokens(state.history[:3])
             if not budget.has_tokens(reserve + minimum + 1):
                 return closing if state.step_index else work
@@ -2372,6 +2381,7 @@ class RoomCrew:
         try:
             with managed_member_processes(member.sandbox) as process_cleanup:
                 result = member.run(objective, execution=execution, budget=allocated,
+                                    steering=self.steering.subscribe(role, execution.task.task_id) if self.steering else None,
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,
                                     on_step=observe, before_answer=preflight_publication,

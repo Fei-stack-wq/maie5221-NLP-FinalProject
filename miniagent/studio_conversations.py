@@ -132,12 +132,19 @@ def addressed_members(text: str, thread: dict) -> list[str]:
     return recipients
 
 
+def turn_attachments(turn):
+    refs = {r["id"]: r for r in turn.get("message_attachments", [])}
+    for event in turn.get("steering", []):
+        refs.update((r["id"], r) for r in event.get("message_attachments", []))
+    return list(refs.values())
+
+
 def conversation_attachments(history, metadata):
     """Collect immutable inputs in this conversation's current project, newest messages first."""
     visible = {item["id"]: item for item in metadata.get("attachments", [])}
     if metadata.get("thread", {}).get("inherit_files", True):
         for turn in reversed(history):
-            for item in turn.get("message_attachments", []):
+            for item in turn_attachments(turn):
                 visible.setdefault(item["id"], item)
             if turn.get("inherit_files") is False:
                 break
@@ -167,14 +174,23 @@ def project_context(thread: dict, history: list[dict]) -> str:
     # for the active request, even after many multi-page conversations.
     remaining = 96 * 1024
     recent = []
+    include_steering = thread.get("inherit_files", True)
     for turn in reversed(history):
         answer = turn["answer"]
         excerpt = answer if len(answer) <= 5000 else answer[:3000] + "\n[…回复中段已省略…]\n" + answer[-2000:]
         entry = json.dumps({"用户": turn["user"], "回复者": turn["recipient"],
                             "执行状态": turn["status"], "历史回复": excerpt,
                             "回复摘录": turn["answer_truncated"] or len(answer) > 5000}, ensure_ascii=False)
+        progress = [e for e in turn.get("events", []) if e["kind"] == "assistant_progress"]
+        if progress:
+            entry += "\n最近的公开进度：" + json.dumps(
+                [{"role": e["role"], "text": e["text"][:700]} for e in progress[-2:]], ensure_ascii=False)
         decisions = [{"role": e["role"], "kind": e["kind"], "text": e["text"][:1600]}
                      for e in turn.get("events", []) if e["kind"] in {"member_report", "human_answer"}]
+        if include_steering and turn.get("steering"):
+            entry += "\n本轮用户的追加要求：" + json.dumps([row["text"] for row in turn["steering"]], ensure_ascii=False)
+        if turn.get("inherit_files") is False:
+            include_steering = False
         if thread.get("superagent"):
             decisions.extend({"已创建": e["entity"]} for e in turn.get("events", [])
                              if e["kind"] == "studio_entity" and isinstance(e.get("entity"), dict))

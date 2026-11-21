@@ -230,13 +230,17 @@ class StudioHandler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "room.zip":
             self._send(200, service.room_bundle(parts[3]), "application/zip", filename=f"{parts[3]}-room.zip")
             return
-        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "artifacts.zip":
-            bundle = service.artifact_bundle(parts[3])
-            self._send(200, bundle, "application/zip", filename=f"{parts[3]}-artifacts.zip")
+        if len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] in {"artifacts.zip", "project.zip"}:
+            bundle = service.artifact_bundle(parts[3], project=parts[4] == "project.zip")
+            self._send(200, bundle, "application/zip", filename=f"{parts[3]}-{parts[4]}")
             return
         if len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "attachments":
             meta = service._meta(service._directory(parts[3]))
-            if not any(isinstance(ref, dict) and ref.get("id") == parts[5] for ref in meta.get("attachments", [])):
+            from .studio_conversations import turn_attachments
+            from .studio_steering import steering_rows
+            updates = steering_rows(service.room_events(parts[3])) if meta.get("has_steering") else []
+            refs = turn_attachments({"message_attachments": meta.get("attachments", []), "steering": updates})
+            if not any(ref["id"] == parts[5] for ref in refs):
                 raise StudioError("这条消息没有该附件。", "attachment_not_found", 404)
             ref, stream = open_upload(service.runs_dir, parts[5])
             with stream:
@@ -293,6 +297,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
         parts = unquote(url.path).split("/")
         cancel = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "cancel"
+        steer = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "steer"
         reply = len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "questions"
         review = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "review"
         profile_op = parts[:3] == ["", "api", "profiles"] and (
@@ -301,7 +306,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         channel_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) in (4, 5)
         members_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) == 6 and parts[5] == "members"
         if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages")
-                and not (cancel or reply or review or profile_op or channel_op or members_op)) or url.query:
+                and not (cancel or steer or reply or review or profile_op or channel_op or members_op)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -324,6 +329,9 @@ class StudioHandler(BaseHTTPRequestHandler):
         def constant(value):
             raise ValueError("non-finite JSON")
         payload = json.loads(body, object_pairs_hook=pairs, parse_constant=constant)
+        if steer:
+            self._json(202, {"event": self.server.studio_service.steer(parts[3], payload)})
+            return
         if url.path == "/api/workspaces/pick":
             from .studio_workspace import WorkspaceError, pick_directory
             if payload != {}:

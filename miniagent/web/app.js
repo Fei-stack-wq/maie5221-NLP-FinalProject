@@ -119,6 +119,38 @@ function limitFields(demo, values={}) {
 const chatDrafts = new Map();
 const chatSubmissions = new Map();
 const pendingChat = new Set();
+const steerAttempts = new Map();
+
+function canSteer(run) {
+ return Boolean(state.config?.run_steering && run?.accepts_steering!==false && !run?.cancel_requested &&
+  ['queued','running','waiting_user'].includes(run?.status));
+}
+
+async function sendRunSteer(composer, runId, message, attachments) {
+ const fingerprint=JSON.stringify([message,attachments]);
+ let attempt=steerAttempts.get(composer);
+ if (attempt && (attempt.fingerprint!==fingerprint || (runId && attempt.runId!==runId))) {
+  steerAttempts.delete(composer);
+  attempt=null;
+ }
+ // A lost HTTP response can outlive the run. Retry against the original run
+ // before considering a new turn with this same text and set of originals.
+ if (!attempt && !runId) return false;
+ if (!attempt) {
+  attempt={id:crypto.randomUUID(),runId,fingerprint};
+  steerAttempts.set(composer,attempt);
+ }
+ try {
+  await api('/api/runs/'+encodeURIComponent(attempt.runId)+'/steer',{method:'POST',body:JSON.stringify({
+   request_id:attempt.id,message,...(attachments.length?{attachments}:{}),
+  })});
+ } catch (error) {
+  if (error.status>=400 && error.status<500) steerAttempts.delete(composer);
+  throw error;
+ }
+ steerAttempts.delete(composer);
+ return true;
+}
 const chatRoles = () => [...(state.config?.conversation_roles || []),
  ...(state.config?.custom_profiles || []).map(profile => ({id:profile.id,label:profile.name}))];
 const roleLabel = id => state.detail?.conversation?.profiles?.find(p=>p.id===id)?.name || chatRoles().find(role => role.id === id)?.label || id;
@@ -566,18 +598,28 @@ function chatTransitionNotice(thread, run) {
   return `<div class="chat-notice"><span>你正在查看较早的一轮。</span>
    <a class="secondary" href="${chatLink(thread.head_run_id)}">继续最新对话 ${icon('arrow')}</a></div>`;
  }
- if (run.status==='waiting_user') return '';
- if (runActive(run)) return '<p class="chat-notice" role="status">当前角色正在执行。结束后可在这里继续对话。</p>';
+ if (canSteer(run) || run.status==='waiting_user') return '';
+ if (runActive(run)) return '<p class="chat-notice" role="status">本轮正在执行或收尾。</p>';
  if (!thread.can_continue) return '<p class="chat-notice">当前运行的执行状态有待核实，暂时无法继续。</p>';
  return '';
 }
 
 function conversationComposer(thread,run) {
- if (run.status==='waiting_user' && thread.head_run_id===run.id) return '';
+ if (run.status==='waiting_user' && thread.head_run_id===run.id && !canSteer(run)) return '';
  if (thread.kind==='group' && !thread.members.length && thread.head_run_id===run.id && !runActive(run)) return '<p class="chat-notice">添加群成员后即可发送消息。<button type="button" class="text-button" data-edit-members>添加成员</button></p>';
  const unavailable = chatTransitionNotice(thread,run);
  if (unavailable) return unavailable;
  const draft = chatDrafts.get(thread.id) || {};
+ if (canSteer(run)) {
+  const sending=pendingChat.has(thread.id);
+  return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}" data-steer="${e(run.id)}">
+   <fieldset ${sending?'disabled':''}><label class="composer-label" for="chat-reply">给当前任务发消息</label>
+   <textarea id="chat-reply" name="message" maxlength="8000" ${sending?'readonly':''} placeholder="追问进度、补充资料，或调整当前要求…">${e(draft.message||'')}</textarea>
+   ${studioAttachments.picker('reply-'+thread.id,sending)}
+   <div class="reply-footer"><span class="muted-note">角色会在下一次决策时读到你的消息。</span>
+   <button type="submit" class="primary" ${sending?'disabled':''}>${sending?'正在发送…':'发送'}${icon('arrow')}</button></div></fieldset>
+   ${draft.error?`<p class="form-error" role="alert">${e(draft.error)}</p>`:''}</form>`;
+ }
  const last = thread.turns.at(-1);
  const dispatch = draft.dispatch || (thread.kind==='group' ? 'team' : 'single');
  const status = pendingChat.has(thread.id);
@@ -588,7 +630,7 @@ function conversationComposer(thread,run) {
  return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}">
    <fieldset ${status ? 'disabled' : ''}>
     <label class="composer-label" for="chat-reply">继续对话</label>
-    <textarea id="chat-reply" name="message" maxlength="8000" placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
+    <textarea id="chat-reply" name="message" maxlength="8000" ${status?'readonly':''} placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
     ${studioAttachments.picker('reply-'+thread.id,status)}
     <div class="reply-options">
      ${thread.kind==='group' && intent==='edit'?dispatchField(dispatch):''}
@@ -619,10 +661,7 @@ function conversationComposer(thread,run) {
 function conversationPanel(detail) {
  const thread = detail.conversation;
  if (!thread) return empty('当前运行没有项目对话','可从“对话”发起私聊或群聊。');
- if (historyThread !== thread.id) {
-  roomHistory.clear();
-  historyThread = thread.id;
- }
+ useRoomHistory(thread.id);
  const group = thread.kind==='group';
  const latestVersion = thread.artifact_run_id;
  const history = thread.turns.map(entry => {
@@ -652,6 +691,11 @@ function conversationPanel(detail) {
 
 function rememberReply(form) {
  const fields = form.elements;
+ if (form.dataset.steer) {
+  const draft={...chatDrafts.get(form.dataset.thread),message:fields.message.value};
+  chatDrafts.set(form.dataset.thread,draft);
+  return draft;
+ }
  const draft = {interactionMode:fields.interaction_mode.value,message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
   sourcePaths:fields.required_source_review_paths?.value ?? chatDrafts.get(form.dataset.thread)?.sourcePaths,
   rules:fields.acceptance_checks?.value,children:fields.child_checks?.value,base:fields.base?.value,dispatch:fields.dispatch?.value,
@@ -664,6 +708,7 @@ async function sendReply(form) {
  const id = form.dataset.thread;
  if (pendingChat.has(id) || !form.reportValidity()) return;
  const draft = rememberReply(form);
+ const targetRun=form.dataset.steer;
  const attachmentKey = studioAttachments.keyFor(form);
  if (!draft.message.trim() && !studioAttachments.count(attachmentKey)) {
   draft.error = '请填写消息或添加附件。';
@@ -673,7 +718,7 @@ async function sendReply(form) {
  const payload = {interaction_mode:draft.interactionMode,mode:draft.intent==='edit'&&draft.dispatch==='team'?'team':'single',limits:draft.limits,objective:draft.message.trim(),conversation:{
   parent_run_id:form.dataset.parent,recipient:draft.recipient,intent:draft.intent
  }};
- if (draft.intent === 'edit') {
+ if (!targetRun && draft.intent === 'edit') {
   payload.acceptance_files = parseFiles(draft.files);
   if (payload.mode==='team' && draft.sourcePaths?.trim()) payload.required_source_review_paths=parseFiles(draft.sourcePaths);
   if (draft.base==='failed') payload.conversation.recover_failed=true;
@@ -692,6 +737,15 @@ async function sendReply(form) {
  try {
   const attachments = await studioAttachments.prepare(attachmentKey);
   if (attachments.length) payload.attachments=attachments.map(item=>item.id);
+  if (await sendRunSteer(attachmentKey,targetRun,payload.objective,payload.attachments || [])) {
+   studioAttachments.clear(attachmentKey);
+   chatDrafts.delete(id);
+   // Clear the live textarea as well as its draft while preserving its focus.
+   if (form.isConnected) form.elements.message.value='';
+   toast('消息已加入当前任务。');
+   await refreshDetail();
+   return;
+  }
   const fingerprint = JSON.stringify(payload);
   let submission = chatSubmissions.get(id);
   if (submission?.fingerprint !== fingerprint) {
@@ -791,11 +845,11 @@ function eventLabel(event){const names={step_start:'开始一轮决策与执行'
 function summaryStats(detail){const s=detail.summary||{},r=detail.run;return `<div class="panel summary-panel"><h3>运行摘要</h3><div class="stat-line"><span>执行模式</span><strong>${e(runModeLabel(r, detail.conversation?.kind))}</strong></div><div class="stat-line"><span>完成任务</span><strong>${r.completed_count||0} / ${r.task_count||0}</strong></div><div class="stat-line"><span>运行耗时</span><strong>${duration(r.duration_ms)}</strong></div><div class="stat-line"><span>生成产物</span><strong>${detail.artifacts?.length||0} 个</strong></div><div class="stat-line"><span>${detail.summary_incomplete?'部分 token 记录':'已记录 token'}</span><strong>${Number(s.total_tokens||0).toLocaleString()}</strong></div><div class="summary-rule"></div><div class="summary-callout">${icon('shield')}${r.status==='completed'?'结果已通过独立验收。你可以在验收页查看检查项与证据。':endedWithoutChecks(detail)?'执行已结束。本轮未配置独立验收，可以查看产物或继续对话。':r.status==='unverified'?'独立验收尚未确认本轮结果，具体原因可在验收页查看。':r.status==='interrupted'?'当前服务未持有执行权，无法判断原执行者是否仍在运行。历史状态保留。':'每个任务的状态与验收记录会持续保存。'}</div><p class="muted-note">${r.mode?.includes('demo')?'离线演示的 token 为估算值。':'token 按已有记录汇总，不代表完整费用账单。'}</p></div>`;}
 function overviewReply(detail) {
  const turn = detail.conversation?.turns.find(entry=>entry.run_id===detail.run.id);
- if (turn) return studioReplyStreams.slot(roomPage(turn,detail));
- const reply = {...detail.run,run_id:detail.run.id,events:detail.room_events,answer:detail.answer,
+ const reply = turn ? roomPage(turn,detail) : {...detail.run,run_id:detail.run.id,events:detail.room_events,answer:detail.answer,
   answer_truncated:detail.answer_truncated,artifacts:detail.artifacts};
- if (reply.answer) return `<section class="panel" data-key="archived-run-answer"><div class="panel-heading">回复</div>${roomReply(reply,false)}</section>`;
- return studioReplyStreams.slot(reply);
+ const messages = studioReplyStreams.timeline(reply) + studioReplyStreams.slot(reply) + StudioActivity.current(reply,detail);
+ const answer = !turn && reply.answer ? roomReply(reply,false) : '';
+ return messages || answer ? `<section class="panel" data-key="archived-run-answer"><div class="panel-heading">回复</div>${messages}${answer}</section>` : '';
 }
 function overview(detail){const events=eventEntries(detail.events||[]).slice(-6).reverse();return `${overviewReply(detail)}<div class="overview-grid"><div class="panel"><div class="panel-heading"><span>${icon('branch')}任务树</span><small>点击任务查看详情</small></div><div class="task-tree">${taskNodes(detail.tasks||[])}</div></div>${summaryStats(detail)}</div><div class="panel activity-panel"><div class="panel-heading"><span>${icon('clock')}最近动态</span><button class="text-button" data-tab="logs">查看完整日志 ${icon('arrow')}</button></div><div class="activity-list">${events.map(({event,key})=>`<div class="activity-row" data-key="${e(key)}"><span class="activity-time">${e(clockText(event.ts?event.ts*1000:event.iso))}</span>${icon(event.kind?.includes('end')?'check':'circle')}<span class="activity-label">${e(eventLabel(event))}</span></div>`).join('')||'<p class="muted-note">等待第一条执行记录…</p>'}</div></div>`;}
 function logs(detail){const all=detail.events||[];const list=eventEntries(all).filter(({event})=>state.logFilter==='all'||(state.logFilter==='tools'?event.kind==='tool_result':state.logFilter==='acceptance'?event.kind==='acceptance':(event.kind?.includes('error')||['context_limit','output_recovery_exhausted'].includes(event.kind)||event.error_class||event.error||event.ok===false)));return `<div class="log-toolbar"><select id="log-filter" class="filter-select" aria-label="筛选日志">${[['all','全部事件'],['tools','工具调用'],['acceptance','验收事件'],['errors','错误事件']].map(([v,t])=>`<option value="${v}" ${state.logFilter===v?'selected':''}>${t}</option>`).join('')}</select><p>${detail.events_truncated?'仅展示最近部分日志 · ':''}${list.length} 条事件 · 点击展开详情</p></div>${list.length?`<div class="log-list">${list.map(({event,key})=>`<details class="log-entry ${event.error_class||event.ok===false||event.kind?.includes('error')||['context_limit','output_recovery_exhausted'].includes(event.kind)?'error':''}" data-key="${e(key)}" data-log="${e(key)}" ${state.logOpen.has(key)?'open':''}><summary><span class="activity-time">${e(clockText(event.ts?event.ts*1000:event.iso))}</span><span class="event-kind">${e(event.kind)}</span><span class="log-caption">${e(eventLabel(event))}${event.error||event.error_class||event.finish_reason==='length'?`<small>${e(event.finish_reason==='length'?'输出截断 (length) · '+event.completion_tokens+' token':event.error||event.preview||event.error_class)}</small>`:''}</span>${icon('chevron')}</summary><pre>${e(JSON.stringify(event,null,2))}</pre></details>`).join('')}</div>`:empty('这里还没有事件','执行日志会在任务运行时更新。')}`;}
@@ -807,7 +861,7 @@ function filePreview() {
  if (!f) return '<div class="initial-loading"><span class="spinner"></span>正在读取产物…</div>';
  if (f.error) return `<div class="error-panel">${e(f.error)}</div>`;
  const run=state.runId, name=e(f.path.split('/').pop());
- const size=state.detail?.artifacts?.find(file=>file.path===f.path)?.size;
+ const size=[...(state.detail?.artifacts || []),...(state.detail?.other_project_files || [])].find(file=>file.path===f.path)?.size;
  const download=label=>StudioMarkdown.overDownloadLimit(size)?'':
   `<a class="text-button" href="${e(fileURL(run,f.path,'download'))}" download>${icon('download')}${label}</a>`;
  if (f.media_type==='image/png') return `<div class="file-header"><span>${name}</span>${download('下载截图')}</div>
@@ -820,14 +874,38 @@ function filePreview() {
   ${f.truncated?`<div class="run-warning">${StudioMarkdown.truncationNotice(size)}</div>`:''}
   <div class="file-content ${md?'prose':''}">${md?StudioMarkdown.documentHTML(f.content, {run, path:f.path}):`<pre>${e(f.content)}</pre>`}</div>`;
 }
+function artifactButton(file) {
+ const path=file.path.replace(/^(?:workspaces\/[^/]+\/)?agents\/[^/]+\//,'');
+ const change={added:'新增',modified:'修改',declared:'指定交付'}[file.change];
+ return `<button id="file-${e(file.path)}" class="artifact-button ${file.path===state.selectedFile?'active':''}" data-file="${e(file.path)}">
+  ${icon('file')}<span><strong>${e(file.project_path || path)}</strong><small>${change?e(change)+' · ':''}${sizeText(file.size||0)}</small></span></button>`;
+}
 function artifacts(detail) {
- let files = detail.artifacts || [];
- if (state.selectedFile?.startsWith('handoffs/')) {
-  const receipts = (detail.room_events || []).flatMap(row => row.artifacts || []);
-  const selected = receipts.find(file => file.path === state.selectedFile);
-  files = [selected || {path: state.selectedFile, name: state.selectedFile.split('/').pop()}, ...files];
- }
- if(!files.length)return empty('还没有生成产物','Agent 生成的项目文件会出现在这里。');return `<div class="artifact-toolbar"><p>${runActive(detail.run)?'任务结束后可打包下载全部产物。':'ZIP 保留相对路径；单个文件最多 8 MiB，总计最多 20 MiB。超出时可从本机工作区读取。'}</p>${!runActive(detail.run)?`<button class="secondary" data-action="download-artifacts" ${state.downloads.has(detail.run.id)?'disabled':''}>${icon('download')}${state.downloads.has(detail.run.id)?'正在打包…':'下载全部产物 ZIP'}</button>`:''}</div><div class="artifact-layout"><div class="artifact-list">${files.map(file=>`<button id="file-${e(file.path)}" class="artifact-button ${file.path===state.selectedFile?'active':''}" data-file="${e(file.path)}">${icon('file')}<span><strong>${e(file.name||file.path.split('/').pop())}</strong><small>${sizeText(file.size||0)}</small></span></button>`).join('')}</div><div class="artifact-preview" id="artifact-preview">${filePreview()}</div></div>`;}
+ const files=detail.artifacts || [], others=detail.other_project_files || [];
+ const turns=detail.conversation?.turns || [], run=detail.run.id;
+ const turn=turns.find(item=>item.run_id===run);
+ const picker=turns.length>1?`<label class="field-label">查看任务<select data-artifact-turn>${turns.map((t,index)=>
+  `<option value="${e(t.run_id)}" ${t.run_id===run?'selected':''}>第 ${index+1} 轮 · ${e((t.user || '附件消息').slice(0,80))}</option>`).join('')}</select></label>`:'';
+ const routed=(turn?.dispatches || []).filter(row=>row.child_run_id).map(row=>
+  `<a class="text-button" href="#run/${encodeURIComponent(row.child_run_id)}/artifacts">${icon('branch')}${e(row.target_name)} · ${e(row.objective)}</a>`).join('');
+ const receipt=state.selectedFile?.startsWith('handoffs/') && (detail.room_events || [])
+  .flatMap(row=>row.artifacts || []).find(file=>file.path===state.selectedFile);
+ const selectedReceipt=receipt || (state.selectedFile?.startsWith('handoffs/')?{path:state.selectedFile}:null);
+ const handoffs=(detail.room_events || []).filter(row=>row.kind==='member_report' && row.published && row.artifacts?.length)
+  .map(row=>`<details class="artifact-project" data-key="artifact-handoff-${e(row.task_id)}"><summary>${e(turn?.member_names?.[row.role] || row.role)} · ${e((row.handoff?.objective || row.task_id || '成员交付').slice(0,80))}</summary>
+   ${row.artifacts.map(file=>artifactLink(run,file)).join(' ')}</details>`).join('');
+ const downloadButton=(scope,label)=>`<button class="secondary" data-action="download-artifacts" data-scope="${scope}" ${state.downloads.has(run)?'disabled':''}>${icon('download')}${label}</button>`;
+ const finished=!runActive(detail.run);
+ const toolbar=`<div class="artifact-toolbar">${picker}${finished && files.length?downloadButton('artifacts','下载本轮交付 ZIP'):''}</div>`;
+ const prior=others.length?`<details class="artifact-project" data-key="artifact-project-${e(run)}"><summary>其他项目文件（${others.length}）</summary>
+  ${others.map(artifactButton).join('')}</details>`:'';
+ return toolbar + (routed?`<div class="artifact-toolbar">本轮派工 ${routed}</div>`:'') + `<div class="artifact-layout">
+  <div class="artifact-list"><div class="section-title"><strong>本轮交付</strong><small>${files.length}</small></div>
+  ${files.length?files.map(artifactButton).join(''):'<p class="muted-note">本轮尚无新增、修改或指定交付的文件。</p>'}
+  ${selectedReceipt?artifactButton(selectedReceipt):''}${handoffs}${prior}
+  ${finished && others.length?downloadButton('project','下载完整项目快照'):''}</div>
+  <div class="artifact-preview" id="artifact-preview">${filePreview()}</div></div>`;
+}
 function acceptance(detail){const reports=detail.acceptance||[];const passed=reports.filter(r=>r.report?.verdict==='passed').length;return `<div class="report-intro">${icon('shield')}<div><h3>${endedWithoutChecks(detail)?'本轮未配置独立验收':reports.length?`${passed} / ${reports.length} 份报告通过验收`:'等待独立验收'}</h3><p>成功由检查结果和证据共同确认。模型的完成答复不会直接计作成功。</p></div></div>${reports.map(item=>{const task=(detail.tasks||[]).find(t=>t.task_id===item.task_id),r=item.report||{};return `<article class="acceptance-card" data-key="acceptance-${e(r.report_id||item.task_id)}"><div class="acceptance-title"><span>${e(task?.objective||item.task_id)}</span>${badge(r.verdict)}</div><div class="acceptance-body">${r.reason?`<p>${e(r.reason)}</p>`:''}${(r.checks||[]).map(check=>{const criterion=item.spec?.criteria?.find(c=>c.id===check.criterion_id);return `<div class="check-row">${badge(check.verdict)}<span><strong>${e(criterion?.description||check.criterion_id)}</strong><small>${e(check.reason)}</small></span></div>`;}).join('')||'<p>尚无可执行检查结果。</p>'}<p>报告 ${e(r.report_id||'—')}</p></div><details><summary>查看检查规则、报告与证据</summary><pre>${e(JSON.stringify(item,null,2))}</pre></details></article>`;}).join('')||empty('尚无验收报告','运行中任务需等待检查；未配置验收的任务会保留为未验证。')}${detail.report?`<div class="section-header runs-section"><h3>完整运行报告</h3><button class="secondary" data-action="download-report">${icon('download')}保存 Markdown</button></div><div class="panel file-content prose">${markdown(detail.report)}</div>`:''}`;}
 function diagnosis(detail){
  const d=detail.diagnostics;if(!d)return '';
@@ -847,6 +925,12 @@ function diagnosis(detail){
 }
 const roomHistory = new Map();
 let historyThread;
+
+function useRoomHistory(threadId) {
+ if (historyThread===threadId) return;
+ roomHistory.clear();
+ historyThread=threadId;
+}
 
 function roomPage(turn, detail) {
  if (turn.run_id === detail.run.id && Array.isArray(detail.room_events))
@@ -899,7 +983,8 @@ async function loadRoomPage(button) {
  } catch (err) { saved.errors.set(before,err.message); }
  finally {
   saved.pending.delete(before);
-  if (state.route==='detail' && (state.runId===id || state.detail?.conversation?.id===historyThread) && roomHistory.get(id)===saved) render();
+  const visible = state.route==='assistant' || (state.route==='detail' && (state.runId===id || state.detail?.conversation?.id===historyThread));
+  if (visible && roomHistory.get(id)===saved) render();
  }
 }
 
@@ -1005,7 +1090,12 @@ function roomMessages(turn,detail,group) {
   if (offset && turn.event_indices && index>turn.event_indices[offset-1]+1)
    conversation.push(historyButton(turn.run_id,index,'查看此处更早的消息'));
   // The goal is already displayed as the user's message at the top of the turn.
-  if (row.kind==='goal') continue;
+  if (row.kind==='goal' || row.kind==='steer_seen') continue;
+  if (row.kind==='assistant_progress' || row.kind==='user_steer') {
+   conversation.push(studioReplyStreams.message(row,turn));
+   if (row.text_truncated) conversation.push(historyButton(turn.run_id,index+1,'读取完整原文'));
+   continue;
+  }
   if (['assignment','member_report','human_question','human_answer','human_review'].includes(row.kind)) {
    conversation.push(roomMessage(row,index,turn));
   } else {
@@ -1020,7 +1110,7 @@ function roomMessages(turn,detail,group) {
 }
 
 function roomStatus(turn,detail,link) {
- if (runActive(turn)) return `<div class="turn-status"><span>${turn.status==='waiting_user'?'等待你的答复…':'正在处理…'}</span>${link}</div>`;
+ if (runActive(turn)) return `<div class="turn-status">${StudioActivity.current(turn,detail) || `<span>${turn.status==='waiting_user'?'等待你的答复…':'正在处理…'}</span>`}${link}</div>`;
  const current = turn.run_id===detail.run.id;
  const failed = ['failed','error','blocked'].includes(turn.status);
  let message;
@@ -1306,19 +1396,24 @@ async function cancelRun(){
  catch(error){toast(error.message);}
  finally{state.cancelling.delete(id);if(state.runId===id)render();}
 }
-async function downloadArtifacts(){
+async function downloadArtifacts(scope='artifacts'){
  const id=state.runId;if(!id||state.downloads.has(id))return;
  state.downloads.add(id);render();
  try{
-  const response=await fetch(`/api/runs/${encodeURIComponent(id)}/artifacts.zip`,{headers:{Accept:'application/zip'}});
+  const filename=scope==='project'?'project.zip':'artifacts.zip';
+  const response=await fetch(`/api/runs/${encodeURIComponent(id)}/${filename}`,{headers:{Accept:'application/zip'}});
   if(!response.ok){let detail;try{detail=await response.json();}catch{}throw new Error(detail?.error||(response.status===413?'产物超出 ZIP 下载范围，请从本机工作区读取。':'产物下载失败，请稍后重试。'));}
-  const url=URL.createObjectURL(await response.blob()),link=document.createElement('a');link.href=url;link.download=`${id}-artifacts.zip`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('产物 ZIP 已下载，包含文件的相对路径。');
+  const url=URL.createObjectURL(await response.blob()),link=document.createElement('a');link.href=url;link.download=`${id}-${filename}`;link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);toast('产物 ZIP 已下载，包含文件的相对路径。');
  }catch(error){toast(error.message);}
  finally{state.downloads.delete(id);if(state.runId===id)render();}
 }
 function showConnection(){const ready=state.config?.provider_ready;$('#connection-info').innerHTML=`<p>${ready?'DeepSeek 已从本机环境或 .env 读取配置。密钥不会发送到网页。':'离线演示已可用。使用真实模型前，在仓库根目录的 .env 中配置 DEEPSEEK_API_KEY，然后重启本地服务。'}</p><p>当前模型：<code>${e(state.config?.model||'尚未读取')}</code></p><p>单次输出上限：<code>${e(state.config?.max_output_tokens??'未知')} token</code>。可在 .env 中通过 DEEPSEEK_MAX_TOKENS 调整，重启服务后生效。</p><p>任务与文件保存在启动时选择的运行目录。可在角色库管理自定义角色。</p>`;$('#info-dialog').showModal();}
 document.addEventListener('submit',event=>{if(event.target.matches('.role-editor')){event.preventDefault();saveRoleEditor(event.target);return;}if(event.target.matches('.human-form,.review-form')){event.preventDefault();submitDiscussion(event.target);return;}if(event.target.matches('.reply-form')){event.preventDefault();sendReply(event.target);return;}if(event.target.matches('.task-form')){event.preventDefault();submit(event.target);}});
 document.addEventListener('change',event=>{const form=event.target.closest('form');
+ if (event.target.matches('[data-artifact-turn]')) {
+  location.hash='#run/'+encodeURIComponent(event.target.value)+'/artifacts';
+  return;
+ }
  if(form?.matches('.role-editor') && event.target.name==='scope'){
   form.querySelector('[data-project-choice]').hidden=event.target.value!=='project';return;
  }
@@ -1363,7 +1458,7 @@ document.addEventListener('click',event=>{
  if(action==='refresh' && !['roles','assistant'].includes(state.route))refresh().then(()=>toast(state.online?'任务状态已更新。':'服务未连接，请检查启动终端。'));
  if(action==='advanced'){const button=event.target.closest('button'),panel=button.closest('form').querySelector('.advanced');panel.hidden=!panel.hidden;button.setAttribute('aria-expanded',String(!panel.hidden));}
  if(action==='cancel-run')cancelRun();
- if(action==='download-artifacts')downloadArtifacts();
+ if(action==='download-artifacts')downloadArtifacts(event.target.closest('[data-scope]')?.dataset.scope);
  if(action==='download-file'&&state.fileData?.content!==undefined)download(state.selectedFile.split('/').pop(),state.fileData.content);
  if(action==='download-diagnostics'&&state.detail)download(`${state.runId}-diagnostics.json`,JSON.stringify({run:state.detail.run,diagnostics:state.detail.diagnostics,tasks:state.detail.tasks,events:state.detail.events,events_truncated:state.detail.events_truncated},null,2),'application/json');
  if(action==='download-report'&&state.detail?.report)download('report.md',state.detail.report,'text/markdown');

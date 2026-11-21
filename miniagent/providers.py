@@ -114,8 +114,6 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
             if fragments is None:
                 fragments = []
             _require(isinstance(fragments, list), "Invalid stream tool calls")
-            if fragments and not calls:
-                notify("discard", "")
             for item in fragments:
                 _require(isinstance(item, dict), "Invalid stream tool fragment")
                 index = item.get("index")
@@ -139,7 +137,7 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
                 if part is not None:
                     _require(isinstance(part, str), "Invalid assistant stream text")
                     parts.append(part)
-                    if field == "content" and part and not calls:
+                    if field == "content" and part:
                         notify("delta", part)
             finish = choice.get("finish_reason")
         _require(isinstance(finish, str), "Provider stream lacks a final choice")

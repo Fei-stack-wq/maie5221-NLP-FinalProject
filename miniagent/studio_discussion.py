@@ -39,6 +39,10 @@ class RoomDiscussion:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
+            if kind in {"assistant_progress", "user_steer", "steer_seen", "assignment", "member_report", "human_question", "human_answer"}:
+                replies = self._reply_streams.get(run_id)
+                if replies:
+                    replies.room_changed(kind, fields.get("task_id"), reply_id=fields.get("reply_id"))
         return row
 
     def _human_handler(self, run_id, role, *, deadline=None):
@@ -65,6 +69,12 @@ class RoomDiscussion:
                 self._questions[key] = {"request_id": identity, "role": role, "text": self._redact(question), "answer": None, "deadline": expires}
                 try:
                     while self._questions[key]["answer"] is None:
+                        inbox = self._steering.get(run_id)
+                        if (self._questions[key].get("steered") or
+                                inbox and inbox.active_cursor and inbox.active_cursor.pending()):
+                            self._record_room_event(run_id, role, "question_closed", "用户已补充新消息，结束本次等待。",
+                                                    request_id=identity)
+                            return None
                         if self._closed or self._cancellations[run_id].is_set() or (expires is not None and time.monotonic() >= expires):
                             if room_deadline is not None and time.monotonic() >= room_deadline:
                                 self._cancellations[run_id].set()
@@ -88,7 +98,7 @@ class RoomDiscussion:
                         return row
                     raise StudioError("这条问题已经回答。", "answer_conflict", 409)
             pending = self._questions.get((run_id, request_id))
-            if (pending is None or self._closed or self._cancellations[run_id].is_set()
+            if (pending is None or pending.get("steered") or self._closed or self._cancellations[run_id].is_set()
                     or (pending["deadline"] is not None and time.monotonic() >= pending["deadline"])):
                 raise StudioError("本次执行没有在等待这条答复。", "not_waiting", 409)
             row = self._record_room_event(run_id, "user", "human_answer", answer, request_id=request_id,
@@ -111,6 +121,7 @@ class RoomDiscussion:
             return self._record_room_event(run_id, "user", "human_review", note.strip(), verdict=verdict)
 
     def room_bundle(self, run_id):
+        from .studio_conversations import turn_attachments
         from .studio_service import StudioError, _read_file, _TERMINAL
         from .studio_uploads import open_upload
         cap = 64 * 1024**2
@@ -158,7 +169,7 @@ class RoomDiscussion:
                         "criteria": request.get("acceptance_checks", []), "child_checks": request.get("child_checks", {})}))
                     files = []
                     inputs = []
-                    for item in turn["message_attachments"]:
+                    for item in turn_attachments(turn):
                         if size + transcript_size + item["size"] > cap:
                             raise StudioError("会话材料超过 64 MiB，请在原消息中单独下载附件。", "room_too_large", 413)
                         ref, original = open_upload(self.runs_dir, item["id"])

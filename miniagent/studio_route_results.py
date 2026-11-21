@@ -244,16 +244,36 @@ def capture_delivery(service, child, meta):
 
 
 def project_dispatches(service, source_id):
+    from .studio_conversations import member_profiles
     from .studio_service import _read_file
+    from .studio_steering import steering_rows
     rows = service.studio_dispatches(source_id)
     result = []
     for row in rows:
         entry = {**row, "answer": "", "artifacts": [], "pending_questions": []}
         result.append(entry)
         child_id = row.get("child_run_id")
+        entry["accepts_steering"] = bool(child_id and service.accepts_steering(child_id))
         if not child_id or row["status"] == "queued":
             continue
         child = service._directory(child_id)
+        # A card is a preview. Inspect the journal tail rather than loading
+        # every historical discussion whenever the assistant page polls.
+        raw, _ = _read_file(child, "public-room.jsonl", 128 * 1024, missing=True, tail=True)
+        public = [json.loads(line) for line in raw.split(b"\n")[:-1] if line]
+        recent = [r for r in public if r["kind"] in {"assistant_progress", "user_steer"}][-8:]
+        if recent:
+            entry["events"] = [{**r, "text": r["text"][:2000], "text_truncated": len(r["text"]) > 2000} for r in recent]
+            selected = {r["request_id"] for r in recent if r["kind"] == "user_steer"}
+            entry["steering"] = [r for r in steering_rows(public) if r["request_id"] in selected]
+        if recent or row["status"] in {"running", "waiting_user"}:
+            thread = service._meta(child)["thread"]
+            entry["member_names"] = {key: profile["name"] for key, profile in member_profiles(thread).items()}
+        if row["status"] in {"running", "waiting_user"}:
+            entry["archived_tasks"] = [r["task_id"] for r in public if r["kind"] == "member_report" and r.get("task_id")]
+            calls = service.tool_activity(child_id)["calls"]
+            if calls:
+                entry["current_call"] = calls[-1]
         if row["status"] in {"completed", "unverified"}:
             answer, clipped = _read_file(child, "conversation-answer.txt", 8192, missing=True)
             entry.update(answer=answer.decode("utf-8", errors="ignore"), answer_truncated=clipped,

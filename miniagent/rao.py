@@ -415,6 +415,7 @@ def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]
         messages.append({"role": "user", "content": state.goal})
         for question, reply in state.scratch.get("human_replies", []):
             messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})
+        messages.extend(state.scratch.get("live_user_messages", ()))
         if feedback := state.scratch.get("delivery_feedback"):
             messages.append({"role": "user", "content": feedback})
     elif checkpoint := state.scratch.get("work_checkpoint"):
@@ -519,8 +520,8 @@ CONTROL_TOOLS: dict[str, ToolSpec] = {
 # 给模型的系统提示（与 agent.py 的角色提示拼接使用）
 RAO_SYSTEM_SUFFIX = """
 ## 决策方式
-每一步你只有两种选择，必须二选一：
-1. **调用一个或多个工具**（下面的工具清单），我会执行并把结果返回给你。
+每一步按任务需要选择下一项动作：
+1. **调用一个或多个工具**，使用结构化 tool_calls。需要同步进展时，可以在这条消息的公开正文里先告诉用户，再调用工具。
 2. **直接给出最终答复**（不再调用任何工具）。这一条会触发验收检查。
 
 ## 特殊工具
@@ -582,11 +583,12 @@ class RAOUnit:
         self.tool_observed: Callable[[int, Action, Observation], None] | None = None
         self.action_recorder = action_recorder
         self.should_cancel = should_cancel
+        self.steering_pending: Callable[[], bool] | None = None
 
     # ------------------------------------------------------------------ 工具
     def tool_specs(self, allowed_tools: frozenset[str] | None = None,
-                   allowed_write_paths: frozenset[str] | None = None) -> list[ToolSpec]:
-        specs = self.registry.specs()
+                   allowed_write_paths: frozenset[str] | None = None, *, include_unavailable=False) -> list[ToolSpec]:
+        specs = self.registry.specs(available_only=not include_unavailable)
         if self.enable_control_tools:
             specs += [self.delegate_spec if name == "delegate_task" else spec
                       for name, spec in CONTROL_TOOLS.items() if not (self.autonomous and name == "ask_human")]
@@ -681,8 +683,6 @@ class RAOUnit:
         else:
             response = self.provider.chat(messages, tools, temperature=self.temperature)
         decision = self.parse_response(response)
-        if on_stream is not None and decision.kind != "answer":
-            on_stream("discard", "")
         return decision, response
 
     def parse_response(self, response: LLMResponse) -> Decision:
@@ -849,6 +849,11 @@ class RAOUnit:
                              else "未执行：时间或 token 预算已耗尽。" if terminate == ErrorClass.T_BUDGET
                              else "未执行：前序动作已终止本轮任务。"), ts=time.time(),
                 )
+            elif self.steering_pending and self.steering_pending():
+                # Pair all remaining call IDs before inserting the new user message.
+                obs = Observation(step_id=step_id, source=action.tool, ok=False,
+                                  error_class=ErrorClass.A_SKIPPED,
+                                  content="用户刚补充了要求，本项操作尚未开始。请结合新消息重新决定。", ts=time.time())
             elif batch_denial or not budget.has_tokens(token_reserve):
                 obs = Observation(
                     step_id=step_id, source=action.tool, ok=False, error_class=ErrorClass.A_SKIPPED,
@@ -1191,6 +1196,11 @@ class RAOUnit:
                                                    allowed_write_paths, tool_deadline)
             observations.extend(dispatched)
         elif decision.kind != "answer":
+            # Commit the validated public prose before a tool can block or
+            # delegate another task. Tool arguments and reasoning are separate
+            # protocol fields and never enter this channel.
+            if on_stream is not None and decision.actions and response.text.strip():
+                on_stream("progress", response.text)
             kind, observations, terminate = self.act(state, decision, budget, allowed_tools, token_reserve,
                                                     allowed_write_paths, tool_deadline)
 

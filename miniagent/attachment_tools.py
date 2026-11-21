@@ -233,14 +233,19 @@ def _copy_for_tools(source, ctx, attachment):
                               input_path=relative, bytes=attachment["size"])
 
 
-def attachment_tools(attachments, open_stream, *, read_only=False):
+def attachment_tools(attachments, open_stream, *, read_only=False, live_attachments=None):
     """Bind opaque IDs to the immutable inputs explicitly authorized for this run."""
     allowed = {ref["id"]: {key: ref[key] for key in ("id", "name", "size")} for ref in attachments}
-    if not allowed:
+    if not allowed and live_attachments is None:
         return []
-    entries = list(allowed.values())
+
+    def catalog():
+        if live_attachments is None:
+            return allowed
+        return {**allowed, **{item["id"]: item for item in live_attachments()}}
 
     def list_files(_ctx, args):
+        entries = list(catalog().values())
         offset, limit = args.get("offset", 0), args.get("limit", 40)
         if not 0 <= offset <= len(entries) or not 1 <= limit <= 100:
             return ToolResult.failure("offset 必须位于附件列表内，limit 为 1..100。")
@@ -250,7 +255,7 @@ def attachment_tools(attachments, open_stream, *, read_only=False):
                                   next_offset=following, count=len(page))
 
     def read(ctx, args):
-        ref = allowed.get(args["id"])
+        ref = catalog().get(args["id"])
         if ref is None:
             return ToolResult.failure("当前会话任务无此附件，请用 list_attachments 核对 ID。")
         try:
@@ -290,7 +295,7 @@ def attachment_tools(attachments, open_stream, *, read_only=False):
                                   eof=following is None, attachment_id=ref["id"], returned_chars=len(content))
 
     def copy(ctx, args):
-        ref = allowed.get(args["id"])
+        ref = catalog().get(args["id"])
         if ref is None:
             return ToolResult.failure("当前会话任务无此附件，请用 list_attachments 核对 ID。")
         with open_stream(ref["id"]) as source:
@@ -317,4 +322,7 @@ def attachment_tools(attachments, open_stream, *, read_only=False):
     if not read_only:
         tools.append(Tool("materialize_attachment", "将原始附件复制到当前成员的私有输入目录，返回可供 Python、"
                           "Shell 等读取的相对路径。副本不计入交付。", schema(identifier, ("id",)), copy))
+    if live_attachments is not None and not allowed:
+        for tool in tools:
+            tool.available = lambda: bool(live_attachments())
     return tools

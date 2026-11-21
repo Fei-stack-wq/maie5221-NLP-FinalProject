@@ -231,6 +231,17 @@ class StudioAssistant(StudioChannels):
                  {"name": {"type": "string", "maxLength": 100},
                   "members": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 16},
                   "lead": {"type": "string"}}, ["name", "members", "lead"], create_group)
+        def cancel_queued(ctx, args):
+            from .studio_service import StudioError
+            try:
+                result = self.cancel_queued_dispatch(run_id, args["dispatch_id"])
+            except StudioError as exc:
+                return ToolResult.failure(str(exc), code=exc.code)
+            return ToolResult.success(json.dumps(result, ensure_ascii=False))
+
+        register("cancel_queued_dispatch", "用户在本轮更改派工要求时，可撤回本轮自己登记且仍在排队的旧派工。"
+                 "使用已有接单回执的 dispatch_id；如需换派，再按用户新要求派工。",
+                 {"dispatch_id": {"type": "string"}}, ["dispatch_id"], cancel_queued)
         register("dispatch_studio_task", "提交用户的完整目标。单人私聊只能完成一个角色的工作；跨角色接力和独立复核必须派给群。"
                  "接单后结束本轮；首页不会因子任务结束而自动启动后续阶段。",
                  {"target_kind": {"type": "string", "enum": ["role", "group"]},

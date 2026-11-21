@@ -33,6 +33,16 @@
 
 4. 收尾时打开实际交付物。「自动完成」控制是否向人提问；最终结果仍以运行状态、实际文件和独立验收记录为准。若任务必须使用尚未获得的权限，团队应说明做到了哪里以及缺什么。
 
+### 执行中查看进展、追问或改要求
+
+在原私聊或群聊的输入框直接发送文字或附件。比如维护员正在检查磁盘时，你可以问「现在查到什么了？」或补充「先只出清单，等我确认再清理」。消息绑定到当前运行，角色在下一次模型决策时拿到它。已经启动的工具需要自己返回，尚未开始的同批操作会留给角色按新要求重新决定。点「取消任务」仍可请求停止执行。
+
+从「统一对话」派工后，输入框上的「发给」可以选择接手的具体任务。若只有一项派工仍在执行、统一助手已结束本轮，默认选中该派工。选回「统一助手」即可另发消息。开始输入后，草稿会绑定到所选任务。提交时若对方已开始收尾，页面会保留草稿并说明状态。原先登记的文件和命令验收规则继续用于本轮，聊天补充会改变角色接下来的行动。
+
+助手在工具调用前写的公开说明会作为聊天消息保存，刷新后仍可阅读。只调用工具的步骤显示实际工具状态。收到运行中的补充时，聊天会分别显示等待角色接收或已送达。工具参数和模型思考字段继续走各自的协议通道。公开正文和工具调用共存的处理参考了 Claude Agent SDK 的消息类型及解析用例。[消息解析](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/message_parser.py) · [解析回归用例](https://github.com/anthropics/claude-agent-sdk-python/blob/main/tests/test_message_parser.py)
+
+客户端向 `POST /api/runs/{run_id}/steer` 发送 `request_id`、`message` 和可选的 `attachments`。同一条消息重试沿用相同的 UUID。服务保存用户原话、附件引用与接收回执，在最终答复入账前检查是否仍有新消息。进程中断时，从已保存的记录能区分哪些消息已被模型处理。下一次进入界面能查看原记录。
+
 只用一个角色时，打开「最近对话」→「新建私聊」，选角色和工作区，直接发送完整目标。一个开发角色可以依次实现、自测、修正并交付会议室系统，下次在同一私聊里继续修改。需要由另一个人独立签署时，再选有相应成员的群。
 
 实时正文采用 DeepSeek Chat Completions 的 `delta.content`，工具参数和思考字段单独组装。Studio 通过浏览器的 `EventSource` 推送公开文本。断线重连从当前草稿快照恢复，正式交接完成后从房间记录读取正文。浏览器关闭连接不会重发模型请求。[DeepSeek 分片协议](https://api-docs.deepseek.com/api/create-chat-completion/) · [EventSource 重连与关闭语义](https://html.spec.whatwg.org/multipage/server-sent-events.html)
@@ -155,7 +165,8 @@ HTTP 的运行 `id` 是运行目录标识，不等于 M0-01 `RunRecord.run_id`�
 | `GET /api/runs/{id}/artifact?path=...` | 相对路径 → 文本内容与截断标记 | 受限文本预览 |
 | `POST /api/runs` | JSON 启动请求（可选 `limits`、`conversation`）→ `202` 与运行摘要 | 校验、请求去重、提交后台执行 |
 | `POST /api/runs/{id}/cancel` | 空 JSON 对象 → `202` 与运行摘要 | 同源及 CSRF 校验后请求协作式停止；幂等 |
-| `GET /api/runs/{id}/artifacts.zip` | 已结束运行 → ZIP 附件 | 保留产物相对路径，执行失败也可导出 |
+| `GET /api/runs/{id}/artifacts.zip` | 已结束运行 → 本轮交付 ZIP | 收入本轮新增、修改或明确指定交付的可下载文件，保留相对路径 |
+| `GET /api/runs/{id}/project.zip` | 已结束运行 → 项目快照 ZIP | 一并收入该轮工作区里的已有文件及项目依赖 |
 
 `diagnostics` 包含 `execution_status`、`acceptance_status`、`issues`、`blocked_tasks`、`current_activity`、`configuration` 和 `incomplete`。例如，旧运行可以同时呈现持久总状态 `unverified`、推导执行状态 `failed`、验收状态 `not_configured`；三者分别说明历史结果、执行事实和检查配置，不能混为一次验收失败。
 
@@ -166,6 +177,10 @@ HTTP 的运行 `id` 是运行目录标识，不等于 M0-01 `RunRecord.run_id`�
 会话复用 `POST /api/runs`。使用 `mode="single"`，把用户原话放在 `objective`。首次请求的 `conversation` 示例为 `{"kind":"group","members":["worker","reviewer"],"recipient":"worker","intent":"edit"}`。私聊使用 `"kind":"dm"` 和一位成员。后续请求示例为 `{"parent_run_id":"<最新一轮的运行 ID>","recipient":"reviewer","intent":"question"}`。接收人必须属于此会话。后端保留原始任务目标，按总量上限向下一轮提供近几轮公开消息的摘录。需要了解具体实现时，角色可以读取当前项目文件。提问回合留空 `acceptance_files`。角色 ID 及显示名来自 `GET /api/bootstrap` 的 `conversation_roles`。
 
 详情接口的 `conversation` 返回会话 ID、类型、成员、`turns`、`head_run_id`（最新消息所在运行）和 `artifact_run_id`（项目文件所在运行）。每条回复有独立的 `run_id`，可回到该轮查看执行记录。提交下一条消息以最新回合为依据，重试同一条消息时复用原 `request_id`。
+
+在「产物」里用「查看任务」切换该会话的某一轮。「本轮交付」与聊天文件卡、运行列表计数及本轮 ZIP 使用同一口径。例如，第一轮制作预订系统，第二轮从同一份预约记录生成仪表盘，第二轮只列新看板、本轮更新的文件和任务明确指定交付的文件。「其他项目文件」可展开查看已有代码和输入资料，需要整套可运行项目时下载完整项目快照。统一助手派出的子任务可由本轮派工链接进入各自的产物页。
+
+文件归属采用 Git 按输入、输出两棵文件树比较内容的做法。Studio 在准备本地工作区、派工输入或继承项目时记录文件 SHA-256。旧的私聊没有独立清单时，按保存的来源任务或恢复检查点比较。读取不到原始依据时，不会将整个文件夹登记为新交付。这里比较内容并保留用户明确指定的交付，不要求工作区本身使用 Git。[Git diff-tree 实现](https://github.com/git/git/blob/v2.49.0/builtin/diff-tree.c) · [Git 的多版本差异用例](https://github.com/git/git/blob/master/t/t4013-diff-various.sh)
 
 离线任务的启动请求示例：
 

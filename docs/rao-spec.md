@@ -211,16 +211,11 @@ HITL 有/无人、委派有/无编排器、预算切分、验收通过/打回/�
 
 ---
 
-## 7. 与 ReAct 的区别
+## 7. 单角色的工具循环与聊天
 
-| 维度 | 朴素 ReAct              | 本 RAO                                       |
-| ---- | ----------------------- | -------------------------------------------- |
-| 观察 | 自由文本直接拼回上下文  | 对象化：ok / error_class / artifacts / bytes |
-| 决策 | 文本 + 工具调用混在一起 | 闭集五选一，可校验                           |
-| 终止 | 模型说停就停            | 外部验收函数判定                             |
-| 循环 | 无检测                  | 签名重复时告警，保留工作工具                  |
-| 重试 | 统一重试                | 按 error_class 分策略                        |
-| 测试 | 只能端到端              | 单步断言                                     |
+本项目把一次模型决策、一次或多次工具动作以及相应观察称为 RAO。模型可以直接给出最终答复，也可以在同一条消息里先说明进展，再请求工具。工具结果通过调用 ID 回到模型上下文。验收、角色交接、会话消息和文件版本分别由执行器、群负责人和 Studio 的持久记录处理。
+
+ReAct 原论文研究推理与动作如何交替。生产框架可以用结构化消息实现这一循环。OpenAI Agents SDK 的 Runner 执行模型请求的工具、追加结果并再次调用模型，也能移交给另一角色。Pi 在执行循环中接收排队的用户消息，并通过独立的消息和工具事件驱动界面。这些实现支持在 Studio 保留 RAO，同时让聊天拥有自己的输入队列与公开消息记录。[ReAct 原论文](https://react-lm.github.io/) · [OpenAI Agents SDK 的循环](https://openai.github.io/openai-agents-python/running_agents/#the-agent-loop) · [Pi 的运行循环](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts) · [Pi 的循环测试](https://github.com/earendil-works/pi/blob/main/packages/agent/test/agent-loop.test.ts)
 
 ---
 
