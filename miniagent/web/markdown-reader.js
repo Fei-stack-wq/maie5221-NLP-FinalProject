@@ -210,6 +210,37 @@
   }
 
   const overDownloadLimit = size => size > 8 * 1024 ** 2;
+  const attachmentPreviewBytes = 256 * 1024;
+  const canPreviewAttachment = (name, size) => isMarkdown(name) && Number.isSafeInteger(size) &&
+    size >= 0 && size <= attachmentPreviewBytes;
+
+  async function attachmentText(url, controller) {
+    const response = await fetch(url, {signal:controller.signal, redirect:'error'});
+    if (!response.ok) throw new Error('读取附件失败（HTTP ' + response.status + '）。');
+    const overflow = () => {
+      controller.abort();
+      return new Error('附件超过 256 KiB，请下载原文查看。');
+    };
+    if (Number(response.headers.get('Content-Length')) > attachmentPreviewBytes) throw overflow();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > attachmentPreviewBytes) throw overflow();
+        chunks.push(decoder.decode(value,{stream:true}));
+      }
+      chunks.push(decoder.decode());
+      return chunks.join('');
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
   function truncationNotice(size) {
     if (overDownloadLimit(size)) return '仅显示前 256 KiB。文件超过 8 MiB 下载上限，请在本机工作区打开全文。';
     if (!Number.isSafeInteger(size)) return '仅显示前 256 KiB。单文件最多可下载 8 MiB，更大文件请在本机工作区查看。';
@@ -223,22 +254,30 @@
       .find(h => h.dataset.mdHeading === fragment);
     heading?.scrollIntoView({block:'start'});
   }
-  let stack = [], generation = 0;
+  let stack = [], generation = 0, attachmentController;
   async function show(ref) {
+    attachmentController?.abort();
+    attachmentController = null;
     const request = ++generation;
     const name = projectPath(ref.path);
     dialog.querySelector('h2').textContent = name.split('/').pop();
     const pathLabel = dialog.querySelector('.md-path');
     pathLabel.textContent = name;
     pathLabel.hidden = !name.includes('/');
-    dialog.querySelector('.md-origin').textContent = ref.kind === 'diagnostic' ? '诊断附件' : snapshot(ref.path) ? '交接时的版本' : '本轮工作区';
-    dialog.querySelector('[download]').href = fileURL(ref.run, ref.path, 'download');
-    dialog.querySelector('[download]').hidden = overDownloadLimit(ref.size);
+    dialog.querySelector('.md-origin').textContent = ref.attachmentURL ? '消息附件' : ref.kind === 'diagnostic' ? '诊断附件' : snapshot(ref.path) ? '交接时的版本' : '本轮工作区';
+    dialog.querySelector('[download]').href = ref.attachmentURL || fileURL(ref.run, ref.path, 'download');
+    dialog.querySelector('[download]').hidden = !ref.attachmentURL && overDownloadLimit(ref.size);
     back.hidden = stack.length < 2;
     body.textContent = '正在读取…';
     body.scrollTop = 0;
     if (!dialog.open) dialog.showModal();
     try {
+      if (ref.attachmentURL) {
+        attachmentController = new AbortController();
+        const text = await attachmentText(ref.attachmentURL, attachmentController);
+        if (request === generation && dialog.open) body.innerHTML = render(text, null, null, false, ref);
+        return;
+      }
       const data = await api(fileURL(ref.run, ref.path, 'artifact'));
       if (request !== generation || !dialog.open) return;
       body.innerHTML = (data.truncated ? '<p class="run-warning">' + truncationNotice(ref.size) + '</p>' : '') +
@@ -263,7 +302,13 @@
   });
   back.addEventListener('click', () => { if (stack.length > 1) { stack.pop(); show(stack.at(-1)); } });
   dialog.querySelector('[data-md-close]').addEventListener('click', () => dialog.close());
-  dialog.addEventListener('close', () => { if (!dialog.open) { generation++; stack = []; } });
+  dialog.addEventListener('close', () => { if (!dialog.open) { generation++; attachmentController?.abort(); stack = []; } });
   window.addEventListener('hashchange', () => { if (dialog.open) dialog.close(); });
-  window.StudioMarkdown = {render, documentHTML, attributes, overDownloadLimit, truncationNotice};
+  function openAttachment(name, size, url) {
+    if (!canPreviewAttachment(name, size)) return;
+    const ref = {path:name, name, size, attachmentURL:url};
+    stack = [ref];
+    show(ref);
+  }
+  window.StudioMarkdown = {render, documentHTML, attributes, overDownloadLimit, truncationNotice, canPreviewAttachment, openAttachment};
 })();

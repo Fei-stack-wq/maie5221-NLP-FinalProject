@@ -132,6 +132,18 @@ def addressed_members(text: str, thread: dict) -> list[str]:
     return recipients
 
 
+def conversation_attachments(history, metadata):
+    """Collect immutable inputs in this conversation's current project, newest messages first."""
+    visible = {item["id"]: item for item in metadata.get("attachments", [])}
+    if metadata.get("thread", {}).get("inherit_files", True):
+        for turn in reversed(history):
+            for item in turn.get("message_attachments", []):
+                visible.setdefault(item["id"], item)
+            if turn.get("inherit_files") is False:
+                break
+    return list(visible.values())
+
+
 def project_context(thread: dict, history: list[dict]) -> str:
     if thread.get("superagent"):
         lines = ["统一工作室对话。下面是历史消息、当前项目的派工回执和可用角色。当前用户要求在下一条消息中。"]

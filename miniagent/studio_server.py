@@ -9,13 +9,15 @@ import hmac
 import json
 import re
 import secrets
+import shutil
 import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .studio_service import StudioError, StudioService
 from .studio_preview import PREVIEW_CSP, html_preview
+from .studio_uploads import UploadError, open_upload, save_upload
 
 MAX_BODY_BYTES = 65536
 _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -28,6 +30,7 @@ _ASSETS = {"/": ("index.html", "text/html; charset=utf-8"),
            "/superagent.js": ("superagent.js", "text/javascript; charset=utf-8"),
            "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
            "/activity.css": ("activity.css", "text/css; charset=utf-8"),
+           "/attachments.js": ("attachments.js", "text/javascript; charset=utf-8"),
            "/markdown-reader.js": ("markdown-reader.js", "text/javascript; charset=utf-8"),
            "/markdown-reader.css": ("markdown-reader.css", "text/css; charset=utf-8"),
            "/markdown-it.min.js": ("vendor/markdown-it.min.js", "text/javascript; charset=utf-8"),
@@ -59,19 +62,24 @@ class StudioHandler(BaseHTTPRequestHandler):
         # URLs and request bodies can contain user input. No request echo.
         pass
 
-    def _send(self, status: int, payload: bytes, content_type: str, *, filename: str | None = None,
-              csp: str = _CSP):
+    def _headers(self, status: int, length: int, content_type: str, *, filename: str | None, csp: str):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(length))
         if filename is not None:
-            self.send_header("Content-Disposition", f"attachment; filename=\"{filename}\"; filename*=UTF-8''{filename}")
+            fallback = re.sub(r"[^A-Za-z0-9._ -]", "_", filename)
+            encoded = quote(filename, safe="")
+            self.send_header("Content-Disposition", f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", csp)
         self.end_headers()
+
+    def _send(self, status: int, payload: bytes, content_type: str, *, filename: str | None = None,
+              csp: str = _CSP):
+        self._headers(status, len(payload), content_type, filename=filename, csp=csp)
         if self.command != "HEAD":
             try:
                 self.wfile.write(payload)
@@ -132,7 +140,7 @@ class StudioHandler(BaseHTTPRequestHandler):
                 self._post()
             else:
                 self._get()
-        except StudioError as exc:
+        except (StudioError, UploadError) as exc:
             self._json(exc.status, {"error": str(exc), "code": exc.code})
         except (ValueError, UnicodeError, json.JSONDecodeError):
             self._json(400, {"error": "请求格式无效。", "code": "invalid_request"})
@@ -226,6 +234,20 @@ class StudioHandler(BaseHTTPRequestHandler):
             bundle = service.artifact_bundle(parts[3])
             self._send(200, bundle, "application/zip", filename=f"{parts[3]}-artifacts.zip")
             return
+        if len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "attachments":
+            meta = service._meta(service._directory(parts[3]))
+            if not any(isinstance(ref, dict) and ref.get("id") == parts[5] for ref in meta.get("attachments", [])):
+                raise StudioError("这条消息没有该附件。", "attachment_not_found", 404)
+            ref, stream = open_upload(service.runs_dir, parts[5])
+            with stream:
+                self._headers(200, ref["size"], "application/octet-stream", filename=ref["name"],
+                              csp="default-src 'none'; sandbox")
+                if self.command != "HEAD":
+                    try:
+                        shutil.copyfileobj(stream, self.wfile, length=256 * 1024)
+                    except (ConnectionError, TimeoutError):
+                        pass
+            return
         if len(parts) == 4 and parts[:3] == ["", "api", "runs"]:
             self._json(200, service.detail(parts[3]))
             return
@@ -236,10 +258,9 @@ class StudioHandler(BaseHTTPRequestHandler):
             if parts[4] == "excerpt":
                 self._json(200, service.artifact_excerpt(parts[3], params["path"][0]))
             elif parts[4] == "download":
-                from urllib.parse import quote
                 name = params["path"][0]
                 data = service.download_artifact(parts[3], name)
-                self._send(200, data, "application/octet-stream", filename=quote(name.rsplit("/", 1)[-1], safe=""))
+                self._send(200, data, "application/octet-stream", filename=name.rsplit("/", 1)[-1])
             elif parts[4] == "preview":
                 name = params["path"][0]
                 if name.lower().endswith(".png"):
@@ -251,8 +272,25 @@ class StudioHandler(BaseHTTPRequestHandler):
             return
         raise StudioError("页面不存在。", "not_found", 404)
 
+    def _request_length(self) -> int:
+        if self.headers.get_all("Transfer-Encoding"):
+            raise StudioError("不支持分块请求。")
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+            raise StudioError("请求长度无效。")
+        return int(lengths[0])
+
     def _post(self):
         url = urlsplit(self.path)
+        if url.path == "/api/uploads":
+            params = parse_qs(url.query, keep_blank_values=True, strict_parsing=True, errors="strict")
+            if set(params) != {"name"} or len(params["name"]) != 1:
+                raise StudioError("上传请求需要一个文件名。")
+            if self.headers.get_content_type() != "application/octet-stream" or self.headers.get("Content-Encoding"):
+                raise StudioError("附件必须以 application/octet-stream 原始字节发送。", "unsupported_media_type", 415)
+            ref = save_upload(self.server.studio_service.runs_dir, params["name"][0], self.rfile, self._request_length())
+            self._json(201, {"upload": ref})
+            return
         parts = unquote(url.path).split("/")
         cancel = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "cancel"
         reply = len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "questions"
@@ -268,12 +306,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise StudioError("请求必须为 JSON。", "unsupported_media_type", 415)
-        if self.headers.get("Transfer-Encoding"):
-            raise StudioError("不支持分块请求。")
-        lengths = self.headers.get_all("Content-Length", [])
-        if len(lengths) != 1 or not lengths[0].isdigit():
-            raise StudioError("请求长度无效。")
-        length = int(lengths[0])
+        length = self._request_length()
         if length > MAX_BODY_BYTES:
             raise StudioError("任务描述过长。", "body_too_large", 413)
         if length == 0:

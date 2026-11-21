@@ -100,11 +100,11 @@ def _scalar(event):
 def _result(event, tool):
     """Human-readable results derived strictly from typed host metrics."""
     parts = []
-    if _natural(event.get("returned_chars")) and tool in {"read_file", "read_source"}:
+    if _natural(event.get("returned_chars")) and tool in {"read_file", "read_source", "read_attachment"}:
         parts.append(f"已读取 {event['returned_chars']} 字符")
-    if _natural(event.get("bytes")) and tool in {"write_file", "edit_file", "append_file", "http_get"}:
+    if _natural(event.get("bytes")) and tool in {"write_file", "edit_file", "append_file", "http_get", "materialize_attachment"}:
         parts.append(f"{event['bytes']} 字节")
-    if _natural(event.get("count")) and tool in {"list_dir", "find_files", "search_files", "search_sources"}:
+    if _natural(event.get("count")) and tool in {"list_dir", "find_files", "search_files", "search_sources", "list_attachments"}:
         parts.append(f"{event['count']} 项结果")
     if type(event.get("exit_code")) is int:
         parts.append(f"退出码 {event['exit_code']}")

@@ -625,3 +625,39 @@ main{padding:28px 18px}
 .chat-diagnostics { margin:0 0 10px;color:var(--muted);font-size:12px }
 .chat-diagnostics > summary { width:fit-content;cursor:pointer }
 .chat-diagnostics .diagnosis { margin:10px 0;color:var(--ink) }
+.upload-picker,.reply-form .upload-picker {
+ display:flex;align-items:flex-start;flex-wrap:wrap;gap:6px 10px;
+ border:0;margin:0;padding:2px 18px 10px;min-width:0;
+}
+.upload-add,.upload-chip {display:inline-flex;align-items:center;gap:6px;min-width:0}
+.upload-add {
+ flex:none;padding:5px 2px;color:var(--muted);background:transparent;
+ font:inherit;font-size:12px;line-height:20px;
+}
+.upload-add:hover,.upload-chip button:hover,.sent-uploads a:hover {color:var(--accent-dark)}
+.upload-add svg,.upload-chip svg {width:15px;height:15px;flex:none}
+.upload-list {
+ display:flex;flex-wrap:wrap;gap:5px;min-width:0;max-width:100%;
+ padding:0;margin:0;list-style:none;
+}
+.upload-list:empty {display:none}
+.upload-list li {max-width:100%;min-width:0}
+.upload-chip {
+ max-width:100%;flex-wrap:wrap;border:1px solid var(--line);border-radius:6px;
+ background:var(--surface);color:var(--ink);font-size:12px;line-height:1.5;padding:3px 7px;
+}
+.upload-chip .upload-name {overflow-wrap:anywhere;min-width:0}
+.upload-chip small {color:var(--muted);font-size:11px;white-space:nowrap}
+.upload-chip .upload-error {color:var(--danger,#a43e36);overflow-wrap:anywhere}
+.upload-chip button {
+ display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;
+ color:var(--muted);background:transparent;padding:0;
+}
+.upload-chip button svg,.sent-uploads a svg:last-child {width:12px;height:12px}
+.sent-uploads {margin-top:5px}
+.sent-uploads a {text-decoration:none;padding:5px 8px}
+.previewable-upload {gap:2px;padding:0 3px}
+.upload-chip [data-preview-upload] {width:auto;height:auto;min-height:30px;min-width:0;max-width:100%;gap:6px;padding:4px;color:inherit;text-align:start}
+.upload-chip [data-preview-upload] svg {width:15px;height:15px}
+.previewable-upload a {display:inline-flex;align-items:center;justify-content:center;min-height:30px}
+.assistant-user>div {min-width:0}

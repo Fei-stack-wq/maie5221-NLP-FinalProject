@@ -90,6 +90,7 @@ class StudioCrewTest(unittest.TestCase):
         from miniagent.studio_crew import RoomCrew
         crew = object.__new__(RoomCrew)
         crew.lead, crew.profiles = "manager", {"manager": {}, "builder": {}}
+        crew.input_tools = ()
         question = "请确认本轮成员是否具备运行 Python 的能力？"
         message = crew.human_request_gate({"question": question, "decision_kind": "missing_user_data"})
         self.assertIn("run_python", message)

@@ -12,6 +12,7 @@
     ask_human:'请求用户答复', human:'请求用户答复', list_studio_roles:'查看角色',
     list_studio_targets:'查找协作者', dispatch_studio_task:'委派任务',
     list_studio_deliveries:'查找已交付文件', read_studio_delivery:'读取已交付文件',
+    list_attachments:'查看会话附件', read_attachment:'读取附件', materialize_attachment:'复制附件到成员工作区',
     create_studio_role:'创建角色', create_studio_group:'创建群聊'
   };
   const states = {running:'执行中', succeeded:'完成', failed:'失败', interrupted:'已中断'};

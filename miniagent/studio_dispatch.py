@@ -37,9 +37,12 @@ class StudioDispatch:
                     target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_name TEXT NOT NULL,
                     objective TEXT NOT NULL, inputs TEXT NOT NULL, acceptance TEXT NOT NULL,
                     child TEXT NOT NULL UNIQUE, room TEXT, state TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
-                    participants TEXT)''')
-                if 'participants' not in {c['name'] for c in db.execute('PRAGMA table_info(dispatches)')}:
+                    participants TEXT, attachment_ids TEXT NOT NULL DEFAULT '[]')''')
+                columns = {c['name'] for c in db.execute('PRAGMA table_info(dispatches)')}
+                if 'participants' not in columns:
                     db.execute("ALTER TABLE dispatches ADD COLUMN participants TEXT")
+                if 'attachment_ids' not in columns:
+                    db.execute("ALTER TABLE dispatches ADD COLUMN attachment_ids TEXT NOT NULL DEFAULT '[]'")
                 db.execute('CREATE INDEX IF NOT EXISTS dispatch_source ON dispatches(source)')
                 db.execute('CREATE INDEX IF NOT EXISTS dispatch_pending ON dispatches(state)')
             else:
@@ -74,9 +77,11 @@ class StudioDispatch:
                           ensure_ascii=False)
 
     def request_studio_dispatch(self, source_run_id, *, target_kind, target_id, objective,
-                                acceptance_files=None, input_files=None, required_participants=None):
+                                acceptance_files=None, input_files=None, required_participants=None, attachment_ids=None):
+        from .studio_conversations import conversation_attachments
         from .studio_route_results import bind_inputs
         from .studio_service import StudioError, _relative
+        from .studio_uploads import UploadError, validate_upload_ids
         inputs = [] if input_files is None else input_files
         acceptance = [] if acceptance_files is None else acceptance_files
         if not isinstance(inputs, list) or len(inputs) > 20 or not all(isinstance(path, str) for path in inputs):
@@ -91,6 +96,16 @@ class StudioDispatch:
             if (thread.get('superagent') is not True or source_run_id not in self._active
                     or self._cancellations[source_run_id].is_set()):
                 raise StudioError('派工只能由正在执行的统一对话发起。', 'inactive_source', 409)
+            current_ids = [item['id'] for item in source.get('attachments', [])]
+            try:
+                attached = current_ids if attachment_ids is None else validate_upload_ids(attachment_ids)
+            except UploadError as exc:
+                raise StudioError(str(exc), exc.code, exc.status) from None
+            if set(attached) - set(current_ids):
+                history = self._conversation(self._directory(source_run_id), before=thread['ordinal'], with_answers=False)
+                visible = conversation_attachments(history['turns'], source)
+                if set(attached) - {item['id'] for item in visible}:
+                    raise StudioError('只能转交当前项目对话中可见的附件。', 'invalid_attachment')
             participants = [] if required_participants is None else required_participants
             name, _ = self._dispatch_target(source, target_kind, target_id, participants)
             inputs = bind_inputs(self, self._directory(source_run_id), source, inputs)
@@ -104,7 +119,8 @@ class StudioDispatch:
             with self._dispatch_db(write=True) as db:
                 row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 if row is not None:
-                    if (set(json.loads(row['inputs'])) != set(inputs) or set(json.loads(row['acceptance'])) != set(acceptance)
+                    if (json.loads(row['attachment_ids']) != attached or set(json.loads(row['inputs'])) != set(inputs)
+                            or set(json.loads(row['acceptance'])) != set(acceptance)
                             or row['participants'] is not None and set(json.loads(row['participants'])) != set(participants)):
                         raise StudioError('同一派工已登记，但输入或验收条件不同。', 'dispatch_conflict', 409)
                     if row['state'] == 'queued' and row['participants'] is None:
@@ -112,9 +128,10 @@ class StudioDispatch:
                 else:
                     child = 'studio-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:12]
                     db.execute('''INSERT INTO dispatches
-                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,participants,state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
-                            target_id, name, objective, json.dumps(inputs), json.dumps(acceptance), child, json.dumps(participants)))
+                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,participants,attachment_ids,state)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
+                            target_id, name, objective, json.dumps(inputs), json.dumps(acceptance), child, json.dumps(participants),
+                            json.dumps(attached)))
                     row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 return self._dispatch_receipt(row)
 
@@ -140,6 +157,7 @@ class StudioDispatch:
         return self._redact({'dispatch_id': row['id'], 'source_run_id': row['source'],
             'target_kind': row['target_kind'], 'target_id': row['target_id'], 'target_name': row['target_name'],
             'objective': row['objective'], 'input_files': json.loads(row['inputs']),
+            **({'attachment_ids': json.loads(row['attachment_ids'])} if 'attachment_ids' in row.keys() and row['attachment_ids'] != '[]' else {}),
             'acceptance_files': json.loads(row['acceptance']), 'status': status,
             'child_run_id': child, 'conversation_id': row['room'] if child else None, 'error': error})
 
@@ -222,6 +240,8 @@ class StudioDispatch:
                        'interaction_mode': source['request'].get('interaction_mode', 'interactive')}
             if source.get('workspace_path'):
                 payload['workspace_path'] = source['workspace_path']
+            if attachment_ids := json.loads(row['attachment_ids']):
+                payload['attachments'] = attachment_ids
             group = ({'group_id': row['target_id'], 'participants': json.loads(row['participants'] or '[]')}
                      if row['target_kind'] == 'group' else {})
             native = self.start(payload, routed={**pointer, **group, 'child_run_id': row['child'],

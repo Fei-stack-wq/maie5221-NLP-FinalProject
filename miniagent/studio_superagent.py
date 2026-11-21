@@ -9,6 +9,7 @@ from .studio_channels import StudioChannels
 from .studio_route_results import delivery_catalog, read_delivery
 from .studio_conversations import ROLE_DUTIES, ROLE_LABELS
 from .studio_roles import knowledge_project
+from .studio_uploads import MAX_ATTACHMENTS
 from .tools import Tool
 
 ASSISTANT_INSTRUCTIONS = """你是个人 Agent 工作室的 Superagent。用户在这里既能直接办事，也能把工作交给自己的角色和团队。
@@ -72,7 +73,7 @@ class StudioAssistant(StudioChannels):
     def send_superagent(self, payload):
         from .studio_service import StudioError
         if (not isinstance(payload, dict) or not {"request_id", "message"} <= payload.keys()
-                <= {"request_id", "message", "parent_run_id", "workspace_path", "interaction_mode"}):
+                <= {"request_id", "message", "parent_run_id", "workspace_path", "interaction_mode", "attachments"}):
             raise StudioError("请提供消息、请求 ID 和当前对话末轮。")
         parent = payload.get("parent_run_id")
         if parent is not None and (not isinstance(parent, str) or not parent):
@@ -88,6 +89,8 @@ class StudioAssistant(StudioChannels):
             request["workspace_path"] = payload["workspace_path"]
         if "interaction_mode" in payload:
             request["interaction_mode"] = payload["interaction_mode"]
+        if "attachments" in payload:
+            request["attachments"] = payload["attachments"]
         return self.start(request, superagent=True)
 
     def studio_routing_group(self, source_meta, group_id):
@@ -237,6 +240,8 @@ class StudioAssistant(StudioChannels):
                   "objective": {"type": "string", "description": "给接手方的完整任务和交付要求，包括输入文件的项目相对路径"},
                   "input_files": {"type": "array", "items": {"type": "string"},
                                   "description": "需要交接的工作区相对文件名，或先前交付的 dispatch:<dispatch_id>/<文件路径> ref"},
+                  "attachment_ids": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_ATTACHMENTS,
+                                     "description": "随派工转交的用户原件 ID，可用 list_attachments 查找。省略时转交本条消息的附件，空数组表示不转交附件。"},
                   "acceptance_files": {"type": "array", "items": {"type": "string"},
                                        "description": "交付必须包含的工作区相对文件名"}},
                  ["target_kind", "target_id", "required_participants", "objective"], dispatch_task)

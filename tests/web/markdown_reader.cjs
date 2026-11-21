@@ -9,6 +9,37 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   page.on('request', r => { if (!r.url().startsWith(new URL(url).origin)) remote.push(r.url()); });
   await page.goto(url);
   const first = page.locator('.chat-turn').first();
+  const reader = page.locator('#markdown-reader');
+  const preview = first.getByRole('button',{name:'预览 用户笔记.md'});
+  const download = first.getByRole('link',{name:'下载 用户笔记.md'});
+  await preview.click();
+  await reader.getByRole('heading',{name:'Uploaded note'}).waitFor();
+  assert.equal(await reader.locator('strong').innerText(),'原始记录');
+  assert.equal(await reader.locator('img,script').count(),0);
+  assert.equal(await reader.getByRole('link',{name:'下载原文'}).getAttribute('href'),await download.getAttribute('href'));
+  await page.keyboard.press('Escape');
+  assert.equal(await first.getByRole('button',{name:'预览 large-input.md'}).count(),0);
+  assert(await first.getByRole('link',{name:'下载 large-input.md'}).isVisible());
+  const rawDownload = page.waitForEvent('download');
+  await download.click();
+  assert((await fs.readFile(await (await rawDownload).path(),'utf8')).includes('<script>window.bad = true</script>'));
+  // Even a stream without Content-Length must respect the preview cap.
+  await page.evaluate(path => {
+    const fetch = window.fetch;
+    window.fetch = (input, options) => {
+      if (input !== path) return fetch(input,options);
+      window.fetch = fetch;
+      return Promise.resolve(new Response(new ReadableStream({start(stream) {
+        stream.enqueue(new Uint8Array(256 * 1024));
+        stream.enqueue(new Uint8Array(1));
+        stream.close();
+      }})));
+    };
+  },await download.getAttribute('href'));
+  await preview.click();
+  await reader.getByText(/超过 256 KiB/).waitFor();
+  assert.equal(await reader.locator('article h1').count(),0);
+  await page.keyboard.press('Escape');
   const receipt = first.locator('[data-kind="member_report"]').filter({hasText:'评审报告'});
   const line = receipt.locator('.room-line');
   // Explicit link, inline code and bare path each resolve to the same receipt.
@@ -17,7 +48,6 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   assert.equal(await links.count(), 3);
   assert.equal(new Set(await links.evaluateAll(nodes => nodes.map(n => n.dataset.mdPath))).size, 1);
   await links.first().click();
-  const reader = page.locator('#markdown-reader');
   await reader.getByRole('heading', {name:'Handoff edition'}).waitFor();
   assert.equal(await reader.getByRole('columnheader').count(), 2);
   assert.equal(await reader.locator('ol li').count(), 2);
@@ -123,6 +153,20 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   await (await late).finished();
   await page.evaluate(() => new Promise(requestAnimationFrame));
   assert.equal(await selectedFile.getByRole('heading',{name:'Long bulletin'}).isVisible(),true);
+  // A process started before the upload route existed still serves text chat.
+  await page.route('**/attachments.js', route=>route.fulfill({status:404,body:''}));
+  await page.goto(url);
+  await page.reload();
+  const reply = page.locator('.reply-form');
+  await reply.locator('textarea[name=message]').fill('继续之前的纯文本任务');
+  assert.equal(await reply.locator('[data-pick-uploads]').count(),0);
+  await page.route('**/api/runs', route => route.request().method()==='POST'
+    ? route.fulfill({status:400,json:{error:'已捕获请求'}}) : route.fallback());
+  const outgoing = page.waitForRequest(r=>r.method()==='POST' && new URL(r.url()).pathname==='/api/runs');
+  await reply.locator('[type=submit]').click();
+  const payload = (await outgoing).postDataJSON();
+  assert.equal(payload.objective,'继续之前的纯文本任务');
+  assert.equal(Object.hasOwn(payload,'attachments'),false);
   assert.deepEqual(errors, []);
   assert.deepEqual(remote, []);
   console.log('Chat Markdown, publication history, nested links and mobile reader passed.');

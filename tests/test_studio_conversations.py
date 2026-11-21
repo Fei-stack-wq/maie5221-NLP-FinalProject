@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+import zipfile
+from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -11,6 +13,7 @@ from miniagent.config import Settings
 from miniagent.providers import ScriptedProvider
 from miniagent.studio_service import StudioError, StudioService
 from miniagent.studio_conversations import project_context
+from miniagent.studio_uploads import save_upload
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_service import finished, request
 
@@ -94,6 +97,26 @@ class ConversationTest(unittest.TestCase):
             detail = finished(self.service, run["id"])
         self.assertEqual(factory.call_count, 1)
         return detail, provider
+
+    def test_attachment_only_turn_followup_and_new_project(self):
+        raw = b"unique-maintenance-log"
+        ref = save_upload(self.runs, "诊断.log", BytesIO(raw), len(raw))
+        payload = msg("", fresh(), attachments=[ref["id"]])
+        first, _ = self.run_turn(payload, [tool("read_attachment", id=ref["id"]), {"text": "收到日志。"}])
+        identity = first["run"]["id"]
+        self.assertEqual(self.service.start(payload)["id"], identity)
+        turn = first["conversation"]["turns"][0]
+        self.assertEqual((turn["user"], turn["message_attachments"], turn["artifacts"]), ("", [ref], []))
+        with zipfile.ZipFile(BytesIO(self.service.room_bundle(identity))) as packet:
+            self.assertEqual(packet.read(f"turn-001/attachments/{ref['id']}/诊断.log"), raw)
+        second, reader = self.run_turn(msg("接着核对上面的日志", reply(identity, intent="question")),
+                                       [tool("read_attachment", id=ref["id"]), {"text": "已核对。"}])
+        self.assertIn(raw.decode(), str(reader.requests))
+        self.assertNotIn("materialize_attachment", reader.requests[0][1])
+        self.assertEqual(second["conversation"]["turns"][-1]["message_attachments"], [])
+        reset = {**reply(second["run"]["id"]), "inherit_files": False}
+        _, new_project = self.run_turn(msg("换一个项目", reset), [{"text": "好的。"}])
+        self.assertNotIn("read_attachment", new_project.requests[0][1])
 
     def seed(self, members=None):
         return self.run_turn(msg("设计一个游戏", fresh(members=members)), [

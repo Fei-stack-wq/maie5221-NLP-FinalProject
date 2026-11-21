@@ -2,6 +2,7 @@
 // Buildless local UI. All runtime-owned text passes through escapeHTML; no raw
 // model HTML, remote resources or provider credentials enter this application.
 const icons = {
+ paperclip:'m21 11-9 9a6 6 0 0 1-8.5-8.5L14 1.5a4 4 0 0 1 5.7 5.7L9 18a2 2 0 1 1-2.8-2.8L16 5.5',
  down:'M12 4v14m-6-6 6 6 6-6',
  messages:'M21 13a3 3 0 0 1-3 3H9l-6 4v-5a3 3 0 0 1-1-2V6a3 3 0 0 1 3-3h13a3 3 0 0 1 3 3Z',user:'M20 21v-2a5 5 0 0 0-5-5H9a5 5 0 0 0-5 5v2M16 6a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
  hash:'M10 3 7 21M17 3l-3 18M4 9h16M3 15h16',pin:'m15 3 6 6-3 1-3 4v3l-2 1-7-7 1-2h3l4-3ZM9 15l-6 6',pinFilled:'m15 3 6 6-3 1-3 4v3l-2 1-7-7 1-2h3l4-3ZM9 15l-6 6m6-12 6 6',
@@ -21,10 +22,15 @@ const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'
 const e = escapeHTML;
 const labels = {completed:'已完成',passed:'通过',succeeded:'已完成',running:'运行中',queued:'排队中',verifying:'验收中',created:'已创建',ready:'待执行',failed:'失败',error:'错误',cancelled:'已取消',cancel_requested:'正在取消',unverified:'未验证',interrupted:'待核实',blocked:'受阻',waiting_user:'等待回复',ended:'已结束'};
 const modeLabels = {demo:'单 Agent 演示','team-demo':'协作演示',single:'单 Agent',team:'多 Agent 协作',cli:'CLI 运行',imported:'历史 CLI 运行'};
-const state = {config:null,chats:null,runs:[],detail:null,route:'assistant',runId:null,tab:'overview',search:'',filter:'all',logFilter:'all',selectedFile:null,fileData:null,expanded:new Set(),logOpen:new Set(),polling:false,online:true,initialized:false,detailSignature:'',submission:null,cancelling:new Set(),downloads:new Set()};
+const state = {config:null,chats:null,runs:[],detail:null,route:'assistant',runId:null,tab:'overview',search:'',filter:'all',logFilter:'all',selectedFile:null,fileData:null,expanded:new Set(),logOpen:new Set(),polling:false,online:true,initialized:false,detailSignature:'',cancelling:new Set(),downloads:new Set()};
 let toastTimer;
 const $ = selector => document.querySelector(selector);
 const main = $('#main');
+// An already-running Studio can serve newer files while its route table is older.
+const studioAttachments = window.studioMessageFiles || {
+ picker:()=>'', history:()=>'', keyFor:()=>null, count:()=>0, prepare:async()=>[],
+ hold(){}, clear(){}
+};
 // Keep live views mounted. Polls reconcile existing nodes, so elapsed time and
 // new log entries do not restart page animations or discard browser state.
 function nodeKey(node){return node.nodeType===1?(node.getAttribute('data-key')||node.id||null):null;}
@@ -582,7 +588,8 @@ function conversationComposer(thread,run) {
  return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}">
    <fieldset ${status ? 'disabled' : ''}>
     <label class="composer-label" for="chat-reply">继续对话</label>
-    <textarea id="chat-reply" name="message" maxlength="8000" required placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
+    <textarea id="chat-reply" name="message" maxlength="8000" placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
+    ${studioAttachments.picker('reply-'+thread.id,status)}
     <div class="reply-options">
      ${thread.kind==='group' && intent==='edit'?dispatchField(dispatch):''}
      <label class="field-label"><span id="reply-recipient-label">${teamLead?'负责人':'回复角色'}</span>
@@ -625,7 +632,7 @@ function conversationPanel(detail) {
    : `<a class="text-button" href="#run/${encodeURIComponent(turn.run_id)}">查看本轮</a>`;
   return `<article class="chat-turn" data-key="turn-${e(turn.run_id)}">
    <div class="chat-user"><div class="speaker">你 <small>发给 ${e(turn.member_names?.[turn.recipient] || roleLabel(turn.recipient))}</small></div>
-   <p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p></div>
+   ${turn.user?`<p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p>`:''}${studioAttachments.history(turn)}</div>
    ${roomMessages(turn,detail,group)}
    ${studioReplyStreams.slot(turn)}
    <div class="chat-agent">${turn.answer ? `<div class="speaker">${group?roomAvatar(turn,turn.recipient):icon('cpu')} ${memberLink(turn.role_keys?turn:thread,turn.recipient)} ${link}</div>
@@ -657,8 +664,9 @@ async function sendReply(form) {
  const id = form.dataset.thread;
  if (pendingChat.has(id) || !form.reportValidity()) return;
  const draft = rememberReply(form);
- if (!draft.message.trim()) {
-  draft.error = '请输入消息内容。';
+ const attachmentKey = studioAttachments.keyFor(form);
+ if (!draft.message.trim() && !studioAttachments.count(attachmentKey)) {
+  draft.error = '请填写消息或添加附件。';
   render();
   return;
  }
@@ -678,17 +686,21 @@ async function sendReply(form) {
    if(payload.mode==='team'&&draft.children?.trim()) payload.child_checks=JSON.parse(draft.children); }
   catch(error){draft.error=error.message;render();return;}
  }
- const fingerprint = JSON.stringify(payload);
- let submission = chatSubmissions.get(id);
- if (submission?.fingerprint !== fingerprint) {
-  submission = {fingerprint,id:crypto.randomUUID()};
-  chatSubmissions.set(id,submission);
- }
- payload.request_id = submission.id;
  pendingChat.add(id);
+ studioAttachments.hold(attachmentKey,true);
  render();
  try {
+  const attachments = await studioAttachments.prepare(attachmentKey);
+  if (attachments.length) payload.attachments=attachments.map(item=>item.id);
+  const fingerprint = JSON.stringify(payload);
+  let submission = chatSubmissions.get(id);
+  if (submission?.fingerprint !== fingerprint) {
+   submission = {fingerprint,id:crypto.randomUUID()};
+   chatSubmissions.set(id,submission);
+  }
+  payload.request_id = submission.id;
   const data = await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
+  studioAttachments.clear(attachmentKey);
   chatDrafts.delete(id);
   chatSubmissions.delete(id);
   if (state.runId === form.dataset.parent) {
@@ -700,6 +712,7 @@ async function sendReply(form) {
   if (error.code === 'forbidden') state.config = null;
   await refresh();
  } finally {
+  studioAttachments.hold(attachmentKey,false);
   pendingChat.delete(id);
   if (state.detail?.conversation?.id === id) render();
  }
@@ -720,6 +733,8 @@ function detailBadge(detail) {
  return badge(runStatus(detail.run));
 }
 
+let dialogAttachmentKey='';
+const newChatSubmissions = new WeakMap();
 function formHTML(prefix='home',mode='team-demo',objective='') {
  const demo = mode==='demo' || mode==='team-demo';
  const chat = chatMode(mode);
@@ -737,6 +752,7 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
   ${newConversationFields(mode)}
   <label class="composer-label" for="${prefix}-objective">${chat ? '首条消息' : '任务目标'}</label>
   <textarea id="${prefix}-objective" name="objective" placeholder="描述你想解决的问题或要完成的任务…" ${demo?'readonly':''} maxlength="8000">${e(goal)}</textarea>
+  ${chat ? studioAttachments.picker(prefix==='dialog'?dialogAttachmentKey:'new-home') : ''}
   ${chat || mode==='demo' ? `<div class="workspace-choice"><label class="field-label" for="${prefix}-workspace">本地工作区（选填）</label>
    <div><input id="${prefix}-workspace" name="workspace_path" placeholder="项目文件夹的绝对路径" autocomplete="off" spellcheck="false">
     <button type="button" class="secondary" data-action="pick-workspace">${icon('folder')}选择文件夹</button></div>
@@ -1147,7 +1163,14 @@ async function refreshDetail() {
 }
 async function refresh(){if(state.polling)return;state.polling=true;try{if(!state.config)state.config=await api('/api/bootstrap');const data=await api('/api/runs');state.runs=data.runs||[];setOnline(true);if(!state.initialized){state.initialized=true;await route();}updateSidebar();if(state.route==='home'&&$('#home-runs')){patchHTML($('#home-runs'),state.runs.length?`<div class="run-list">${state.runs.slice(0,5).map(runRow).join('')}</div>`:empty('工作室已经准备好了','运行上方演示，你的第一个任务会出现在这里。'));const count=$('.section-title .count-badge');setText(count,state.runs.length);}if(state.route==='runs'&&$('#all-runs'))patchHTML($('#all-runs'),runList());if(state.route==='detail')await refreshDetail();if(state.route==='assistant')await studioAssistant.refresh();await chatDirectory.refresh();await refreshRoleIfNeeded();}catch{setOnline(false);}finally{state.polling=false;}}
 function formTitle(mode){return mode==='group'?'新建群聊':mode==='single'?'新建私聊':'开始一个新任务';}
-function openForm(mode=state.config?.provider_ready?'single':'team-demo',objective=''){ $('#dialog-title').textContent=formTitle(mode); $('#dialog-form').innerHTML=formHTML('dialog',mode,objective);$('#task-dialog').showModal();setTimeout(()=>$('#dialog-objective').focus(),0);}
+function openForm(mode=state.config?.provider_ready?'single':'team-demo',objective=''){
+ studioAttachments.clear(dialogAttachmentKey);
+ dialogAttachmentKey='new-'+crypto.randomUUID();
+ $('#dialog-title').textContent=formTitle(mode);
+ $('#dialog-form').innerHTML=formHTML('dialog',mode,objective);
+ $('#task-dialog').showModal();
+ setTimeout(()=>$('#dialog-objective').focus(),0);
+}
 function swapMode(form, mode, objective='') {
  const {prefix} = form.dataset;
  const saved = new FormData(form);
@@ -1186,6 +1209,7 @@ async function submit(form) {
  const fields = new FormData(form);
  const mode = fields.get('mode');
  const chat = chatMode(mode);
+ const attachmentKey = studioAttachments.keyFor(form);
  const payload = {mode:chat?'single':mode,objective:String(fields.get('objective')||'').trim(),
   scheduler:fields.get('scheduler')||'serial',thinking:fields.get('thinking')||'disabled'};
  const workspace = String(fields.get('workspace_path') || '').trim();
@@ -1199,7 +1223,7 @@ async function submit(form) {
  if (chat || mode === 'team') {
   payload.interaction_mode = fields.get('interaction_mode');
   if (!state.config?.provider_ready) return showError('请先配置本机 DeepSeek API key 并重启服务，或使用离线演示。');
-  if (!payload.objective) return showError('请填写消息内容。');
+  if (!payload.objective && !studioAttachments.count(attachmentKey)) return showError(chat?'请填写消息或添加附件。':'请填写消息内容。');
   payload.limits={};
   for (const field of runLimitFields) {
    const value = Number(fields.get(field.name));
@@ -1226,23 +1250,37 @@ async function submit(form) {
    if (payload.mode==='team' && fields.get('child_checks')?.trim()) payload.child_checks=JSON.parse(fields.get('child_checks'));
   } catch(error){return showError(error.message);}
  }
- const fingerprint = JSON.stringify(payload);
- if (state.submission?.fingerprint!==fingerprint) state.submission={fingerprint,id:crypto.randomUUID()};
- payload.request_id=state.submission.id;
+ studioAttachments.hold(attachmentKey,true);
  button.disabled=true;
+ form.inert=true;
  const text=button.innerHTML;
  button.innerHTML='<span class="spinner"></span>正在发送';
  try {
+  const attachments=await studioAttachments.prepare(attachmentKey);
+  if (attachments.length) payload.attachments=attachments.map(item=>item.id);
+  const fingerprint = JSON.stringify(payload);
+  let submission=newChatSubmissions.get(form);
+  if (submission?.fingerprint!==fingerprint) {
+   submission={fingerprint,id:crypto.randomUUID()};
+   newChatSubmissions.set(form,submission);
+  }
+  payload.request_id=submission.id;
   const response=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
-  state.submission=null;
-  if ($('#task-dialog').open) $('#task-dialog').close();
-  location.hash = chat ? chatLink(response.run.id) : '#run/'+encodeURIComponent(response.run.id);
+  studioAttachments.clear(attachmentKey);
+  newChatSubmissions.delete(form);
+  const dialog=form.closest('#task-dialog');
+  if (form.isConnected && (!dialog || dialog.open)) {
+   if (dialog) dialog.close();
+   location.hash = chat ? chatLink(response.run.id) : '#run/'+encodeURIComponent(response.run.id);
+  }
   toast(chat?'消息已发送。':'任务已发起。');
   await refresh();
  } catch(error) {
   showError(error.message);
   if (error.code==='forbidden') {state.config=null;await refresh();}
  } finally {
+  studioAttachments.hold(attachmentKey,false);
+  form.inert=false;
   if (button.isConnected) {button.disabled=false;button.innerHTML=text;}
  }
 }

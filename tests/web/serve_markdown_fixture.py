@@ -1,6 +1,7 @@
 """Two Studio turns, including a frozen member receipt and a withheld private draft."""
 import hashlib
 import json
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from miniagent.config import Settings
 from miniagent.providers import ScriptedProvider
 from miniagent.studio_server import create_server
 from miniagent.studio_service import StudioService
+from miniagent.studio_uploads import save_upload
 from tests.test_studio_conversations import reply
 from tests.test_studio_service import finished, request
 from tests.web.serve_room_fixture import call
@@ -22,8 +24,13 @@ def main():
             {"text": "已发布 docs/Report.md。另有 ledger.md 和 agents/reviewer/ledger.md，搜索来源 https://example.org/?file=Report.md。长文 Long.md、Giant.md。"},
         ])
         second = ScriptedProvider([{"text": "已核对上一版。"}])
+        inputs = {
+            "用户笔记.md": "# Uploaded note\n\n**原始记录**\n\n![image](https://example.org/input.png)\n\n<script>window.bad = true</script>".encode(),
+            "large-input.md": b"x" * (256 * 1024 + 1),
+        }
+        attachments = [save_upload(Path(scratch), name, BytesIO(raw), len(raw))["id"] for name, raw in inputs.items()]
         with patch("miniagent.studio_service.DeepSeekProvider", side_effect=[first, second]):
-            run = service.start(request("single", objective="出具报告", conversation={
+            run = service.start(request("single", objective="出具报告", attachments=attachments, conversation={
                 "kind":"group", "members":["worker","reviewer"], "recipient":"worker", "intent":"edit",
             }))
             finished(service, run["id"])

@@ -2,6 +2,24 @@
 
 当前版本的自定义角色、群内分工、运行中答复、累计预算及失败续聊操作，见 [团队任务与续聊](studio-team-workflow.md)。以下包含早期版本的验收记录。
 
+## 随消息发送文件
+
+在统一助手、私聊或群聊输入框点「添加附件」。可以一次选多个文件，发送前可移除，也可以只发附件。比如将一份电脑维护说明 PDF 和两份同名的诊断日志一起发给维护员，让它对照说明解释报错。下次在同一会话里说「继续看第二份日志」即可。消息显示各文件的原名、大小和下载链接，256 KiB 以内的 Markdown 附件还可点开阅读。文件上传了一部分就断线时，保留当前页面，再点发送可复用已经上传成功的文件。
+
+| 上传的材料 | 角色如何使用 |
+| --- | --- |
+| 文本、代码、Markdown、CSV、JSON、日志 | 分页读正文，可在追问中继续读。 |
+| PDF、DOCX、XLSX、PPTX | 读取 PDF 文字层、指定 PDF 页、Word 段落和表格、Excel 单元格、幻灯片文字和表格。PDF 提取需要本机安装 Poppler。 |
+| 图片、ZIP、其他二进制文件 | 图片可读尺寸和格式，安装了 Tesseract 和对应语言包时可识别文字。ZIP 可列出目录并按条目读取。其他二进制可按字节读取，执行角色也可将完整原件复制到自己的私有输入目录，交给合适的程序处理。 |
+
+统一助手派工默认转交当前消息中的附件。需要转交旧文件或其中几份时，助手可用 `list_attachments` 找到文件并用 `dispatch_studio_task.attachment_ids` 指定。目标私聊或群聊获得所选资料的原件，文件名相同也不会互相覆盖。同一会话切换到新项目会重置可用的旧附件，仍可从原消息下载。原件单独保存在本机运行目录，群成员按需读取，输出工作区只收交付物。导出完整会话时，各轮原件在 ZIP 的 `turn-…/attachments/` 内。
+
+每条消息最多附 100 个文件。上传和下载按流传输；复杂格式的内联解析支持单文件 32 MiB 以内，更大的文件仍可复制原件供本地工具处理。仅选择后尚未发送的文件留在当前页面；浏览器刷新会丢弃这些草稿。已经上传成功、但最终没有发成消息的原件可能保留在本机附件目录。
+
+实现参考了 Django 分块接收和中断清理，以及 Werkzeug 的下载文件名处理。Studio 根据本机消息记录核对下载权限，模型使用不可变文件 ID，输入与产物分开保存。[Django 上传处理器](https://github.com/django/django/blob/main/django/core/files/uploadhandler.py) · [上传回归用例](https://github.com/django/django/blob/main/tests/file_uploads/tests.py) · [Werkzeug 下载用例](https://github.com/pallets/werkzeug/blob/main/tests/test_send_file.py) · [Zulip 的附件权限设计](https://zulip.readthedocs.io/en/11.1/production/security-model.html)
+
+文档提取按格式选择解析器，复用现有 Poppler 适配器、python-docx、python-pptx、openpyxl 与 Pillow。Office 解析保留段落、工作表或幻灯片的顺序，以分页工具向角色返回内容。[MarkItDown 的表格转换器](https://github.com/microsoft/markitdown/blob/main/packages/markitdown/src/markitdown/converters/_xlsx_converter.py) · [python-docx 1.2 的段落与表格接口](https://github.com/python-openxml/python-docx/blob/v1.2.0/src/docx/document.py) · [对应的文档用例](https://github.com/python-openxml/python-docx/blob/v1.2.0/tests/test_document.py) · [openpyxl 的只读工作簿](https://openpyxl.readthedocs.io/en/stable/optimized.html)
+
 > 2026-11-17（America/Los_Angeles），开发分支 `jinyuwu/local-studio-gui`。本次给已有任务执行能力增加可视化入口：发起任务、任务树、运行状态、日志、文本产物和验收报告。已支持用项目私聊或群聊追问并迭代产物。侧栏「角色库」支持创建长期助手、维护跨会话记忆、编写与审核技能。操作见[个人角色库](personal-role-library.md)。
 
 

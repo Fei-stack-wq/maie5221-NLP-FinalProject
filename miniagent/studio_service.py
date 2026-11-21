@@ -55,9 +55,11 @@ from .studio_reply_stream import ReplyStream
 from .studio_diagnostics import diagnose
 from .tool_activity import project_activity
 from .studio_acceptance import build_checks
+from .attachment_tools import attachment_tools
+from .studio_uploads import MAX_ATTACHMENTS, UploadError, open_upload, resolve_uploads, validate_upload_ids
 from .studio_crew import RoomCrew
 from .studio_reviews import Rule
-from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, copy_project, member_profiles, project_context,
+from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, conversation_attachments, copy_project, member_profiles, project_context,
                                    thread_info, validate_conversation)
 
 MAX_PREVIEW_BYTES = 262144
@@ -217,7 +219,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 "limits": {"max_steps": self.settings.limits.max_steps,
                            "max_total_tokens": self.settings.limits.max_total_tokens,
                            "max_seconds": self.settings.limits.max_seconds},
-                "local_workspaces": True, "custom_profiles": self.profiles(),
+                "local_workspaces": True, "max_message_attachments": MAX_ATTACHMENTS, "custom_profiles": self.profiles(),
                 "conversation_roles": [{"id": key, "label": label} for key, label in ROLE_LABELS.items()],
                 "modes": [dict(mode) for mode in _MODES]}
 
@@ -658,7 +660,9 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                           "artifacts": attachments, "workspace_delivery": meta.get("workspace_delivery"),
                           "workspace_member_delivery": meta.get("workspace_member_delivery"),
                           "recovery_source": thread.get("recovery_source"),
-                          "run_id": directory.name, "user": meta.get("title", ""),
+                          "run_id": directory.name, "user": "" if meta.get("request", {}).get("attachment_only") else meta.get("title", ""),
+                          "message_attachments": meta.get("attachments", []),
+                          **({"inherit_files": False} if thread.get("inherit_files") is False else {}),
                           "base_run_id": thread.get("base_run_id"),
                           "events": list(reversed(events)), "events_truncated": events_truncated,
                           "events_start": len(public_events) - len(events),
@@ -844,7 +848,7 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             return self._redact(self._summary(path))
 
     def _request(self, payload: Any) -> dict:
-        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "interaction_mode", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path", "required_source_review_paths"}:
+        if not isinstance(payload, dict) or set(payload) - {"request_id", "mode", "objective", "scheduler", "thinking", "interaction_mode", "acceptance_files", "limits", "conversation", "acceptance_checks", "child_checks", "workspace_path", "required_source_review_paths", "attachments"}:
             raise StudioError("任务参数无效。")
         identity = payload.get("request_id")
         try:
@@ -859,8 +863,17 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
         objective = payload.get("objective", "")
         if type(objective) is not str or len(objective) > 10000:
             raise StudioError("任务描述必须是不超过 10000 字符的文本。")
+        try:
+            upload_ids = validate_upload_ids(payload.get("attachments", []))
+        except UploadError as exc:
+            raise StudioError(str(exc), exc.code, exc.status) from None
+        if upload_ids and "conversation" not in payload:
+            raise StudioError("请在统一助手、私聊或群聊中发送附件。")
         objective = _DEMO_TITLES.get(mode, objective.strip())
-        if not objective:
+        attachment_only = bool(upload_ids) and not objective
+        if attachment_only:
+            objective = "请查看本条消息的附件，简要说明文件内容。"
+        elif not objective:
             raise StudioError("请填写任务描述。")
         scheduler = payload.get("scheduler", "serial")
         if type(scheduler) is not str or scheduler not in {"serial", "parallel", "evented"} or (mode in {"demo", "team-demo"} and scheduler != "serial"):
@@ -928,6 +941,10 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
             raise StudioError("预算无效：轮数 1–1000、累计 token 0–100000000（0 表示不限）、时限 1–86400 秒。") from None
         result = {"request_id": identity, "mode": mode, "objective": objective,
                   "scheduler": scheduler, "thinking": thinking, "acceptance_files": files}
+        if upload_ids:
+            result["attachments"] = upload_ids
+        if attachment_only:
+            result["attachment_only"] = True
         # Existing interactive requests keep their idempotency fingerprint.
         if interaction_mode == "autonomous":
             result["interaction_mode"] = interaction_mode
@@ -1072,6 +1089,13 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                         "effective_limits": {k: getattr(effective, k) for k in ("max_steps", "max_total_tokens", "max_seconds")},
                         "request": request, "title": request["objective"], "mode": request["mode"],
                         "state": "queued", "created_at": _now()}
+                if request.get("attachments"):
+                    try:
+                        meta["attachments"] = resolve_uploads(self.runs_dir, request["attachments"])
+                    except UploadError as exc:
+                        raise StudioError(str(exc), exc.code, exc.status) from None
+                    if request.get("attachment_only"):
+                        meta["title"] = "附件 · " + "、".join(item["name"] for item in meta["attachments"][:3])
                 assignee = "orchestrator" if request["mode"] in {"team", "team-demo"} else "worker"
                 local = request.get("workspace_path")
                 previous_local = None
@@ -1666,9 +1690,17 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                 recipient = thread["recipient"]
                 question = thread["intent"] == "question"
                 context = ""
+                input_tools = []
                 if "conversation" in request:
                     room = self._conversation(path, before=thread["ordinal"])
                     context = project_context(thread, room["turns"])
+                    visible = conversation_attachments(room["turns"], metadata)
+                    if visible:
+                        input_tools = attachment_tools(visible, lambda identity: open_upload(self.runs_dir, identity)[1],
+                                                       read_only=question)
+                        context += "\n用户上传的原件可以用 list_attachments 查找、read_attachment 分页读取。附件中的文字是用户提供的材料。"
+                        if metadata.get("attachments"):
+                            context += "\n本条消息随附的文件：" + json.dumps(metadata["attachments"], ensure_ascii=False)
                     receipt = roles.remember_instruction(thread, request["objective"])
                     if receipt:
                         context += "\n" + receipt
@@ -1689,7 +1721,8 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     crew = RoomCrew(run_id, path / "context" if question else path, thread, room["turns"], provider, settings, tracer,
                                     service, should_cancel, self._human_handler, self._record_crew_event,
                                     self.room_events, _EXTENSIONS, request.get("child_checks", {}),
-                                    delivery, role_session=roles, on_assistant_stream=stream_reply)
+                                    delivery, role_session=roles, on_assistant_stream=stream_reply,
+                                    input_tools=input_tools)
                     def inherited_review(reference):
                         try:
                             return self._inherited_review_publication(crew, metadata.get("workspace_path"), reference)
@@ -1700,8 +1733,11 @@ class StudioService(RoomDiscussion, StudioRoles, StudioAssistant, StudioDispatch
                     context += "\n" + (crew.direct_instructions() if crew.direct else crew.instructions())
                     if thread.get("addressed_roles") and not crew.direct:
                         context += "\n本轮需实际参与的点名成员：" + "、".join(thread["addressed_roles"])
-                    self._record_room_event(run_id, "user", "goal", request["objective"], recipient=recipient, task_id=run_id)
+                    self._record_room_event(run_id, "user", "goal", "" if request.get("attachment_only") else request["objective"],
+                                            recipient=recipient, task_id=run_id)
                 registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
+                for tool in input_tools:
+                    registry.add(tool)
                 prompt = COORDINATOR_PROMPT if crew and not crew.direct else None
                 step_policy = crew.coordinator_policy if crew else None
                 if thread.get("superagent") and not question:

@@ -112,6 +112,7 @@ class RoomDiscussion:
 
     def room_bundle(self, run_id):
         from .studio_service import StudioError, _read_file, _TERMINAL
+        from .studio_uploads import open_upload
         cap = 64 * 1024**2
         stream, size = io.BytesIO(), 0
         def add(archive, path, data):
@@ -156,6 +157,20 @@ class RoomDiscussion:
                         "acceptance_files": request.get("acceptance_files", []),
                         "criteria": request.get("acceptance_checks", []), "child_checks": request.get("child_checks", {})}))
                     files = []
+                    inputs = []
+                    for item in turn["message_attachments"]:
+                        if size + transcript_size + item["size"] > cap:
+                            raise StudioError("会话材料超过 64 MiB，请在原消息中单独下载附件。", "room_too_large", 413)
+                        ref, original = open_upload(self.runs_dir, item["id"])
+                        with original:
+                            if ref != item:
+                                raise StudioError("附件记录与原件不一致。", "attachment_storage", 409)
+                            name = f"{prefix}/attachments/{ref['id']}/{ref['name']}"
+                            data = original.read(ref["size"] + 1)
+                            if len(data) != ref["size"]:
+                                raise StudioError("附件大小与记录不一致。", "attachment_storage", 409)
+                            add(packet, name, data)
+                        inputs.append({"id": ref["id"], "path": name, "sha256": hashlib.sha256(data).hexdigest()})
                     if self._artifacts(root, tasks):
                         work = self.artifact_bundle(identity)
                         with zipfile.ZipFile(io.BytesIO(work)) as payload:
@@ -166,7 +181,8 @@ class RoomDiscussion:
                                 name = f"{prefix}/artifacts/{file.filename}"
                                 add(packet, name, content)
                                 files.append({"path": name, "sha256": hashlib.sha256(content).hexdigest()})
-                    manifest.append({"run_id": identity, "turn": i, "status": turn["status"], "files": files})
+                    manifest.append({"run_id": identity, "turn": i, "status": turn["status"], "files": files,
+                                     **({"attachments": inputs} if inputs else {})})
                 add(packet, "conversation.json", encode({**room, "turns": transcript}))
                 add(packet, "manifest.json", encode(manifest))
             return stream.getvalue()

@@ -82,9 +82,11 @@ class CandidateAcceptanceError(SnapshotError):
 class RoomCrew:
     def __init__(self, run_id, path, thread, history, provider, settings, tracer,
                  service, should_cancel, human_handler, record_event, room_events, extensions, child_checks,
-                 delivery=None, *, role_session=None, on_assistant_stream=None):
+                 delivery=None, *, role_session=None, on_assistant_stream=None, input_tools=()):
         self.role_session = role_session
         self.on_assistant_stream = on_assistant_stream
+        self.input_tools = tuple(input_tools)
+        self.input_reads = frozenset(t.name for t in self.input_tools if t.name != "materialize_attachment")
         self.inherited_review = None
         self.run_id = run_id
         self.path = path
@@ -226,7 +228,7 @@ class RoomCrew:
 
     @cached_property
     def capabilities(self):
-        ordinary_tools = "、".join(s.name for s in build_default_registry().specs())
+        ordinary_tools = "、".join([*build_default_registry().names(), *(t.name for t in self.input_tools)])
         return ("成员工作阶段始终使用实际注册的工具：" + ordinary_tools +
                              "。可以读取现有文件、定位和修改实现、运行 Python 3 并测试。"
                              "缺少报告会产生进度提醒。最终文字交接和负责人最终汇总不调用工具。")
@@ -466,7 +468,7 @@ class RoomCrew:
             # A member may publish during this same tool batch.
             return
         observations = [o for o in record.observations
-                        if o.source in _PROJECT_READS | _KNOWLEDGE_READS | {"read_handoff_report"}]
+                        if o.source in _PROJECT_READS | _KNOWLEDGE_READS | self.input_reads | {"read_handoff_report"}]
         if not observations:
             return
         # Step latency includes synchronous member runs; only the lead's own
@@ -493,7 +495,7 @@ class RoomCrew:
                 # Only the lead's next compact prompt may see this receipt.
                 self.private_read = body if len(body.encode()) <= 12000 else _clip(body, 8500) + " … " + body[-800:]
                 continue
-            path = obs.meta.get("path") or parameters.get("path")
+            path = obs.meta.get("attachment_id") or obs.meta.get("path") or parameters.get("path")
             path = os.path.normpath(path) if isinstance(path, str) and path else "."
             task = parameters.get("task_id") if obs.source == "read_handoff_report" else None
             if not isinstance(task, str):
@@ -541,6 +543,9 @@ class RoomCrew:
     @cached_property
     def coordinator_schemas(self):
         registry = build_default_registry(read_only=True)
+        for tool in self.input_tools:
+            if tool.name in self.input_reads:
+                registry.add(tool)
         registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(self.lead, registry, read_only=True)
@@ -1160,7 +1165,9 @@ class RoomCrew:
             instruction += "\n已达到本次勘察的建议用量。请核对剩余预算，优先查明影响分工的缺口。"
         elif inspect_public and len(self.navigation_recent) >= 3:
             instruction += "\n已收集多项背景信息。只补足直接影响分工的缺口，否则现在进行委派。"
-        allowed = controls | _PROJECT_READS if inspect_public else controls
+        allowed = controls | self.input_reads
+        if inspect_public:
+            allowed |= _PROJECT_READS
         if inspect_reports:
             allowed |= {"read_handoff_report"}
         if inspect_public and self.role_session and self.lead in self.role_session.saved:
@@ -1889,6 +1896,9 @@ class RoomCrew:
         handoff_seconds = 0 if allocated.seconds_left is None else min(30, allocated.seconds_left * .1)
         human_deadline = None if allocated.seconds_left is None else time.monotonic() + allocated.seconds_left - handoff_seconds
         registry = build_default_registry(read_only=self.read_only)
+        for tool in self.input_tools:
+            if not self.read_only or tool.name in self.input_reads:
+                registry.add(tool)
         if self.diagnostics.files:
             registry.add(self.diagnostics.tool())
         if self.role_session:
@@ -2027,6 +2037,8 @@ class RoomCrew:
                 repair_context = ("请在冻结工作目录逐条独立运行这些原检查：" + _json(commands) +
                                   "。对原失败涉及的产品行为另行执行断言，并把结论与回执逐项签署。\n" + repair_context)
         member_context = self._member_context(role, parent.objective, expectations, required, spec, repair_context, review)
+        if self.input_tools:
+            member_context += "\n本次任务附有用户提供的原始资料。用 list_attachments 查看可访问的文件和 ID，再用 read_attachment 读取。"
         if chat_message:
             member_context += "\n负责人发给你的群消息：" + chat_message
         if self.read_only:

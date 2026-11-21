@@ -7,6 +7,7 @@ const studioAssistant = (() => {
   {icon:'branch', name:'分派任务', description:'从这里跟进交付', prompt:'请找一位合适的现有角色检查当前项目的开发环境，写一份维护清单，并把结果带回这里。'}
  ];
  const indexedRoles = new Set();
+ const attachmentKey = 'assistant';
  let detail=null, head=null, loaded=false, sending=false, reading=false, choosing=false;
  let epoch=0, loadError='', sendError='', request=null, draft='', workspace='', selectedInteraction='';
  const active = () => Boolean(detail && runActive(detail.run));
@@ -61,7 +62,7 @@ const studioAssistant = (() => {
   const status = waiting ? '<p class="assistant-note">等待你的答复</p>' : pending ? '<p class="assistant-pending" role="status"><i></i>正在处理…</p>' :
    failed || (!turn.answer && !entities && !dispatches) ? `<p class="assistant-note">${e(labels[turn.status] || '本轮已结束')}${error ? ' · '+e(error) : ''} · <a href="#run/${encodeURIComponent(turn.run_id)}">查看运行记录</a></p>` : '';
   return `<article class="assistant-turn" data-key="assistant-turn-${e(turn.run_id)}">
-   <div class="assistant-user"><span class="prompt-sign" aria-hidden="true">›</span><div><span class="sr-only">你</span><p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p></div></div>
+   <div class="assistant-user"><span class="prompt-sign" aria-hidden="true">›</span><div><span class="sr-only">你</span>${turn.user?`<p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p>`:''}${studioAttachments.history(turn)}</div></div>
    <div class="assistant-reply"><div class="assistant-byline"><span class="small-terminal" aria-hidden="true">${icon('terminal')}</span><strong>工作室助手</strong><a href="#run/${encodeURIComponent(turn.run_id)}" title="查看本轮运行详情">本轮详情 ${icon('chevron')}</a></div>
    ${activity}
    ${turn.answer ? `<div class="assistant-answer prose">${markdown(turn.answer,turn)}</div>` : ''}
@@ -83,13 +84,14 @@ const studioAssistant = (() => {
   const runningId = active() ? detail.run.id : null;
   return `<form class="assistant-composer" id="assistant-form" data-key="assistant-form">
    <label class="sr-only" for="assistant-message">给工作室助手发消息</label>
-   <div class="assistant-input-row"><span class="prompt-sign" aria-hidden="true">›</span><textarea id="assistant-message" name="message" rows="2" maxlength="8000" placeholder="描述你的目标，也可以点名角色或群聊…" required></textarea></div>
+   <div class="assistant-input-row"><span class="prompt-sign" aria-hidden="true">›</span><textarea id="assistant-message" name="message" rows="2" maxlength="8000" placeholder="描述你的目标，也可以点名角色或群聊…"></textarea></div>
+   ${studioAttachments.picker(attachmentKey,sending)}
    <div class="assistant-tools"><div class="assistant-context">
    <button type="button" class="assistant-folder" data-assist-pick aria-label="选择工作区" title="${e(path || '选择本机项目文件夹')}" ${choosing||sending||active()?'disabled':''}>${icon('folder')}<span>${e(choosing?'正在选择…':folder)}</span></button>
    <select name="interaction_mode" class="assistant-interaction" aria-label="执行方式" ${sending||active()?'disabled':''}>${interactionOptions(interactionMode())}</select>
    ${ready && state.config.model ? `<span class="assistant-model" title="当前模型"><i></i>${e(state.config.model)}</span>`:''}
    </div><div class="assistant-send-tools">${runningId?'<span class="assistant-state">运行中</span>':'<span class="assistant-shortcut">Shift + Enter 换行</span>'}
-   <button class="assistant-send" type="submit" aria-label="发送消息" title="发送消息（Enter）" ${locked || !draft.trim()?'disabled':''}>${icon('arrow')}</button></div></div>
+   <button class="assistant-send" type="submit" aria-label="发送消息" title="发送消息（Enter）" ${locked || (!draft.trim() && !studioAttachments.count(attachmentKey))?'disabled':''}>${icon('arrow')}</button></div></div>
    ${!ready?'<p class="assistant-config-note">发送消息需要配置 DeepSeek。<button type="button" data-action="connection">查看连接设置</button></p>':''}
    ${sendError?`<p class="assistant-error" role="alert">${e(sendError)}</p>`:''}</form>`;
  }
@@ -158,23 +160,26 @@ const studioAssistant = (() => {
  async function send(form) {
   if (sending || active() || !loaded || loadError || !state.config?.provider_ready) return;
   const message=form.elements.message.value.trim();
-  if (!message) return;
+  if (!message && !studioAttachments.count(attachmentKey)) return;
   const path = workspace;
   const mode=form.elements.interaction_mode.value;
-  if (!request || request.message!==message || request.workspace!==path || request.interactionMode!==mode) {
-   request={id:crypto.randomUUID(),message,workspace:path,parent:head,interactionMode:mode};
-  }
-  const payload={request_id:request.id,message,parent_run_id:request.parent,interaction_mode:request.interactionMode};
-  if (request.workspace) payload.workspace_path=request.workspace;
   epoch++; sending=true; sendError=''; draw();
   try {
+   const attachments=await studioAttachments.prepare(attachmentKey);
+   const ids=attachments.map(item=>item.id);
+   const fingerprint=JSON.stringify([message,path,mode,ids]);
+   if (request?.fingerprint!==fingerprint) request={id:crypto.randomUUID(),parent:head,fingerprint};
+   const payload={request_id:request.id,message,parent_run_id:request.parent,interaction_mode:mode};
+   if (path) payload.workspace_path=path;
+   if (ids.length) payload.attachments=ids;
    const data=await api('/api/superagent/messages',{method:'POST',body:JSON.stringify(payload)});
+   studioAttachments.clear(attachmentKey);
    if (draft.trim()===message) draft='';
    request=null; head=data.run.id; selectedInteraction='';
    // Keep earlier turns and display the accepted message while the first poll arrives.
    const turns=messages().filter(turn=>turn.run_id!==head);
    detail={run:{interaction_mode:mode,...data.run},conversation:{...detail?.conversation,workspace_path:workspace || detail?.conversation?.workspace_path,
-    turns:[...turns,{run_id:head,user:message,status:data.run.status,events:[],artifacts:[]}]}};
+    turns:[...turns,{run_id:head,user:message,message_attachments:attachments,status:data.run.status,events:[],artifacts:[]}]}};
    workspace=''; loaded=false;
    draw(true);
   } catch(error) {
@@ -207,11 +212,18 @@ const studioAssistant = (() => {
    selectedInteraction=event.target.value;
   }
  });
+ function updateSendButton(form) {
+  const btn=form.querySelector('.assistant-send');
+  btn.disabled=(!draft.trim() && !studioAttachments.count(attachmentKey)) || !state.config?.provider_ready || !loaded || Boolean(loadError) || sending || active();
+ }
  document.addEventListener('input',event=>{
   if (event.target.id!=='assistant-message') return;
   draft=event.target.value;
-  const btn=event.target.form.querySelector('.assistant-send');
-  btn.disabled=!draft.trim() || !state.config?.provider_ready || !loaded || Boolean(loadError) || sending || active();
+  updateSendButton(event.target.form);
+ });
+ document.addEventListener('attachmentschange',event=>{
+  const form=event.target.closest('#assistant-form');
+  if (form) updateSendButton(form);
  });
  document.addEventListener('keydown',event=>{
   if (event.target.id==='assistant-message' && event.key==='Enter' && !event.shiftKey && !event.isComposing && event.keyCode!==229) {

@@ -2,6 +2,7 @@
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
+from io import BytesIO
 import threading
 import time
 import unittest
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 from miniagent.config import Settings
 from miniagent.studio_service import StudioService
+from miniagent.studio_uploads import save_upload
 from tests.support import cleanup, make_temp_dir
 from tests.test_studio_conversations import RecordingProvider, fresh, msg
 from tests.test_studio_service import finished
@@ -74,6 +76,32 @@ class StudioDispatchTest(unittest.TestCase):
             follow, = self.settled(again)
         self.assertEqual(follow['conversation_id'], row['conversation_id'])
         self.assertEqual(self.service.detail(follow['child_run_id'])['conversation']['turns'][0]['run_id'], row['child_run_id'])
+
+    def test_dispatch_forwards_current_originals_or_explicit_earlier_files(self):
+        earlier = save_upload(self.runs, '旧资料.txt', BytesIO(b'earlier original'), 16)
+        current = save_upload(self.runs, '新资料.txt', BytesIO(b'current original'), 16)
+        first = {**message('给你一份参考资料。'), 'attachments': [earlier['id']]}
+        with patch('miniagent.studio_service.DeepSeekProvider', return_value=RecordingProvider([{'text': '收到。'}])):
+            source = self.service.send_superagent(first)['id']
+            finished(self.service, source)
+
+        parent = RecordingProvider([route(), {'text': '已转交。'}])
+        child = RecordingProvider([tool('read_attachment', id=current['id']), {'text': '已读取。'}])
+        with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[parent, child]):
+            source = self.service.send_superagent({**message('请小维看本条附件。', source),
+                                                   'attachments': [current['id']]})['id']
+            row, = self.settled(source)
+        self.assertIn('current original', str(child.requests))
+        self.assertNotIn(earlier['id'], str(child.requests))
+        turn = self.service.detail(row['child_run_id'])['conversation']['turns'][-1]
+        self.assertEqual(turn['message_attachments'], [current])
+        parent = RecordingProvider([route(attachment_ids=[earlier['id']]), {'text': '已转交原件。'}])
+        child = RecordingProvider([tool('read_attachment', id=earlier['id']), {'text': '已读取。'}])
+        with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[parent, child]):
+            source = self.service.send_superagent(message('让小维也看看旧资料。', source))['id']
+            row, = self.settled(source)
+        self.assertIn('earlier original', str(child.requests))
+        self.assertEqual(self.service.detail(row['child_run_id'])['conversation']['turns'][-1]['message_attachments'], [earlier])
 
     def test_switching_workspace_does_not_reuse_role_project(self):
         rooms = []
