@@ -187,6 +187,14 @@ Acceptance = Callable[[Path], tuple[bool, str]]   # (workspace) -> (ok, reason)
 
 M0-02 已接入独立 AcceptanceSpec/Report、文件内容/hash 检查与回执闭包。完整 API、CLI 配置和 POSIX 文件检查限制见 [M0-02 说明](m0-02-acceptance-and-metrics.md)。
 
+### 执行中反复得到同一个失败结果
+
+一次编辑在检查版本和唯一匹配后，若发现替换前后的内容相同，工具返回 `no_change`、文件路径和当前 SHA-256。全量覆盖相同字节也返回这个回执。原文件的修改时间得以保留，该次调用的产物列表为空。Pi 的编辑工具同样在实际写入前比较结果。Studio 继续采用精确匹配与预期版本校验。[Pi 的编辑实现](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/src/core/tools/edit-diff.ts#L401-L403) · [Pi 的回归用例](https://github.com/earendil-works/pi/blob/f6d0c2f9b6ffbcb00c5da52e7e88570539c78bde/packages/coding-agent/test/tools.test.ts#L1664-L1686)
+
+`run_shell` 用 Bash 的 `pipefail` 执行管道。比如 `sh check.sh 2>&1 | tail -2` 中检查进程退出 7，即使两行输出都正常显示，工具仍会报告失败及退出码 7。连续截取多段诊断时，已有的失败也会进入最终回执。调用者可用 `if` 或 `||` 明确处理预期内的失败。GitHub Actions Runner 同样为 Bash 启用 `pipefail`。Studio 允许后续展示命令执行完毕，方便模型同时看到退出码和断言输出。[GitHub Actions Runner 的 Bash 参数](https://github.com/actions/runner/blob/v2.328.0/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs)
+
+在私聊或群成员的任务中，同一项检查在读取、调试、编辑等多个步骤后仍反复报告相同失败，运行时会把失败断言、期间观察到的文件版本和仍缺少的已声明文件一并送入下一次模型决策。缺件检查只查看当前工作副本中的路径，不提前执行验收。助手可以按证据调整诊断、修改实现或先补齐其他交付。提示和所在步骤记入 `trace.jsonl` 的 `progress_advisory` 事件。重复结果不会触发任务超时、轮数终止或工具回收。结果指纹的用法参考了 OpenClaw 对工具有无进展的检测。[OpenClaw 的工具循环检测](https://github.com/openclaw/openclaw/blob/v2026.3.8/src/agents/tool-loop-detection.ts) · [上游回归用例](https://github.com/openclaw/openclaw/blob/v2026.3.8/src/agents/tool-loop-detection.test.ts)
+
 ---
 
 ## 6. 单步测试方法

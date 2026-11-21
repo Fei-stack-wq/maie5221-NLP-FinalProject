@@ -160,6 +160,39 @@ class CodingToolsTest(unittest.TestCase):
         self.assertEqual(result.meta["artifacts"], [path.name])
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
 
+    def test_identical_replacement_and_overwrite_keep_original_inode_and_mtime(self):
+        content = "\ufeffconst result = '通过';\r\n"
+        path = self.seed(content)
+        before = path.stat()
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        for tool, arguments in (("edit_file", {"old_text": "通过", "new_text": "通过"}),
+                                ("write_file", {"content": content})):
+            with self.subTest(tool=tool):
+                receipt = self.call(tool, path=path.name, **arguments)
+                self.assertFalse(receipt.ok)
+                self.assertEqual(receipt.meta["code"], "no_change")
+                self.assertIs(receipt.meta["changed"], False)
+                self.assertEqual(receipt.meta["sha256"], digest)
+                self.assertNotIn("artifacts", receipt.meta)
+                self.assertEqual(path.stat().st_ino, before.st_ino)
+                self.assertEqual(path.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(path.read_bytes(), content.encode())
+
+    def test_identical_requests_still_check_version_and_unique_match(self):
+        path = self.seed("twice twice")
+        for args, code in (({"old_text": "twice", "new_text": "twice"}, "ambiguous_edit"),
+                           ({"old_text": "absent", "new_text": "absent"}, "text_not_found"),
+                           ({"old_text": "twice twice", "new_text": "twice twice",
+                             "expected_sha256": "0"*64}, "file_conflict")):
+            with self.subTest(code=code):
+                self.assertEqual(self.call("edit_file", path=path.name, **args).meta["code"], code)
+        self.assertEqual(self.call("write_file", path=path.name, content="twice twice",
+                                   expected_sha256="0"*64).meta["code"], "file_conflict")
+        created = self.call("write_file", path="empty.txt", content="")
+        self.assertTrue(created.ok, created.content)
+        self.assertEqual(created.meta["artifacts"], ["empty.txt"])
+        self.assertEqual(self.call("write_file", path="empty.txt", content="").meta["code"], "no_change")
+
     def test_ambiguous_and_overlapping_matches_do_not_mutate(self):
         for content, old in (("target + target", "target"), ("aaa", "aa")):
             with self.subTest(content=content):

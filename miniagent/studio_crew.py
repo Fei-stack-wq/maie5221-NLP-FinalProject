@@ -2381,6 +2381,7 @@ class RoomCrew:
         try:
             with managed_member_processes(member.sandbox) as process_cleanup:
                 result = member.run(objective, execution=execution, budget=allocated,
+                                    deliverable_paths=tuple(paths),
                                     steering=self.steering.subscribe(role, execution.task.task_id) if self.steering else None,
                                     acceptance=build_checks(spec.get("files", []), spec.get("checks", [])),
                                     conversation_context=member_context, step_policy=member_policy,

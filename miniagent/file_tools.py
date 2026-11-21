@@ -64,6 +64,11 @@ def _expected(args: dict, actual: str | None) -> ToolResult | None:
     return None
 
 
+def _no_change(path: str, sha256: str) -> ToolResult:
+    return ToolResult.failure(f"[no_change] {path} 内容未变化，已跳过写入（sha256={sha256}）。",
+                              code="no_change", changed=False, path=path, sha256=sha256)
+
+
 def _atomic_replace(path: Path, data: bytes, version) -> None:
     # Temporary files are colocated so replacement is atomic on the same volume.
     descriptor, temporary = tempfile.mkstemp(prefix=".miniagent-write-", dir=path.parent)
@@ -151,21 +156,23 @@ def write_file(ctx: ToolContext, args: dict) -> ToolResult:
     if len(content) > MAX_WRITE_CHARS:
         return ToolResult.failure(f"内容过长（上限 {MAX_WRITE_CHARS} 字符）；创建首段后使用 append_file，或拆分文件。")
     path = ctx.sandbox.resolve(args["path"])
+    data = content.encode("utf-8")
+    sha256 = hashlib.sha256(data).hexdigest()
     with _lock(path):
         version = _path_version(path)
         actual = None
-        if "expected_sha256" in args and version is not None:
+        if version is not None and ("expected_sha256" in args or version[2] == len(data)):
             current, version = _load_for_edit(path)
             actual = hashlib.sha256(current).hexdigest()
         conflict = _expected(args, actual)
         if conflict:
             return conflict
-        data = content.encode("utf-8")
+        if actual == sha256:
+            return _no_change(args["path"], sha256)
         ctx.sandbox.ensure_parent(path)
         _atomic_replace(path, data, version)
-    sha256 = hashlib.sha256(data).hexdigest()
     return ToolResult.success(f"已写入 {args['path']}（{len(content)} 字符，sha256={sha256}）",
-                              bytes=len(data), path=args["path"], sha256=sha256, artifacts=[args["path"]])
+                              changed=True, bytes=len(data), path=args["path"], sha256=sha256, artifacts=[args["path"]])
 
 
 def edit_file(ctx: ToolContext, args: dict) -> ToolResult:
@@ -188,13 +195,15 @@ def edit_file(ctx: ToolContext, args: dict) -> ToolResult:
             return ToolResult.failure("替换未执行：old_text 必须在原文件中恰好匹配一次；请读取并增加匹配上下文。",
                                       code="ambiguous_edit" if occurrences else "text_not_found",
                                       matches=max(occurrences, 2 if ambiguous else 0), sha256=original_hash)
+        if old == new:
+            return _no_change(args["path"], original_hash)
         updated = (text[:first] + new + text[first + len(old):]).encode("utf-8")
         if len(updated) > MAX_EDIT_BYTES:
             return ToolResult.failure(f"替换后文件超过 {MAX_EDIT_BYTES} 字节，未修改原文件。")
         _atomic_replace(path, updated, version)
     sha256 = hashlib.sha256(updated).hexdigest()
     return ToolResult.success(f"已精确替换 {args['path']} 的 1 处内容（sha256={sha256}）",
-                              path=args["path"], sha256=sha256, previous_sha256=original_hash,
+                              changed=True, path=args["path"], sha256=sha256, previous_sha256=original_hash,
                               bytes=len(updated), artifacts=[args["path"]])
 
 
@@ -216,5 +225,5 @@ def append_file(ctx: ToolContext, args: dict) -> ToolResult:
         _atomic_replace(path, updated, version)
     sha256 = hashlib.sha256(updated).hexdigest()
     return ToolResult.success(f"已追加到 {args['path']}（sha256={sha256}）",
-                              path=args["path"], sha256=sha256, previous_sha256=original_hash,
+                              changed=True, path=args["path"], sha256=sha256, previous_sha256=original_hash,
                               bytes=len(updated), artifacts=[args["path"]])

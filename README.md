@@ -80,7 +80,9 @@ python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-p
 
 没有配置独立验收时，答复和产物仍保留，但结果为 `unverified`，不会计入成功。原 `examples/tasks.jsonl` 和无验收的委派演示属于这种情况。文件检查器当前需要 POSIX no-follow 能力，Windows 上会明确报错；接口、配置与平台边界见 [M0-02 说明](docs/m0-02-acceptance-and-metrics.md)。
 
-编码成员可用 `run_python` 执行 Python，或在 macOS、Linux 上用 `run_shell` 启动非交互式 `/bin/sh`。两个工具共用工具时限和项目环境，PATH 优先使用 Studio 的 Python 解释器，子进程仅继承选定的系统变量。在 macOS、Linux 上，两者共用输出限额和进程组清理，均记录退出码、耗时和标准输出、标准错误的首尾片段。Shell 还可指定项目内的相对工作目录。Windows 的 Python 工具沿用宿主原生子进程。成员需要跨步使用本地测试服务时，请把服务输出重定向到项目日志。命令以 Studio 进程的系统用户权限运行，工作目录用于定位项目文件。
+编码成员可用 `run_python` 执行 Python，或在 macOS、Linux 上用 `run_shell` 启动非交互式 Bash。两个工具共用工具时限和项目环境，PATH 优先使用 Studio 的 Python 解释器，子进程仅继承选定的系统变量。在 macOS、Linux 上，两者共用输出限额和进程组清理，均记录退出码、耗时和标准输出、标准错误的首尾片段。Shell 还可指定项目内的相对工作目录。Windows 的 Python 工具沿用宿主原生子进程。成员需要跨步使用本地测试服务时，请把服务输出重定向到项目日志。命令以 Studio 进程的系统用户权限运行，工作目录用于定位项目文件。
+
+`run_shell` 对管道启用 Bash 的 `pipefail`。例如 `python3 check.py 2>&1 | tail -5; echo done` 仍会输出最后五行和 `done`。若测试退出 7，工具会报告退出码 7。每个管道按最右侧失败阶段确定状态。工具记录第一个未处理的管道失败码，以及整段 Shell 的最终退出码。Shell 最终返回 0 时采用该管道失败码。脚本可以在管道所在作用域用 `if` 或 `||` 显式处理预期失败。命令替换会开启子 Shell，例如 `log=$(check | tail -5 || echo recovered)` 会在子 Shell 内执行恢复。某些 Bash 版本会先记录内部失败，再执行外层赋值语句的恢复。使用 `head` 提前关闭读取端时，上游可能收到 SIGPIPE，Shell 会按同一规则处理。前台命令和通过 `poll_process` 领取的后台命令使用相同规则。实现参考了 GitHub Actions Runner 的 Bash 参数以及 mvdan/sh 的管道回归，并为单次运行补充了跨子 Shell 的退出码记录。[GitHub Actions Runner 源码](https://github.com/actions/runner/blob/v2.328.0/src/Runner.Worker/Handlers/ScriptHandlerHelpers.cs#L11-L18) · [mvdan/sh 管道与退出码测试](https://github.com/mvdan/sh/blob/master/interp/interp_test.go#L3056-L3096)
 
 每次运行在 `runs/<run_id>/` 下留下：
 

@@ -23,7 +23,7 @@ from .shell_tool import CommandSessions
 from .compaction import RollingCompactor
 from .request_window import fit_history, output_headroom
 from .context_window import ContextLimitError, TaskTokenLimitError, UsageAnchor
-from .acceptance import AcceptanceInput, bind, evaluate
+from .acceptance import AcceptanceInput, bind, evaluate, missing_file_probe
 from .metrics import Tracer
 from .providers import Provider, ProviderError, provider_configuration
 from .rao import (
@@ -195,6 +195,7 @@ class Agent:
         execution: ExecutionHandle | None = None,
         *,
         conversation_context: str = "",
+        deliverable_paths: tuple[str, ...] = (),
         system_prompt: str | None = None,
         before_answer: Callable[[], str | PendingPeerReview | None] | None = None,
         step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
@@ -400,6 +401,7 @@ class Agent:
             self.sandbox.command_sessions = CommandSessions()
         try:
             acceptance = bind(acceptance, self.sandbox.root, task_id=task_id, objective=task)
+            self.unit.missing_deliverables = missing_file_probe(acceptance, self.sandbox.root, deliverable_paths)
             while True:
                 if preview:
                     preview.close()
@@ -927,6 +929,8 @@ class Agent:
             return
         if record.host_handoff:
             self.tracer.event("bound_handoff_dispatched", **identity, step=record.step, **record.host_handoff)
+        if record.progress_advisory:
+            self.tracer.event("progress_advisory", **identity, step=record.step, message=record.progress_advisory)
         self.tracer.event(
             "step",
             **identity,
@@ -954,8 +958,10 @@ class Agent:
 
     def _trace_tool(self, identity, step, obs, operation):
         command_metrics = {}
+        if operation in {"write_file", "edit_file"} and obs.meta.get("code") == "no_change":
+            command_metrics["changed"] = False
         if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:
-            metrics = ("exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
+            metrics = ("exit_code", "pipeline_exit_code", "shell_exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
                        "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state", "replayed_tool_call_id")
             command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
         if obs.source == operation and obs.ok:

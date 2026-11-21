@@ -109,6 +109,40 @@ def _parent_fd(root_fd: int, parts: tuple[str, ...]) -> int:
         raise
 
 
+def missing_file_probe(binding: AcceptanceBinding | None, workspace: Path,
+                       assigned_paths: tuple[str, ...] = ()) -> Callable[[], list[str]] | None:
+    """Inspect declared output paths on demand, without invoking an acceptance check."""
+    checker = binding.evaluator if binding else None
+    declared = checker.names if isinstance(checker, _FilesAcceptance) else getattr(checker, "required_paths", ())
+    names = tuple(dict.fromkeys(_relative_name(name) for name in (*assigned_paths, *declared)))
+    if not names:
+        return None
+
+    def missing() -> list[str]:
+        absent = []
+        if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+            raise OSError("no-follow file inspection is unavailable")
+        root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for name in names:
+                parts = Path(name).parts
+                try:
+                    parent = _parent_fd(root_fd, parts[:-1])
+                    try:
+                        info = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False)
+                    finally:
+                        os.close(parent)
+                    if not stat.S_ISREG(info.st_mode):
+                        absent.append(name)
+                except (FileNotFoundError, NotADirectoryError):
+                    absent.append(name)
+        finally:
+            os.close(root_fd)
+        return absent
+
+    return missing
+
+
 def _read_regular(workspace: Path, name: str) -> bytes | None:
     """Read a stable regular file through no-follow directory descriptors.
 

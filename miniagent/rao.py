@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from .config import Limits
 from .providers import DeepSeekProvider, Provider
 from .sandbox import Sandbox, SandboxError
+from .tool_progress import ToolProgress
 from .studio_reviews import REVIEW_REQUEST_SCHEMA
 from .schemas import LLMResponse, RequestAttempts, ToolCall, ToolResult, ToolSpec, Usage, UsageSource
 from .tools import ToolContext, ToolRegistry
@@ -329,6 +330,7 @@ class RAOState(BaseModel):
     step_index: int = 0
     history: list[dict[str, Any]] = Field(default_factory=list)
     scratch: dict[str, Any] = Field(default_factory=dict)
+    _tool_progress: ToolProgress = PrivateAttr(default_factory=ToolProgress)
 
 
 @dataclass(frozen=True)
@@ -416,6 +418,8 @@ def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]
         for question, reply in state.scratch.get("human_replies", []):
             messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})
         messages.extend(state.scratch.get("live_user_messages", ()))
+        if policy.phase == "work" and state._tool_progress.current_advisory:
+            messages.append({"role": "user", "content": state._tool_progress.current_advisory})
         if feedback := state.scratch.get("delivery_feedback"):
             messages.append({"role": "user", "content": feedback})
     elif checkpoint := state.scratch.get("work_checkpoint"):
@@ -457,6 +461,7 @@ class StepRecord(BaseModel):
     recoverable_output_length: bool = False
     unstructured_tool_call: bool = False
     host_handoff: dict[str, str] | None = None
+    progress_advisory: str | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -584,6 +589,7 @@ class RAOUnit:
         self.action_recorder = action_recorder
         self.should_cancel = should_cancel
         self.steering_pending: Callable[[], bool] | None = None
+        self.missing_deliverables: Callable[[], list[str]] | None = None
 
     # ------------------------------------------------------------------ 工具
     def tool_specs(self, allowed_tools: frozenset[str] | None = None,
@@ -964,7 +970,7 @@ class RAOUnit:
     # --------------------------------------------------------------- Observe
     def _observe(self, result: ToolResult, action: Action, step_id: str) -> Observation:
         artifacts = list(result.meta.get("artifacts") or [])
-        if (not artifacts and action.tool not in {"read_file", "read_lines", "read_source", "list_dir", "find_files", "search_files"}
+        if (result.ok and not artifacts and action.tool not in {"read_file", "read_lines", "read_source", "list_dir", "find_files", "search_files"}
                 and isinstance(result.meta.get("path"), str)):
             artifacts = [result.meta["path"]]
         error_class = None if result.ok else classify_failure(result.content)
@@ -1207,11 +1213,18 @@ class RAOUnit:
         # Superseded proposals stay in the transcript for protocol pairing.
         # The step verdict belongs to the action that the runtime executed.
         outcomes = dispatched if host_handoff else observations
+        advisory = None
+        if not host_handoff and not terminate and outcomes:
+            advisory = state._tool_progress.observe_batch(
+                decision.actions, outcomes, self.loop_warn, self.missing_deliverables)
+            if advisory:
+                state.history.append({"role": "user", "content": advisory})
         failed = [obs for obs in outcomes if not obs.ok]
         return StepRecord(
             step=state.step_index,
             decision_kind=kind,
             host_handoff=host_handoff,
+            progress_advisory=advisory,
             tool_names=[obs.source for obs in observations],
             observations=observations,
             ok=not failed,

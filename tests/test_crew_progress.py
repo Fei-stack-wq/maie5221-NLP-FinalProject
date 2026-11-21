@@ -1187,7 +1187,10 @@ print("FAIL lines:", [line for line in lines if "FAIL" in line] or "none")
             result = registry.dispatch("run_shell", args, ctx)
             self.observe("run_shell", result.content, ok=result.ok, args=args, meta=result.meta)
             return result
-        self.assertTrue(run(cmd + " 2>&1 | tail -80").ok)
+        filtered_failure = run(cmd + " 2>&1 | tail -80")
+        self.assertFalse(filtered_failure.ok)
+        self.assertEqual(filtered_failure.meta["exit_code"], 1)
+        self.assertIn("ValueError: wrong value", filtered_failure.content)
         [pending] = self.p.evidence()["pending_verification"]
         self.assertTrue(self.p.blocked_reason())
 

@@ -97,6 +97,53 @@ class ShellToolTest(unittest.TestCase):
                 self.assertGreater(result.meta["stderr_bytes"], 249999)
                 self.assertGreater(result.meta["stdout_bytes"], 119999)
 
+    def test_filtered_test_failure_survives_sed_tail_and_a_successful_epilogue(self):
+        project = self.root / "project"
+        project.mkdir()
+        (project / "check.py").write_text(
+            "import sys\nprint('[7] check')\nprint('FAIL snapshot')\n"
+            "print('[8] next')\nprint('51 passed, 1 failed')\nsys.exit(23)\n")
+        result = self.run_command(
+            r"cd project && python3 check.py 2>&1 | sed -n '/\[7\]/,/\[8\]/p'; "
+            "python3 check.py 2>&1 | tail -1; echo collected")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.meta["exit_code"], 23)
+        self.assertEqual(result.meta["shell_exit_code"], 0)
+        self.assertEqual(result.meta["pipeline_exit_code"], 23)
+        for diagnostic in ["FAIL snapshot", "51 passed, 1 failed", "collected"]:
+            self.assertIn(diagnostic, result.content)
+
+    def test_subshells_report_pipeline_failures_without_contaminating_stdout(self):
+        for command, expected in [("{ (exit 31) | tail -1; }; printf done", "done"),
+                                  ("( (exit 31) | tail -1 ); printf done", "done"),
+                                  ('log=$({ echo diagnostic; exit 31; } | tail -1); printf "%s" "$log"', "diagnostic")]:
+            with self.subTest(command=command):
+                result = self.run_command(command)
+                self.assertFalse(result.ok)
+                self.assertEqual(result.meta["exit_code"], 31)
+                self.assertEqual(result.meta["shell_exit_code"], 0)
+                self.assertEqual(result.content.split("stdout:\n")[1], expected)
+
+    def test_rightmost_failing_stage_and_final_shell_exit_are_distinct(self):
+        result = self.run_command("(exit 2) | (exit 11) | tail -1; exit 17")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.meta["exit_code"], 17)
+        self.assertEqual(result.meta["shell_exit_code"], 17)
+        self.assertEqual(result.meta["pipeline_exit_code"], 11)
+
+    def test_shell_conditionals_can_handle_pipeline_failures(self):
+        for command in ["if (exit 7) | tail -2; then exit 1; else echo recovered; fi",
+                        "(exit 7) | tail -2 || echo recovered",
+                        "( (exit 7) | tail -2 ) || echo recovered",
+                        "log=$( (exit 7) | tail -2 || echo recovered ); echo \"$log\"",
+                        "(exit 7); echo recovered:$?",
+                        "echo 'literal | character'; printf '%s\\n' recovered | tail -1"]:
+            with self.subTest(command=command):
+                result = self.run_command(command)
+                self.assertTrue(result.ok, result.content)
+                self.assertEqual(result.meta["exit_code"], 0)
+                self.assertIn("recovered", result.content)
+
     def test_timeout_reaps_the_command_tree(self):
         self.ctx.limits.tool_timeout_seconds = 0.5
         python = ("import subprocess; from pathlib import Path\n"

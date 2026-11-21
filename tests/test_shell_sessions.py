@@ -84,6 +84,18 @@ class ShellSessionTest(unittest.TestCase):
         self.assertFalse((self.root/'leaked').exists())
         self.assertIsNone(self.ctx.sandbox.command_sessions)
 
+    def test_collected_session_preserves_the_filtered_test_exit_code(self):
+        command = "(echo 'FAIL case'; exit 19) | tail -1; echo collected"
+        with managed_member_processes(self.ctx.sandbox):
+            job = self.run_tool("run_shell", command=command, yield_after_seconds=0)
+            if job.meta["process_state"] == "running":
+                job = self.run_tool("poll_process", process_id=job.meta["process_id"], wait_seconds=5)
+            self.assertEqual(job.meta["process_state"], "exited")
+            self.assertFalse(job.ok)
+            self.assertEqual(job.meta["exit_code"], 19)
+            self.assertIn("FAIL case", job.content)
+            self.assertIn("collected", job.content)
+
     def test_agent_protects_time_for_close_and_rejects_uncollected_exit(self):
         action = lambda name, **args: {'tool_calls':[{'name':name,'arguments':args}]}
         provider = ScriptedProvider([action('run_shell', command='sleep 3', timeout=30), {'text':'unfinished'}])

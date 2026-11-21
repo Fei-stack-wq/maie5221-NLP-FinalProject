@@ -19,6 +19,25 @@ from tests.test_studio_service import finished
 
 
 class ActivityTests(unittest.TestCase):
+    def test_no_change_has_no_artifact_and_reports_the_reason_in_the_timeline(self):
+        with TemporaryDirectory() as directory:
+            service = StudioService(Path(directory) / "runs", Settings(api_key="test-key"))
+            self.addCleanup(service.close)
+            script = [{"tool_calls": [{"name": "write_file", "arguments": {"path": "note.md", "content": "ready"}}]},
+                      {"tool_calls": [{"name": "edit_file", "arguments": {"path": "note.md", "old_text": "ready",
+                                                                          "new_text": "ready"}}]},
+                      {"text": "The note exists."}]
+            with patch("miniagent.studio_service.DeepSeekProvider", return_value=ScriptedProvider(script)):
+                run = service.start({"request_id": str(uuid.uuid4()), "mode": "single", "objective": "Prepare a note.",
+                                     "conversation": {"kind": "dm", "intent": "edit", "members": ["worker"], "recipient": "worker"}})
+                detail = finished(service, run["id"])
+            event = next(e for e in detail["events"] if e["kind"] == "tool_result" and e["tool"] == "edit_file")
+            self.assertFalse(event["ok"])
+            self.assertEqual(event["artifacts"], [])
+            call = next(c for c in detail["activity"]["calls"] if c["tool"] == "edit_file")
+            self.assertEqual(call["status"], "failed")
+            self.assertIn("内容未变化", call["error"])
+
     def test_live_call_in_batch_finishes_with_same_identity_and_no_private_payload(self):
         with TemporaryDirectory() as directory:
             service = StudioService(Path(directory) / "runs", Settings(api_key="test-secret-key"))

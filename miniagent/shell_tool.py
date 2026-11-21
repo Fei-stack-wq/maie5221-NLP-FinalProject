@@ -4,9 +4,11 @@ from __future__ import annotations
 import math
 import os
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -151,13 +153,33 @@ def run_shell(ctx: ToolContext, args: dict) -> ToolResult:
     cwd = ctx.sandbox.resolve(args.get("cwd", "."), must_exist=True)
     if not cwd.is_dir():
         return ToolResult.failure("命令工作目录必须是项目中的目录。")
-    argv = ["/bin/sh", "-c", command]
+    bash = shutil.which("bash", path=os.defpath)
+    if bash is None:
+        return ToolResult.failure("run_shell 需要系统 Bash 以保留管道退出码。")
+    argv = [bash, "--noprofile", "--norc", "-E", "-o", "pipefail", "-c", command]
     if "yield_after_seconds" in args:
         sessions = ctx.sandbox.command_sessions
         if sessions is None:
             return ToolResult.failure("此工作区没有活动进程作用域，请省略 yield_after_seconds 以前台执行。")
         return sessions.start(ctx, argv, cwd, args)
-    return run_posix_argv(ctx, argv, cwd, args.get("timeout"))
+    return _run_bash(ctx, argv, cwd, args.get("timeout"))
+
+
+def _run_bash(ctx, argv, cwd, timeout):
+    # ERR fires only for unhandled failures. PIPESTATUS distinguishes pipelines
+    # from ordinary commands whose status a script may inspect in its next line.
+    # Recording the first such failure in a private inherited FD works in ()
+    # and $() too, without consuming their stdout or stopping later diagnostics.
+    with tempfile.TemporaryFile() as status:
+        fd = status.fileno()
+        trap = f"""trap '
+            case ${{#PIPESTATUS[@]}} in
+                1) ;;
+                *) _studio_failed_pipeline=$?
+                   if [[ ! -s /dev/fd/{fd} ]]; then printf "%s\\n" "$_studio_failed_pipeline" >&{fd}; fi ;;
+            esac' ERR
+"""
+        return run_posix_argv(ctx, [*argv[:-1], trap + argv[-1]], cwd, timeout, pipeline_status=status)
 
 
 def command_timeout(ctx, requested):
@@ -171,7 +193,7 @@ def command_timeout(ctx, requested):
 
 
 def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeout=None, *,
-                   failure_evidence_limit=8192) -> ToolResult:
+                   failure_evidence_limit=8192, pipeline_status=None) -> ToolResult:
     try:
         timeout = command_timeout(ctx, requested_timeout)
     except ValueError as exc:
@@ -192,6 +214,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     with subprocess.Popen(
         argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
+        pass_fds=(pipeline_status.fileno(),) if pipeline_status is not None else (),
     ) as process:
         try:
             cancelled = not _drain(process, stdout, stderr, started + timeout, ctx.should_cancel)
@@ -207,7 +230,15 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
                 else:
                     ctx.sandbox.track_shell_group(process.pid)
     elapsed = round((time.monotonic() - started) * 1000)
-    parts = [f"exit_code={process.returncode}"]
+    exit_code = process.returncode
+    pipeline_meta = {}
+    if pipeline_status is not None and not (timed_out or cancelled):
+        saved = os.pread(pipeline_status.fileno(), 4, 0).partition(b"\n")[0]
+        if saved.isdigit() and 0 < int(saved) <= 255:
+            pipeline_meta = {"pipeline_exit_code": int(saved), "shell_exit_code": exit_code}
+            if exit_code == 0:
+                exit_code = int(saved)
+    parts = [f"exit_code={exit_code}"]
     if timed_out or cancelled:
         status = f"命令执行超时（{timeout:g} 秒）" if timed_out else "命令已取消"
         cleanup = f"尚未确认 {pending_children} 个子进程退出" if pending_children else "已停止"
@@ -218,10 +249,10 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     if not stdout.count and not stderr.count and not timed_out:
         parts.append("（无输出）")
     failure_evidence = {}
-    if (process.returncode is not None and process.returncode > 0 and not timed_out and not cancelled
+    if (exit_code is not None and exit_code > 0 and not timed_out and not cancelled
             and (stdout.truncated or stderr.truncated)
             and stdout.complete is not None and stderr.complete is not None):
-        complete = [f"exit_code={process.returncode}"]
+        complete = [f"exit_code={exit_code}"]
         complete.extend(f"{name}:\n{bytes(stream.complete).decode('utf-8', errors='replace')}"
                         for name, stream in [("stdout", stdout), ("stderr", stderr)] if stream.count)
         output = "\n".join(complete)
@@ -230,8 +261,8 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
             # model-facing head/tail display or asserting that the check passed.
             failure_evidence["complete_failure_output"] = output
     return ToolResult(
-        ok=not timed_out and not cancelled and process.returncode == 0, content="\n".join(parts),
-        meta={"exit_code": process.returncode, "elapsed_ms": elapsed, "timeout_s": timeout,
+        ok=not timed_out and not cancelled and exit_code == 0, content="\n".join(parts),
+        meta={"exit_code": exit_code, **pipeline_meta, "elapsed_ms": elapsed, "timeout_s": timeout,
               "timed_out": timed_out, "cancelled": cancelled, "cwd": ctx.sandbox.relative(cwd), "stdout_bytes": stdout.count,
               "stderr_bytes": stderr.count, "truncated": stdout.truncated or stderr.truncated,
               **({"cleanup_pending_children": pending_children} if pending_children else {}),
@@ -261,7 +292,7 @@ class CommandSessions:
         def cancelled():
             return self.stopping.is_set() or bool(ctx.should_cancel and ctx.should_cancel())
         worker = replace(ctx, should_cancel=cancelled)
-        future = self.executor.submit(run_posix_argv, worker, argv, cwd, timeout)
+        future = self.executor.submit(_run_bash, worker, argv, cwd, timeout)
         self.jobs[handle] = (future, args["command"])
         return self.poll(handle, min(wait, timeout))
 

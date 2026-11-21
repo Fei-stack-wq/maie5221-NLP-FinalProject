@@ -316,7 +316,7 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="write_file",
-            description="创建或完整覆盖工作区文本文件（最多 1000000 字符）。局部修改使用 edit_file，分段续写使用 append_file；可提供 expected_sha256 防止覆盖已变化的文件。",
+            description="创建或完整覆盖工作区文本文件（最多 1000000 字符）。内容与原文件相同时返回 no_change。局部修改使用 edit_file，分段续写使用 append_file。可提供 expected_sha256 防止覆盖已变化的文件。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -332,7 +332,7 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="edit_file",
-            description="精确修改文件的一处内容。old_text 必须唯一匹配，保留所有其他字节；修改前先读取。expected_sha256 可防止修改过时版本。",
+            description="精确修改文件的一处内容。old_text 必须唯一匹配，new_text 与它相同时返回 no_change。保留所有其他字节。修改前先读取，expected_sha256 可防止修改过时版本。",
             parameters={
                 "type": "object",
                 "properties": {
@@ -392,10 +392,11 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="run_shell",
-            description="在项目相对目录运行非交互 POSIX shell 命令，可执行测试、构建、管道。"
-                        "返回真实退出码与有界 stdout/stderr。跨轮的本地测试服务应重定向输出。",
+            description="在项目相对目录用非交互 Bash 运行测试、构建和管道，返回退出码与有界 stdout/stderr。"
+                        "管道启用 pipefail，用 sed/tail 截取输出会保留测试失败码。可在管道所在作用域用 if 或 || 处理失败。"
+                        "跨轮的本地测试服务应重定向输出。",
             parameters={"type": "object", "properties": {
-                "command": {"type": "string", "description": "交给 /bin/sh -c 的命令"},
+                "command": {"type": "string", "description": "交给 Bash 的命令，可包含管道和多行脚本"},
                 "cwd": {"type": "string", "description": "项目内已有的相对目录，默认项目根目录"},
                 "timeout": {"type": "number", "description": "默认 120 秒，可显式申请更长；受部署上限与任务剩余时间约束。"},
                 "yield_after_seconds": {"type": "number", "description": "成员可选提前返回的等待秒数；未结束则返回进程句柄，须用 poll_process 领取真实退出码。"},

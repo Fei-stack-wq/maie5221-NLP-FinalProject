@@ -1,8 +1,23 @@
 """User-supplied, declarative checks on the delivered workspace."""
 import json
 import re
+from dataclasses import dataclass
 
-from .acceptance import _read_regular, _relative_name, accept_files
+from .acceptance import Acceptance, _read_regular, _relative_name, accept_files
+
+
+@dataclass(frozen=True)
+class _StudioChecks:
+    checks: tuple[tuple[str, Acceptance], ...]
+    required_paths: tuple[str, ...]
+
+    def __call__(self, root):
+        failures = []
+        for label, check in self.checks:
+            passed, reason = check(root)
+            if not passed:
+                failures.append(f"{label} · {reason}")
+        return not failures, "；".join(failures) if failures else f"{len(self.checks)} 项交付检查通过"
 
 
 def build_checks(paths, criteria):
@@ -57,14 +72,7 @@ def build_checks(paths, criteria):
                     return False, "JSON 或字段无效"
                 return equal, "字段符合期望" if equal else "字段与期望不符"
             checks.append((path, matches))
+    required_paths = tuple(dict.fromkeys([*paths, *(path for path, _ in checks)]))
     if delivered:
         checks.insert(0, ("交付文件", delivered))
-
-    def verify(root):
-        failures = []
-        for label, check in checks:
-            passed, reason = check(root)
-            if not passed:
-                failures.append(f"{label} · {reason}")
-        return not failures, "；".join(failures) if failures else f"{len(checks)} 项交付检查通过"
-    return verify
+    return _StudioChecks(tuple(checks), required_paths)

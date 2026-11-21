@@ -176,7 +176,10 @@ def project_activity(events, active=False, clipped=False, *, run_id=None, thread
                 call["summary"] = created_name(tool, event.get("created_entity"))
         call["output"] = _result(event, call["tool"])
         if call["status"] != "succeeded":
-            call["error"] = _ERRORS.get(event.get("error_class"), "工具调用未成功")
+            if tool in {"edit_file", "write_file"} and event.get("changed") is False:
+                call["error"] = "文件内容未变化，已跳过写入"
+            else:
+                call["error"] = _ERRORS.get(event.get("error_class"), "工具调用未成功")
         duration = event.get("elapsed_ms")
         start, finish = call.get("_start"), event.get("ts")
         if not isinstance(duration, (int, float)) and type(start) in (int, float) and type(finish) in (int, float):
