@@ -20,7 +20,11 @@ def request(url, method="GET", body=None, header=True):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     if header and method != "GET":
-        req.add_header("X-Studio", "1")
+        from urllib.parse import urlsplit
+        origin = "http://" + urlsplit(url).netloc
+        token = json.loads(request(origin+"/api/bootstrap")[2])["token"]
+        req.add_header("Origin", origin)
+        req.add_header("X-Studio-Token",token)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             return response.status, response.headers, response.read()
@@ -33,7 +37,7 @@ class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         tmp = Path(tempfile.mkdtemp())
-        script = Script(lead=[
+        script = Script(room=[reply("",call("start_room_task",quote="make slides"))], lead=[
             reply("", call("write_file", path="index.html", content="<h1>Slides</h1><script>1</script>")),
             reply("", call("write_file", path="notes.md", content="# Notes")),
             reply("Built index.html and notes.md."),

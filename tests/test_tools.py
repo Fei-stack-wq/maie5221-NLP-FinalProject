@@ -24,12 +24,12 @@ class ToolTest(unittest.TestCase):
     # ------------------------------------------------------------ 参数校验
     def test_validation_reports_missing_required(self) -> None:
         errors = validate_arguments({"required": ["path"]}, {})
-        self.assertIn("缺少必填参数 path", errors)
+        self.assertIn("Missing required parameter path", errors)
 
     def test_validation_reports_unknown_argument(self) -> None:
         schema = {"properties": {"path": {"type": "string"}}, "required": ["path"]}
         errors = validate_arguments(schema, {"path": "a", "hallucinated": 1})
-        self.assertTrue(any("未知参数" in error for error in errors))
+        self.assertTrue(any("Unknown parameter" in error for error in errors))
 
     def test_validation_rejects_bool_as_integer(self) -> None:
         schema = {"properties": {"n": {"type": "integer"}}}
@@ -49,22 +49,22 @@ class ToolTest(unittest.TestCase):
     def test_missing_required_argument_is_a_result_not_an_exception(self) -> None:
         result = self.registry.dispatch("write_file", {"path": "a.md"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("缺少必填参数", result.content)
+        self.assertIn("Missing required parameter", result.content)
 
     def test_read_missing_file(self) -> None:
         result = self.registry.dispatch("read_file", {"path": "nope.md"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("沙箱拒绝", result.content)
+        self.assertIn("Workspace access denied", result.content)
 
     def test_unknown_tool(self) -> None:
         result = self.registry.dispatch("rm_rf", {"path": "/"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("未知工具", result.content)
+        self.assertIn("Unknown tool", result.content)
 
     def test_escape_attempt_through_tool(self) -> None:
         result = self.registry.dispatch("write_file", {"path": "../evil.md", "content": "x"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("沙箱拒绝", result.content)
+        self.assertIn("Workspace access denied", result.content)
         self.assertFalse((self._base / "evil.md").exists())
 
     # ------------------------------------------------------------ HITL
@@ -72,7 +72,7 @@ class ToolTest(unittest.TestCase):
         (self.root / "a.md").write_text("x", encoding="utf-8")
         result = self.registry.dispatch("delete_file", {"path": "a.md"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("需要人类批准", result.content)
+        self.assertIn("requires human approval", result.content)
         self.assertTrue((self.root / "a.md").exists())
 
     def test_delete_passes_with_approval(self) -> None:
@@ -101,7 +101,7 @@ class ToolTest(unittest.TestCase):
     def test_http_get_blocks_localhost(self) -> None:
         result = self.registry.dispatch("http_get", {"url": "http://localhost:8000/admin"}, self.ctx)
         self.assertFalse(result.ok)
-        self.assertIn("禁止访问内网", result.content)
+        self.assertIn("Private or local", result.content)
 
     # ------------------------------------------------------------ 清单
     def test_registry_exposes_workspace_and_research_tools(self) -> None:

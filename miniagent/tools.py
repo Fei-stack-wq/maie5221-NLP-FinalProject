@@ -36,7 +36,7 @@ MAX_TOOL_OUTPUT = 8_000
 def truncate(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     if len(text) <= limit:
         return text
-    return f"{text[:limit]}\n...[已截断，原文 {len(text)} 字符]"
+    return f"{text[:limit]}\n...[truncated, original length {len(text)} characters]"
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ _PY_TYPES: dict[str, Any] = {
 def validate_arguments(schema: dict[str, Any], arguments: Any) -> list[str]:
     """按 JSON Schema（够用的子集）校验模型给的参数，返回错误列表。"""
     if not isinstance(arguments, dict):
-        return ["参数必须是一个 JSON 对象"]
+        return ["Arguments must be a JSON object"]
 
     errors: list[str] = []
     schema = schema or {}
@@ -63,12 +63,12 @@ def validate_arguments(schema: dict[str, Any], arguments: Any) -> list[str]:
 
     for key in schema.get("required") or []:
         if key not in arguments:
-            errors.append(f"缺少必填参数 {key}")
+            errors.append(f"Missing required parameter {key}")
 
     for key, value in arguments.items():
         spec = properties.get(key)
         if spec is None:
-            errors.append(f"未知参数 {key}（schema 里没有定义，可能是模型幻觉）")
+            errors.append(f"Unknown parameter {key} in tool schema")
             continue
         expected = spec.get("type")
         py_type = _PY_TYPES.get(expected or "")
@@ -76,10 +76,10 @@ def validate_arguments(schema: dict[str, Any], arguments: Any) -> list[str]:
             continue
         # 布尔是 int 的子类，必须单独拦，否则 True 会被当成整数放过
         if expected in {"integer", "number"} and isinstance(value, bool):
-            errors.append(f"参数 {key} 应为 {expected}，实际是布尔值")
+            errors.append(f"Parameter {key} must be {expected}, received boolean")
             continue
         if not isinstance(value, py_type):
-            errors.append(f"参数 {key} 类型错误：应为 {expected}")
+            errors.append(f"Parameter {key} must be {expected}")
     return errors
 
 
@@ -133,21 +133,21 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None or (tool.available is not None and not tool.available()):
             return ToolResult.failure(
-                f"未知工具 {name!r}。可用工具：{', '.join(self.names())}"
+                f"Unknown tool {name!r}. Available tools: {', '.join(self.names())}"
             )
 
         errors = validate_arguments(tool.parameters, arguments)
         if errors:
-            return ToolResult.failure("参数校验失败：" + "；".join(errors), invalid_arguments=True)
+            return ToolResult.failure("Invalid arguments: " + "；".join(errors), invalid_arguments=True)
 
         try:
             return tool.fn(ctx, arguments)
         except SandboxError as exc:
-            return ToolResult.failure(f"沙箱拒绝访问：{exc}")
+            return ToolResult.failure(f"Workspace access denied: {exc}")
         except subprocess.TimeoutExpired:
-            return ToolResult.failure(f"工具 {name} 执行超时。")
+            return ToolResult.failure(f"Tool {name} timed out.")
         except Exception as exc:  # noqa: BLE001 - 工具层的错误必须被吸收
-            return ToolResult.failure(f"工具 {name} 执行异常：{type(exc).__name__}: {exc}")
+            return ToolResult.failure(f"Tool {name} failed: {type(exc).__name__}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +156,10 @@ class ToolRegistry:
 def _list_dir(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     path = ctx.sandbox.resolve(args.get("path") or ".", must_exist=True)
     if not path.is_dir():
-        return ToolResult.failure(f"不是目录：{args.get('path')}")
+        return ToolResult.failure(f"Not a directory: {args.get('path')}")
     offset, limit = args.get("offset", 0), args.get("limit", 100)
     if offset < 0 or not 1 <= limit <= 200:
-        return ToolResult.failure("offset 必须非负；limit 为 1..200")
+        return ToolResult.failure("offset must be nonnegative and limit must be 1..200")
     entries = sorted(path.iterdir())
     rows = []
     for item in entries[offset:offset + limit]:
@@ -171,9 +171,9 @@ def _list_dir(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         else:
             rows.append(f"[file] {name}  ({item.stat(follow_symlinks=False).st_size} bytes)")
     next_offset = offset + len(rows) if offset + len(rows) < len(entries) else None
-    output = "\n".join(rows) or ("（空目录）" if not entries else "（已到目录末尾）")
+    output = "\n".join(rows) or ("(empty directory)" if not entries else "(end of directory)")
     if next_offset is not None:
-        output += f"\n[下一页 offset={next_offset}]"
+        output += f"\n[next offset={next_offset}]"
     return ToolResult.success(output, path=ctx.sandbox.relative(path), count=len(rows),
                               total=len(entries), offset=offset, next_offset=next_offset)
 
@@ -182,17 +182,17 @@ def _list_dir(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 def _delete_file(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     path = ctx.sandbox.resolve(args["path"], must_exist=True)
     if not path.is_file():
-        return ToolResult.failure(f"不是文件：{args['path']}")
+        return ToolResult.failure(f"Not a file: {args['path']}")
 
     # 人机闸门：删除是不可逆的关键操作，必须经过人类批准（课程要求 2.1c）。
-    if ctx.approve is None or not ctx.approve(f"agent 请求删除文件：{args['path']}"):
+    if ctx.approve is None or not ctx.approve(f"Delete file {args['path']}?"):
         return ToolResult.failure(
-            "已取消：删除文件需要人类批准（HITL 拦截）。\n"
-            "请改用 write_file 覆盖，或请人类在界面中确认。"
+            "Deletion requires human approval.\n"
+            "Ask the requester for approval."
         )
 
     path.unlink()
-    return ToolResult.success(f"已删除 {args['path']}")
+    return ToolResult.success(f"Deleted {args['path']}")
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ def _delete_file(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     code = str(args["code"])
     if len(code) > 20_000:
-        return ToolResult.failure("代码过长（上限 20000 字符）。")
+        return ToolResult.failure("Code exceeds 20000 characters.")
 
     argv = ["python", "-I", "-B", "-c", code]
     if os.name == "posix":
@@ -210,12 +210,12 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     # Keep the native Python path on hosts without POSIX process groups.
     timeout = command_timeout(ctx, args.get("timeout"))
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
-        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
+        return ToolResult.failure("Cancelled or deadline reached before command start.")
     env = project_environment(ctx)
     argv[0] = os.path.join(env["VIRTUAL_ENV"], "Scripts", "python.exe")
     timeout = command_timeout(ctx, args.get("timeout"))
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
-        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
+        return ToolResult.failure("Cancelled or deadline reached before command start.")
 
     # -I: 隔离模式（忽略 PYTHONPATH / 用户 site-packages），避免环境污染。
     # cwd 设为沙箱根目录，相对路径天然落在 agent 自己的目录里。
@@ -237,7 +237,7 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     if completed.stderr:
         parts.append(f"stderr:\n{completed.stderr}")
     if not completed.stdout and not completed.stderr:
-        parts.append("（无输出）")
+        parts.append("(no output)")
 
     return ToolResult(
         ok=completed.returncode == 0,
@@ -255,13 +255,13 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="read_file",
-            description="分页读取工作区 UTF-8 文件；offset 是从 0 开始的 Unicode 字符位置，默认一页 32768 个字符，limit 最多 65536。按返回的 next_offset 继续；sha256 可用于后续编辑版本检查。",
+            description="Read a UTF-8 workspace file by Unicode character offset. Default page 32768, maximum 65536. Continue at next_offset. Use sha256 for subsequent version checks.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "相对工作区根目录的路径"},
-                    "offset": {"type": "integer", "description": "从 0 开始的 Unicode 字符位置，默认 0"},
-                    "limit": {"type": "integer", "description": "本页最多字符数，1..65536，默认 32768"},
+                    "path": {"type": "string", "description": "Workspace-relative path"},
+                    "offset": {"type": "integer", "description": "Zero-based Unicode character offset, default 0"},
+                    "limit": {"type": "integer", "description": "Maximum page size, 1..65536, default 32768"},
                 },
                 "required": ["path"],
             },
@@ -271,41 +271,41 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="list_dir",
-            description="列出工作区内某个目录的文件与大小。",
+            description="List workspace files and their sizes.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "相对路径，默认当前目录"},
-                    "offset": {"type": "integer", "description": "跳过的条目数，默认 0"},
-                    "limit": {"type": "integer", "description": "每页条目数，1..200，默认 100"}
+                    "path": {"type": "string", "description": "Relative path, default current directory"},
+                    "offset": {"type": "integer", "description": "Number of entries to skip, default 0"},
+                    "limit": {"type": "integer", "description": "Entries per page, 1..200, default 100"}
                 },
                 "required": [],
             },
             fn=_list_dir,
         )
     )
-    scope = {"path": {"type": "string", "description": "搜索根目录或文件，默认当前工作区"},
-             "offset": {"type": "integer", "description": "跳过的结果行数，默认 0"},
-             "limit": {"type": "integer", "description": "每页最多 1..150 条，默认 40"}}
-    registry.add(Tool("search_files", "用 ripgrep 在项目中查代码与文本。返回路径、行号和匹配行；可按 glob、字面量、大小写和上下文筛选。",
+    scope = {"path": {"type": "string", "description": "File or directory to search, default workspace root"},
+             "offset": {"type": "integer", "description": "Result lines to skip, default 0"},
+             "limit": {"type": "integer", "description": "Page size, 1..150, default 40"}}
+    registry.add(Tool("search_files", "Search project text with ripgrep. Returns paths, line numbers and matches. Supports globs, literal matches, case options and context.",
                       {"type": "object", "properties": {**scope, "query": {"type": "string"},
                        "glob": {"type": "string"}, "literal": {"type": "boolean"},
-                       "ignore_case": {"type": "boolean"}, "context": {"type": "integer", "description": "上下各 0..8 行"}},
+                       "ignore_case": {"type": "boolean"}, "context": {"type": "integer", "description": "Context lines on either side, 0..8"}},
                        "required": ["query"]}, search_files))
-    registry.add(Tool("find_files", "递归查找项目文件；pattern 是 glob，例如 **/*.py。返回相对工作区的路径。",
+    registry.add(Tool("find_files", "Find workspace files recursively using a glob, e.g. **/*.py. Returns relative paths.",
                       {"type": "object", "properties": {**scope, "pattern": {"type": "string"}}, "required": []}, find_files))
-    registry.add(Tool("read_lines", "按行号读取源码片段，返回行号、文件版本和下一页；常与 search_files 合用。",
+    registry.add(Tool("read_lines", "Read numbered lines with a version hash and next page. Use after search_files.",
                       {"type": "object", "properties": {"path": {"type": "string"},
-                       "start_line": {"type": "integer", "description": "首行从 1 开始"},
-                       "limit": {"type": "integer", "description": "1..400 行，默认 120"}},
+                       "start_line": {"type": "integer", "description": "First line, starting at 1"},
+                       "limit": {"type": "integer", "description": "1..400 lines, default 120"}},
                        "required": ["path"]}, read_lines))
     registry.add(
         Tool(
             name="read_source",
-            description="从已存来源的正文或检索结果按字符分页，可用关键词直接定位。无需重新下载或运行脚本。",
+            description="Read a saved source or discovery record by character offset or keyword.",
             parameters={"type": "object", "properties": {
-                "path": {"type": "string", "description": "http_get 或 search_sources 返回的 sources/ 路径"},
-                "query": {"type": "string", "description": "选填。从 offset 起匹配的字面词组，忽略大小写"},
+                "path": {"type": "string", "description": "sources/ path returned by http_get or search_sources"},
+                "query": {"type": "string", "description": "Optional case-insensitive literal phrase starting from offset"},
                 "offset": {"type": "integer", "minimum": 0},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 12000}}, "required": ["path"]},
             fn=read_source,
@@ -317,13 +317,13 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="write_file",
-            description="创建或完整覆盖工作区文本文件（最多 1000000 字符）。内容与原文件相同时返回 no_change。局部修改使用 edit_file，分段续写使用 append_file。可提供 expected_sha256 防止覆盖已变化的文件。",
+            description="Create or replace a workspace text file, up to 1000000 characters. Identical content returns no_change. Use edit_file for local edits and append_file for segments. expected_sha256 prevents overwriting a changed version.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "相对路径，例如 notes/a.md"},
-                    "content": {"type": "string", "description": "完整文件内容"},
-                    "expected_sha256": {"type": "string", "description": "可选，最近读取/写入所得的 SHA256；不匹配则拒绝修改"},
+                    "path": {"type": "string", "description": "Relative path such as notes/a.md"},
+                    "content": {"type": "string", "description": "Complete file content"},
+                    "expected_sha256": {"type": "string", "description": "Optional SHA-256 from the previous read or write. A mismatch prevents the change."},
                 },
                 "required": ["path", "content"],
             },
@@ -333,14 +333,14 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="edit_file",
-            description="精确修改文件的一处内容。old_text 必须唯一匹配，new_text 与它相同时返回 no_change。保留所有其他字节。修改前先读取，expected_sha256 可防止修改过时版本。",
+            description="Replace exactly one match, preserving other bytes. Identical replacement returns no_change. Read first and optionally provide expected_sha256.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "工作区相对路径"},
-                    "old_text": {"type": "string", "description": "在原文件中只出现一次的完整匹配文本"},
-                    "new_text": {"type": "string", "description": "替换文本；空字符串表示删除匹配片段"},
-                    "expected_sha256": {"type": "string", "description": "可选，最近读取/写入的 SHA256；不匹配则拒绝修改"},
+                    "path": {"type": "string", "description": "Workspace-relative path"},
+                    "old_text": {"type": "string", "description": "Literal text matching exactly once"},
+                    "new_text": {"type": "string", "description": "Replacement text, or an empty string to delete the match"},
+                    "expected_sha256": {"type": "string", "description": "Optional SHA-256 from the previous read or write"},
                 },
                 "required": ["path", "old_text", "new_text"],
             },
@@ -350,13 +350,13 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="append_file",
-            description="向已有 UTF-8 文件末尾追加文本，不自动插入换行。长文件可先 write_file 再分段追加；每段最多 1000000 字符。提供 expected_sha256 可防止重复追加或旧版本写入。",
+            description="Append text to an existing UTF-8 file. Include any desired newline. Maximum 1000000 characters per call. expected_sha256 prevents stale or duplicate appends.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "工作区相对路径，文件必须已存在"},
-                    "content": {"type": "string", "description": "追加文本，需要换行时显式包含换行符"},
-                    "expected_sha256": {"type": "string", "description": "可选，最近读取/写入所得的 SHA256"},
+                    "path": {"type": "string", "description": "Relative path to an existing file"},
+                    "content": {"type": "string", "description": "Text to append, including any desired newlines"},
+                    "expected_sha256": {"type": "string", "description": "Optional SHA-256 from the previous read or write"},
                 },
                 "required": ["path", "content"],
             },
@@ -366,10 +366,10 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="delete_file",
-            description="删除工作区内的一个文件。需要人类批准，可能被拒绝。",
+            description="Delete a workspace file after human approval.",
             parameters={
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "相对路径"}},
+                "properties": {"path": {"type": "string", "description": "Relative path"}},
                 "required": ["path"],
             },
             fn=_delete_file,
@@ -378,12 +378,12 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="run_python",
-            description="在沙箱目录中执行一段 Python 代码并返回 stdout/stderr。用于计算、数据处理、验证结果。",
+            description="Run Python in the workspace and return stdout and stderr. Suitable for calculations, data processing and checks.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "要执行的 Python 源码"},
-                    "timeout": {"type": "number", "description": "默认 120 秒，可显式申请更长；受部署上限与任务剩余时间约束。"},
+                    "code": {"type": "string", "description": "Python source"},
+                    "timeout": {"type": "number", "description": "Seconds, default 120. A longer timeout is subject to deployment and task limits."},
                 },
                 "required": ["code"],
             },
@@ -393,14 +393,14 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="run_shell",
-            description="在项目相对目录用非交互 Bash 运行测试、构建和管道，返回退出码与有界 stdout/stderr。"
-                        "管道启用 pipefail，用 sed/tail 截取输出会保留测试失败码。可在管道所在作用域用 if 或 || 处理失败。"
-                        "跨轮的本地测试服务应重定向输出。",
+            description="Run tests, builds and pipelines via noninteractive Bash in a project directory. Returns the exit code and bounded stdout/stderr. "
+                        "Pipelines use pipefail, including when truncating output with sed or tail. Handle failures explicitly within the pipeline scope. "
+                        "Redirect output for services that continue between steps.",
             parameters={"type": "object", "properties": {
-                "command": {"type": "string", "description": "交给 Bash 的命令，可包含管道和多行脚本"},
-                "cwd": {"type": "string", "description": "项目内已有的相对目录，默认项目根目录"},
-                "timeout": {"type": "number", "description": "默认 120 秒，可显式申请更长；受部署上限与任务剩余时间约束。"},
-                "yield_after_seconds": {"type": "number", "description": "成员可选提前返回的等待秒数；未结束则返回进程句柄，须用 poll_process 领取真实退出码。"},
+                "command": {"type": "string", "description": "Bash command, pipeline or multiline script"},
+                "cwd": {"type": "string", "description": "Existing workspace-relative directory, default project root"},
+                "timeout": {"type": "number", "description": "Seconds, default 120. A longer timeout is subject to deployment and task limits."},
+                "yield_after_seconds": {"type": "number", "description": "Optional early yield in seconds. Use poll_process on the handle for the final exit code."},
             }, "required": ["command"]},
             fn=_run_shell,
         )
@@ -408,9 +408,9 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="poll_process",
-            description="领取本成员 run_shell 的进程结果。运行中只返回句柄，终态返回一次真实退出码和输出。",
+            description="Collect this member's run_shell process result. A running process returns a handle. The final output and exit code can be collected once.",
             parameters={"type":"object", "properties":{
-                "process_id":{"type":"string"}, "wait_seconds":{"type":"number", "description":"最多等待秒数，默认 10，0 为立即查询。"}},
+                "process_id":{"type":"string"}, "wait_seconds":{"type":"number", "description":"Seconds to wait, default 10. Zero polls immediately."}},
                 "required":["process_id"]},
             fn=poll_process,
         )
@@ -455,8 +455,8 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                          "(e.g. TLS errors), `curl -sL` through run_shell is an alternative."),
             parameters={
                 "type": "object",
-                "properties": {"url": {"type": "string", "description": "完整 URL"},
-                               "pdf_page": {"type": "integer", "minimum": 1, "description": "PDF 指定页码，从 1 开始"}},
+                "properties": {"url": {"type": "string", "description": "Full URL"},
+                               "pdf_page": {"type": "integer", "minimum": 1, "description": "One-based PDF page number"}},
                 "required": ["url"],
             },
             fn=_http_get,

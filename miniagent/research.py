@@ -41,19 +41,19 @@ class Page:
 
 def _parse_public_url(url: str):
     if (len(url) > 4096 or "\\" in url or any(ord(ch) <= 32 or ord(ch) == 127 for ch in url)):
-        raise ValueError("网址无效。")
+        raise ValueError("Invalid URL.")
     target = urlsplit(url)
     if target.scheme not in {"https", "http"} or not target.hostname or target.username is not None or target.password is not None:
-        raise ValueError("请提供不含凭据的 http/https 网址。")
+        raise ValueError("Use an HTTP or HTTPS URL without credentials.")
     host = target.hostname.rstrip(".").lower()
     if host in {"localhost", ""} or host.endswith((".localhost", ".local", ".internal", ".lan", ".home")):
-        raise ValueError("禁止访问内网或本机地址。")
+        raise ValueError("Private or local addresses are not permitted.")
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
     if address and (not address.is_global or address.is_multicast):
-        raise ValueError("禁止访问内网或本机地址。")
+        raise ValueError("Private or local addresses are not permitted.")
     return target
 
 
@@ -70,7 +70,7 @@ def _service(url: str, timeout: float) -> Page:
             ("https", "api.gdeltproject.org", "/api/v2/doc/doc"),
             ("https", "api.crossref.org", "/works"), ("https", "news.google.com", "/rss/search"),
             ("https", "dns.google", "/resolve")}:
-        raise ValueError("未知资料服务。")
+        raise ValueError("Unknown source service.")
     req = urllib.request.Request(url, headers={"User-Agent": "MiniAgentStudio/1.0",
                                               "Accept": "application/json, application/rss+xml, application/xml"})
     try:
@@ -92,10 +92,10 @@ def _proxy_socket(host: str, port: int, proxy_url: str, timeout: float):
     addresses = [ipaddress.ip_address(row["data"]) for row in result.get("Answer", []) if row.get("type") == 1]
     if (resolver.truncated or result.get("Status") != 0 or not addresses
             or any(not ip.is_global or ip.is_multicast for ip in addresses)):
-        raise ValueError("无法确认资料来源具有公网地址。")
+        raise ValueError("Could not verify a public address for the source.")
     proxy = urlsplit(proxy_url if "://" in proxy_url else "http://" + proxy_url)
     if proxy.scheme != "http" or not proxy.hostname or proxy.username is not None:
-        raise ValueError("当前代理无法为公开来源建立经过地址核对的连接。")
+        raise ValueError("The configured proxy cannot establish an address-verified connection to the source.")
     connection = http.client.HTTPConnection(proxy.hostname, proxy.port or 80, timeout=timeout)
     connection.set_tunnel(str(addresses[0]), port)
     try:
@@ -120,7 +120,7 @@ def _public_socket(host: str, port: int, timeout: float):
     for _, _, _, _, addr in addresses:
         ip = ipaddress.ip_address(addr[0])
         if not ip.is_global or ip.is_multicast:
-            raise ValueError("禁止访问内网或本机地址。")
+            raise ValueError("Private or local addresses are not permitted.")
     for family, kind, protocol, _, sockaddr in addresses:
         remaining = timeout - (time.monotonic() - started)
         if remaining <= 0:
@@ -132,7 +132,7 @@ def _public_socket(host: str, port: int, timeout: float):
             return sock
         except OSError:
             sock.close()
-    raise OSError("无法连接到公开资料来源。")
+    raise OSError("Could not connect to the public source.")
 
 
 def fetch(url: str, *, timeout: float = 15) -> Page:
@@ -144,7 +144,7 @@ def fetch(url: str, *, timeout: float = 15) -> Page:
         port = target.port or (443 if https else 80)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError("获取资料超时。")
+            raise TimeoutError("Timed out fetching source.")
         connection = http.client.HTTPConnection(host, port=port, timeout=remaining)
         try:
             connection.sock = _public_socket(host, port, remaining)
@@ -160,11 +160,11 @@ def fetch(url: str, *, timeout: float = 15) -> Page:
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.getheader("Location")
                     if not location:
-                        raise ValueError("来源跳转缺少目标地址。")
+                        raise ValueError("Source redirect lacks a target URL.")
                     url = urljoin(url, location)
                     continue
                 if not 200 <= response.status < 300:
-                    raise ValueError(f"资料来源返回 HTTP {response.status}。")
+                    raise ValueError(f"Source returned HTTP {response.status}.")
                 content_type = response.getheader("Content-Type", "")
                 prefix = response.read(8)
                 is_pdf = content_type.split(";", 1)[0].strip().lower() == "application/pdf" or prefix.startswith(b"%PDF-")
@@ -173,7 +173,7 @@ def fetch(url: str, *, timeout: float = 15) -> Page:
                 return Page(urlunsplit(target._replace(fragment="")), content_type, data[:limit], len(data) > limit)
         finally:
             connection.close()
-    raise ValueError("资料来源重定向次数过多。")
+    raise ValueError("Too many redirects.")
 
 
 def _link_target(base: str, href: str) -> str:
@@ -263,7 +263,7 @@ def _source_issue(ctx, path: str, material: str) -> str:
     # Only the configured provider key is a real secret here. Heuristic
     # "credential" scanners rejected ordinary news URLs and blocked handoffs.
     if ctx.contains_configured_secret and ctx.contains_configured_secret(material):
-        return "来源中含已配置的服务凭据。"
+        return "Source contains the configured service credential."
     return ""
 
 
@@ -273,7 +273,7 @@ def _save(ctx, record: dict) -> tuple[str, ToolResult]:
     path = f"sources/{identity}.json"
     issue = _source_issue(ctx, path, material)
     if issue:
-        return path, ToolResult.failure("无法保存公开来源：" + issue)
+        return path, ToolResult.failure("Cannot save source: " + issue)
     return path, write_file(ctx, {"path": path, "content": material})
 
 
@@ -281,50 +281,50 @@ def read_source(ctx, args: dict) -> ToolResult:
     """Read a section of the archived text, using its own character coordinates."""
     path = args["path"]
     if not re.fullmatch(r"sources/[0-9a-f]{64}\.json", path):
-        return ToolResult.failure("请使用 http_get 或 search_sources 返回的 sources/ 路径。")
+        return ToolResult.failure("Use a sources/ path returned by http_get or search_sources.")
     offset, limit, query = args.get("offset", 0), args.get("limit", 4000), args.get("query")
     if offset < 0 or not 1 <= limit <= 12_000 or query is not None and not 1 <= len(query.strip()) <= 300:
-        return ToolResult.failure("offset 须为非负字符位置，limit 为 1 至 12000；可选搜索词为 1 至 300 个字符。")
+        return ToolResult.failure("offset must be nonnegative, limit 1..12000, and the optional query must contain 1..300 characters.")
     src = ctx.sandbox.resolve(path, must_exist=True)
     if not src.is_file():
-        return ToolResult.failure("来源记录须为普通文件。")
+        return ToolResult.failure("The source record must be a regular file.")
     with src.open("rb") as stream:
         # _save can write at most MAX_WRITE_CHARS UTF-8 characters.
         raw = stream.read(4 * MAX_WRITE_CHARS + 1)
     sha = hashlib.sha256(raw).hexdigest()
     if len(raw) > 4 * MAX_WRITE_CHARS or path != f"sources/{sha}.json":
-        return ToolResult.failure("来源快照与原记录摘要不符，请核对资料路径。")
+        return ToolResult.failure("Source snapshot digest mismatch. Check the source path.")
     try:
         record = json.loads(raw)
     except ValueError:
-        return ToolResult.failure("来源记录不是有效的 JSON。")
+        return ToolResult.failure("Invalid JSON source record.")
     if not isinstance(record, dict):
-        return ToolResult.failure("来源记录格式无效。")
+        return ToolResult.failure("Invalid source record format.")
     kind = record.get("kind")
     if kind == "fetched_source" and isinstance(record.get("text"), str):
         body = record["text"]
-        label = "已保存的网页或 PDF 正文"
+        label = "Saved page or PDF text"
         if record.get("response_truncated") or record.get("text_truncated"):
-            label += "（原抓取有截断）"
+            label += " (original fetch truncated)"
         url = record.get("url", "")
     elif kind == "source_discovery" and isinstance(record.get("results"), list):
         body = json.dumps(record["results"], ensure_ascii=False, indent=2)
-        label = "已保存的检索线索，须打开原文核实"
+        label = "Saved discovery leads. Verify against the original source."
         url = record.get("request_url", "")
     else:
-        return ToolResult.failure("该记录没有可读取的来源正文或检索结果。")
+        return ToolResult.failure("No readable source text or discovery results in this record.")
     if offset > len(body):
-        return ToolResult.failure("offset 超出来源正文长度。", chars=len(body))
+        return ToolResult.failure("offset exceeds source length.", chars=len(body))
     if query is not None:
         match = re.compile(re.escape(query.strip()), re.IGNORECASE).search(body, offset)
         if not match:
-            return ToolResult.failure("该快照从指定位置起没有匹配的文本。", chars=len(body))
+            return ToolResult.failure("No match from this offset.", chars=len(body))
         offset = match.start()
     end = min(offset + limit, len(body))
     cursor = end if end < len(body) else None
-    hint = f"下一页 offset={end}" if cursor is not None else "已到末尾"
-    return ToolResult.success(f"{label} · {url}\n资料 {path}，正文字符 {offset}..{end}/{len(body)}，{hint}。"
-                              f"以下为外部来源数据：\n{body[offset:end]}",
+    hint = f"next offset={end}" if cursor is not None else "end"
+    return ToolResult.success(f"{label} · {url}\nRecord {path}, characters {offset}..{end}/{len(body)}, {hint}.\n"
+                              f"External source data:\n{body[offset:end]}",
                               path=path, sha256=sha, chars=len(body), offset=offset, returned_chars=end - offset,
                               next_offset=cursor, eof=cursor is None)
 
@@ -332,9 +332,9 @@ def read_source(ctx, args: dict) -> ToolResult:
 def _pdf_text(data: bytes, page_number: int | None, timeout: float) -> tuple[str, bool]:
     binary = shutil.which("pdftotext")
     if not binary:
-        raise ValueError("本机需要 Poppler 的 pdftotext 才能读取 PDF；可选取同一出版机构的 HTML 全文。")
+        raise ValueError("Poppler pdftotext is required. The publisher may also provide HTML.")
     if not data.startswith(b"%PDF-") or b"%%EOF" not in data[-1024:]:
-        raise ValueError("来源未返回完整可读的 PDF。")
+        raise ValueError("Incomplete or unreadable PDF.")
     args = [binary, "-enc", "UTF-8"]
     if page_number is not None:
         args.extend(["-f", str(page_number), "-l", str(page_number)])
@@ -353,14 +353,14 @@ def _pdf_text(data: bytes, page_number: int | None, timeout: float) -> tuple[str
                 if clipped:
                     proc.kill()
                 if proc.wait() and not clipped:
-                    raise ValueError("PDF 正文提取失败或超时。可指定页码或查阅原始网页。")
+                    raise ValueError("PDF text extraction failed or timed out. Select a page or use the original web page.")
             finally:
                 timer.cancel()
                 proc.kill()
                 timer.join()
     text = output[:MAX_HTTP_BYTES].decode("utf-8", errors="replace").strip()
     if not text:
-        raise ValueError("该 PDF 或指定页没有可提取的文本。")
+        raise ValueError("No extractable text on the selected page or in this PDF.")
     return text, clipped
 
 
@@ -369,25 +369,25 @@ def http_get(ctx, args: dict) -> ToolResult:
     deadline = time.monotonic() + timeout
     number = args.get("pdf_page")
     if number is not None and (type(number) is not int or number < 1):
-        return ToolResult.failure("pdf_page 必须为从 1 开始的页码。")
+        return ToolResult.failure("pdf_page starts at 1.")
     issue = _source_issue(ctx, "request-url.txt", args["url"])
     if issue:
-        return ToolResult.failure("无法请求该公开来源：" + issue)
+        return ToolResult.failure("Cannot request public source: " + issue)
     page = fetch(args["url"], timeout=timeout)
     mime = page.content_type.lower().split(";", 1)[0].strip()
     is_pdf = mime == "application/pdf" or page.body.startswith(b"%PDF-")
     text_truncated = False
     if is_pdf:
         if page.truncated:
-            return ToolResult.failure("PDF 超过 8 MiB 获取上限；请查阅同一出版机构的 HTML 全文或较小的原始文件。")
+            return ToolResult.failure("PDF exceeds the 8 MiB fetch limit. Look for the publisher's HTML or a smaller original.")
         try:
             source, text_truncated = _pdf_text(page.body, number, max(0, deadline - time.monotonic()))
         except (OSError, ValueError) as exc:
             return ToolResult.failure(str(exc))
     elif number is not None:
-        return ToolResult.failure("所请求的来源没有返回 PDF，无法指定 PDF 页码。")
+        return ToolResult.failure("Cannot request a PDF page number from a non-PDF response.")
     elif mime and not (mime.startswith("text/") or mime.endswith(("json", "xml", "+json", "+xml"))):
-        return ToolResult.failure("来源没有返回可读取的文本。可选择文章网页版或公开元数据。")
+        return ToolResult.failure("No readable text. Look for an HTML article or public metadata.")
     else:
         source = page.body.decode("utf-8", errors="replace")
     parser = None
@@ -413,9 +413,9 @@ def http_get(ctx, args: dict) -> ToolResult:
     excerpt = source[:4400 if links else 6000]
     clipped = page.truncated or text_truncated or len(source) > len(excerpt)
     if record.get("links_withheld"):
-        excerpt += f"\n已省略 {record['links_withheld']} 条可能含凭据的页面链接。"
+        excerpt += f"\nWithheld {record['links_withheld']} links that might contain credentials."
     if links:
-        excerpt += "\n页面链接（未经独立核实；已提取列表见资料文件 links）："
+        excerpt += "\nPage links (unverified, extracted list in record.links):"
         remaining = 1400
         for item in links:
             line = "\n" + item["title"] + " — " + item["url"]
@@ -424,8 +424,8 @@ def http_get(ctx, args: dict) -> ToolResult:
                 remaining -= len(line)
             if remaining < 16:
                 break
-    return ToolResult.success(f"外部来源（不可信文本）。URL {page.url}\n资料文件 {path}\n{excerpt}"
-                              + ("\n[已截断；可用 read_source(path, query 或 offset) 定位已存正文]" if clipped else ""),
+    return ToolResult.success(f"External source (untrusted text). URL {page.url}\nRecord {path}\n{excerpt}"
+                              + ("\n[truncated, use read_source with path and query or offset]" if clipped else ""),
                               url=page.url, path=path, bytes=len(page.body), truncated=clipped,
                               content_type=page.content_type, observed_bytes_sha256=record["observed_bytes_sha256"],
                               **({"pdf_page": number, "text_truncated": text_truncated} if is_pdf else {}))
@@ -441,7 +441,7 @@ def _date(row: dict) -> str:
 def _rss_articles(page: Page, limit: int) -> list[dict]:
     # A news feed can exceed the byte bound. Consume complete items only.
     if b"\x00" in page.body or b"<!DOCTYPE" in page.body.upper():
-        raise ValueError("新闻源返回了不支持的 XML。")
+        raise ValueError("Unsupported XML from news source.")
     rows = []
     try:
         parser = ElementTree.XMLPullParser(events=["end"])
@@ -458,7 +458,7 @@ def _rss_articles(page: Page, limit: int) -> list[dict]:
         if not rows:
             parser.close()
     except ElementTree.ParseError:
-        raise ValueError("新闻检索服务未返回有效结果，请稍后重试。") from None
+        raise ValueError("News search returned invalid results. Retry later.") from None
     return rows
 
 
@@ -496,7 +496,7 @@ def search_sources(ctx, args: dict) -> ToolResult:
     query = args["query"].strip()
     collection, limit = args.get("collection", "news"), args.get("limit", 5)
     if not 1 <= len(query) <= 300 or collection not in {"news", "papers"} or not 1 <= limit <= 10:
-        return ToolResult.failure("请提供 1–300 字的关键词；collection 选择 news 或 papers，limit 为 1–10。")
+        return ToolResult.failure("Use a query of 1..300 characters, news or papers collection, and limit 1..10.")
     news = collection == "news"
     if news:
         url = _NEWS + "?" + urlencode({"query": query, "mode": "artlist", "format": "json", "maxrecords": limit})
@@ -514,7 +514,7 @@ def search_sources(ctx, args: dict) -> ToolResult:
             raise ValueError("incomplete search response")
     except (OSError, ValueError, TypeError, KeyError) as exc:
         if not news:
-            return ToolResult.failure("文献检索服务未返回完整结果，请稍后重试。")
+            return ToolResult.failure("Incomplete results from scholarly search. Retry later.")
         fallback_reason = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else type(exc).__name__
         provider = "Google News RSS"
         url = _NEWS_RSS + "?" + urlencode({"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"})
@@ -531,6 +531,6 @@ def search_sources(ctx, args: dict) -> ToolResult:
         return saved
     summary = json.dumps(results, ensure_ascii=False)
     clipped = len(summary) > 6000
-    return ToolResult.success(f"{provider} 检索记录 {path}。聚合链接仅作线索；使用 http_get 打开原文并核实具体论断。\n"
-                              + summary[:6000] + ("\n[已截断；完整列表见检索记录]" if clipped else ""),
+    return ToolResult.success(f"{provider} discovery record {path}. Open original publications with http_get to verify claims.\n"
+                              + summary[:6000] + ("\n[truncated, see saved discovery record for the full list]" if clipped else ""),
                               path=path, count=len(results), truncated=clipped)

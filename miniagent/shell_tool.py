@@ -59,7 +59,7 @@ class _Output:
         return self.count > self.head_limit + self.tail_limit
 
     def text(self):
-        marker = "\n…[已截断]…\n".encode() if self.truncated else b""
+        marker = "\n…[truncated]…\n".encode() if self.truncated else b""
         return (bytes(self.head) + marker + self.tail).decode("utf-8", errors="replace")
 
 
@@ -151,21 +151,21 @@ def _drain(process, stdout, stderr, deadline, should_cancel):
 
 def run_shell(ctx: ToolContext, args: dict) -> ToolResult:
     if os.name != "posix":
-        return ToolResult.failure("run_shell 需要本机 POSIX shell。")
+        return ToolResult.failure("run_shell requires a local POSIX shell.")
     command = args["command"]
     if not command.strip() or len(command) > 20000 or "\x00" in command:
-        return ToolResult.failure("命令须为 1 至 20000 字符的非空文本。")
+        return ToolResult.failure("command must contain 1..20000 characters.")
     cwd = ctx.sandbox.resolve(args.get("cwd", "."), must_exist=True)
     if not cwd.is_dir():
-        return ToolResult.failure("命令工作目录必须是项目中的目录。")
+        return ToolResult.failure("cwd must be a directory in the project.")
     bash = shutil.which("bash", path=os.defpath)
     if bash is None:
-        return ToolResult.failure("run_shell 需要系统 Bash 以保留管道退出码。")
+        return ToolResult.failure("run_shell requires Bash to preserve pipeline exit codes.")
     argv = [bash, "--noprofile", "--norc", "-E", "-o", "pipefail", "-c", command]
     if "yield_after_seconds" in args:
         sessions = ctx.sandbox.command_sessions
         if sessions is None:
-            return ToolResult.failure("此工作区没有活动进程作用域，请省略 yield_after_seconds 以前台执行。")
+            return ToolResult.failure("This workspace has no process scope. Omit yield_after_seconds to run in the foreground.")
         return sessions.start(ctx, argv, cwd, args)
     return _run_bash(ctx, argv, cwd, args.get("timeout"))
 
@@ -190,7 +190,7 @@ def _run_bash(ctx, argv, cwd, timeout):
 def command_timeout(ctx, requested):
     seconds = 120.0 if requested is None else float(requested)
     if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError("超时秒数必须是有限正数。")
+        raise ValueError("timeout must be a positive finite number of seconds.")
     timeout = min(seconds, ctx.limits.tool_timeout_seconds)
     if ctx.deadline is not None:
         timeout = min(timeout, max(0, ctx.deadline - time.monotonic()))
@@ -204,7 +204,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     except ValueError as exc:
         return ToolResult.failure(str(exc))
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
-        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
+        return ToolResult.failure("Cancelled or deadline reached before command start.")
     env = project_environment(ctx)
     if ctx.sandbox.command_wrapper is not None:
         argv = ctx.sandbox.command_wrapper(argv)
@@ -212,7 +212,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     # overall task deadline before starting the requested command.
     timeout = command_timeout(ctx, requested_timeout)
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
-        return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
+        return ToolResult.failure("Cancelled or deadline reached before command start.")
     started = time.monotonic()
     stdout, stderr = _Output(failure_evidence_limit), _Output(failure_evidence_limit)
     timed_out = False
@@ -247,14 +247,14 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
                 exit_code = int(saved)
     parts = [f"exit_code={exit_code}"]
     if timed_out or cancelled:
-        status = f"命令执行超时（{timeout:g} 秒）" if timed_out else "命令已取消"
-        cleanup = f"尚未确认 {pending_children} 个子进程退出" if pending_children else "已停止"
+        status = f"Timed out ({timeout:g}s)" if timed_out else "Cancelled"
+        cleanup = f"Exit of {pending_children} children still unconfirmed" if pending_children else "stopped"
         parts.append(f"{status}，{cleanup}。")
     for name, stream in [("stdout", stdout), ("stderr", stderr)]:
         if stream.count:
             parts.append(f"{name}:\n{stream.text()}")
     if not stdout.count and not stderr.count and not timed_out:
-        parts.append("（无输出）")
+        parts.append("(no output)")
     failure_evidence = {}
     if (exit_code is not None and exit_code > 0 and not timed_out and not cancelled
             and (stdout.truncated or stderr.truncated)
@@ -288,13 +288,13 @@ class CommandSessions:
     def start(self, ctx, argv, cwd, args):
         wait = args["yield_after_seconds"]
         if not math.isfinite(wait) or wait < 0:
-            return ToolResult.failure("等待时间须为非负有限秒数。")
+            return ToolResult.failure("Wait must be a nonnegative finite number of seconds.")
         if len(self.jobs) >= 4:
-            return ToolResult.failure("当前成员已有四个未领取的进程结果，请先用 poll_process 领取。")
+            return ToolResult.failure("Four results are pending for this member. Collect one with poll_process.")
         # Validate before issuing a handle, even when the caller asks for an immediate yield.
         timeout = command_timeout(ctx, args.get("timeout"))
         if timeout <= 0:
-            return ToolResult.failure("本次执行时间已用完。")
+            return ToolResult.failure("Execution time exhausted.")
         handle = uuid.uuid4().hex
         def cancelled():
             return self.stopping.is_set() or bool(ctx.should_cancel and ctx.should_cancel())
@@ -306,15 +306,15 @@ class CommandSessions:
     def poll(self, handle, wait):
         job = self.jobs.get(handle)
         if job is None:
-            return ToolResult.failure("当前分工没有该进程，或它的最终结果已领取。")
+            return ToolResult.failure("Unknown process for this assignment, or its final result has already been collected.")
         if not math.isfinite(wait) or wait < 0:
-            return ToolResult.failure("等待时间须为非负有限秒数。")
+            return ToolResult.failure("Wait must be a nonnegative finite number of seconds.")
         future, command = job
         try:
             result = future.result(timeout=wait)
         except FutureTimeout:
             # A completion racing this timeout remains available on the next poll.
-            return ToolResult.success(f"运行中：{handle}。用 poll_process 领取最终输出和退出码。",
+            return ToolResult.success(f"Running: {handle}. Use poll_process to collect the final output and exit code.",
                                       process_id=handle, process_state="running")
         except Exception:
             del self.jobs[handle]
@@ -335,17 +335,17 @@ class CommandSessions:
 
     def pending_reason(self):
         if self.jobs:
-            return "命令尚未领取最终结果。请用 poll_process 查询这些句柄：" + "、".join(self.jobs)
+            return "Process results pending. Use poll_process with these handles: " + "、".join(self.jobs)
         return ""
 
 
 def poll_process(ctx, args):
     sessions = ctx.sandbox.command_sessions
     if sessions is None:
-        return ToolResult.failure("此工作区没有活动进程作用域。")
+        return ToolResult.failure("No process scope is active for this workspace.")
     wait = args.get("wait_seconds", 10.0)
     if not math.isfinite(wait) or wait < 0:
-        return ToolResult.failure("等待时间须为非负有限秒数。")
+        return ToolResult.failure("Wait must be a nonnegative finite number of seconds.")
     wait = min(wait, ctx.limits.tool_timeout_seconds)
     if ctx.deadline is not None:
         wait = min(wait, max(0, ctx.deadline - time.monotonic()))

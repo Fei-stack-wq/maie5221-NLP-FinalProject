@@ -24,6 +24,7 @@ from .schemas import LLMResponse, ToolCall, ToolSpec, Usage
 class Provider(ABC):
     name: str = "provider"
     transport: str = "unknown"
+    supports_streaming = False
 
     @abstractmethod
     def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
@@ -81,11 +82,12 @@ def _strict_json_object(text: str) -> dict[str, Any]:
 
 
 def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str], None],
-                            should_cancel: Callable[[], bool] | None) -> dict:
+                            should_cancel: Callable[[], bool] | None, *, secret: str = "") -> dict:
     """Rebuild the ordinary completion envelope. Only assistant content reaches notify."""
     identity = {}
     content, reasoning = [], []
     calls = {}
+    pending = ""
     finish = usage = None
     try:
         for event in events:
@@ -138,7 +140,17 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
                     _require(isinstance(part, str), "Invalid assistant stream text")
                     parts.append(part)
                     if field == "content" and part:
-                        notify("delta", part)
+                        visible = pending + part
+                        pending = ""
+                        if secret:
+                            visible = visible.replace(secret, "[redacted]")
+                            # Hold a possible key prefix across provider chunks.
+                            for n in range(min(len(visible), len(secret)-1), 0, -1):
+                                if visible.endswith(secret[:n]):
+                                    visible, pending = visible[:-n], visible[-n:]
+                                    break
+                        if visible:
+                            notify("delta", visible)
             finish = choice.get("finish_reason")
         _require(isinstance(finish, str), "Provider stream lacks a final choice")
         _require(sorted(calls) == list(range(len(calls))), "Incomplete stream tool indexes")
@@ -149,6 +161,8 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
             message["tool_calls"] = [{"id": call["id"], "type": call["type"],
                                       "function": {"name": "".join(call["names"]), "arguments": "".join(call["arguments"])}}
                                      for _, call in sorted(calls.items())]
+        if pending:
+            notify("delta", pending)
         return {**identity, "usage": usage, "choices": [{"finish_reason": finish, "message": message}]}
     except Exception:
         # The next HTTP attempt starts with empty accumulators and a new preview.
@@ -163,6 +177,7 @@ class DeepSeekProvider(Provider):
     deadline is separate from the future root BudgetLedger. Environment values
     are read by Settings/CLI, never implicitly by this constructor.
     """
+    supports_streaming = True
     name = "deepseek"
     transport = "http"
     FINISH_REASONS = {"stop", "tool_calls", "length", "content_filter",
@@ -302,7 +317,7 @@ class DeepSeekProvider(Provider):
             options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
             if on_stream is not None:
                 payload.update(stream=True, stream_options={"include_usage": True})
-                options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel)
+                options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel, secret=self.api_key)
             result = self._post_with_retry(payload, **options)
         except ProviderError as exc:
             if exc.status_code == 402 and urlsplit(self.base_url).hostname == "api.deepseek.com":
@@ -316,7 +331,8 @@ class DeepSeekProvider(Provider):
         except ProviderError as exc:
             exc.attempts = result.attempts
             raise
-        return response.model_copy(update={"request_attempts": result.attempts})
+        return response.model_copy(update={"request_attempts": result.attempts,
+                                           "text":response.text.replace(self.api_key, "[redacted]")})
 
     def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None,
                          stream_decoder: Callable[[Iterator[dict]], dict] | None = None) -> HTTPResult:

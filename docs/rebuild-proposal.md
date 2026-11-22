@@ -5,6 +5,14 @@ Branch `jinyuwu/model-driven-studio` (worktree `../MultiAgentNLP-rebuild`), base
 `jinyuwu/integrate-bounded-core` (`530df33`); read old code with
 `git show jinyuwu/integrate-bounded-core:<path>`. Do not merge it back.
 
+## Implementation and verification
+
+The Studio entry point on this branch now runs the bounded core for the assistant,
+private chats and teams. Current interfaces, persistence and checks are described
+in [architecture.md](architecture.md). The [acceptance record](mid-test-status.md)
+distinguishes offline replay from real model and artifact results. The phases
+below preserve the original proposal.
+
 ## 1. Why
 
 The original runtime let **host code decide the workflow**: phase policies swapped
@@ -81,7 +89,7 @@ upstream links: `docs/architecture.md`.
 | 15 | User verdict on a delivery (`review_delivery`) | rewrite as message | UI buttons "accept" / "request changes" post a normal user message; no host state. |
 | 16 | Acceptance files/checks (`studio_acceptance`, `acceptance.py`) | rewrite as evaluation | `evaluation.py`: after a task, run declared checks (file exists, contains, command exit 0) in a copy of the project; store a score in `task.json`; show in UI; optionally include the list in the lead's task text. Never blocks (invariant 5). |
 | 17 | Diagnostics (`studio_diagnostics`) | rewrite small | summarize from trace: provider errors, budget hits, loop-guard events, cancelled. |
-| 18 | Status questions without a run (`studio_group_status`, `studio_room_reply`) | drop special path | while running → steering (agent answers in its next public text); idle → a normal task. |
+| 18 | Status questions without a run (`studio_group_status`, `studio_room_reply`) | restore room-scoped turns | The addressed role answers follow-ups from room evidence. Explicit changes steer the same active task. Independent work starts or queues. |
 | 19 | Recover failed member / inherited reviews / signed reviews / probes / peer recheck / coordinator workspace / check provenance / tool_progress / intake allowance / read cap | **drop** | replaced by invariants 1–2; published partial work already persists. |
 | 20 | Credential heuristics, file-type allow-lists, snapshot validators (`project_data`) | **drop** | keep configured-key redaction and 25 MB file cap. |
 | 21 | CLI `eval` (batch metrics), `orchestrate` DAG, `tasks` (SQLite TaskStore), `report` | `eval` rewrite, drop `orchestrate`/`tasks` | `eval --tasks file.jsonl` runs single-agent or team tasks with evaluation checks → completion rate, mean/p95 duration, tokens (course metrics). TaskStore/orchestrator are superseded by the lead-driven team + JSON store. |

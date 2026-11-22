@@ -11,8 +11,10 @@ from .store import GroupStore
 
 
 def summarize(tasks: list[dict]) -> dict:
-    finished = [t for t in tasks if t.get("status") not in {None, "running"}]
+    finished = [t for t in tasks if t.get("status") not in {None, "running", "queued"}]
     completed = [t for t in finished if t["status"] == "completed"]
+    dispatched = sum(t["status"] == "dispatched" for t in finished)
+    delivery_attempts = len(finished) - dispatched
     durations = sorted(t.get("metrics", {}).get("duration_s", 0) for t in finished if t.get("metrics"))
     tokens = sum(t.get("metrics", {}).get("prompt_tokens", 0) + t.get("metrics", {}).get("completion_tokens", 0)
                  for t in finished)
@@ -20,7 +22,8 @@ def summarize(tasks: list[dict]) -> dict:
     return {
         "tasks": len(finished),
         "completed": len(completed),
-        "completion_rate": round(len(completed) / len(finished), 3) if finished else 0.0,
+        "dispatched": dispatched,
+        "completion_rate": round(len(completed) / delivery_attempts, 3) if delivery_attempts else 0.0,
         "mean_duration_s": round(sum(durations) / len(durations), 1) if durations else 0.0,
         "p95_duration_s": p95,
         "total_tokens": tokens,
@@ -34,7 +37,7 @@ def group_report(store: GroupStore) -> str:
     summary = summarize(tasks)
     lines = [f"## {store.group.name} ({store.group.id})", "",
              f"Tasks {summary['tasks']} · completed {summary['completed']} "
-             f"({summary['completion_rate']:.0%}) · mean {summary['mean_duration_s']}s · "
+             f"({summary['completion_rate']:.0%} of delivery attempts) · dispatched {summary['dispatched']} · mean {summary['mean_duration_s']}s · "
              f"p95 {summary['p95_duration_s']}s · tokens {summary['total_tokens']:,} · "
              f"delegations {summary['delegations']} · questions {summary['questions']}", "",
              "| task | status | duration s | steps | tool calls | delegations | questions | tokens | request |",

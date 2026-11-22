@@ -41,13 +41,13 @@ from .config import Limits, Settings
 from .context import ContextManager
 from .loop_guard import LoopGuard
 from .provider_http import ProviderError
-from .providers import DeepSeekProvider, Provider
+from .providers import Provider
 from .sandbox import Sandbox
-from .schemas import LLMResponse, ToolCall, Usage
+from .schemas import LLMResponse, ToolCall, ToolResult, Usage
 from .shell_tool import CommandSessions
 from .tools import ToolContext, ToolRegistry
 
-Status = Literal["completed", "max_steps", "stuck", "budget", "cancelled", "error"]
+Status = Literal["completed", "dispatched", "max_steps", "stuck", "budget", "cancelled", "error"]
 
 MAX_TOOL_RESULT_CHARS = 24_000
 WRAP_UP_INSTRUCTION = (
@@ -75,7 +75,7 @@ class AgentResult:
 
     @property
     def ok(self) -> bool:
-        return self.status == "completed"
+        return self.status in ("completed", "dispatched")
 
 
 class ProcessScope:
@@ -189,8 +189,9 @@ class Agent:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None:
                 options["deadline_seconds"] = max(5.0, remaining + 60.0)
-            if self.stream and isinstance(self.provider, DeepSeekProvider):
+            if self.stream and getattr(self.provider, "supports_streaming", False):
                 stream_id = uuid.uuid4().hex
+                self.emit("delta", stream_id=stream_id, phase="discard", text="")
                 options["on_stream"] = lambda phase, text: self.emit("delta", stream_id=stream_id, phase=phase, text=text)
                 options["should_cancel"] = self.should_cancel
             if specs:
@@ -289,21 +290,31 @@ class Agent:
                 if response.text.strip():
                     self.emit("say", text=response.text.strip())
                 executed = 0
+                batch_ok = True
+                handed_off = False
                 for call in calls:
                     executed += 1
                     if self.should_cancel():
+                        batch_ok = False
                         messages.append({"role": "tool", "tool_call_id": call.id,
                                          "content": "Not executed: the task was cancelled."})
                         continue
                     if executed > self.limits.max_tool_calls_per_step:
+                        batch_ok = False
                         content = (f"Not executed: at most {self.limits.max_tool_calls_per_step} tool calls run "
                                    "per response. Repeat this call in your next response if it is still needed.")
                         messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                         continue
-                    content, ok = self._execute(call, tool_ctx)
+                    tool_result = self._execute(call, tool_ctx)
+                    content, ok = tool_result.content, tool_result.ok
+                    batch_ok = batch_ok and ok
+                    handed_off = handed_off or tool_result.handed_off
                     tool_calls += 1
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                     guard.record(call.name, call.arguments, ok, content)
+                if handed_off and batch_ok and not self.should_cancel() and not take_inbox():
+                    status = "dispatched"
+                    break
                 verdict = guard.check()
                 if verdict.nudge:
                     messages.append({"role": "user", "content": verdict.nudge})
@@ -341,21 +352,21 @@ class Agent:
         return result
 
     # ------------------------------------------------------------------
-    def _execute(self, call: ToolCall, ctx: ToolContext) -> tuple[str, bool]:
+    def _execute(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
         self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
         if call.parse_error:
-            content, ok = (f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
-                           "possibly cut off because the call was too large. Split the work into smaller calls."), False
+            result = ToolResult.failure(f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
+                                        "possibly cut off because the call was too large. Split the work into smaller calls.")
         else:
             result = self.registry.dispatch(call.name, call.arguments, ctx)
-            content, ok = result.content, result.ok
+        content, ok = result.content, result.ok
         if len(content) > MAX_TOOL_RESULT_CHARS:
             content = content[:MAX_TOOL_RESULT_CHARS] + f"\n…[truncated: {len(content) - MAX_TOOL_RESULT_CHARS} more characters]"
         if not ok and not content.startswith(("Tool call rejected", "Error")):
             content = "Error: " + content
         self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600])
-        return content, ok
+        return result.model_copy(update={"content":content})
 
     def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model) -> str:
         messages.append({"role": "user", "content": WRAP_UP_INSTRUCTION.format(reason=reason)})

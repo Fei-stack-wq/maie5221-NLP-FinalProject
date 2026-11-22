@@ -46,10 +46,12 @@ def _template(name: str) -> dict:
 
 
 def cmd_studio(args) -> int:
-    from .server import serve
     settings = _settings(args)
+    from .server import serve
     studio = Studio(settings)
+    studio.env_file = Path(args.env_file or ".env").resolve()
     main, preview = serve(studio, args.port)
+    studio.restore_queue()
     url = f"http://127.0.0.1:{main.server_address[1]}/"
     print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")
     print(f"model {settings.model}, thinking {settings.thinking}, runs in {settings.runs_dir.resolve()}")
@@ -66,6 +68,8 @@ def cmd_studio(args) -> int:
         studio.close()
         main.shutdown()
         preview.shutdown()
+        main.server_close()
+        preview.server_close()
     return 0
 
 
@@ -74,6 +78,8 @@ def _print_event(event: dict, names: dict) -> None:
     name = lambda agent: names.get(agent, agent)  # noqa: E731
     if kind == "user_message":
         print(f"\n[you] {event['text']}")
+    elif kind == "room_reply":
+        print(f"\n[{name(event['agent'])}] {event['text']}")
     elif kind == "delegation":
         print(f"\n[{name(event['agent'])} → {name(event['assignee'])}] {event['task']}")
     elif kind == "report":
@@ -89,11 +95,13 @@ def _print_event(event: dict, names: dict) -> None:
         print(f"\n— task {event['status']} — {json.dumps(event.get('metrics', {}), ensure_ascii=False)}")
 
 
-def _drive(studio: Studio, group_id: str, text: str, *, read_answers: bool = True) -> dict:
+def _drive(studio: Studio, group_id: str, text: str, *, read_answers: bool = True, conversation: bool = False) -> dict:
     store = studio.group(group_id)
     names = {m.id: m.name for m in store.group.members}
     after = store.chat()[-1]["seq"] if store.chat() else 0
-    route = studio.post(group_id, text)
+    route = studio.post(group_id, text, queue=not conversation)
+    if route["route"] == "reply":
+        return route
     answered: set[str] = set()
     while True:
         state = studio.state(group_id, after)
@@ -112,7 +120,9 @@ def _drive(studio: Studio, group_id: str, text: str, *, read_answers: bool = Tru
                 if not line.strip():
                     break
                 lines.append(line.rstrip("\n"))
-            studio.post(group_id, "\n".join(lines) or "Please decide yourselves and state your assumptions.")
+            result = studio.post(group_id, "\n".join(lines) or "Please decide yourselves and state your assumptions.")
+            if result["route"] != "answer":
+                answered.discard(question["id"])
         time.sleep(0.5)
     return studio.store.get(group_id).load_task(route["task_id"])
 
@@ -133,7 +143,10 @@ def cmd_team(args) -> int:
     else:
         template = _template(args.template)
         text = template["tasks"][args.task - 1]["text"]
-    record = _drive(studio, group_id, text)
+    record = _drive(studio, group_id, text, conversation=bool(args.group and args.message))
+    if record.get("route") == "reply":
+        print(record["text"])
+        return 0
     print(f"\ngroup {group_id} · task {record['id']} · {record['status']}")
     print(f"project: {studio.group(group_id).project.root}")
     return 0 if record["status"] == "completed" else 1
@@ -184,6 +197,46 @@ def cmd_smoke(args) -> int:
     return 0 if report.get("ok") else 1
 
 
+def cmd_migrate(args) -> int:
+    from .roles import Roles
+    roles = Roles(_settings(args).runs_dir)
+    print(json.dumps(roles.migrate(Path(args.source)), ensure_ascii=False))
+    return 0
+
+
+def cmd_eval(args) -> int:
+    from .metrics import summarize
+    from .evaluation import validate
+    settings = _settings(args)
+    rows = [json.loads(line) for line in Path(args.tasks).read_text().splitlines() if line.strip()]
+    for row in rows:
+        if not isinstance(row.get("text"), str) or not row["text"].strip():
+            raise ValueError("Every evaluation task needs text")
+        validate(row.get("checks", []))
+    studio = Studio(settings)
+    records, groups = [], {}
+    try:
+        for row in rows:
+            key = row.get("group")
+            if key is None or key not in groups:
+                template = _template(row["template"]) if row.get("template") else {
+                    "name":"Evaluation","lead":"agent","members":[{"id":"agent","name":"Agent","prompt":""}]}
+                gid = studio.create_group(template["name"], template["members"], template["lead"], "autonomous")["id"]
+                if key is not None:
+                    groups[key] = gid
+            else:
+                gid = groups[key]
+            tid = studio.post(gid, row["text"], queue=True, options={"checks":row.get("checks",[])})["task_id"]
+            studio.wait(gid)
+            records.append(studio.group(gid).load_task(tid))
+        print(json.dumps({"summary":summarize(records),
+                          "tasks":[{k:r.get(k) for k in ("id","group_id","status","evaluation")} for r in records]},
+                         ensure_ascii=False, indent=2))
+    finally:
+        studio.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m miniagent", description="miniagent multi-agent Studio")
     parser.add_argument("--env-file", help="read settings from this .env (default: ./.env if present)")
@@ -220,8 +273,23 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--group")
     p.set_defaults(fn=cmd_report)
 
+    p = sub.add_parser("migrate", help="import legacy role definitions and approved knowledge")
+    p.add_argument("--source", required=True)
+    p.set_defaults(fn=cmd_migrate)
+    p = sub.add_parser("eval", help="run JSONL evaluation tasks")
+    p.add_argument("--tasks", required=True)
+    p.set_defaults(fn=cmd_eval)
+
     p = sub.add_parser("smoke", help="live provider protocol probe")
     p.set_defaults(fn=cmd_smoke)
 
     args = parser.parse_args(argv)
+    if args.command in {"studio", "demo", "run", "team", "migrate", "eval"}:
+        from .instance import session_lock, StudioInUse
+        try:
+            with session_lock(_settings(args).runs_dir):
+                return args.fn(args)
+        except StudioInUse as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     return args.fn(args)

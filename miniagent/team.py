@@ -29,6 +29,7 @@ still writes a final report (see :class:`~miniagent.agent.Agent`).
 
 from __future__ import annotations
 
+import json
 import difflib
 import re
 import threading
@@ -66,7 +67,8 @@ class HumanChannel:
         self._cond = threading.Condition()
         self._pending: dict | None = None
         self._answer: str | None = None
-        self._messages: list[str] = []
+        self._messages: list[tuple[int, str]] = []
+        self._finished = False
         self._cursors: dict[str, int] = {}
         self.questions = 0
 
@@ -91,30 +93,39 @@ class HumanChannel:
             cursor = self._cursors.get(agent, 0)
             new = self._messages[cursor:]
             self._cursors[agent] = len(self._messages)
-        return [f"[Message from the requester, sent while the team was working]\n{text}" for text in new]
+        return [f"[Message from the requester, sent while the team was working]\n{text}" for _, text in new]
 
-    def start_cursor(self, agent: str) -> None:
+    def start_cursor(self, agent: str, before_seq: int) -> None:
         """An agent that starts now has already seen all earlier messages in its context."""
         with self._cond:
-            self._cursors[agent] = len(self._messages)
+            self._cursors[agent] = sum(seq < before_seq for seq, _ in self._messages)
+
+    def finish(self) -> None:
+        with self._cond:
+            self._finished = True
 
     # called by the service (requester)
     def pending(self) -> dict | None:
         with self._cond:
-            return dict(self._pending) if self._pending else None
+            return dict(self._pending) if self._pending and self._answer is None else None
 
-    def receive(self, text: str) -> str:
-        """Route a requester message: answer the pending question, else queue it. Returns the route."""
+    def receive(self, text: str, *, attachments=(), answer_to=None, steer_only=False) -> str:
+        """Apply an answer to its exact question, or steer without consuming a question."""
         with self._cond:
-            if self._pending is not None and self._answer is None:
-                qid = self._pending["id"]
+            if self._finished or self.should_cancel():
+                return "stale"
+            pending = self._pending if self._answer is None else None
+            if answer_to is not None and (not pending or pending["id"] != answer_to):
+                return "stale"
+            if pending and not steer_only:
                 self._answer = text
-                self.store.append("answer", task_id=self.task_id, qid=qid, text=text,
-                                  agent=self._pending["agent"])
+                self.store.append("answer", task_id=self.task_id, qid=pending["id"], text=text,
+                                  agent=pending["agent"], attachments=list(attachments))
                 self._cond.notify_all()
                 return "answer"
-            self._messages.append(text)
-            self.store.append("user_message", task_id=self.task_id, text=text, during_task=True)
+            message = self.store.append("user_message", task_id=self.task_id, text=text, during_task=True,
+                              attachments=list(attachments))
+            self._messages.append((message["seq"], text))
             return "steering"
 
 
@@ -132,7 +143,7 @@ def _roster(members: list[Member], exclude: str) -> str:
 
 
 def lead_prompt(me: Member, members: list[Member], settings: Settings, interactive: bool,
-                can_delegate: bool) -> str:
+                can_delegate: bool, *, studio_assistant: bool = False) -> str:
     parts = [
         f"You are {me.name} (id `{me.id}`). {me.prompt}".strip(),
         "",
@@ -167,7 +178,12 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "## How you work",
             "- You have a private workspace that is a copy of the shared project; files you create or change are "
             "published to the project when you finish.",
-            "- Do the work yourself with your tools and verify it before you finish.",
+            ("- Decide how to fulfill this commission from the user's intent, prior conversation and available "
+             "roles and rooms. You can work here, dispatch to a role's DM or an existing room, or organize a "
+             "group and dispatch to it. Use the directory to identify the right destination or role; follow the "
+             "user's choice when given. Studio delivers dispatch links and the eventual result and files to this "
+             "chat automatically. Use await_result only when your own next step needs that result." if studio_assistant else
+             "- Do the work yourself with your tools and verify it before you finish."),
         ]
     if interactive:
         parts += [
@@ -182,7 +198,7 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "instead of asking, and list them in your final answer.",
         ]
     parts += [
-        "- Save durable lessons, conventions and requester preferences with `remember`.",
+        "- Save durable lessons, conventions and requester preferences with `propose_knowledge`, subject to user approval.",
         "",
         "## Finishing",
         "End with your final message to the requester (plain text, no tool call): what was delivered (file "
@@ -219,7 +235,7 @@ def member_prompt(me: Member, lead: Member, members: list[Member], settings: Set
     else:
         parts.append("- The requester is not available. Make reasonable assumptions and state them in your report.")
     parts += [
-        "- Save durable lessons and conventions with `remember`.",
+        "- Save durable lessons and conventions with `propose_knowledge`, subject to user approval.",
         "",
         "## Your report",
         "When you are done, reply with your report as plain text (no tool call): what you did, the files you "
@@ -245,6 +261,18 @@ def _clip(text: str, limit: int) -> str:
 def render_event(event: dict, names: dict[str, str]) -> str:
     kind = event["kind"]
     who = lambda agent: f"{names.get(agent, agent)} ({agent})"  # noqa: E731
+    if kind == "room_reply":
+        return f"**{who(event['agent'])}:** {_clip(event['text'], 4500)}"
+    if kind == "assistant_group_created":
+        return f"Studio created {event['group_name']} ({event['target_group_id']})."
+    if kind == "dispatch_sent":
+        return f"Studio dispatched {event['target_task_id']} to {event['group_name']} ({event['target_group_id']})."
+    if kind == "dispatch_finished":
+        paths = ", ".join(c["path"] for c in event.get("artifacts", [])[:25])
+        return (f"{event['group_name']} returned {event['target_task_id']}: {event['status']}. "
+                f"{_clip(event.get('text') or event.get('error'), 1800)} Files: {paths}")
+    if kind == "progress":
+        return f"**{who(event['agent'])} (progress):** {_clip(event['text'], 1200)}"
     if kind == "user_message":
         return f"**Requester:** {_clip(event['text'], 6000)}"
     if kind == "delegation":
@@ -289,9 +317,6 @@ def agent_context(store: GroupStore, agent_id: str, before_seq: int) -> str:
     if chat:
         sections.append("## Group conversation so far\n" + chat)
     sections.append("## Team project files\n" + listing(store.project.files()))
-    memory = store.memory(agent_id).strip()
-    if memory:
-        sections.append("## Your notes from earlier work in this group\n" + _clip(memory, 4000))
     journal = store.journal(agent_id, limit=5)
     if journal:
         rows = [f"- ({j.get('status')}) {_clip(j.get('assignment', ''), 300)} → files: "
@@ -318,6 +343,10 @@ class TeamTask:
         self.channel = channel
         self.should_cancel = should_cancel
         self.on_activity = on_activity
+        self.studio = None
+        self.dispatched_by = None
+        self.options = {}
+        self.created_at = now()
         self.group = store.group
         self.interactive = self.group.mode == "interactive"
         self.delegations = 0
@@ -330,6 +359,14 @@ class TeamTask:
     # -- plumbing ---------------------------------------------------------
     def _event(self, event: dict) -> None:
         event = {"task_id": self.task_id, **event}
+        if event["type"] == "end" and event.get("agent") == self.primary:
+            self.channel.finish()
+        if event["type"] == "say":
+            self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
+        if event["type"] == "delta":
+            self.store.previews.fragment(self.task_id, event["agent"], event["phase"], event["text"])
+        elif event["type"] in ("step", "tool_call"):
+            self.store.previews.fragment(self.task_id, event["agent"], "discard", "")
         if event["type"] != "delta":
             self.store.trace(self.task_id, event)
         if self.on_activity:
@@ -348,12 +385,14 @@ class TeamTask:
                     "question": {"type": "string", "description": "The complete question(s) for the requester"}},
                     "required": ["question"]},
                 fn=lambda _ctx, args, agent=agent_id: self._ask(agent, args["question"])))
-        registry.add(Tool(
-            name="remember",
-            description=("Save a short note to your long-term memory in this group (requester preferences, "
-                         "decisions, conventions, lessons). Your notes are shown to you in every future assignment."),
-            parameters={"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]},
-            fn=lambda _ctx, args, agent=agent_id: self._remember(agent, args["note"])))
+        if self.studio is not None:
+            from .studio_tools import role_tools, assistant_tools
+            extras = role_tools(self.studio, self.group, agent_id)
+            extras.extend(self.studio.uploads.tools(self.store, agent_id))
+            if self.group.kind == "assistant":
+                extras.extend(assistant_tools(self.studio, self.group.id, self.task_id))
+            for tool in extras:
+                registry.add(tool)
         return registry
 
     def _ask(self, agent: str, question: str) -> ToolResult:
@@ -368,14 +407,23 @@ class TeamTask:
         self._event({"type": "answer", "agent": agent, "text": answer})
         return ToolResult.success(f"The requester answered:\n{answer}")
 
-    def _remember(self, agent: str, note: str) -> ToolResult:
-        note = note.strip()
-        if not note or len(note) > 2000:
-            return ToolResult.failure("A note must be 1–2000 characters.")
-        self.store.remember(agent, note)
-        return ToolResult.success("Saved to your long-term notes.")
+    def _context(self, agent, through):
+        context = agent_context(self.store, agent, through)
+        if self.studio is not None:
+            if self.group.kind == "assistant":
+                from .assistant_room import workspace_evidence
+                evidence = workspace_evidence(self.studio, self.store)
+                context += "\nStudio directory and your recent dispatches (reference data):\n" + json.dumps(evidence, ensure_ascii=False)
+            notes = self.studio.roles.entries(agent, group=self.group.id)
+            if agent not in self.group.role_ids:
+                notes = [r for r in notes if r["scope"] == "group:" + self.group.id]
+            if notes:
+                context += "\nApproved knowledge:\n" + _clip("\n".join(r["text"] for r in notes), 6000)
+            uploads = [r for event in self.store.chat() if event["seq"] <= through for r in event.get("attachments", [])]
+            if uploads:
+                context += "\nMessage attachments:\n" + _clip(json.dumps(uploads, ensure_ascii=False), 6000)
+        return context
 
-    # -- delegation -------------------------------------------------------
     def _delegate_tool(self, lead_id: str) -> Tool:
         ids = [m.id for m in self.group.members if m.id != lead_id]
         return Tool(
@@ -384,6 +432,7 @@ class TeamTask:
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report and the list of published files."),
             parameters={"type": "object", "properties": {
+                "max_steps": {"type":"integer","minimum":1,"maximum":150},
                 "assignee": {"type": "string", "enum": ids, "description": "Teammate id"},
                 "task": {"type": "string", "description": "The complete assignment: goal, context, exact files, "
                                                           "and how the result will be checked"},
@@ -405,6 +454,9 @@ class TeamTask:
             return ToolResult.failure(
                 f"The delegation budget for this task ({self.settings.team.max_delegations}) is used up. "
                 "Finish now with what the team has produced and state what remains open.")
+        max_steps = args.get("max_steps")
+        if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150,self.settings.limits.max_steps)):
+            return ToolResult.failure(f"max_steps must be between 1 and {min(150,self.settings.limits.max_steps)}")
         previous = self.history.setdefault(assignee, [])
         similar = sum(1 for old in previous
                       if difflib.SequenceMatcher(None, old[:3000], task[:3000]).ratio() >= 0.9)
@@ -424,7 +476,7 @@ class TeamTask:
             self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
         event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
                                   task=task, deliverables=deliverables)
-        result, changes, skipped = self._run_member(member, task, deliverables, event["seq"])
+        result, changes, skipped = self._run_member(member, task, deliverables, event["seq"], max_steps)
         self.lead_baseline = self.store.project.checkout(lead_workspace)
         report = result.answer or "(no report)"
         if result.error:
@@ -452,7 +504,7 @@ class TeamTask:
         ok = result.status in {"completed", "max_steps", "stuck", "budget"}
         return ToolResult(ok=ok, content="\n".join(lines))
 
-    def _run_member(self, member: Member, task: str, deliverables: list[str], trigger_seq: int):
+    def _run_member(self, member: Member, task: str, deliverables: list[str], trigger_seq: int, max_steps=None):
         workspace = self.store.workspace(member.id)
         baseline = self.store.project.checkout(workspace)
         lead = self.group.member(self.primary)
@@ -461,15 +513,16 @@ class TeamTask:
             assignment += "\n\nFiles you are expected to create or update: " + ", ".join(deliverables)
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
         agent = Agent(member.id, self.provider, self._registry(member.id, lead=False), Sandbox(workspace, member.id),
-                      self.settings, system_prompt=member_prompt(member, lead, self.group.members, self.settings,
+                      self.settings, limits=self.settings.limits if max_steps is None else replace(self.settings.limits, max_steps=max_steps),
+                      system_prompt=member_prompt(member, lead, self.group.members, self.settings,
                                                                  self.interactive),
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel,
                       stream=True)
-        self.channel.start_cursor(member.id)
+        self.channel.start_cursor(member.id, trigger_seq)
         self.active.append(member.id)
         self._update(active=list(self.active))
         try:
-            result = agent.run(assignment, context=agent_context(self.store, member.id, trigger_seq))
+            result = agent.run(assignment, context=self._context(member.id, trigger_seq))
         finally:
             self.active.remove(member.id)
             self._update(active=list(self.active))
@@ -492,8 +545,11 @@ class TeamTask:
         me = self.group.member(self.primary)
         can_delegate = self.primary == self.group.lead and len(self.group.members) > 1
         self.record = {"id": self.task_id, "group_id": self.group.id, "text": self.text, "primary": self.primary,
-                       "status": "running", "created_at": now(), "finished_at": None, "active": [self.primary],
-                       "delegations": 0, "assignments": [], "final_answer": "", "error": ""}
+                       "status": "running", "created_at": self.created_at, "trigger_seq": self.trigger_seq, "finished_at": None, "active": [self.primary],
+                       "delegations": 0, "assignments": [], "final_answer": "", "error": "", "options": self.options, "role_ids": list(self.group.role_ids)}
+        self.record["room_kind"] = self.group.kind
+        if self.dispatched_by:
+            self.record["dispatched_by"] = self.dispatched_by
         self.store.save_task(self.record)
         self.store.append("task_started", task_id=self.task_id, agent=self.primary)
         workspace = self.store.workspace(self.primary)
@@ -502,7 +558,8 @@ class TeamTask:
         # The coordinating lead gets the lead budget; a member addressed directly works
         # like any assignment, with the member budget.
         limits = replace(settings.limits, max_steps=settings.team.lead_max_steps) if can_delegate else settings.limits
-        prompt = lead_prompt(me, self.group.members, settings, self.interactive, can_delegate)
+        prompt = lead_prompt(me, self.group.members, settings, self.interactive, can_delegate,
+                             studio_assistant=self.group.kind == "assistant")
         if not can_delegate and self.primary != self.group.lead:
             lead = self.group.member(self.group.lead)
             prompt += (f"\n\nThe requester addressed this message to you directly, so you handle it yourself. "
@@ -510,15 +567,15 @@ class TeamTask:
         agent = Agent(self.primary, self.provider, self._registry(self.primary, lead=can_delegate),
                       Sandbox(workspace, self.primary), settings, system_prompt=prompt, limits=limits,
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel, stream=True)
-        self.channel.start_cursor(self.primary)
-        result = agent.run(self.text, context=agent_context(self.store, self.primary, self.trigger_seq))
+        self.channel.start_cursor(self.primary, self.trigger_seq)
+        result = agent.run(self.text, context=self._context(self.primary, self.trigger_seq))
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
         if changes:
             self.store.append("publish", task_id=self.task_id, agent=self.primary,
                               changes=[c.as_dict() for c in changes])
-        status = {"completed": "completed", "cancelled": "cancelled", "error": "failed"}.get(result.status, "incomplete")
-        answer = result.answer or ("" if status == "cancelled" else "(The lead stopped without a final answer.)")
+        status = {"completed": "completed", "dispatched":"dispatched", "cancelled": "cancelled", "error": "failed"}.get(result.status, "incomplete")
+        answer = result.answer or ("" if status in ("cancelled","dispatched") else "(The lead stopped without a final answer.)")
         if answer:
             self.store.append("final", task_id=self.task_id, agent=self.primary, text=answer, status=status,
                               error=result.error)

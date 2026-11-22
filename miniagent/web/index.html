@@ -5,18 +5,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>miniagent Studio</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/theme.css">
+  <link rel="stylesheet" href="/static/studio.css">
   <script src="/static/vendor/markdown-it.min.js" defer></script>
+  <link rel="stylesheet" href="/static/workbench.css">
   <script src="/static/app.js" defer></script>
+  <script src="/static/directory.js" defer></script>
+  <script src="/static/reader.js" defer></script>
+  <script src="/static/workbench.js" defer></script>
 </head>
 <body>
-  <aside id="sidebar">
-    <div class="brand">miniagent <span>Studio</span></div>
+  <aside id="sidebar" class="sidebar">
+    <div class="brand">Agent <span>Studio</span></div>
+    <nav id="sections"><button id="workbench-nav">工作台</button><button id="assistant-nav">工作室助手</button><button id="rooms-nav">最近对话</button>
+    <button id="roles-nav">角色库</button><button id="tasks-nav">任务记录</button></nav>
+    <label for="group-list">固定群聊</label>
     <button id="new-group" class="primary">＋ 新建群聊</button>
     <ul id="group-list"></ul>
+    <button id="connection">模型连接</button>
     <div id="config" class="muted small"></div>
   </aside>
 
   <main id="main">
+    <section id="directory" hidden></section>
     <div id="empty" class="empty">
       <h1>多智能体协作工作室</h1>
       <p>新建一个群聊，填入成员和各自的职责（或直接选用 Mid_Test 场景模板），然后在群里发布任务。</p>
@@ -27,12 +38,13 @@
       <header id="room-head">
         <div class="title">
           <h2 id="room-name"></h2>
-          <div id="room-members" class="chips"></div>
+
         </div>
         <div class="actions">
           <span id="task-buttons"></span>
           <button id="edit-group" title="编辑群聊">设置</button>
           <button id="toggle-files">文件</button>
+          <button id="room-options">会话管理</button>
           <button id="stop" class="danger" hidden>停止</button>
         </div>
       </header>
@@ -44,20 +56,29 @@
       <div id="activity" hidden></div>
       <form id="composer">
         <div id="question-banner" hidden></div>
+        <div class="options"><label>附件 <input id="uploads" type="file" multiple></label>
+          <label>思考 <select id="thinking"><option value="">默认</option><option value="enabled">开</option><option value="disabled">关</option></select></label>
+          <button id="task-options" type="button">运行选项</button>
+          <label><input type="checkbox" id="queue">排队新任务</label><button id="bottom" type="button">↓ 最新</button></div>
         <div class="row">
-          <textarea id="input" rows="3" placeholder="发布任务或回复群里的问题。以 @成员ID 开头可直接点名某位成员。Enter 发送，Shift+Enter 换行。"></textarea>
+          <textarea id="input" rows="3" placeholder="追问、讨论或交办工作。可用 @成员ID 点名。Enter 发送，Shift+Enter 换行。"></textarea>
           <button type="submit" class="primary">发送</button>
         </div>
+        <div id="sending-status" class="muted small" role="status" hidden>正在处理这条消息…</div>
         <div id="composer-error" class="error" hidden></div>
       </form>
     </section>
   </main>
 
+  <aside id="member-panel" hidden>
+    <header><strong>群成员</strong><button id="manage-members" class="link">管理</button></header>
+    <ul id="room-members"></ul>
+  </aside>
   <aside id="files" hidden>
     <header>
       <strong>团队项目文件</strong>
       <span>
-        <a id="download-zip" href="#">下载 ZIP</a>
+        <a id="assessor-zip" href="#">导出对话与交付</a> · <a id="download-zip" href="#">下载 ZIP</a>
         <button id="close-files" class="link">关闭</button>
       </span>
     </header>
@@ -80,6 +101,7 @@
       </label>
       <div class="members-head"><strong>成员</strong><button type="button" id="add-member" class="link">＋ 添加成员</button></div>
       <div id="member-rows"></div>
+      <label>引用角色库 <select id="library-member"></select></label>
       <label>负责人 <select id="group-lead"></select></label>
       <div id="group-error" class="error" hidden></div>
       <div class="dialog-actions">
@@ -88,5 +110,12 @@
       </div>
     </form>
   </dialog>
+  <dialog id="sheet"><form id="sheet-content"></form><button id="sheet-close" type="button">关闭</button></dialog>
+  <dialog id="document-reader" aria-labelledby="reader-title">
+    <header><div><small id="reader-origin"></small><h2 id="reader-title"></h2></div>
+      <div class="actions"><button id="reader-back" type="button">返回上篇</button><a id="reader-download" download>下载原文</a><button id="reader-close" type="button">关闭阅读器</button></div>
+    </header><article id="reader-body"></article>
+  </dialog>
+  <div id="notice" role="status" hidden></div>
 </body>
 </html>

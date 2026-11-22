@@ -100,30 +100,30 @@ class Sandbox:
         """
         raw = "" if rel_path is None else str(rel_path).strip()
         if not raw:
-            raise SandboxError("路径不能为空")
+            raise SandboxError("Path cannot be empty")
 
         normalized = raw.replace("\\", "/")
         if normalized.startswith("/") or normalized.startswith("~"):
-            raise SandboxError(f"不允许绝对路径: {raw}")
+            raise SandboxError(f"Absolute path not allowed: {raw}")
         if normalized.startswith("//"):
-            raise SandboxError(f"不允许网络路径: {raw}")
+            raise SandboxError(f"Network path not allowed: {raw}")
         if len(normalized) > 1 and normalized[1] == ":":
-            raise SandboxError(f"不允许盘符路径: {raw}")
+            raise SandboxError(f"Drive path not allowed: {raw}")
 
         candidate = Path(normalized)
         if candidate.is_absolute():
-            raise SandboxError(f"不允许绝对路径: {raw}")
+            raise SandboxError(f"Absolute path not allowed: {raw}")
 
         try:
             resolved = (self.root / candidate).resolve(strict=False)
         except OSError as exc:  # 极长路径、非法字符等
-            raise SandboxError(f"无法解析路径 {raw}: {exc}") from exc
+            raise SandboxError(f"Cannot resolve {raw}: {exc}") from exc
 
         if not _is_inside(resolved, self.root):
-            raise SandboxError(f"路径越界（拒绝访问沙箱之外）: {raw}")
+            raise SandboxError(f"Path outside workspace: {raw}")
 
         if must_exist and not resolved.exists():
-            raise SandboxError(f"文件不存在: {raw}")
+            raise SandboxError(f"File not found: {raw}")
         return resolved
 
     def relative(self, path: Path) -> str:
@@ -135,7 +135,7 @@ class Sandbox:
 
     def ensure_parent(self, path: Path) -> None:
         if not _is_inside(path, self.root):
-            raise SandboxError(f"路径越界: {path}")
+            raise SandboxError(f"Path outside workspace: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------ 观测

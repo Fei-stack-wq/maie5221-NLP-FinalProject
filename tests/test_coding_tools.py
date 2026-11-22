@@ -292,7 +292,7 @@ class CodingToolsTest(unittest.TestCase):
         with patch("miniagent.file_tools.os.fsync", side_effect=concurrent_change):
             result = self.call("edit_file", path=path.name, old_text="original", new_text="ours")
         self.assertFalse(result.ok)
-        self.assertIn("变化", result.content)
+        self.assertIn("changed", result.content)
         self.assertEqual(path.read_text(), "external update")
         self.assertFalse(list(self.root.glob(".miniagent-write-*")))
 
@@ -336,7 +336,7 @@ class CodingToolsTest(unittest.TestCase):
                 with self.subTest(tool=name, path=path):
                     result = self.call(name, path=path, **arguments)
                     self.assertFalse(result.ok)
-                    self.assertIn("沙箱拒绝", result.content)
+                    self.assertIn("Workspace access denied", result.content)
         self.assertEqual(outside.read_text(), "untouched")
 
     def test_directories_and_special_files_do_not_block_or_mutate(self):

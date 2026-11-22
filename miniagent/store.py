@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .chat_stream import ChatStream
 from .workspace import Project
 
 _ID = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,47}\Z")
@@ -38,13 +39,16 @@ class Member:
     id: str
     name: str
     prompt: str
+    note: str = ""
 
     def validate(self) -> None:
         if not _ID.fullmatch(self.id or ""):
             raise ValueError(f"invalid member id {self.id!r}: use letters, digits, _ or -, starting with a letter")
-        if not self.name.strip() or len(self.name) > 100:
+        if not isinstance(self.name, str) or not self.name.strip() or len(self.name) > 100:
             raise ValueError(f"member {self.id} needs a name (max 100 characters)")
-        if len(self.prompt) > 8000:
+        if not isinstance(self.note,str) or len(self.note)>3000:
+            raise ValueError("Invalid group note")
+        if not isinstance(self.prompt, str) or len(self.prompt) > 8000:
             raise ValueError(f"member {self.id} prompt is longer than 8000 characters")
 
 
@@ -57,7 +61,16 @@ class Group:
     mode: str = "interactive"
     created_at: float = field(default_factory=now)
 
+    kind: str = "group"
+    pinned: bool = False
+    archived: bool = False
+    folder: str = ""
+    role_ids: list[str] = field(default_factory=list)
+    created_by: dict | None = None
+
     def validate(self) -> None:
+        if self.kind not in {"group", "dm", "assistant"} or (self.kind != "group" and len(self.members) != 1):
+            raise ValueError("DM and assistant conversations have exactly one member")
         if not self.name.strip() or len(self.name) > 120:
             raise ValueError("group name is required (max 120 characters)")
         if not 1 <= len(self.members) <= 12:
@@ -84,7 +97,9 @@ class Group:
     @classmethod
     def from_dict(cls, data: dict) -> "Group":
         return cls(id=data["id"], name=data["name"], lead=data["lead"], mode=data.get("mode", "interactive"),
-                   created_at=data.get("created_at", now()),
+                   created_at=data.get("created_at", now()), kind=data.get("kind", "group"),
+                   pinned=data.get("pinned", False), archived=data.get("archived", False),
+                   folder=data.get("folder", ""), role_ids=data.get("role_ids", []), created_by=data.get("created_by"),
                    members=[Member(**m) for m in data["members"]])
 
 
@@ -95,12 +110,18 @@ class GroupStore:
         self.root = root
         self.group = group
         self._lock = threading.RLock()
+        self.turn_lock = threading.Lock()
+        self._notice_ids: set[str] = set()
         self._seq = 0
         self._chat_path = root / "chat.jsonl"
         if self._chat_path.exists():
             for line in self._chat_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
-                    self._seq = max(self._seq, json.loads(line).get("seq", 0))
+                    event = json.loads(line)
+                    self._seq = max(self._seq, event.get("seq", 0))
+                    if event.get("notice_id"):
+                        self._notice_ids.add(event["notice_id"])
+        self.previews = ChatStream(self._seq)
         self.project = Project(root / "project", root / "project-log.jsonl")
 
     # -- chat -------------------------------------------------------------
@@ -110,7 +131,15 @@ class GroupStore:
             event = {"seq": self._seq, "time": now(), "kind": kind, **fields}
             with self._chat_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            self.previews.committed(event)
             return event
+
+    def append_notice(self, kind, notice_id, **fields):
+        """A producer retry and a startup replay deliver the same public event once."""
+        with self._lock:
+            if notice_id not in self._notice_ids:
+                self.append(kind, notice_id=notice_id, **fields)
+                self._notice_ids.add(notice_id)
 
     def chat(self, after: int = 0) -> list[dict]:
         with self._lock:
@@ -157,6 +186,8 @@ class GroupStore:
 
     # -- tasks ------------------------------------------------------------
     def task_dir(self, task_id: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", task_id):
+            raise ValueError("Invalid task ID")
         path = self.root / "tasks" / task_id
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -179,7 +210,7 @@ class GroupStore:
             path = folder / "task.json"
             if path.exists():
                 rows.append(json.loads(path.read_text(encoding="utf-8")))
-        return sorted(rows, key=lambda row: row.get("created_at", 0))
+        return sorted(rows, key=lambda row: (row.get("created_at", 0), row.get("trigger_seq", 0)))
 
     def trace(self, task_id: str, event: dict) -> None:
         with self._lock, (self.task_dir(task_id) / "trace.jsonl").open("a", encoding="utf-8") as stream:
@@ -195,15 +226,16 @@ class Store:
         self._lock = threading.RLock()
         self._open: dict[str, GroupStore] = {}
 
-    def create(self, name: str, members: list[dict], lead: str, mode: str = "interactive") -> GroupStore:
+    def create(self, name: str, members: list[dict], lead: str, mode: str = "interactive", **options) -> GroupStore:
         group = Group(id="g-" + uuid.uuid4().hex[:12], name=name.strip(),
                       members=[Member(id=m["id"].strip(), name=(m.get("name") or m["id"]).strip(),
-                                      prompt=(m.get("prompt") or "").strip()) for m in members],
-                      lead=lead, mode=mode)
+                                      prompt=(m.get("prompt") or "").strip(), note=m.get("note","")) for m in members],
+                      lead=lead, mode=mode, **options)
         group.validate()
         root = self.root / group.id
         root.mkdir(parents=True)
-        (root / "group.json").write_text(json.dumps(group.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        from .roles import write_json
+        write_json(root / "group.json", group.to_dict())
         store = GroupStore(root, group)
         with self._lock:
             self._open[group.id] = store
@@ -225,8 +257,8 @@ class Store:
 
     def update_group(self, store: GroupStore) -> None:
         store.group.validate()
-        (store.root / "group.json").write_text(json.dumps(store.group.to_dict(), ensure_ascii=False, indent=2),
-                                               encoding="utf-8")
+        from .roles import write_json
+        write_json(store.root / "group.json", store.group.to_dict())
 
     def groups(self) -> list[Group]:
         rows = []

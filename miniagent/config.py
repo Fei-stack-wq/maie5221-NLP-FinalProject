@@ -48,7 +48,7 @@ def validate_provider_options(
     *,
     model: str = DEFAULT_MODEL,
     base_url: str = DEFAULT_BASE_URL,
-    thinking: Literal["enabled", "disabled"] = "disabled",
+    thinking: Literal["enabled", "disabled"] = "enabled",
     reasoning_effort: Literal["low", "high", "max"] = "high",
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -90,7 +90,7 @@ def validate_provider_options(
 class Limits:
     """Budgets for one agent run (one member assignment or one lead turn)."""
 
-    max_steps: int = 80
+    max_steps: int = 100
     """Model turns for one agent run. Always finite (1..1000)."""
 
     max_seconds: float = 0
@@ -117,7 +117,7 @@ class Limits:
 class TeamLimits:
     """Bounds for one group task (the lead's coordination of the whole team)."""
 
-    lead_max_steps: int = 60
+    lead_max_steps: int = 80
     """Model turns of the lead for one task (delegations are tool calls inside these turns)."""
 
     max_delegations: int = 24
@@ -141,7 +141,7 @@ class Settings:
     limits: Limits = field(default_factory=Limits)
     team: TeamLimits = field(default_factory=TeamLimits)
     runs_dir: Path = Path("runs")
-    thinking: Literal["enabled", "disabled"] = "disabled"
+    thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort: Literal["low", "high", "max"] = "high"
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS

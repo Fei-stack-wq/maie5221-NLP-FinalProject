@@ -2,8 +2,7 @@
 
 miniagent is a small multi-agent collaboration system. A **group** has members
 with role prompts; one member is the **lead**. A requester (the human) posts a
-task in the group chat; the lead plans, delegates pieces to members, has their
-work checked by other members, asks the requester when a decision is theirs,
+task in the group chat; the lead plans, delegates pieces to members, may ask other members to review, asks the requester when a decision is theirs,
 and finishes with a final answer. Files are the team's shared output.
 
 ```
@@ -94,36 +93,109 @@ model call → tool batch (≤ `max_tool_calls_per_step`, extra calls answered a
 up to twice. Background processes started by shell commands are tracked by
 process group and killed when the run ends.
 
-**`team.py`** — `TeamTask` runs one requester message. The lead's extra tools:
-`delegate_task(assignee, task, deliverables)`, `ask_human(question)`,
-`remember(note)`. A delegation publishes the lead's own edits, checks out the
-project into the member's workspace, runs the member, publishes the member's
-changes, refreshes the lead, and returns the full report with the published
-file list and any missing expected files. Every agent's first message contains
-the group conversation so far (previous tasks, delegations, reports, questions,
-answers, final answers), the project file list, its own long-term notes and its
-recent assignments — this is how Task 2 continues from Task 1.
+**`team.py`** runs one task against a snapshot of the group. All actors use the
+same loop and base tools. A coordinating lead also has `delegate_task`. A
+directly addressed member works alone. A delegation publishes the lead's edits,
+checks out the project for the member, publishes the member's changes, and
+returns its report, the changed paths and any missing expected files. The next
+task starts with the same group's conversation, current project manifest,
+recent assignments and explicitly approved role knowledge.
 
-**`workspace.py`** — `Project.checkout` mirrors the project into a workspace;
-`Project.publish` applies a workspace's adds/modifications/deletions since its
-baseline and logs them. Caches (`node_modules`, `.venv`, …), VCS folders,
-symlinks and files over 25 MB are skipped and reported.
+**`workspace.py` and `folders.py`** maintain private checkouts and the shared
+project. A user can bind an external folder. At task start Studio imports
+changed files. At completion it compares hashes from the last synchronization,
+publishes changed outputs and preserves concurrent external edits. A different
+generated version is written alongside an external edit as `.miniagent-conflict`.
+Symlinks, VCS directories, caches and files over 25 MB are excluded. These
+local workspaces separate files; shell and Python execute as the local OS user.
 
-**`store.py`** — plain files under `runs/groups/<id>/`: `group.json`,
-`chat.jsonl` (numbered public events), `project/`, `agents/<id>/workspace|memory.md|journal.jsonl`,
-`tasks/<id>/task.json|trace.jsonl`.
+**`studio.py`, `server.py`, `web/`** expose one service to the UI, CLI and
+assistant tools. A private chat is a one-member group with independent files and
+history. In a group or DM, `room_turn.py` gives the addressed role the room's
+recent dialogue, published changes, named members, recorded evaluation, active task
+and pending question. A text response appends two conversation events. An explicit
+model action can commission work, steer the same running task, or answer the exact
+pending question. A stale target leaves a visible reply. No worker workspace is
+acquired for a conversation reply. Turns in one room are ordered independently of
+other rooms. This restores the distinction made in the earlier Studio
+`studio_room_reply.py` and uses the conversation-level handoff pattern illustrated
+by the [Agents SDK routing example](https://github.com/openai/openai-agents-python/blob/main/examples/agent_patterns/routing.py). Explicitly queued tasks
+keep their own attachments and options, and start in FIFO order. On restart,
+orphaned running tasks are recorded as interrupted, then queued work resumes.
+One writer process owns each data directory. The server validates its loopback
+Host, same-origin Origin and per-instance token for mutations. The preview has
+a separate origin. The desktop launcher picks available ports at startup.
 
-**`studio.py` / `server.py` / `web/`** — one task thread per group; a
-requester message answers a pending question, else steers a running task, else
-starts a task (`@member` addresses one member directly). The API (port N)
-requires an `X-Studio: 1` header on mutations; generated files are served from
-a separate preview origin (port N+1) so a generated page can use
-`localStorage` but cannot reach the API.
+**`roles.py`, `attachments.py`, `studio_tools.py`** implement three routes for
+information. The library stores reusable definitions and append-only knowledge
+revisions. An approved entry is visible to the same role either in its originating
+room or generally, according to its scope. Original uploads are content-addressed
+and only attachment references sent to a conversation are available to its ordinary
+members. The user's unified assistant can explicitly dispatch across rooms, inspect
+a dispatched task and read a published group file. Role prompts, run options and
+the active roster are resolved when work is dispatched.
+
+**`evaluation.py`** freezes per-task changed files into `artifacts.zip`. Exists,
+contains and command checks score a temporary checkout. The record includes each
+outcome and the command exit code. The user can inspect the score, download the
+task snapshot, or export the current project together with the complete group
+transcript (`chat.md` and `chat.jsonl`). Asking for changes sends another
+ordinary message. There is no separate approval engine that can reverse a model
+result. The separation of execution and scoring follows Inspect AI's
+[scorer interface](https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/scorer/_scorer.py).
+Settings and the jade palette were adapted from this repository's
+[Studio integration](https://github.com/Fei-stack-wq/maie5221-NLP-FinalProject/tree/530df33).
+
+Under `runs/`, each `groups/<gid>/` owns the public `chat.jsonl`, `project/`,
+`agents/<id>/workspace`, journals, and `tasks/<tid>/` records, traces and snapshots.
+Library roles live in `roles/<id>/`. Original uploads live in `uploads/<sha256>/`.
+The legacy signature ledger is outside this execution path.
 
 **Metrics** — `task.json` records status, duration, steps, tool calls,
 delegations, questions and provider-reported tokens for the lead and each
 assignment; `python -m miniagent report` aggregates completion rate, mean/p95
 duration and tokens.
+
+## Unified assistant conversations
+
+The sidebar assistant, groups and DMs enter the same model-driven room turn. A direct answer appends chat events. The explicit queue control still submits work. For the assistant, the evidence also includes library roles and room rosters. Ordinary follow-ups have access to the assistant's own task evidence and its outgoing dispatch receipts. Other rooms' conversations and independently commissioned tasks stay outside this projection.
+
+After a commission the model has local work tools as well as directory, role creation, group creation and dispatch tools. It can handle the work, reuse a role's DM or choose a team. Both the room router and the worker see the relevant directory and conversation context. This adapts the [OpenAI Agents SDK agent-as-tool mechanism](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent.py#L646) and its [nested result test](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_agent_as_tool.py#L558). Studio returns an asynchronous receipt identifying a durable task; the destination's own execution record supplies its progress and delivery.
+
+- Each new dispatch records the source room and parent task in the target's queued and running records. Pre-routing history can be recovered from successful `start_task` tool results in the assistant's own trace. The evidence includes running or queued dispatches and the four most recent terminal dispatches in detail. Earlier dispatches have a compact catalog and their original receipts can be read on demand. A published file excerpt resolves against that specific task's evidence.
+- A progress question can be answered even after the dispatching assistant finishes. Changes and answers identify an observed running task. Multiple eligible targets require an explicit task ID in the model action. Delivery rechecks the captured execution and pending question, so a late answer cannot land in the next task. Forwarding creates a visible receipt in the assistant conversation.
+- A standalone roster request can call `change_group_members(group_id, add_role_ids?, remove_member_ids?, lead?)` from chat, without creating a task. A commissioned assistant can use the same operation as part of organizing a delivery. The service applies the delta under the same lock as the group editor, validates the complete roster and preserves member notes. A repeated change has no side effects. Removing the lead requires a remaining lead. A running task keeps its original team; later tasks use the revised roster.
+
+Offline coverage lives in `tests/test_assistant_room.py`, `tests/test_studio_fusion.py` and `tests/test_ui_smoke.py`.
+
+## Studio workbench
+
+The workbench opens existing rooms through the normal composer. Opening task details, traces or publications only performs reads. The overview follows the [integrated Studio workbench, tool disclosure and Markdown reader](https://github.com/Fei-stack-wq/maie5221-NLP-FinalProject/tree/530df33/miniagent/web). Its data comes from the bounded runtime.
+
+- `GET /api/tasks` supplies the workbench and filters. `GET /api/tasks/<id>?view=summary` omits the large trace. The root identifies the task's primary agent. Each recorded `delegation` adds one branch, including repeat assignments to the same member. The subsequent `report` from that assignee supplies its outcome. A terminal task without a matching report shows that the report is missing.
+- `GET /api/tasks/<id>/tools?cursor=<byte offset>` returns recorded calls and results, the next cursor and a more-pages flag. The chat disclosure matches results by actor and call ID in trace order. The model runtime determines which tools are called. The UI displays the stored argument and output previews.
+- Report and publication cards link to `GET /api/tasks/<id>/files/<path>?sha256=<published digest>`. Task snapshots supply historical bytes. For older records without a snapshot the current file can supply the bytes if its digest matches. Missing revisions return 404. The room file panel opens the current project version.
+- The reader uses the bundled markdown-it with raw HTML disabled. Document links and raster images resolve inside the originating task or project. Escape closes the reader and Back returns to the preceding document.
+
+## Dispatch receipts in the assistant chat
+
+When the assistant creates a room, the room record saves the originating group and task. When it starts a task, the queued record saves the same provenance before the worker can run. The assistant chat receives `assistant_group_created` and `dispatch_sent` events at those commits. The receipt links to the actual room and task, including work queued behind another run.
+
+By default a successful `start_task` handoff ends the assistant turn with status `dispatched`. The child runs independently. If the assistant has other work, it can choose `after_dispatch="continue"`. When it needs the child's result for synthesis, `"await_result"` waits on a completion signal that also wakes on cancellation or shutdown. The agent can still check status on request. A tool error in the same batch or steering that arrived during a call returns control to the model.
+
+The child posts `dispatch_finished` to the originating chat after recording the outcome, snapshot and evaluation. The notification carries the final answer, actual status, warnings and published file revisions. File cards use the child's task ID and digest. Failed and cancelled work has its own outcome. A handoff counts separately from a completed delivery in group metrics.
+
+A notification ID combines the event kind with the target room or task ID. Each source chat checks the ID under its append lock. Startup replays committed target records and can recover older task origins from the source assistant's successful dispatch trace. A crash between dispatch and notification, or reopening the chat, therefore does not require another model turn.
+
+The batch handoff follows the [OpenAI Agents SDK tool termination path](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L808-L831). The separate child start and outcome signals follow the [Temporal Python SDK child completion handler](https://github.com/temporalio/sdk-python/blob/e64f9dd3b3b513da6676caf5c1a6cbbb36119503/temporalio/worker/_workflow_instance.py#L985-L1020). Studio implements these semantics using its existing group records, chat log and worker condition. Offline API, worker, restart and browser regressions are in `tests/test_dispatch_notices.py`.
+
+## Streaming public chat replies
+
+The room router requests streaming on both its initial model call and its read-only continuation after an evidence lookup. Task leads and members use the same public content stream. The existing POST still returns the committed route and result to API clients. Opening a room in the browser also subscribes to `GET /api/groups/<id>/chat-stream` using Server-Sent Events. Visible model text appears inside the timeline while the POST or worker is still running. Thinking tokens and tool arguments stay out of the reply bubble.
+
+Each group holds its own transient drafts, one per task and actor plus one for the current conversation turn. A subscriber receives the current text on connection and new fragments thereafter. A failed provider attempt drops its draft. When the chat log commits progress or a final message, the stream names the new sequence number. The browser fetches those durable events and replaces the draft with the committed Markdown. Refreshing the page can reattach to an active draft. Workbench links and dispatch notifications still come from the chat log.
+
+This follows the separation between incremental model events and committed items in the [OpenAI Agents SDK streaming implementation](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/result.py#L1005-L1080) and its [terminal output regressions](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_streamed_terminal_output_backfill.py#L62-L118). Studio reuses its existing room log for recovery. `tests/test_chat_stream.py` holds the model stream open until Chromium has rendered the first segment, including across a refresh.
 
 ## Verification
 

@@ -56,6 +56,7 @@ class ToolResult(BaseModel):
     ok: bool
     content: str
     meta: dict[str, Any] = Field(default_factory=dict)
+    handed_off: bool = False  # The tool committed an asynchronous handoff with automatic delivery.
 
     @classmethod
     def success(cls, content: str, **meta: Any) -> "ToolResult":

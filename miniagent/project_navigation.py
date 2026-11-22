@@ -24,9 +24,9 @@ def _rg_path():
 def _scope(ctx, requested):
     scope = ctx.sandbox.resolve(requested, must_exist=True)
     if any(part.startswith(".") for part in scope.relative_to(ctx.sandbox.root).parts):
-        raise ValueError("请选择项目内可见的文件或目录")
+        raise ValueError("Choose a visible workspace file or directory")
     if not (scope.is_file() or scope.is_dir()):
-        raise ValueError("请选择普通文件或目录")
+        raise ValueError("Choose a regular file or directory")
     return scope
 
 
@@ -34,13 +34,13 @@ def _page(ctx, args, *, filenames):
     requested = args.get("path", ".")
     scope = _scope(ctx, requested)
     if filenames and not scope.is_dir():
-        return ToolResult.failure("find_files 的 path 必须是目录")
+        return ToolResult.failure("find_files requires a directory as its path")
     limit, offset = args.get("limit", 40), args.get("offset", 0)
     if not 1 <= limit <= 150 or not 0 <= offset <= 1_000_000:
-        return ToolResult.failure("limit 范围为 1..150，offset 为 0..1000000")
+        return ToolResult.failure("limit must be 1..150 and offset 0..1000000")
     binary = _rg_path()
     if not binary:
-        return ToolResult.failure("缺少 rg。请安装项目的 requirements.txt 或系统 ripgrep。")
+        return ToolResult.failure("ripgrep is missing. Install the repository requirements or a system copy of rg.")
     cmd = [binary, "--no-config", "--no-follow", "--no-require-git", "--no-ignore-parent",
            "--no-ignore-global", "--sort", "path", "--color", "never"]
     pattern = args.get("pattern" if filenames else "glob")
@@ -53,7 +53,7 @@ def _page(ctx, args, *, filenames):
     else:
         query, context = args["query"], args.get("context", 0)
         if not query or len(query) > 4096 or not 0 <= context <= 8:
-            return ToolResult.failure("query 须为 1..4096 个字符，context 范围为 0..8")
+            return ToolResult.failure("query must contain 1..4096 characters and context must be 0..8")
         cmd.extend(["--with-filename", "--line-number", "--no-heading", "--no-context-separator",
                     "--max-columns", "320", "--max-columns-preview", "--context", str(context)])
         if args.get("literal"):
@@ -93,15 +93,15 @@ def _page(ctx, args, *, filenames):
             timer.cancel()
             proc.stdout.close()
         if expired.is_set():
-            return ToolResult.failure("搜索超时，请缩小 path 或 glob", timed_out=True)
+            return ToolResult.failure("Search timed out. Narrow the path or glob.", timed_out=True)
         if not more and proc.returncode not in (0, 1):
             diagnostic.seek(0)
             error = diagnostic.read(1500).decode("utf-8", "replace").strip()
-            return ToolResult.failure(f"ripgrep 搜索失败：{error}", exit_code=proc.returncode)
+            return ToolResult.failure(f"ripgrep failed: {error}", exit_code=proc.returncode)
     next_offset = offset + len(rows) if more else None
-    output = "\n".join(rows) or "（没有结果）"
+    output = "\n".join(rows) or "(no results)"
     if more:
-        output += f"\n[下一页 offset={next_offset}]"
+        output += f"\n[next offset={next_offset}]"
     return ToolResult.success(output, path=requested, count=len(rows), offset=offset,
                               next_offset=next_offset, truncated=more)
 
@@ -118,13 +118,13 @@ def read_lines(ctx, args):
     path = _scope(ctx, args["path"])
     start, count = args.get("start_line", 1), args.get("limit", 120)
     if start < 1 or not 1 <= count <= 400:
-        return ToolResult.failure("start_line 从 1 开始，limit 为 1..400 行")
+        return ToolResult.failure("start_line starts at 1 and limit must be 1..400 lines")
     data, _ = _load_for_edit(path)
     try:
         source = data.decode("utf-8")
         lines = source.splitlines(keepends=True)
     except UnicodeDecodeError:
-        return ToolResult.failure("请选择 UTF-8 文本文件")
+        return ToolResult.failure("Choose a UTF-8 text file")
     rows = []
     used = 0
     char_start = sum(map(len, lines[:start - 1]))
@@ -138,7 +138,7 @@ def read_lines(ctx, args):
         if len(row) > 16_000:
             prefix = row[:15_800]
             partial_line = number
-            rows.append(prefix + f" … [长行；完整内容可用 read_file 从 offset={char_end} 分页读取]")
+            rows.append(prefix + f" … [long line, use read_file from offset={char_end}]")
             char_end += len(prefix) - len(label)
             break
         rows.append(row)
@@ -146,10 +146,10 @@ def read_lines(ctx, args):
         used += len(row) + 1
     next_line = start + len(rows) if start + len(rows) <= len(lines) else None
     digest = hashlib.sha256(data).hexdigest()
-    output = "\n".join(rows) or "（已到文件末尾）"
-    footer = f"\n[总行数 {len(lines)}，sha256={digest}"
+    output = "\n".join(rows) or "(end of file)"
+    footer = f"\n[total lines {len(lines)}, sha256={digest}"
     if next_line is not None:
-        footer += f"，下一页 start_line={next_line}"
+        footer += f", next start_line={next_line}"
     return ToolResult.success(output + footer + "]", path=args["path"], start_line=start,
                               next_line=next_line, total_lines=len(lines), sha256=digest,
                               chars=len(source), char_start=char_start, char_end=char_end,

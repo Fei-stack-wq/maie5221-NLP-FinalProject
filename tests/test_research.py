@@ -100,7 +100,7 @@ class ResearchTest(unittest.TestCase):
         self.assertNotIn(secret, raw.decode())
         self.assertNotIn(secret, result.content)
         self.assertIn(side, raw.decode())
-        self.assertIn("已省略 2 条", result.content)
+        self.assertIn("Withheld 2 links", result.content)
         retrieved = self.registry.dispatch("read_source", {"path":path}, self.ctx)
         self.assertTrue(retrieved.ok)
         self.assertIn(record["text"], retrieved.content)
@@ -191,7 +191,7 @@ class ResearchTest(unittest.TestCase):
         self.assertEqual(record["results"][0]["indexed_at"], "20261110T120000Z")
         discovery_page = self.registry.dispatch("read_source", {"path": search.meta["path"], "query": "campus"}, self.ctx)
         self.assertTrue(discovery_page.ok, discovery_page.content)
-        self.assertIn("检索线索", discovery_page.content)
+        self.assertIn("discovery leads", discovery_page.content)
         body = b"<html><head><title>Hidden</title></head><body>Evidence <script>hidden()</script> supported.</body></html>"
         with patch("miniagent.research.fetch", return_value=Page(article + "/final", "text/html", body, False)):
             fetched = self.registry.dispatch("http_get", {"url": article}, self.ctx)
@@ -266,7 +266,7 @@ class ResearchTest(unittest.TestCase):
                     patch("miniagent.research._service", return_value=resolver), \
                     patch("miniagent.research.http.client.HTTPConnection") as connector:
                 if ip == "10.10.10.10":
-                    with self.assertRaisesRegex(ValueError, "公网地址"):
+                    with self.assertRaisesRegex(ValueError, "public address"):
                         _public_socket("public.example", 443, 1)
                     connector.assert_not_called()
                 else:
@@ -280,17 +280,17 @@ class ResearchTest(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
 
     def test_public_endpoint_and_redirect_validation(self):
-        with self.assertRaisesRegex(ValueError, "禁止访问内网"):
+        with self.assertRaisesRegex(ValueError, "Private or local"):
             fetch("http://127.0.0.1/admin")
         private = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.15",443))]
         with patch("socket.getaddrinfo", return_value=private), patch("socket.socket") as sock:
-            with self.assertRaisesRegex(ValueError, "禁止访问内网"):
+            with self.assertRaisesRegex(ValueError, "Private or local"):
                 _public_socket("public-looking.example",443,1)
             sock.assert_not_called()
         with patch("miniagent.research.http.client.HTTPConnection") as connection, patch("miniagent.research._public_socket") as sock:
             redirect = connection.return_value.getresponse.return_value.__enter__.return_value
             redirect.status=302
             redirect.getheader.return_value="http://localhost:8080/target"
-            with self.assertRaisesRegex(ValueError,"禁止访问内网"):
+            with self.assertRaisesRegex(ValueError,"Private or local"):
                 fetch("http://external.example/link")
             sock.assert_called_once()

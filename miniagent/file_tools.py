@@ -48,7 +48,7 @@ def _path_version(path: Path):
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode):
-        raise ValueError("目标必须是普通文件")
+        raise ValueError("Expected a regular file")
     return _version(info)
 
 
@@ -57,15 +57,15 @@ def _expected(args: dict, actual: str | None) -> ToolResult | None:
     if expected is None:
         return None
     if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
-        return ToolResult.failure("参数校验失败：expected_sha256 必须是 64 位十六进制摘要。")
+        return ToolResult.failure("expected_sha256 must be a 64-digit hexadecimal digest.")
     if expected.lower() != actual:
-        return ToolResult.failure("文件版本冲突：内容已变化，请重新 read_file 后再编辑。",
+        return ToolResult.failure("File changed since the last read. Read the current version before editing.",
                                   code="file_conflict", sha256=actual)
     return None
 
 
 def _no_change(path: str, sha256: str) -> ToolResult:
-    return ToolResult.failure(f"[no_change] {path} 内容未变化，已跳过写入（sha256={sha256}）。",
+    return ToolResult.failure(f"[no_change] {path} was unchanged. Skipped writing (sha256={sha256}).",
                               code="no_change", changed=False, path=path, sha256=sha256)
 
 
@@ -81,7 +81,7 @@ def _atomic_replace(path: Path, data: bytes, version) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         if _path_version(path) != version:
-            raise FileChangedError("文件在写入前发生变化，请重新读取后重试。")
+            raise FileChangedError("File changed just before writing. Read the file and retry.")
         os.replace(temporary, path)
     finally:
         if descriptor >= 0:
@@ -93,17 +93,17 @@ def _load_for_edit(path: Path) -> tuple[bytes, tuple]:
     # The size guard precedes allocation; read(limit+1) handles concurrent growth.
     info = path.stat()
     if not stat.S_ISREG(info.st_mode):
-        raise ValueError("目标必须是普通文件")
+        raise ValueError("Expected a regular file")
     if info.st_size > MAX_EDIT_BYTES:
-        raise ValueError(f"文件超过编辑上限 {MAX_EDIT_BYTES} 字节，请拆分文件。")
+        raise ValueError(f"File exceeds the {MAX_EDIT_BYTES}-byte edit limit. Split the file.")
     with path.open("rb") as stream:
         before = _version(os.fstat(stream.fileno()))
         data = stream.read(MAX_EDIT_BYTES + 1)
         after = _version(os.fstat(stream.fileno()))
     if len(data) > MAX_EDIT_BYTES:
-        raise ValueError(f"文件超过编辑上限 {MAX_EDIT_BYTES} 字节，请拆分文件。")
+        raise ValueError(f"File exceeds the {MAX_EDIT_BYTES}-byte edit limit. Split the file.")
     if before != after or _path_version(path) != before:
-        raise FileChangedError("读取过程中文件发生变化，请重新读取后重试。")
+        raise FileChangedError("File changed during the read. Read the file and retry.")
     return data, before
 
 
@@ -111,12 +111,12 @@ def read_file(ctx: ToolContext, args: dict) -> ToolResult:
     """Read a Unicode-character page; hash the stream without buffering the file."""
     offset, limit = args.get("offset", 0), args.get("limit", DEFAULT_READ_CHARS)
     if type(offset) is not int or not 0 <= offset <= 2**63 - 1:
-        return ToolResult.failure("参数校验失败：offset 必须是从 0 开始的非负字符位置。")
+        return ToolResult.failure("offset must be a nonnegative character position starting at zero.")
     if type(limit) is not int or not 1 <= limit <= MAX_READ_CHARS:
-        return ToolResult.failure(f"参数校验失败：limit 必须是 1..{MAX_READ_CHARS} 的整数。")
+        return ToolResult.failure(f"limit must be an integer from 1 to {MAX_READ_CHARS}.")
     path = ctx.sandbox.resolve(args["path"], must_exist=True)
     if not path.is_file():
-        return ToolResult.failure(f"不是文件：{args['path']}")
+        return ToolResult.failure(f"Not a file: {args['path']}")
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     digest, pieces, total_chars = hashlib.sha256(), [], 0
     with _lock(path), path.open("rb") as stream:
@@ -133,18 +133,18 @@ def read_file(ctx: ToolContext, args: dict) -> ToolResult:
                 if not block:
                     break
         except UnicodeDecodeError:
-            return ToolResult.failure("该文件不是 UTF-8 文本，无法读取。")
+            return ToolResult.failure("This file is not UTF-8 text.")
         if before != _version(os.fstat(stream.fileno())) or _path_version(path) != before:
-            return ToolResult.failure("读取过程中文件发生变化，请重试。", code="file_conflict")
+            return ToolResult.failure("File changed during the read. Retry.", code="file_conflict")
     text = "".join(pieces)
     has_more = offset + len(text) < total_chars
     next_offset = offset + len(text) if has_more else None
     sha256 = digest.hexdigest()
-    footer = f"\n[文件版本 sha256={sha256}；字符范围 {offset}..{offset + len(text)}；总字符 {total_chars}。"
+    footer = f"\n[sha256={sha256}, characters {offset}..{offset + len(text)} of {total_chars}. "
     if has_more:
-        footer += f"已截断；继续读取：read_file(path=原路径, offset={next_offset}, limit={limit})]"
+        footer += f"Truncated. Continue with read_file at offset={next_offset}, limit={limit}.]"
     else:
-        footer += "已到文件末尾。]"
+        footer += "End of file.]"
     return ToolResult.success(text + footer, path=args["path"], chars=total_chars,
                               returned_chars=len(text), bytes=before[2], sha256=sha256,
                               offset=offset, next_offset=next_offset, eof=not has_more,
@@ -154,7 +154,7 @@ def read_file(ctx: ToolContext, args: dict) -> ToolResult:
 def write_file(ctx: ToolContext, args: dict) -> ToolResult:
     content = args["content"]
     if len(content) > MAX_WRITE_CHARS:
-        return ToolResult.failure(f"内容过长（上限 {MAX_WRITE_CHARS} 字符）；创建首段后使用 append_file，或拆分文件。")
+        return ToolResult.failure(f"Content exceeds {MAX_WRITE_CHARS} characters. Use append_file for subsequent segments or split the file.")
     path = ctx.sandbox.resolve(args["path"])
     data = content.encode("utf-8")
     sha256 = hashlib.sha256(data).hexdigest()
@@ -171,14 +171,14 @@ def write_file(ctx: ToolContext, args: dict) -> ToolResult:
             return _no_change(args["path"], sha256)
         ctx.sandbox.ensure_parent(path)
         _atomic_replace(path, data, version)
-    return ToolResult.success(f"已写入 {args['path']}（{len(content)} 字符，sha256={sha256}）",
+    return ToolResult.success(f"Wrote {args['path']} ({len(content)} characters, sha256={sha256})",
                               changed=True, bytes=len(data), path=args["path"], sha256=sha256, artifacts=[args["path"]])
 
 
 def edit_file(ctx: ToolContext, args: dict) -> ToolResult:
     old, new = args["old_text"], args["new_text"]
     if not old or max(len(old), len(new)) > MAX_WRITE_CHARS:
-        return ToolResult.failure(f"参数校验失败：old_text 不能为空；替换文本最多 {MAX_WRITE_CHARS} 字符。")
+        return ToolResult.failure(f"old_text must be nonempty. Replacement text may contain at most {MAX_WRITE_CHARS} characters.")
     path = ctx.sandbox.resolve(args["path"], must_exist=True)
     with _lock(path):
         data, version = _load_for_edit(path)
@@ -192,17 +192,17 @@ def edit_file(ctx: ToolContext, args: dict) -> ToolResult:
         first = text.find(old)
         ambiguous = first >= 0 and text.find(old, first + 1) >= 0
         if occurrences != 1 or ambiguous:
-            return ToolResult.failure("替换未执行：old_text 必须在原文件中恰好匹配一次；请读取并增加匹配上下文。",
+            return ToolResult.failure("old_text must match exactly once. Read the file and include more surrounding context.",
                                       code="ambiguous_edit" if occurrences else "text_not_found",
                                       matches=max(occurrences, 2 if ambiguous else 0), sha256=original_hash)
         if old == new:
             return _no_change(args["path"], original_hash)
         updated = (text[:first] + new + text[first + len(old):]).encode("utf-8")
         if len(updated) > MAX_EDIT_BYTES:
-            return ToolResult.failure(f"替换后文件超过 {MAX_EDIT_BYTES} 字节，未修改原文件。")
+            return ToolResult.failure(f"The result exceeds {MAX_EDIT_BYTES} bytes. File unchanged.")
         _atomic_replace(path, updated, version)
     sha256 = hashlib.sha256(updated).hexdigest()
-    return ToolResult.success(f"已精确替换 {args['path']} 的 1 处内容（sha256={sha256}）",
+    return ToolResult.success(f"Replaced one match in {args['path']} (sha256={sha256})",
                               changed=True, path=args["path"], sha256=sha256, previous_sha256=original_hash,
                               bytes=len(updated), artifacts=[args["path"]])
 
@@ -210,7 +210,7 @@ def edit_file(ctx: ToolContext, args: dict) -> ToolResult:
 def append_file(ctx: ToolContext, args: dict) -> ToolResult:
     content = args["content"]
     if not content or len(content) > MAX_WRITE_CHARS:
-        return ToolResult.failure(f"参数校验失败：追加内容必须非空且不超过 {MAX_WRITE_CHARS} 字符。")
+        return ToolResult.failure(f"Append nonempty text up to {MAX_WRITE_CHARS} characters.")
     path = ctx.sandbox.resolve(args["path"], must_exist=True)
     with _lock(path):
         data, version = _load_for_edit(path)
@@ -221,9 +221,9 @@ def append_file(ctx: ToolContext, args: dict) -> ToolResult:
             return conflict
         updated = data + content.encode("utf-8")
         if len(updated) > MAX_EDIT_BYTES:
-            return ToolResult.failure(f"追加后文件超过 {MAX_EDIT_BYTES} 字节，未修改原文件。")
+            return ToolResult.failure(f"The result exceeds {MAX_EDIT_BYTES} bytes. File unchanged.")
         _atomic_replace(path, updated, version)
     sha256 = hashlib.sha256(updated).hexdigest()
-    return ToolResult.success(f"已追加到 {args['path']}（sha256={sha256}）",
+    return ToolResult.success(f"Appended to {args['path']} (sha256={sha256})",
                               changed=True, path=args["path"], sha256=sha256, previous_sha256=original_hash,
                               bytes=len(updated), artifacts=[args["path"]])

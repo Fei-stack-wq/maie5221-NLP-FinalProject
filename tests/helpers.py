@@ -16,7 +16,7 @@ from miniagent.schemas import LLMResponse, ToolCall, Usage
 _ids = itertools.count(1)
 
 
-def call(name: str, **arguments: Any) -> dict:
+def call(name: str, /, **arguments: Any) -> dict:
     return {"tool": name, "arguments": arguments}
 
 
@@ -49,10 +49,11 @@ class FakeProvider(Provider):
 
     def chat(self, messages, tools=None, temperature=0.0, **options):
         snapshot = copy.deepcopy(messages)
+        agent = "room" if any(t.name == "start_room_task" for t in tools or []) else agent_of(snapshot)
         with self.lock:
-            self.requests.append({"agent": agent_of(snapshot), "messages": snapshot,
+            self.requests.append({"agent": agent, "messages": snapshot,
                                   "tools": [t.name for t in tools or []], "options": options})
-        response = self.respond(agent_of(snapshot), snapshot, tools, options)
+        response = self.respond(agent, snapshot, tools, options)
         # Report a realistic prompt size, like a real provider would.
         return response.model_copy(update={"usage": Usage(prompt_tokens=estimate_tokens(snapshot),
                                                           completion_tokens=response.usage.completion_tokens)})

@@ -164,9 +164,10 @@ class Project:
             return changes, skipped
 
     def history(self, limit: int = 200) -> list[dict]:
-        if not self.log_path.exists():
-            return []
-        lines = self.log_path.read_text(encoding="utf-8").splitlines()[-limit:]
+        with self._lock:
+            if not self.log_path.exists():
+                return []
+            lines = self.log_path.read_text(encoding="utf-8").splitlines()[-limit:]
         return [json.loads(line) for line in lines if line.strip()]
 
     def resolve(self, rel: str) -> Path:

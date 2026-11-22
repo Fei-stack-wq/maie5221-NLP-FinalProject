@@ -76,7 +76,7 @@ class TeamTest(unittest.TestCase):
             qa=[reply("", call("run_shell", command="python3 app.py")), reply("app.py prints hello. No issues.")],
         )
         studio, gid, provider = self.studio(script)
-        studio.post(gid, "Build a hello app")
+        studio.post(gid, "Build a hello app", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["status"], "completed")
         self.assertEqual(task["delegations"], 2)
@@ -106,18 +106,19 @@ class TeamTest(unittest.TestCase):
         studio, gid, provider = self.studio(script)
         store = studio.group(gid)
         (store.workspace("lead") / "secret.txt").write_text("lead private draft")
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         finished(studio, gid)
         result = tool_results(provider.for_agent("dev")[1]["messages"])[-1]
         self.assertNotIn("lead private draft", result)
-        self.assertIn("越界", result)
+        self.assertIn("outside workspace", result)
 
     def test_question_waits_for_the_requester_answer(self):
         def lead_after_answer(messages):
             return reply("Using " + tool_results(messages)[-1].split("\n", 1)[1])
-        script = Script(lead=[reply("", call("ask_human", question="Which database?")), lead_after_answer])
+        script = Script(room=[reply("", call("answer_open_question", quote="SQLite please"))],
+                        lead=[reply("", call("ask_human", question="Which database?")), lead_after_answer])
         studio, gid, _ = self.studio(script)
-        studio.post(gid, "Plan the storage")
+        studio.post(gid, "Plan the storage", queue=True)
         question = wait_for(lambda: (studio.state(gid)["live"] or {}).get("question"))
         self.assertEqual(question["question"], "Which database?")
         self.assertEqual(studio.post(gid, "SQLite please")["route"], "answer")
@@ -131,7 +132,7 @@ class TeamTest(unittest.TestCase):
     def test_autonomous_mode_offers_no_question_tool(self):
         script = Script(lead=[reply("ok")])
         studio, gid, provider = self.studio(script, mode="autonomous")
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         finished(studio, gid)
         self.assertNotIn("ask_human", provider.for_agent("lead")[0]["tools"])
         self.assertIn("not available during this task", provider.for_agent("lead")[0]["messages"][0]["content"])
@@ -146,9 +147,9 @@ class TeamTest(unittest.TestCase):
             return reply("noted: " + (note[0].split("\n", 1)[1] if note else "nothing"))
         script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Do the work carefully.")),
                               lambda m: reply("final: " + tool_results(m)[-1].splitlines()[2])],
-                        dev=[dev_first, dev_second])
+                        dev=[dev_first, dev_second], room=[reply("",call("change_current_task",quote="Use Python 3.12"))])
         studio, gid, _ = self.studio(script)
-        studio.post(gid, "start")
+        studio.post(gid, "start", queue=True)
         wait_for(lambda: "dev" in ((studio.state(gid)["live"] or {}).get("active") or []))
         self.assertEqual(studio.post(gid, "Use Python 3.12")["route"], "steering")
         gate.set()
@@ -164,7 +165,7 @@ class TeamTest(unittest.TestCase):
             return reply("", call("delegate_task", assignee="dev", task=task_text))
         script = Script(default=lambda agent, m: lead(agent, m) if agent == "lead" else reply("tried, still failing"))
         studio, gid, _ = self.studio(script, team=TeamLimits(lead_max_steps=20, max_repeat_assignments=3))
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["delegations"], 3)
         self.assertTrue(task["final_answer"].startswith("stopping: Error: Refused"))
@@ -182,7 +183,7 @@ class TeamTest(unittest.TestCase):
             return reply("", call("delegate_task", assignee="dev", task=next(pieces)))
         script = Script(default=lambda agent, m: lead(agent, m) if agent == "lead" else reply("did it"))
         studio, gid, _ = self.studio(script, team=TeamLimits(lead_max_steps=30, max_delegations=4))
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["delegations"], 4)
         self.assertEqual(task["final_answer"], "wrapping up")
@@ -197,7 +198,7 @@ class TeamTest(unittest.TestCase):
         provider = FakeProvider(respond)
         studio = Studio(settings(self.tmp, team=TeamLimits(lead_max_steps=4)), provider_factory=lambda _s: provider)
         gid = studio.create_group("T", TEAM, "lead")["id"]
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["status"], "incomplete")
         self.assertEqual(task["final_answer"], "partial delivery report")
@@ -209,7 +210,7 @@ class TeamTest(unittest.TestCase):
                               lambda m: reply("lead saw: " + tool_results(m)[-1].splitlines()[0])],
                         dev=[dev])
         studio, gid, _ = self.studio(script)
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["status"], "completed")
         self.assertIn("status: error", task["final_answer"])
@@ -217,7 +218,7 @@ class TeamTest(unittest.TestCase):
     def test_mention_routes_to_the_member_directly(self):
         script = Script(qa=[reply("checked")])
         studio, gid, provider = self.studio(script)
-        studio.post(gid, "@qa please check the app")
+        studio.post(gid, "@qa please check the app", queue=True)
         task = finished(studio, gid)
         self.assertEqual(task["primary"], "qa")
         request = provider.for_agent("qa")[0]
@@ -232,9 +233,9 @@ class TeamTest(unittest.TestCase):
                               reply("FINAL-ONE: booking.py created"),
                               reply("second done")])
         studio, gid, provider = self.studio(script)
-        studio.post(gid, "Task one: build booking")
+        studio.post(gid, "Task one: build booking", queue=True)
         finished(studio, gid)
-        studio.post(gid, "Task two: add a dashboard")
+        studio.post(gid, "Task two: add a dashboard", queue=True)
         finished(studio, gid)
         second = provider.for_agent("lead")[-1]["messages"][1]["content"]
         self.assertIn("Task one: build booking", second)
@@ -246,19 +247,23 @@ class TeamTest(unittest.TestCase):
         script = Script(lead=[reply("", call("ask_human", question="Proceed?"))],
                         default=lambda a, m: reply("unreachable"))
         studio, gid, _ = self.studio(script)
-        studio.post(gid, "go")
+        studio.post(gid, "go", queue=True)
         wait_for(lambda: (studio.state(gid)["live"] or {}).get("question"))
         studio.cancel(gid)
         task = finished(studio, gid)
         self.assertEqual(task["status"], "cancelled")
 
     def test_memory_note_is_shown_in_later_assignments(self):
-        script = Script(lead=[reply("", call("remember", note="Requester prefers SQLite.")), reply("ok"),
+        script = Script(lead=[reply("", call("propose_knowledge", text="Requester prefers SQLite.")), reply("ok"),
                               reply("second")])
         studio, gid, provider = self.studio(script)
-        studio.post(gid, "one")
+        studio.post(gid, "one", queue=True)
         finished(studio, gid)
-        studio.post(gid, "two")
+        note, = studio.roles.entries("lead")
+        self.assertEqual(note["status"], "proposed")
+        self.assertEqual(studio.roles.entries("lead", group=gid), [])
+        studio.roles.revise("lead",note["id"],"approved")
+        studio.post(gid, "two", queue=True)
         finished(studio, gid)
         self.assertIn("Requester prefers SQLite.", provider.for_agent("lead")[-1]["messages"][1]["content"])
 
