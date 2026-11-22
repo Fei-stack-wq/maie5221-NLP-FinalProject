@@ -5,15 +5,24 @@ function fileIndex(changes) {
 }
 function artifactCards(scope, changes) {
   if (!changes?.length) return null;
-  return el("div",{class:"artifact-grid"},changes.map(c=>{
-    const deleted=c.change==="deleted", path=c.path, ext=path.split(".").pop();
-    const card=el("button",{type:"button",class:"artifact-card",disabled:deleted,
-      title:path,"aria-label":path+(deleted?"（已删除）":"")},el("small",{},ext===path?"FILE":ext.toUpperCase()),
-      el("span",{},el("strong",{},path),el("small",{},({added:"新增",modified:"修改",deleted:"删除"})[c.change]||c.change,
-        Number.isFinite(c.size)?" · "+new Intl.NumberFormat().format(c.size)+" B":"")));
-    if (!deleted) card.onclick=()=>openDocument({...fileRef(scope,path),sha256:c.sha256});
-    return card;
-  }));
+  const card=c=>{
+    const deleted=c.change==="deleted", path=c.path, ext=path.includes(".")?path.split(".").pop().toLowerCase():"";
+    const name=path.split("/").pop(), folder=path.slice(0,path.length-name.length);
+    const node=el("button",{type:"button",class:"artifact-card",disabled:deleted,"data-ext":ext,
+      title:path,"aria-label":path+(deleted?"（已删除）":"")},el("small",{},ext?ext.toUpperCase().slice(0,5):"FILE"),
+      el("span",{},el("strong",{},folder?el("span",{class:"dir"},folder):null,name),el("small",{},(({added:"新增",modified:"修改",deleted:"删除"})[c.change]||c.change)+
+        (Number.isFinite(c.size)?" · "+(c.size>1024?(c.size/1024).toFixed(1)+" KB":c.size+" B"):""))));
+    if (!deleted) node.onclick=()=>openDocument({...fileRef(scope,path),sha256:c.sha256});
+    return node;
+  };
+  // Archived web sources are evidence, not deliverables: fold them away.
+  const main=changes.filter(c=>!c.path.startsWith("sources/")), sources=changes.filter(c=>c.path.startsWith("sources/"));
+  const box=el("div",{});
+  const shown=main.slice(0,8), rest=main.slice(8);
+  if (shown.length) box.append(el("div",{class:"artifact-grid"},shown.map(card)));
+  if (rest.length) box.append(el("details",{class:"artifact-more"},el("summary",{},`另外 ${rest.length} 个文件`),el("div",{class:"artifact-grid"},rest.map(card))));
+  if (sources.length) box.append(el("details",{class:"artifact-more"},el("summary",{},`资料来源存档 · ${sources.length} 份`),el("div",{class:"artifact-grid"},sources.map(card))));
+  return box;
 }
 
 function taskAddress(hash) {
@@ -189,7 +198,7 @@ async function workbenchView() {
       $("#composer").requestSubmit();
     } catch(error) { showError(error); }
   };
-  view.append(heading("工作台",button("刷新",workbenchView)),stats,form,list);
+  view.append(heading("工作台","所有团队的任务一览。点数字筛选，点任务看详情。",button("刷新",workbenchView)),stats,form,list);
   select(0);
 }
 

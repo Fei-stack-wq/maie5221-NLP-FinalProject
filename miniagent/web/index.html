@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7faff">
   <title>miniagent Studio</title>
   <link rel="stylesheet" href="/static/app.css">
-  <link rel="stylesheet" href="/static/theme.css">
   <link rel="stylesheet" href="/static/studio.css">
-  <script src="/static/vendor/markdown-it.min.js" defer></script>
   <link rel="stylesheet" href="/static/workbench.css">
+  <script src="/static/vendor/markdown-it.min.js" defer></script>
   <script src="/static/app.js" defer></script>
   <script src="/static/directory.js" defer></script>
   <script src="/static/reader.js" defer></script>
@@ -16,13 +16,18 @@
 </head>
 <body>
   <aside id="sidebar" class="sidebar">
-    <div class="brand">Agent <span>Studio</span></div>
-    <nav id="sections"><button id="workbench-nav">工作台</button><button id="assistant-nav">工作室助手</button><button id="rooms-nav">最近对话</button>
-    <button id="roles-nav">角色库</button><button id="tasks-nav">任务记录</button></nav>
-    <label for="group-list">固定群聊</label>
-    <button id="new-group" class="primary">＋ 新建群聊</button>
+    <div class="brand"><span class="brand-mark" data-icon="spark"></span><span class="label">Agent <span>Studio</span></span></div>
+    <button id="new-group" class="primary"><span data-icon="plus"></span>新建群聊</button>
+    <nav id="sections" aria-label="导航">
+      <button id="assistant-nav"><span data-icon="spark"></span>工作室助手</button>
+      <button id="workbench-nav"><span data-icon="grid"></span>工作台</button>
+      <button id="rooms-nav"><span data-icon="chat"></span>最近对话</button>
+      <button id="roles-nav"><span data-icon="users"></span>角色库</button>
+      <button id="tasks-nav"><span data-icon="list"></span>任务记录</button>
+    </nav>
+    <label for="group-list">群聊</label>
     <ul id="group-list"></ul>
-    <button id="connection">模型连接</button>
+    <button id="connection"><span class="conn-dot" id="conn-dot"></span><span class="conn-text"><strong id="conn-title">模型连接</strong><small id="conn-detail">正在读取…</small></span><span data-icon="key"></span></button>
     <div id="config" class="muted small"></div>
   </aside>
 
@@ -37,34 +42,41 @@
     <section id="room" hidden>
       <header id="room-head">
         <div class="title">
-          <h2 id="room-name"></h2>
-
+          <div class="title-row"><h2 id="room-name"></h2><span id="room-mode" class="mode-badge" hidden>自主模式</span></div>
+          <div class="subrow"><span id="room-avatars" class="avatar-stack"></span>
+            <button id="workspace-choice" type="button" aria-haspopup="dialog">工作区 · Studio 默认目录 ▾</button></div>
         </div>
         <div class="actions">
-          <span id="task-buttons"></span>
-          <button id="edit-group" title="编辑群聊">设置</button>
-          <button id="toggle-files">文件</button>
-          <button id="room-options">会话管理</button>
-          <button id="stop" class="danger" hidden>停止</button>
+          <button id="stop" class="danger" hidden><span data-icon="stop"></span>停止任务</button>
+          <button id="toggle-files" class="ghost" title="浏览团队项目文件"><span data-icon="folder"></span>文件</button>
+          <button id="edit-group" class="ghost" title="成员与群设置"><span data-icon="gear"></span>设置</button>
+          <button id="room-options" class="ghost" title="固定、归档、工作区"><span data-icon="dots"></span>管理</button>
         </div>
       </header>
-      <div id="timeline"></div>
+      <div id="key-banner" class="key-banner" hidden><span>还没有配置 DeepSeek API key，团队暂时无法开始工作。</span><button type="button" class="primary" id="key-banner-open">填写 API key</button></div>
+      <div id="timeline" aria-live="polite"></div>
+      <button id="bottom" type="button" hidden><span data-icon="down"></span>回到最新</button>
       <div id="live" hidden>
         <div id="live-status"></div>
-        <button id="toggle-activity" class="link">活动记录</button>
+        <button id="toggle-activity" class="link">查看活动记录</button>
       </div>
       <div id="activity" hidden></div>
       <form id="composer">
         <div id="question-banner" hidden></div>
-        <div class="options"><label>附件 <input id="uploads" type="file" multiple></label>
-          <label>思考 <select id="thinking"><option value="">默认</option><option value="enabled">开</option><option value="disabled">关</option></select></label>
-          <button id="task-options" type="button">运行选项</button>
-          <label><input type="checkbox" id="queue">排队新任务</label><button id="bottom" type="button">↓ 最新</button></div>
-        <div class="row">
-          <textarea id="input" rows="3" placeholder="追问、讨论或交办工作。可用 @成员ID 点名。Enter 发送，Shift+Enter 换行。"></textarea>
-          <button type="submit" class="primary">发送</button>
+        <div class="suggestions"><small>可以直接发送：</small><span id="task-buttons"></span></div>
+        <div class="composer-box">
+          <textarea id="input" rows="2" placeholder="交办工作、追问进展，或回答团队的问题。用 @成员ID 点名某位成员。"></textarea>
+          <div id="attachment-chips" class="chips"></div>
+          <div class="composer-bar">
+            <label class="tool-button" title="添加附件"><span data-icon="clip"></span>附件<input id="uploads" type="file" multiple hidden></label>
+            <label class="pill-select" title="思考模式"><span data-icon="bulb"></span><select id="thinking" aria-label="思考模式"><option value="">思考 · 默认</option><option value="enabled">思考 · 开</option><option value="disabled">思考 · 关</option></select></label>
+            <button id="task-options" type="button" class="tool-button" title="步数、协作方式和验收"><span data-icon="sliders"></span>运行选项</button>
+            <label class="toggle" id="queue-toggle" title="当前任务结束后再开始这条消息" hidden><input type="checkbox" id="queue">排队为新任务</label>
+            <span class="spacer"></span>
+            <span id="sending-status" role="status" hidden><span class="spinner"></span>正在发送…</span>
+            <button type="submit" class="primary send" title="发送（Enter）">发送<span data-icon="send"></span></button>
+          </div>
         </div>
-        <div id="sending-status" class="muted small" role="status" hidden>正在处理这条消息…</div>
         <div id="composer-error" class="error" hidden></div>
       </form>
     </section>
@@ -78,21 +90,21 @@
     <header>
       <strong>团队项目文件</strong>
       <span>
-        <a id="assessor-zip" href="#">导出对话与交付</a> · <a id="download-zip" href="#">下载 ZIP</a>
-        <button id="close-files" class="link">关闭</button>
+        <a id="assessor-zip" href="#">导出对话与交付</a><a id="download-zip" href="#">下载 ZIP</a>
+        <button id="close-files" class="ghost" title="关闭"><span data-icon="x"></span></button>
       </span>
     </header>
     <ul id="file-list"></ul>
-    <div id="preview"></div>
+    <div id="preview"><p class="muted">选择一个文件预览。</p></div>
   </aside>
 
   <dialog id="group-dialog">
     <form id="group-form" method="dialog">
       <h3 id="group-dialog-title">新建群聊</h3>
-      <label>模板
+      <label>从模板开始
         <select id="template"><option value="">— 自定义 —</option></select>
       </label>
-      <label>群名称 <input id="group-name" required maxlength="120"></label>
+      <label>群名称 <input id="group-name" required maxlength="120" placeholder="例如：软件开发组"></label>
       <label>协作方式
         <select id="group-mode">
           <option value="interactive">互动：成员可在群里向你提问</option>
@@ -101,7 +113,7 @@
       </label>
       <div class="members-head"><strong>成员</strong><button type="button" id="add-member" class="link">＋ 添加成员</button></div>
       <div id="member-rows"></div>
-      <label>引用角色库 <select id="library-member"></select></label>
+      <label>从角色库添加 <select id="library-member"></select></label>
       <label>负责人 <select id="group-lead"></select></label>
       <div id="group-error" class="error" hidden></div>
       <div class="dialog-actions">

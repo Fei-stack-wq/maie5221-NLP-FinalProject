@@ -11,7 +11,18 @@ function button(label, action) {
   return el("button", {type:"button", onclick:() => Promise.resolve().then(action).catch(showError)}, label);
 }
 function heading(title, ...actions) {
-  return el("header", {class:"view-head"}, el("h2",{},title), el("div",{class:"actions"},...actions));
+  const subtitle = typeof actions[0] === "string" ? actions.shift() : "";
+  return el("header", {class:"view-head"}, el("div",{},el("h2",{},title), subtitle ? el("p",{},subtitle) : null),
+    el("div",{class:"actions"},...actions));
+}
+function relativeTime(seconds) {
+  if (!seconds) return "";
+  const diff = Date.now() / 1000 - seconds;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return Math.floor(diff / 60) + " 分钟前";
+  if (diff < 86400) return Math.floor(diff / 3600) + " 小时前";
+  if (diff < 86400 * 7) return Math.floor(diff / 86400) + " 天前";
+  return new Date(seconds * 1000).toLocaleDateString();
 }
 function sheet(title, ...elements) {
   $("#sheet-content").replaceChildren(el("h3",{},title),...elements);
@@ -25,6 +36,7 @@ function enterView(title) {
   state.current = null;
   state.view = title;
   history.replaceState(null, "", "#" + title);
+  setNav(title + "-nav");
   $("#member-panel").hidden = $("#empty").hidden = $("#room").hidden = $("#files").hidden = true;
   const root = $("#directory");
   root.hidden = false; root.replaceChildren();
@@ -56,18 +68,29 @@ async function uploadFile(file) {
 async function roomsView() {
   const root = enterView("rooms"), rooms = await api("/groups");
   if (state.view!=="rooms" || state.current) return;
-  const search = editInput("",{placeholder:"搜索会话","aria-label":"搜索会话",type:"search"});
-  const filter = el("select",{"aria-label":"会话类型"},...["全部","群聊","私聊","已归档"].map(x=>el("option",{},x)));
-  const list = el("div",{class:"cards"});
+  const search = editInput("",{placeholder:"搜索群聊或私聊","aria-label":"搜索会话",type:"search"});
+  const kinds = ["全部","群聊","私聊","已归档"];
+  let kind = "全部";
+  const segmented = el("div",{class:"segmented",role:"group","aria-label":"会话类型"});
+  const list = el("div",{class:"card-grid"});
   function draw() {
-    const visible = rooms.filter(g=>g.kind!=="assistant" && g.archived===(filter.value==="已归档")
-      && (!["私聊","群聊"].includes(filter.value) || g.kind===(filter.value==="私聊"?"dm":"group"))
+    for (const b of segmented.children) b.setAttribute("aria-pressed", b.textContent===kind);
+    const visible = rooms.filter(g=>g.kind!=="assistant" && g.archived===(kind==="已归档")
+      && (!["私聊","群聊"].includes(kind) || g.kind===(kind==="私聊"?"dm":"group"))
       && g.name.toLowerCase().includes(search.value.toLowerCase())).sort((a,b)=>b.last_activity-a.last_activity);
-    list.replaceChildren(...visible.map(g=>button(g.name+" · "+(g.kind==="dm"?"私聊":"群聊"),()=>openGroup(g.id))));
-    if (!visible.length) list.append(el("p",{class:"muted"},"没有匹配的会话"));
+    list.replaceChildren(...visible.map(g=>el("button",{type:"button",class:"card",onclick:()=>openGroup(g.id).catch(showError)},
+      el("div",{class:"card-top"},avatar(g.id,g.name,"square"),el("strong",{},g.name),
+        g.waiting_for_you?el("span",{class:"status interrupted"},"待你回复"):g.running?statusChip("running"):null),
+      el("div",{class:"card-meta"},el("span",{class:"kind"+(g.kind==="dm"?" dm":"")},g.kind==="dm"?"私聊":"群聊"),
+        el("span",{class:"avatar-stack"},...(g.members||[]).slice(0,5).map(m=>avatar(m.id,m.name,"sm"))),
+        el("span",{},relativeTime(g.last_activity))),
+      g.last_status?el("div",{class:"card-meta"},"上次任务",statusChip(g.last_status),`共 ${g.tasks} 项`):el("p",{},"还没有任务"))));
+    if (!visible.length) list.append(el("div",{class:"empty-state"},"没有匹配的会话"));
   }
-  search.oninput = filter.onchange = draw;
-  root.append(heading("最近对话",button("新建群聊",()=>openDialog())),field("查找",search),filter,list);draw();
+  for (const k of kinds) segmented.append(el("button",{type:"button",onclick:()=>{kind=k;draw();}},k));
+  search.oninput = draw;
+  root.append(heading("最近对话","所有群聊和私聊，按最近活动排序。",el("button",{type:"button",class:"primary",onclick:()=>openDialog()},icon("plus"),"新建群聊")),
+    el("div",{class:"toolbar"},search,segmented),list);draw();
 }
 function roleForm(role) {
   const id=editInput(role?.id||""), name=editInput(role?.name||""), prompt=el("textarea",{rows:5},role?.prompt||"");
@@ -80,8 +103,12 @@ function roleForm(role) {
 async function rolesView() {
   const root=enterView("roles"), roles=await api("/roles");
   if (state.view!=="roles" || state.current) return;
-  root.append(heading("角色库",button("创建角色",()=>roleForm())),...roles.map(r=>button(r.name+" · @"+r.id,()=>roleDetail(r))));
-  if (!roles.length) root.append(el("p",{class:"muted"},"还没有保存的角色"));
+  const grid=el("div",{class:"card-grid"},...roles.map(r=>el("button",{type:"button",class:"card","aria-label":r.name+" · @"+r.id,onclick:()=>roleDetail(r).catch(showError)},
+    el("div",{class:"card-top"},avatar(r.id,r.name,"lg"),el("span",{style:"display:grid;min-width:0"},el("strong",{},r.name),el("small",{class:"muted"},"@"+r.id))),
+    el("p",{},r.prompt||"（未填写职责）"))));
+  root.append(heading("角色库","可重复使用的角色。建群时从这里添加，角色的记忆和技能会跟着走。",
+    el("button",{type:"button",class:"primary",onclick:()=>roleForm()},icon("plus"),"创建角色")),
+    roles.length?grid:el("div",{class:"empty-state"},"还没有保存的角色。创建一个，之后建群时可以直接选用。"));
 }
 async function roleDetail(role) {
   const [history,tasks]=await Promise.all([api("/roles/"+role.id+"/knowledge"),api("/tasks")]);
@@ -117,27 +144,89 @@ async function roleDetail(role) {
 async function tasksView() {
   const root=enterView("tasks"), rows=await api("/tasks");
   if (state.view!=="tasks" || state.current) return;
-  root.append(heading("任务记录"),...rows.map(t=>button((STATUS_LABEL[t.status]||t.status)+" · "+t.group_name+" · "+t.text,()=>taskDetail(t.id))));
-  if (!rows.length) root.append(el("p",{class:"muted"},"还没有任务"));
+  const list=el("section",{class:"bench-list"});
+  for (const t of rows) {
+    list.append(el("button",{type:"button",class:"bench-row","aria-label":(STATUS_LABEL[t.status]||t.status)+" · "+t.group_name+" · "+t.text,onclick:()=>taskDetail(t.id).catch(showError)},
+      avatar(t.primary||t.group_id,t.primary||t.group_name,"sm"),
+      el("span",{class:"bench-row-main"},el("small",{},t.group_name+" · @"+(t.primary||"—")),el("strong",{},t.text)),
+      statusChip(t.status),el("time",{},relativeTime(t.created_at))));
+  }
+  root.append(heading("任务记录","每个任务的派工、产物和轨迹。"),rows.length?list:el("div",{class:"empty-state"},"还没有任务。到任意群聊里发布第一项工作吧。"));
 }
 async function connectionSheet() {
-  const key=editInput("",{type:"password",autocomplete:"new-password"});
-  sheet("模型连接",el("p",{},state.config.model+" · "+(state.config.has_key?"已配置密钥":"尚未配置密钥")),field("DeepSeek API key",key),
-    button("验证并保存",async()=>{
+  const ready=Boolean(state.config.has_key);
+  const key=editInput("",{type:"password",autocomplete:"new-password",placeholder:"sk-…",spellcheck:"false"});
+  const toggle=el("button",{type:"button",onclick:()=>{const show=key.type==="password";key.type=show?"text":"password";toggle.textContent=show?"隐藏":"显示";}},"显示");
+  const message=el("p",{class:"sheet-note",role:"status"});
+  const save=el("button",{type:"button",class:"primary",onclick:async()=>{
+    if (!key.value.trim()) { message.textContent="请先粘贴 API key。"; return; }
+    save.disabled=true; message.textContent="正在向 DeepSeek 验证（不消耗 token）…";
+    try {
       const result=await api("/settings/api-key",{method:"POST",body:{api_key:key.value}});
-      state.config.has_key=result.has_key;key.value="";
-      $("#config").textContent=state.config.model+" · 已配置密钥";
-      sheet("模型连接",el("p",{},result.verified?"验证通过":"密钥已保存，暂未确认连接"));
-    }));
+      state.config.has_key=result.has_key; key.value=""; updateConnection();
+      if (state.group) renderHead();
+      message.textContent=result.verified?"✓ 已验证并保存，新任务立即生效。":"已保存，但暂时没能确认连接；第一次运行任务时会再验证。";
+      status.className="key-state ready"; status.lastChild.textContent="DeepSeek 已配置 · "+state.config.model;
+    } catch(error) { message.textContent=error.message; }
+    finally { save.disabled=false; }
+  }},icon("check"),"验证并保存");
+  const status=el("div",{class:"key-state"+(ready?" ready":"")},el("span",{class:"conn-dot"+(ready?" ready":"")}),
+    el("span",{},ready?"DeepSeek 已配置 · "+state.config.model:"尚未配置 DeepSeek API key"));
+  sheet("模型连接",status,field(ready?"更换 API key":"DeepSeek API key",el("div",{class:"key-row"},key,toggle)),save,message,
+    el("p",{class:"sheet-note"},"密钥只保存在这台电脑的 .env 文件里，网页不会再显示完整内容。可在 platform.deepseek.com 创建。"));
+  key.focus();
 }
+function workspaceSheet() {
+  const g=state.group;
+  if (!g || g.id !== state.current) return;
+  const path=editInput(g.folder||"",{placeholder:"输入本机项目文件夹的绝对路径"});
+  const error=el("p",{class:"error",role:"alert",hidden:true});
+  const manual=el("details",{},el("summary",{},"手动输入路径"),field("文件夹路径",path));
+  const actions=el("div",{class:"workspace-actions"});
+  let busy=false;
+  const current=()=>state.current===g.id && error.isConnected && $("#sheet").open;
+  async function apply(getPath) {
+    if (busy) return;
+    busy=true; error.hidden=true;
+    const controls=[...actions.querySelectorAll("button"),...manual.querySelectorAll("button")];
+    controls.forEach(node=>{node.disabled=true;});
+    try {
+      const folder=await getPath();
+      if (folder===null || !current()) return;
+      const updated=await api("/groups/"+g.id,{method:"PATCH",body:{folder}});
+      if (current()) {
+        state.group=updated; renderHead(); $("#sheet").close(); poll();
+      }
+    } catch (err) {
+      if (current()) {error.textContent=err.message; error.hidden=false; manual.open=true;}
+    } finally {
+      busy=false; controls.forEach(node=>{node.disabled=false;});
+    }
+  }
+  actions.append(button("选择本地文件夹…",()=>apply(async()=>{
+    const result=await api("/folders/pick",{method:"POST",body:{}});
+    return result.path || null;
+  })));
+  if (g.folder) actions.append(button("使用 Studio 默认目录",()=>apply(()=>"")));
+  manual.append(button("使用此路径",()=>apply(()=>{
+    if (!path.value.trim()) throw Error("请输入本机文件夹的绝对路径。");
+    return path.value;
+  })));
+  const help=g.running ? "当前任务结束后可以切换工作区。" :
+    g.kind==="assistant" ? "新建群聊或私聊会沿用你选的本地文件夹，任务交付后写入该目录。" :
+    "任务开始时读取所选文件夹，交付后把本次修改写回。";
+  sheet("会话工作区",el("small",{class:"muted"},g.folder?"当前本地目录":"当前 Studio 默认目录"),
+    el("code",{class:"workspace-path"},g.workspace_path),el("p",{class:"muted"},help),
+    ...(g.running?[]:[actions,manual,error]));
+}
+
 function roomOptions() {
-  const g=state.group, path=editInput(g.folder||"");
+  const g=state.group;
   const patch=async body=>{await api("/groups/"+g.id,{method:"PATCH",body});$("#sheet").close();await openGroup(g.id);};
   sheet("会话管理",el("p",{},g.members.map(m=>m.name+" (@"+m.id+")").join(" · ")),
     button(g.pinned?"取消固定":"固定到侧栏",()=>patch({pinned:!g.pinned})),
     button(g.archived?"恢复会话":"归档会话",()=>patch({archived:!g.archived})),
-    field("本机工作区",path),button("选择文件夹",async()=>{const r=await api("/folders/pick",{method:"POST",body:{}});if(r.path)path.value=r.path;}),
-    button("保存工作区",()=>patch({folder:path.value})),
+    button("会话工作区",workspaceSheet),
     button("移到废纸篓",async()=>{if(confirm("将此会话移到本地废纸篓？")){await api("/groups/"+g.id,{method:"DELETE"});$("#sheet").close();await roomsView();}}));
 }
 function runOptions() {
@@ -156,7 +245,7 @@ function runOptions() {
 function setupDirectory() {
   const actions={"workbench-nav":workbenchView,"assistant-nav":async()=>openGroup((await api("/assistant")).id),"rooms-nav":roomsView,"roles-nav":rolesView,
     "tasks-nav":tasksView,"connection":connectionSheet,"sheet-close":()=>$("#sheet").close(),
-    "manage-members":()=>$("#edit-group").click(),"room-options":roomOptions,"task-options":runOptions,"bottom":()=>$("#timeline").scrollTop=$("#timeline").scrollHeight};
+    "manage-members":()=>$("#edit-group").click(),"room-options":roomOptions,"workspace-choice":workspaceSheet,"task-options":runOptions,"bottom":()=>$("#timeline").scrollTop=$("#timeline").scrollHeight};
   for(const [id,fn] of Object.entries(actions)) $("#"+id).onclick=()=>Promise.resolve().then(fn).catch(showError);
   $("#sheet-content").onsubmit=e=>e.preventDefault();
 }

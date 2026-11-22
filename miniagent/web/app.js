@@ -23,6 +23,54 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+const ICONS = {
+  plus: "M12 5v14M5 12h14", spark: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z",
+  grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z", chat: "M5 5h14v10H9l-4 4z",
+  users: "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21a7 7 0 0 1 14 0M17 3.5a4 4 0 0 1 0 7.5M22 21a7 7 0 0 0-4-6.3",
+  list: "M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01", key: "M15 7a4 4 0 1 1-3.2 6.4L5 20H3v-2l1.5-1.5H6V15h1.5l1.9-1.9A4 4 0 0 1 15 7z",
+  stop: "M7 7h10v10H7z", folder: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
+  gear: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.9 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.9-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3 15.1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-2.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 9 4.6V4a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.9 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.9H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5.9z",
+  dots: "M5 12h.01M12 12h.01M19 12h.01", down: "M12 5v14M6 13l6 6 6-6", x: "M6 6l12 12M18 6L6 18",
+  clip: "M21 11.5l-8.6 8.6a5 5 0 0 1-7-7l8.6-8.6a3.3 3.3 0 0 1 4.7 4.7l-8.6 8.6a1.7 1.7 0 0 1-2.4-2.4l7.9-7.9",
+  bulb: "M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z",
+  sliders: "M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0M14 4v4M8 10v4M16 16v4", send: "M5 12h14M13 6l6 6-6 6",
+  check: "M5 12l5 5L20 7", arrow: "M5 12h14M13 6l6 6-6 6", question: "M9.1 9a3 3 0 0 1 5.8 1c0 2-3 3-3 3M12 17h.01",
+};
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICONS[name] || ICONS.dots); svg.append(path);
+  return svg;
+}
+function fillIcons(root = document) {
+  for (const slot of root.querySelectorAll("[data-icon]")) {
+    if (!slot.querySelector("svg")) slot.prepend(icon(slot.dataset.icon));
+  }
+}
+const AVATAR_COLORS = ["#3b8ff0", "#8673f2", "#1ea887", "#ef8a3c", "#e2659b", "#16a2b8", "#cf9a12", "#5f6fe0"];
+function avatarColor(id) {
+  let h = 0;
+  for (const ch of String(id || "?")) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+function initials(name) {
+  let text = String(name || "?").trim();
+  // "场景一-软件开发组" → use the distinctive part after a short prefix.
+  const parts = text.split(/\s*[-·—:：|｜]\s*/).filter(Boolean);
+  if (parts.length > 1 && parts[0].length <= 4) text = parts[1];
+  const cjk = text.match(/[\u4e00-\u9fff]/g);
+  if (cjk) return cjk.slice(0, 2).join("");
+  const words = text.split(/[\s_\-]+/).filter(Boolean);
+  return (words.length > 1 ? words[0][0] + words[1][0] : text.slice(0, 2)).toUpperCase();
+}
+function avatar(id, name, size = "") {
+  const node = el("span", { class: "avatar" + (size ? " " + size : ""), title: name || id, "aria-hidden": "true" }, initials(name || id));
+  node.style.setProperty("--c", avatarColor(id));
+  return node;
+}
+function youAvatar(size = "") { return el("span", { class: "avatar you" + (size ? " " + size : ""), "aria-hidden": "true" }, "你"); }
+
 async function api(path, options = {}) {
   const init = { ...options, headers: { ...(options.headers || {}) } };
   if (options.body !== undefined) {
@@ -88,6 +136,9 @@ function renderEvent(event) {
   const scope={gid:state.current,tid,files};
   const markdown=text=>documentBody(text,scope);
   const who = (label, ...extra) => el("div", { class: "who" }, label, ...extra, el("span", {}, fmtTime(event.time)));
+  const card = (cls, actorId, label, ...body) => el("div", { class: "msg with-avatar " + cls },
+    actorId === "you" ? youAvatar() : avatar(actorId, memberName(actorId)), who(...label), ...body);
+  if (event.kind !== "progress") state.worklog = null;
   switch (event.kind) {
     case "assistant_group_created":
     case "dispatch_sent":
@@ -102,49 +153,80 @@ function renderEvent(event) {
       return el("div",{class:"divider"},el("span",{},changes.join(" · ") || "群聊设置已更新"));
     }
     case "room_reply":
-    case "progress":
-      return el("div",{class:"msg"},who(el("b",{},memberName(event.agent))), markdown(event.text));
+      return card("", event.agent, [el("b",{},memberName(event.agent))], markdown(event.text));
+    case "progress": {
+      // Agents narrate as they work; fold a burst into one quiet, expandable log.
+      const log = state.worklog;
+      if (log && log.agent === event.agent && log.tid === tid && log.node.isConnected && log.node.nextSibling === state.feed?.root) {
+        log.count++;
+        log.latest.textContent = (event.text || "").replace(/\s+/g, " ");
+        log.countLabel.textContent = log.count + " 条进展";
+        log.list.append(el("li", {}, markdown(event.text)));
+        return null;
+      }
+      const latest = el("span", { class: "latest" }, (event.text || "").replace(/\s+/g, " "));
+      const countLabel = el("span", { class: "count" }, "1 条进展");
+      const list = el("ol", {}, el("li", {}, markdown(event.text)));
+      const details = el("details", {}, el("summary", {}, el("b", {}, memberName(event.agent)), latest, countLabel), list);
+      const node = el("div", { class: "msg worklog with-avatar" }, avatar(event.agent, memberName(event.agent), "sm"), details);
+      state.worklog = { agent: event.agent, tid, node, latest, countLabel, list, count: 1 };
+      return node;
+    }
     case "user_message":
       return el("div", { class: "msg user" },
-        who(el("b", {}, event.during_task ? "你（任务进行中）" : "你"),
+        who(el("b", {}, event.during_task ? "你 · 任务进行中" : "你"),
           event.addressed ? el("span", {}, `→ @${event.addressed}`) : null),
-        markdown(event.text), ...(event.attachments||[]).map(a=>el("span",{class:"chip"},a.name)));
+        markdown(event.text), (event.attachments||[]).length ? el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))) : null);
     case "attachments":
-      return el("div",{class:"msg user"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},a.name)));
+      return el("div",{class:"msg user"},el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))));
     case "queued_message":
-      return el("div",{class:"divider"},el("span",{},"已排队 · "+event.text));
+      return el("div",{class:"divider"},el("span",{},"已排队，当前任务结束后开始 · "+event.text));
     case "task_started": {
       const tools=toolWidget(tid);state.toolWidgets.set(tid,tools);
       return el("section",{class:"chat-run"},el("div",{class:"chat-run-head"},
-        el("strong",{},"任务开始 · "+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
+        el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), "任务开始 · "+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
     }
     case "delegation": {
-      const node = el("div", { class: "msg delegation" },
-        who(el("b", {}, `${memberName(event.agent)} → ${memberName(event.assignee)}`), el("span", {}, "派工")),
+      const node = card("delegation", event.agent,
+        [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, "派工")],
         markdown(event.task),
         event.deliverables && event.deliverables.length
-          ? el("div", { class: "chips", style: "margin-top:6px" }, event.deliverables.map((p) => el("span", { class: "chip" }, p))) : null);
+          ? el("div", { class: "chips", style: "margin-top:8px" }, event.deliverables.map((p) => el("span", { class: "chip" }, p))) : null);
       return collapsible(node, event.task);
     }
     case "report": {
       const level = event.status === "completed" ? "" : (event.status === "error" || event.status === "cancelled" ? "failed" : "incomplete");
-      const node = el("div", { class: `msg report ${level}` },
-        who(el("b", {}, memberName(event.agent)), statusChip(event.status),
-          el("span", { class: "muted" }, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)),
+      const node = card(`report ${level}`, event.agent,
+        [el("b", {}, memberName(event.agent)), statusChip(event.status),
+          el("span", {}, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)],
         markdown(event.text), artifactCards(scope,event.changes));
       return collapsible(node, event.text);
     }
-    case "question":
-      return el("div", { class: "msg question" }, who(el("b", {}, `${memberName(event.agent)} 向你提问`)), markdown(event.question));
-    case "answer":
+    case "question": {
+      const node = card("question", event.agent, [el("b", {}, `${memberName(event.agent)} 想请你决定`)], markdown(event.question));
+      const box = el("textarea", { placeholder: "直接在这里回答…", "aria-label": "回答这个问题" });
+      const form = el("form", { class: "answer-box" }, box, el("div", { class: "actions" },
+        el("button", { type: "submit", class: "primary" }, icon("send"), "回答"),
+        button("让团队自己决定", () => answerQuestion(form, "Please decide as a team and state your assumptions."))));
+      form.onsubmit = (e) => { e.preventDefault(); if (box.value.trim()) answerQuestion(form, box.value.trim()); };
+      box.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } };
+      if (event.qid) state.questionForms.set(event.qid, form);
+      node.append(form);
+      return node;
+    }
+    case "answer": {
+      const form = event.qid && state.questionForms.get(event.qid);
+      if (form) form.replaceWith(el("div", { class: "answered-note" }, "✓ 已回答"));
       return el("div", { class: "msg user" }, who(el("b", {}, `你的回答 → ${memberName(event.agent)}`)), markdown(event.text));
+    }
     case "publish":
-      return el("div", { class: "msg publication" }, who(el("b",{},memberName(event.agent)),"文件发布"), artifactCards(scope,event.changes));
+      return card("publication", event.agent, [el("b",{},memberName(event.agent)), el("span",{},"发布了文件")], artifactCards(scope,event.changes));
     case "final":
-      return el("div", {class:"msg final"},
-        who(el("b", {}, `${memberName(event.agent)} · 最终答复`), statusChip(event.status)), markdown(event.text),
-        el("div",{class:"actions"},button("接受交付",()=>deliveryResponse("我接受这次交付。")),
-          button("要求修改",()=>{ $("#input").value="请修改上一份交付：";$("#input").focus(); })));
+      return card("final", event.agent,
+        [el("b", {}, `${memberName(event.agent)} · 交付说明`), statusChip(event.status)], markdown(event.text),
+        el("div",{class:"actions"},el("button",{type:"button",class:"primary",onclick:()=>deliveryResponse("我接受这次交付。").catch(showError)},icon("check"),"接受交付"),
+          button("要求修改",()=>{ $("#input").value="请修改上一份交付：";$("#input").focus(); }),
+          button("查看文件",()=>toggleFiles(true))));
     case "task_finished": {
       state.toolWidgets.get(tid)?.update(null,event.status);
       const m = event.metrics || {};
@@ -163,15 +245,43 @@ function renderEvent(event) {
   }
 }
 
+async function answerQuestion(form, text) {
+  for (const control of form.querySelectorAll("button,textarea")) control.disabled = true;
+  try {
+    await api(`/groups/${state.current}/messages`, { method: "POST", body: { text } });
+    await poll();
+  } catch (error) {
+    for (const control of form.querySelectorAll("button,textarea")) control.disabled = false;
+    showError(error);
+  }
+}
+
 // ---------------------------------------------------------------- sidebar
+let directoryRequest = 0;
 async function loadGroups() {
-  try { state.groups = await api("/groups"); } catch { return; }
+  const request = ++directoryRequest;
+  try {
+    const rows = await api("/groups");
+    if (request !== directoryRequest) return;
+    state.groups = rows;
+  } catch { return; }
   const list = $("#group-list");
-  list.replaceChildren(...state.groups.filter(g => g.pinned && !g.archived).map((g) => el("li", {
-    class: g.id === state.current ? "active" : "", onclick: () => openGroup(g.id),
-  }, el("span", { class: "name", title: g.name }, g.name),
-    el("span", { class: `dot ${g.waiting_for_you ? "waiting" : g.running ? "running" : ""}`,
-      title: g.waiting_for_you ? "等待你的回复" : g.running ? "进行中" : "" }))));
+  const signature = JSON.stringify([state.current, state.groups.map(g => [g.id, g.name, g.pinned, g.archived, g.running, g.waiting_for_you, Math.floor(g.last_activity || 0)])]);
+  if (signature === state.groupSignature && list.childElementCount) return;  // no churn, no flicker
+  state.groupSignature = signature;
+  const visible = state.groups.filter(g => !g.archived && g.kind !== "assistant");
+  const pinned = visible.filter(g => g.pinned);
+  // Recent unpinned rooms (and anything that needs you) stay one click away.
+  const recent = visible.filter(g => !g.pinned).sort((a, b) => b.last_activity - a.last_activity)
+    .filter((g, i) => i < 5 || g.waiting_for_you || g.running || g.id === state.current);
+  const row = (g) => el("li", {
+    class: g.id === state.current ? "active" : "", onclick: () => openGroup(g.id), title: g.name,
+  }, avatar(g.id, g.name, "sm square"), el("span", { class: "name" }, g.name),
+    g.waiting_for_you ? el("span", { class: "pill waiting" }, "待你回复")
+      : g.running ? el("span", { class: "pill running" }, "进行中") : null);
+  list.replaceChildren(...pinned.map(row));
+  if (recent.length) list.append(el("li", { class: "empty-hint section" }, "最近"), ...recent.map(row));
+  if (!pinned.length && !recent.length) list.append(el("li", { class: "empty-hint" }, "新建的群聊会出现在这里"));
 }
 
 // ---------------------------------------------------------------- room
@@ -249,6 +359,8 @@ async function openGroup(id) {
   $("#uploads").value = "";
   state.current = id; state.after = 0; state.activityAfter = 0; state.rendered = new Set();
   state.publications=new Map();state.toolWidgets=new Map();state.view="room";
+  state.questionForms=new Map();state.worklog=null;setNav(null);
+  $("#attachment-chips").replaceChildren();
   state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null;
   $("#question-banner").hidden = $("#live").hidden = true;
   history.replaceState(null, "", "#" + id);
@@ -262,15 +374,28 @@ async function openGroup(id) {
 
 function renderHead() {
   const g = state.group;
-  $("#room-name").textContent = g.name + (g.mode === "autonomous" ? "（自主模式）" : "");
+  const workspace = $("#workspace-choice");
+  workspace.title = g.workspace_path;
+  workspace.textContent = "工作区 · "+(g.folder ? g.folder.split(/[\\/]/).filter(Boolean).pop() : "Studio 默认目录")+" ▾";
+  $("#room-name").textContent = g.name;
+  $("#room-mode").hidden = g.mode !== "autonomous";
+  $("#room-avatars").replaceChildren(...g.members.slice(0, 6).map(m => avatar(m.id, m.name, "sm")));
   $("#member-panel").hidden = g.kind !== "group";
+  const working = new Set(state.live?.active || []);
   $("#room-members").replaceChildren(...g.members.map((m) =>
-    el("li", {title: m.prompt}, el("strong", {}, m.name), el("small", {}, `@${m.id}${m.id === g.lead ? " · 负责人" : ""}`))));
+    el("li", {title: m.prompt, class: working.has(m.id) ? "working" : ""}, avatar(m.id, m.name),
+      el("span", {}, el("strong", {}, m.name), el("small", {}, `@${m.id}${m.id === g.lead ? " · 负责人" : ""}`)))));
   const template = state.templates.find((t) => t.name === g.name);
-  $("#task-buttons").replaceChildren(...(template ? template.tasks.map((t, i) =>
-    el("button", { type: "button", title: t.title, onclick: () => { $("#input").value = t.text; $("#input").focus(); } }, `填入任务 ${i + 1}`)) : []));
+  const idle = !g.running;
+  $("#task-buttons").replaceChildren(...(template && idle ? template.tasks.map((t, i) =>
+    el("button", { type: "button", title: t.text, onclick: () => { $("#input").value = t.text; autoGrow(); $("#input").focus(); } },
+      `任务 ${i + 1} · ${t.title.replace(/^.*?:\s*/, "").slice(0, 28)}`)) : []));
   $("#stop").hidden = !g.running;
+  $("#queue-toggle").hidden = !g.running;
+  if (!g.running) $("#queue").checked = false;
   $("#edit-group").disabled = g.kind === "assistant";
+  $("#key-banner").hidden = Boolean(state.config?.has_key);
+  setNav(g.kind === "assistant" ? "assistant-nav" : null);
 }
 
 function renderLive(live) {
@@ -295,17 +420,23 @@ function renderLive(live) {
     if (a.type === "tool_call") doing = ` · 调用 ${a.tool}`;
     else if (a.type === "delta" || a.type === "say") doing = " · " + (a.text || "").replace(/\s+/g, " ").slice(-90);
   }
-  $("#live-status").replaceChildren(el("span", { class: "spinner" }),
-    `${active.map(memberName).join(" › ")} 正在工作${step}${doing}`);
+  const [done, total] = (steps[current] || "").split("/").map(Number);
+  const bar = el("span", { class: "steps", title: steps[current] ? `第 ${steps[current]} 步` : "" }, el("i"));
+  bar.firstChild.style.width = total ? Math.min(100, Math.round(done / total * 100)) + "%" : "8%";
+  $("#live-status").replaceChildren(live.question ? el("span", { class: "dot waiting" }) : el("span", { class: "spinner" }),
+    ...active.slice(-2).map(id => avatar(id, memberName(id), "sm")),
+    el("span", { class: "text" }, live.question ? `${memberName(live.question.agent)} 在等你回答` :
+      `${active.map(memberName).join(" › ")} 正在工作${step}${doing}`), bar);
   const banner = $("#question-banner");
   if (live.question) {
     banner.hidden = false;
-    banner.replaceChildren(el("b", {}, `${memberName(live.question.agent)} 在等你回答：`), " ", live.question.question.slice(0, 300));
-    banner.append(el("button",{type:"button", onclick:async()=>{await api(`/groups/${state.current}/messages`,{method:"POST",body:{text:"Please decide as a team and state your assumptions."}});poll();}}, "让团队决定"));
-    $("#input").placeholder = "回复问题，也可以继续追问或交办新工作……";
+    banner.replaceChildren(el("b", {}, `${memberName(live.question.agent)} 在等你回答`),
+      el("span", { class: "q" }, live.question.question.replace(/\s+/g, " ").slice(0, 200)),
+      button("让团队自己决定", async()=>{await api(`/groups/${state.current}/messages`,{method:"POST",body:{text:"Please decide as a team and state your assumptions."}});poll();}));
+    $("#input").placeholder = "在这里或问题卡片里回答，也可以继续追问……";
   } else {
     banner.hidden = true;
-    $("#input").placeholder = "询问进展、调整当前要求，或交办另一项任务……";
+    $("#input").placeholder = "询问进展、补充要求，或勾选「排队为新任务」交办下一项工作……";
   }
 }
 
@@ -379,10 +510,15 @@ async function refreshRoom(feed, first) {
     } else {
       state.activityAfter = 0;
     }
-    if (!data.live && state.live) loadGroups();
+    const newChannel = data.events.some(e => e.kind==="assistant_group_created" && e.room_kind==="group");
+    if (newChannel || (!data.live && state.live)) loadGroups();
     state.live = data.live;
     renderLive(data.live);
-    if (!data.live) $("#input").placeholder = "追问、讨论或交办工作。可用 @成员ID 点名。Enter 发送，Shift+Enter 换行。";
+    renderHead();
+    renderWelcome();
+    if (!data.live) $("#input").placeholder = state.group.kind === "assistant"
+      ? "问工作室助手任何事，或请它组建团队、派发任务……"
+      : "交办工作、追问进展，或回答团队的问题。用 @成员ID 点名某位成员。";
   } catch (error) {
     console.warn(error);
   }
@@ -407,8 +543,8 @@ async function send(event) {
     await api(`/groups/${gid}/messages`, {method:"POST", body:{text, attachments:uploads, options, queue}});
     if (state.current !== gid) return;
     state.runOptions = {};
-    $("#queue").checked = false; $("#uploads").value = "";
-    if (input.value.trim() === text) input.value = "";
+    $("#queue").checked = false; $("#uploads").value = ""; renderUploads();
+    if (input.value.trim() === text) { input.value = ""; autoGrow(); }
     poll();
     loadGroups();
   } catch (error) {
@@ -431,9 +567,13 @@ async function toggleFiles(force) {
   const data = await api(`/groups/${gid}/files`);
   if (state.current!==gid || panel.hidden) return;
   const list = $("#file-list");
-  list.replaceChildren(...data.files.map((f) => el("li", { "data-path": f.path, onclick: () => openFile(f.path) },
-    el("span", {}, f.path), el("span", { class: "size" }, f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`))));
-  if (!data.files.length) list.append(el("li", { class: "muted" }, "项目里还没有文件。"));
+  const row = (f) => el("li", { "data-path": f.path, onclick: () => openFile(f.path) },
+    el("span", { class: "name" }, icon(/\.(md|txt)$/i.test(f.path) ? "list" : "folder"), el("span", {}, f.path)),
+    el("span", { class: "size" }, f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`));
+  const main = data.files.filter(f => !f.path.startsWith("sources/")), sources = data.files.filter(f => f.path.startsWith("sources/"));
+  list.replaceChildren(...main.map(row));
+  if (sources.length) list.append(el("li", { class: "group" }, `资料来源存档 · ${sources.length}`), ...sources.map(row));
+  if (!data.files.length) list.append(el("li", { class: "muted" }, "项目里还没有文件。团队交付后会出现在这里。"));
 }
 
 async function openFile(path) {
@@ -531,15 +671,93 @@ async function saveGroup(event) {
   }
 }
 
+// ---------------------------------------------------------------- comfort helpers
+function setNav(id) {
+  for (const b of document.querySelectorAll("#sections button")) {
+    if (b.id === id) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  }
+}
+
+function updateConnection() {
+  const ready = Boolean(state.config?.has_key);
+  $("#conn-dot").classList.toggle("ready", ready);
+  $("#conn-title").textContent = ready ? "DeepSeek 已连接" : "填写 API key";
+  $("#conn-detail").textContent = ready
+    ? `${state.config.model} · 思考${state.config.thinking === "enabled" ? "开" : "关"}`
+    : "配置后团队才能开始工作";
+  const banner = $("#key-banner");
+  if (banner) banner.hidden = ready || !state.current;
+}
+
+// A room with nothing but its creation notice gets a friendly start card.
+function renderWelcome() {
+  const timeline = $("#timeline"), g = state.group;
+  const existing = timeline.querySelector(".welcome");
+  const substantive = [...timeline.children].some(n => !n.classList.contains("divider") && !n.classList.contains("chat-drafts") && !n.classList.contains("welcome"));
+  if (substantive || !g || state.live) { existing?.remove(); return; }
+  if (existing) return;
+  const assistant = g.kind === "assistant";
+  const lead = g.members.find(m => m.id === g.lead);
+  const card = el("div", { class: "welcome" },
+    assistant ? el("span", { class: "brand-mark", style: "width:44px;height:44px;margin:auto" }, icon("spark"))
+      : el("div", { class: "avatar-stack" }, ...g.members.slice(0, 6).map(m => avatar(m.id, m.name))),
+    el("h3", {}, assistant ? "你好，我是工作室助手" : `欢迎来到「${g.name}」`),
+    el("p", {}, assistant
+      ? "告诉我你想完成什么。简单的问题我直接回答；需要团队时，我会建群、找合适的角色并把任务派出去。"
+      : `把任务发到群里，${lead ? lead.name : "负责人"}会拆分工作、委派给合适的成员，并在需要时向你确认。`),
+    assistant ? null : el("div", { class: "roster" }, ...g.members.map(m => el("span", { class: "chip" + (m.id === g.lead ? " lead" : "") }, m.name, " @" + m.id))),
+    el("div", { class: "tips" },
+      el("div", {}, el("b", {}, "说清目标"), "要做什么、给谁用、什么算完成。"),
+      el("div", {}, el("b", {}, "随时插话"), "任务进行中也能补充要求或追问进展。"),
+      el("div", {}, el("b", {}, "看交付"), "完成后点「文件」预览和下载成果。")));
+  timeline.insertBefore(card, state.feed?.root || null);
+}
+
+function autoGrow() {
+  const input = $("#input");
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + "px";
+}
+
+function renderUploads() {
+  const files = Array.from($("#uploads").files || []);
+  $("#attachment-chips").replaceChildren(...files.map((f, i) => el("span", { class: "chip" }, icon("clip"), f.name,
+    el("button", { type: "button", "aria-label": "移除 " + f.name, onclick: () => {
+      const keep = new DataTransfer();
+      Array.from($("#uploads").files).forEach((x, j) => { if (j !== i) keep.items.add(x); });
+      $("#uploads").files = keep.files; renderUploads();
+    } }, "×"))));
+}
+
+function setupComposer() {
+  const input = $("#input"), timeline = $("#timeline"), bottom = $("#bottom");
+  input.addEventListener("input", autoGrow);
+  $("#uploads").addEventListener("change", renderUploads);
+  $("#key-banner-open").addEventListener("click", () => connectionSheet().catch(showError));
+  timeline.addEventListener("scroll", () => {
+    bottom.hidden = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 240;
+  });
+  bottom.addEventListener("click", () => { timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" }); });
+  // Dropping files anywhere in the room attaches them.
+  const room = $("#room");
+  room.addEventListener("dragover", (e) => { if (e.dataTransfer?.types?.includes("Files")) e.preventDefault(); });
+  room.addEventListener("drop", (e) => {
+    if (!e.dataTransfer?.files?.length) return;
+    e.preventDefault();
+    const merged = new DataTransfer();
+    [...$("#uploads").files, ...e.dataTransfer.files].forEach(f => merged.items.add(f));
+    $("#uploads").files = merged.files; renderUploads(); input.focus();
+  });
+}
+
 // ---------------------------------------------------------------- boot
 async function boot() {
   if (window.markdownit) md = window.markdownit({ html: false, linkify: true, breaks: true });
   state.config = await api("/bootstrap");
   state.templates = state.config.templates;
-  setupDirectory();setupReader();
-  $("#config").textContent = `模型 ${state.config.model} · 思考 ${state.config.thinking === "enabled" ? "开" : "关"}` +
-    ` · 负责人 ≤${state.config.lead_max_steps} 步 · 成员 ≤${state.config.member_max_steps} 步` +
-    (state.config.has_key ? "" : " · ⚠ 未配置 DEEPSEEK_API_KEY");
+  setupDirectory();setupReader();fillIcons();updateConnection();
+  setupComposer();
+  $("#config").textContent = `负责人 ≤${state.config.lead_max_steps} 步 · 成员 ≤${state.config.member_max_steps} 步`;
   $("#template").append(...state.templates.map((t) => el("option", { value: t.id }, t.name)));
   $("#template").addEventListener("change", applyTemplate);
   $("#new-group").addEventListener("click", () => openDialog());
