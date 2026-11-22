@@ -36,6 +36,7 @@ from .rao import (
     StepPolicy,
     StepRecord,
     ToolCompletion,
+    CoordinationTurn,
     WorkCheckpoint,
     policy_messages,
 )
@@ -199,6 +200,7 @@ class Agent:
         system_prompt: str | None = None,
         before_answer: Callable[[], str | PendingPeerReview | None] | None = None,
         step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
+        advance_handoff: Callable[[], bool] | None = None,
         preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
         tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
         on_assistant_stream: Callable[[dict], None] | None = None,
@@ -410,7 +412,10 @@ class Agent:
                 if cancellation_observed():
                     status, error = "aborted", "用户请求停止"
                     break
-                receive_steering()
+                # A queued user message gets a model turn before scheduled work.
+                # Otherwise an accepted member handoff needs no coordinator inference.
+                if not receive_steering() and advance_handoff and advance_handoff():
+                    continue
                 policy = step_policy(state, budget) if step_policy else StepPolicy(phase="work")
                 offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
                 text_only = step_policy is not None and not offered
@@ -683,6 +688,13 @@ class Agent:
                     )
                     break
 
+                if policy.phase == "coordinate" and len(state.history) > history_start:
+                    replies = state.scratch.get("human_replies", ())
+                    received = sum(obs.ok and obs.source == "human" for obs in record.observations)
+                    state._coordination_turns.append(CoordinationTurn(
+                        history_start, len(state.history), len(state.scratch.get("live_user_messages", ())),
+                        len(replies) - received,
+                    ))
                 completion = tool_completion(record) if tool_completion and record.observations else None
                 if completion is not None and not isinstance(completion, ToolCompletion):
                     raise TypeError("tool_completion must return ToolCompletion or None")
@@ -698,6 +710,15 @@ class Agent:
                 if record.decision_kind == "answer" or completion is not None:
                     if receive_steering():
                         continue
+                    if completion is not None and completion.blocked:
+                        if receive_steering(finishing=True):
+                            continue
+                        answer = error = completion.answer
+                        status = "error"
+                        if self.tracer:
+                            self.tracer.event("tool_handoff_blocked", **identity, step=record.step,
+                                              evidence=completion.evidence, reason=error)
+                        break
                     if (completion is None and (step_policy is not None or self.unit.autonomous)
                             and record.answer.lstrip().startswith("[BLOCKED]")):
                         if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
@@ -958,6 +979,8 @@ class Agent:
 
     def _trace_tool(self, identity, step, obs, operation):
         command_metrics = {}
+        if operation == "submit_review" and obs.meta.get("review_refusal"):
+            command_metrics["review_refusal"] = obs.meta["review_refusal"]
         if operation in {"write_file", "edit_file"} and obs.meta.get("code") == "no_change":
             command_metrics["changed"] = False
         if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:

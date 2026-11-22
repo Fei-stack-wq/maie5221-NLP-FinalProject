@@ -94,7 +94,7 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   assert.match(await answer.getByText('ledger.md',{exact:true}).getAttribute('title'), /同名/);
   // The query parameter of a search URL should remain part of that URL's text.
   assert.equal(await answer.locator('a').filter({hasText:/^Report\.md$/}).count(),0);
-  await answer.getByRole('link',{name:'agents/reviewer/ledger.md'}).click();
+  await answer.getByRole('link',{name:'agents/worker/reviewer/ledger.md'}).click();
   await reader.getByRole('heading',{name:'reviewer ledger'}).waitFor();
   await page.keyboard.press('Escape');
   await answer.getByRole('link',{name:'Long.md'}).click();
@@ -153,6 +153,50 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   await (await late).finished();
   await page.evaluate(() => new Promise(requestAnimationFrame));
   assert.equal(await selectedFile.getByRole('heading',{name:'Long bulletin'}).isVisible(),true);
+  // The head can be a cancelled false start. Open both real artifact versions
+  // through the API, including an unchanged file absent from a turn's delta.
+  const latestRun = url.split('#run/')[1].split('/')[0];
+  const detailPath = '**/api/runs/'+latestRun;
+  const versions = async route => {
+    const response = await route.fetch(), detail = await response.json();
+    const thread = detail.conversation, [earlier,later] = thread.turns;
+    const path = 'docs/Report.md';
+    const old = {run_id:earlier.run_id,path,ref:'agents/worker/'+path};
+    const revised = {run_id:later.run_id,path,ref:'handoffs/'+'b'.repeat(32)+'/'+path};
+    const inherited = {run_id:earlier.run_id,path:'Appendix.md',ref:'handoffs/'+'a'.repeat(32)+'/Appendix.md'};
+    earlier.published_artifacts = [old,inherited];
+    later.published_artifacts = [revised];
+    thread.turns.push({run_id:'cancelled-head',user:'旧误派',status:'cancelled',events:[],artifacts:[],published_artifacts:[]});
+    const row = {kind:'group_message',parent_run_id:'cancelled-head',disposition:'reply',role:'worker',
+      question:'这份文件如何使用？',after_turn:true,at:'2027-01-01T00:00:00Z'};
+    thread.messages = [
+      {...row,request_id:'pinned-ref',text:'第一版是 `Report.md`，附件是 Appendix.md。',cited_artifacts:[old]},
+      {...row,request_id:'ambiguous-ref',text:'两次交付均有 [报告](docs/Report.md) 和 `Report.md`。'},
+    ];
+    await route.fulfill({json:detail});
+  };
+  await page.route(detailPath,versions);
+  await page.goto(url);
+  await page.reload();
+  const pinned = page.locator('[data-key="group-reply-pinned-ref"]');
+  await pinned.getByRole('link',{name:'Report.md',exact:true}).click();
+  await reader.getByRole('heading',{name:'Published edition'}).waitFor();
+  await page.keyboard.press('Escape');
+  await pinned.getByRole('link',{name:'Appendix.md',exact:true}).click();
+  await reader.getByRole('heading',{name:'Original appendix'}).waitFor();
+  await page.keyboard.press('Escape');
+  const multiple = page.locator('[data-key="group-reply-ambiguous-ref"]');
+  assert.equal(await multiple.getByRole('link').count(),0);
+  await multiple.getByRole('button',{name:'报告',exact:true}).click();
+  const oldVersion = reader.getByRole('link',{name:'第 1 轮 · docs/Report.md'});
+  const newVersion = reader.getByRole('link',{name:'第 2 轮 · docs/Report.md'});
+  await oldVersion.click();
+  await reader.getByRole('heading',{name:'Published edition'}).waitFor();
+  await reader.getByRole('button',{name:'返回'}).click();
+  await newVersion.click();
+  await reader.getByRole('heading',{name:'Revised publication'}).waitFor();
+  await page.keyboard.press('Escape');
+  await page.unroute(detailPath,versions);
   // A process started before the upload route existed still serves text chat.
   await page.route('**/attachments.js', route=>route.fulfill({status:404,body:''}));
   await page.goto(url);
@@ -160,13 +204,13 @@ withFixture('serve_markdown_fixture', async (page, url) => {
   const reply = page.locator('.reply-form');
   await reply.locator('textarea[name=message]').fill('继续之前的纯文本任务');
   assert.equal(await reply.locator('[data-pick-uploads]').count(),0);
-  await page.route('**/api/runs', route => route.request().method()==='POST'
+  await page.route('**/api/groups/*/messages', route => route.request().method()==='POST'
     ? route.fulfill({status:400,json:{error:'已捕获请求'}}) : route.fallback());
-  const outgoing = page.waitForRequest(r=>r.method()==='POST' && new URL(r.url()).pathname==='/api/runs');
+  const outgoing = page.waitForRequest(r=>r.method()==='POST' && new URL(r.url()).pathname.endsWith('/messages'));
   await reply.locator('[type=submit]').click();
   const payload = (await outgoing).postDataJSON();
-  assert.equal(payload.objective,'继续之前的纯文本任务');
-  assert.equal(Object.hasOwn(payload,'attachments'),false);
+  assert.equal(payload.text,'继续之前的纯文本任务');
+  assert.equal(Object.hasOwn(payload.options,'attachments'),false);
   assert.deepEqual(errors, []);
   assert.deepEqual(remote, []);
   console.log('Chat Markdown, publication history, nested links and mobile reader passed.');

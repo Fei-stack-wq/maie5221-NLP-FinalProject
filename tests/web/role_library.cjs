@@ -163,7 +163,17 @@ async function verify(page, url) {
   await page.getByText('旧项目已继续。',{exact:true}).waitFor();
   await page.goto(url+'#roles/legacy');
   await page.getByRole('button',{name:'记忆与技能'}).click();
-  await page.locator('.knowledge-card').getByText('每次修改前创建备份。',{exact:true}).waitFor();
+  const privateNote = page.locator('.knowledge-card').filter({hasText:'每次修改前创建备份。'});
+  await privateNote.getByText(/仅此私聊/).waitFor();
+  await privateNote.getByRole('button',{name:'提炼为通用技能'}).click();
+  assert.equal(await roleDialog.getByLabel('操作步骤').inputValue(),'');
+  assert.equal(await roleDialog.getByLabel('适用范围').inputValue(),'role');
+  await roleDialog.getByLabel('标题').fill('变更前验证');
+  await roleDialog.getByLabel('操作步骤').fill('记录基线，创建备份，再验证恢复。');
+  await roleDialog.getByRole('button',{name:'保存技能'}).click();
+  const sharedSkill = page.locator('.knowledge-card').filter({hasText:'变更前验证'});
+  await sharedSkill.getByText('角色通用',{exact:true}).waitFor();
+  assert.ok(!(await sharedSkill.innerText()).includes('每次修改前创建备份。'));
   // Another client assigns work while the role stays open. Exercise the real
   // host transition rather than forcing a UI refresh or replacing its data.
   await page.getByRole('button',{name:/分配的任务/}).click();

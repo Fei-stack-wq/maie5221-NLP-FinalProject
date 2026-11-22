@@ -1,5 +1,8 @@
 .md-file { color:var(--accent,#345c8a); text-decoration:underline; text-decoration-thickness:1px; text-underline-offset:3px; overflow-wrap:anywhere }
 .md-file code { color:inherit }
+.md-versions { display:inline; font:inherit; padding:0; border:0; background:transparent; cursor:pointer; text-decoration-style:dotted }
+.md-version-list { margin:12px 0; padding-left:1.3em }
+.md-version-list li + li { margin-top:8px }
 .md-unavailable { text-decoration:underline dotted; text-underline-offset:3px }
 .md-reader { color:inherit; width:min(760px,calc(100% - 28px)); max-width:100%; max-height:min(84dvh,900px); padding:0; border:1px solid #cfcac1; border-radius:14px; background:#fffefa; box-shadow:0 24px 96px #26241f40 }
 .md-reader[open] { display:flex; flex-direction:column }

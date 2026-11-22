@@ -11,16 +11,23 @@ import json
 
 from .project_data import validate_project_data
 from .schemas import ToolResult
-from .studio_role_memory import RoleMemoryNotFound
+from .studio_role_memory import RoleMemoryNotFound, visible_to_conversation
 from .tools import Tool, ToolRegistry
 
 ROLE_READ_TOOLS = frozenset({"recall_role_knowledge", "read_role_knowledge"})
 ROLE_TOOLS = ROLE_READ_TOOLS | {"propose_role_knowledge"}
 
 
-def attach_role_tools(registry, store, role, project, run_id, *, read_only=False, redactor=None, secret=""):
+def attach_role_tools(registry, store, role, project, run_id, *, read_only=False, redactor=None, secret="",
+                      conversation_runs=None, conversation_id=None, default_scope=None):
     """Return a separately bound registry. An existing role binding is replaced."""
     bound = ToolRegistry([registry.get(name) for name in registry.names() if name not in ROLE_TOOLS])
+    scopes = {"role": ""}
+    if conversation_id:
+        scopes["conversation"] = conversation_id
+    if project:
+        scopes["project"] = project
+    default_scope = default_scope or ("project" if project else "role")
 
     def clean(value):
         text = redactor(value) if redactor else value
@@ -34,11 +41,11 @@ def attach_role_tools(registry, store, role, project, run_id, *, read_only=False
 
     def visible(entry):
         return (entry["role"] == role and entry["status"] == "active"
-                and entry["active_revision"] == entry["revision"] and in_scope(entry))
+                and entry["active_revision"] == entry["revision"] and in_scope(entry)
+                and visible_to_conversation(entry, conversation_runs, conversation_id))
 
     def in_scope(entry):
-        return (entry["scope"] == "role" or
-                (entry["scope"] == "project" and bool(project) and entry["project"] == project))
+        return entry["scope"] in scopes and entry["project"] == scopes[entry["scope"]]
 
     def active_entry(entry_id):
         # get(role, id) may point to an unapproved candidate revision.
@@ -62,7 +69,8 @@ def attach_role_tools(registry, store, role, project, run_id, *, read_only=False
         kind = args.get("kind")
         if len(query) > 256 or not 1 <= limit <= 12 or kind not in {None, "memory", "skill"}:
             return ToolResult.failure("query 最长 256 字，limit 须为 1 至 12，kind 可选 memory 或 skill。")
-        entries = store.recall(role, project=project, query=query, kind=kind, limit=limit)
+        entries = store.recall(role, project=project, query=query, kind=kind, limit=limit,
+                               conversation_runs=conversation_runs, conversation_id=conversation_id)
         rows = []
         for entry in entries:
             if not visible(entry):
@@ -106,7 +114,7 @@ def attach_role_tools(registry, store, role, project, run_id, *, read_only=False
         entry_id, revision = args.get("entry_id"), args.get("base_revision")
         if (entry_id is None) != (revision is None):
             return ToolResult.failure("修订需要同时给出 entry_id 和检索到的 base_revision。")
-        scope = args.get("scope", "project" if project else "role")
+        scope = args.get("scope", default_scope)
         expected = None
         if entry_id is not None:
             current = active_entry(entry_id)
@@ -131,13 +139,13 @@ def attach_role_tools(registry, store, role, project, run_id, *, read_only=False
             if latest["active_revision"] != revision:
                 return ToolResult.failure("生效版本已变化，请重新读取。")
             expected = latest["revision"]
-        if scope not in {"role", "project"} or (scope == "project" and not project):
-            return ToolResult.failure("scope 须为 role 或 project；当前项目须有绑定标识才能提交项目候选。")
+        if scope not in scopes:
+            return ToolResult.failure("请使用本次会话可用的知识范围：" + "、".join(scopes))
         if kind == "skill" and not title:
             return ToolResult.failure("技能需要可供检索的标题。")
         try:
             saved = store.save(role, kind=kind, title=title, text=text, scope=scope,
-                               project=project if scope == "project" else "", source="agent",
+                               project=scopes[scope], source="agent",
                                source_run=run_id, status="candidate", entry_id=entry_id,
                                expected_revision=expected)
         except ValueError:
@@ -162,10 +170,11 @@ def attach_role_tools(registry, store, role, project, run_id, *, read_only=False
         bound.add(Tool("propose_role_knowledge",
                        "遇到用户的长期偏好、纠正或经过验证的可复用方法时，提交一条待审核记忆或技能。"
                        "技能写明适用条件、步骤和检验方式。修订时提供当前 entry_id 和 base_revision。"
-                       "scope 取 project 表示当前项目，role 表示该角色跨项目通用；有项目时默认 project。",
+                       "conversation 仅在本会话使用，project 表示当前项目，role 用于可跨会话复用的能力或偏好。"
+                       f"本轮默认 {default_scope}。",
                        schema({"kind": kind, "title": {"type": "string", "maxLength": 160},
                                "text": {"type": "string", "minLength": 1, "maxLength": 8000},
-                               "scope": {"type": "string", "enum": ["role", "project"]},
+                               "scope": {"type": "string", "enum": list(scopes)},
                                "entry_id": identifier, "base_revision": {"type": "integer", "minimum": 1}},
                               ["kind", "text"]), propose))
     return bound

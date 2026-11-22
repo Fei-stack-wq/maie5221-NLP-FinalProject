@@ -8,6 +8,7 @@ from miniagent.config import Settings
 from miniagent.studio_service import StudioError, StudioService
 from tests.test_studio_conversations import RecordingProvider, fresh, msg, reply
 from tests.test_studio_service import finished
+from tests.test_studio_superagent import tool
 
 
 class KnowledgeProjectTests(unittest.TestCase):
@@ -65,6 +66,39 @@ class KnowledgeProjectTests(unittest.TestCase):
         self.assertIn("PRIVATE-NEW-PROJECT-55", prompt)
         self.assertNotIn("PRIVATE-OLD-PROJECT-44", prompt)
         self.assertEqual(room["knowledge_project_id"], new)
+
+    def test_two_rooms_sharing_role_and_folder_keep_run_sourced_notes_local(self):
+        folder = self.root / "shared"
+        folder.mkdir()
+        first, _, _ = self.turn(workspace=str(folder))
+        library = self.service.role_memory
+        entry = library.save("maintainer", kind="memory", text="FIRST-GROUP-ONLY", scope="project",
+                             project=str(folder), source="agent", source_run=first, status="candidate")
+        library.set_status("maintainer", entry["id"], "active", entry["revision"])
+        self.memory(str(folder), "CURATED-FOLDER-NOTE")
+        library.save("maintainer", kind="memory", text="PORTABLE-ROLE-PREFERENCE")
+        self.restart()
+        second, second_room, second_prompt = self.turn(workspace=str(folder))
+        self.assertEqual(second_room["id"], second)
+        self.assertNotIn("FIRST-GROUP-ONLY", second_prompt)
+        for shared in ("CURATED-FOLDER-NOTE", "PORTABLE-ROLE-PREFERENCE"):
+            self.assertIn(shared, second_prompt)
+
+        def retrieve(parent):
+            model = RecordingProvider([tool("recall_role_knowledge", query="FIRST-GROUP-ONLY"),
+                                       tool("read_role_knowledge", entry_id=entry["id"]), {"text": "已检索。"}])
+            with patch("miniagent.studio_service.DeepSeekProvider", return_value=model):
+                turn = self.service.start(msg("查询知识", reply(parent, "maintainer")))
+                finished(self.service, turn["id"])
+            return [message["content"] for message in model.requests[-1][0] if message.get("role") == "tool"]
+
+        hidden = retrieve(second)
+        self.assertEqual(len(hidden), 2)
+        self.assertNotIn("FIRST-GROUP-ONLY", str(hidden))
+        self.assertIn("没有这条", hidden[1])
+        visible = retrieve(first)
+        self.assertEqual(len(visible), 2)
+        self.assertTrue(all("FIRST-GROUP-ONLY" in result for result in visible))
 
     def test_old_metadata_after_explicit_reset_recovers_latest_project_identity(self):
         first, _, _ = self.turn()

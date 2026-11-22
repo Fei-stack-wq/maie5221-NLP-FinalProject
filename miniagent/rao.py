@@ -29,6 +29,7 @@ import math
 import re
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -82,6 +83,7 @@ class ErrorClass:
     A_UNKNOWN_TOOL = "A_UNKNOWN_TOOL"              # 模型幻觉出不存在的工具
     A_SANDBOX_DENY = "A_SANDBOX_DENY"              # 路径越界，沙箱拒绝
     A_HUMAN_DENIED = "A_HUMAN_DENIED"              # 人类拒绝或无人可问
+    A_REVIEW_REJECTED = "A_REVIEW_REJECTED"        # 宿主未能据提交的证据签署本次评审
     A_TOOL_TIMEOUT = "A_TOOL_TIMEOUT"              # 工具超时
     A_TOOL_ERROR = "A_TOOL_ERROR"                  # 工具内部异常
     A_SKIPPED = "A_SKIPPED"                        # 超过单步动作上限，未执行
@@ -322,6 +324,15 @@ class Budget(BaseModel):
         return child
 
 
+@dataclass(frozen=True)
+class CoordinationTurn:
+    """One whole lead turn, including parallel calls, replies and any host handoff."""
+    start: int
+    end: int
+    live_before: int
+    human_before: int
+
+
 class RAOState(BaseModel):
     """一步的全部输入。历史 append-only，scratch 放临时标记（重复计数、验收失败次数）。"""
 
@@ -331,6 +342,9 @@ class RAOState(BaseModel):
     history: list[dict[str, Any]] = Field(default_factory=list)
     scratch: dict[str, Any] = Field(default_factory=dict)
     _tool_progress: ToolProgress = PrivateAttr(default_factory=ToolProgress)
+    # This bounds recent verbatim context, never the number of turns an agent may run.
+    _coordination_turns: deque[CoordinationTurn] = PrivateAttr(default_factory=lambda: deque(maxlen=4))
+
 
 
 @dataclass(frozen=True)
@@ -342,10 +356,11 @@ class PendingPeerReview:
 
 @dataclass(frozen=True)
 class ToolCompletion:
-    """Host-authorized final text derived from authenticated tool receipts."""
+    """Host-authorized handoff derived from tool receipts; an unsigned handoff cannot pass acceptance."""
 
     answer: str
     evidence: dict[str, Any]
+    blocked: bool = False
 
     def __post_init__(self):
         if not self.answer.strip() or not self.evidence:
@@ -375,6 +390,16 @@ class BoundHandoff:
     owner: str
     objective: str
     evidence_revision: str
+    deliverable_paths: tuple[str, ...] = ()
+
+    def supersedes(self, decision: Decision) -> bool:
+        if decision.kind == "answer":
+            return True
+        tools = {action.tool for action in decision.actions}
+        if self.deliverable_paths:
+            # The lead may explicitly choose a different owner or request a decision.
+            return bool(tools) and tools.isdisjoint({"delegate_task", "ask_human", "abort_task"})
+        return bool(tools - {"delegate_task", "ask_human"})
 
 
 @dataclass(frozen=True)
@@ -391,6 +416,7 @@ class StepPolicy:
     required_tool: str | None = None
     reviewed_delivery: tuple[dict, ...] = ()
     bound_handoff: BoundHandoff | None = None
+    omit_coordination_turns: int = 0
 
     def __post_init__(self) -> None:
         if self.bound_handoff and "delegate_task" not in (self.allowed_tools or ()):
@@ -415,9 +441,21 @@ def policy_messages(state: RAOState, policy: StepPolicy) -> list[dict[str, Any]]
         if policy.phase == "work" and (context := state.scratch.get("work_context")):
             messages.append({"role": "user", "content": context})
         messages.append({"role": "user", "content": state.goal})
-        for question, reply in state.scratch.get("human_replies", []):
+        # Older human decisions remain visible after their raw call envelopes
+        # rotate out. Replay newer steering at its original turn boundary.
+        turns = list(state._coordination_turns)[policy.omit_coordination_turns:] if policy.phase == "coordinate" else ()
+        replies = state.scratch.get("human_replies", [])
+        if turns:
+            replies = replies[:turns[0].human_before]
+        for question, reply in replies:
             messages.append({"role": "user", "content": f"[用户已答复]\n问题：{question}\n答复：{reply}"})
-        messages.extend(state.scratch.get("live_user_messages", ()))
+        live = state.scratch.get("live_user_messages", ())
+        cursor = 0
+        for turn in turns:
+            messages.extend(live[cursor:turn.live_before])
+            messages.extend(state.history[turn.start:turn.end])
+            cursor = turn.live_before
+        messages.extend(live[cursor:])
         if policy.phase == "work" and state._tool_progress.current_advisory:
             messages.append({"role": "user", "content": state._tool_progress.current_advisory})
         if feedback := state.scratch.get("delivery_feedback"):
@@ -974,6 +1012,8 @@ class RAOUnit:
                 and isinstance(result.meta.get("path"), str)):
             artifacts = [result.meta["path"]]
         error_class = None if result.ok else classify_failure(result.content)
+        if not result.ok and action.tool == "submit_review" and result.meta.get("review_refusal"):
+            error_class = ErrorClass.A_REVIEW_REJECTED
         return Observation(
             step_id=step_id,
             source=action.tool,
@@ -1177,8 +1217,7 @@ class RAOUnit:
                 state.history.append(obs.to_message(call["id"]))
         elif (bound_handoff and "delegate_task" in (allowed_tools or ())
               and bound_handoff != state.scratch.get("last_host_handoff")
-              and (decision.kind == "answer" or (decision.actions and
-                   any(a.tool not in {"delegate_task", "ask_human"} for a in decision.actions)))):
+              and bound_handoff.supersedes(decision)):
             # Keep the provider's actual envelope intact. Pair any superseded
             # requests before recording a separately identified runtime action.
             for call in (message or {}).get("tool_calls", []):
@@ -1188,12 +1227,14 @@ class RAOUnit:
                                       content="已有绑定的分工，本次请求由宿主交接取代。")
                 observations.append(skipped)
                 state.history.append(skipped.to_message(call["id"]))
-            action = Action(id="host_" + uuid.uuid4().hex, tool="delegate_task",
-                            arguments={"assignee": bound_handoff.owner, "objective": bound_handoff.objective})
+            arguments = {"assignee": bound_handoff.owner, "objective": bound_handoff.objective}
+            if bound_handoff.deliverable_paths:
+                arguments["deliverable_paths"] = list(bound_handoff.deliverable_paths)
+            action = Action(id="host_" + uuid.uuid4().hex, tool="delegate_task", arguments=arguments)
             host_handoff = {"target": bound_handoff.target, "version": bound_handoff.version,
                             "state": bound_handoff.state, "owner": bound_handoff.owner, "call_id": action.id}
             state.scratch["last_host_handoff"] = bound_handoff
-            state.history.append({"role": "user", "content": "[宿主调度] 已登记的验收决定需要下一位成员执行。"})
+            state.history.append({"role": "user", "content": "[宿主调度] 已登记的分工交给下一位成员执行。"})
             handoff_call = ToolCall(id=action.id, name=action.tool, arguments=action.arguments)
             state.history.append(LLMResponse(content_is_null=True, reasoning_content="",
                                              tool_calls=[handoff_call]).to_assistant_message())

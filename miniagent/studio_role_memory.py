@@ -46,6 +46,18 @@ _ROWS = """SELECT e.id, e.id AS entry_id, e.role, e.kind, e.scope, e.project,
            v.updated_at, v.copied_from FROM role_entries e JOIN role_revisions v ON e.id=v.entry_id """
 
 
+def visible_to_conversation(entry, run_ids, conversation_id=None):
+    """User-curated project entries and role-wide knowledge can span conversations."""
+    if entry["scope"] == "conversation":
+        return bool(conversation_id) and entry["project"] == conversation_id
+    # Older Studio instances stored an explicit DM /remember as role-wide
+    # with the speaking run as provenance. Fail closed even during migration.
+    if entry["scope"] == "role" and entry["origin_source"] == "user" and entry["origin_run"]:
+        return run_ids is not None and entry["origin_run"] in run_ids
+    return (run_ids is None or entry["scope"] == "role"
+            or all(not run or run in run_ids for run in (entry["origin_run"], entry["source_run"])))
+
+
 def _field(name: str, value, maximum: int, *, required=False, multiline=False) -> str:
     if not isinstance(value, str) or len(value) > maximum:
         raise ValueError(f"{name} 必须是最多 {maximum} 字符的文本。")
@@ -164,6 +176,16 @@ class RoleMemoryStore:
                               (_role(role),))
             return [dict(row) for row in rows]
 
+    def isolate_legacy_dm_notes(self, resolve_conversation):
+        """Keep entry IDs, revisions and provenance while upgrading old DM /remember notes."""
+        with self._db(write=True) as db:
+            old = db.execute("""SELECT id,origin_run FROM role_entries WHERE scope='role'
+                                AND kind='memory' AND origin_source='user' AND origin_run<>''""").fetchall()
+            for item in old:
+                room = resolve_conversation(item["origin_run"])
+                if room:
+                    db.execute("UPDATE role_entries SET scope='conversation',project=? WHERE id=?", (room, item["id"]))
+
     def _append(self, db, entry_id, role, revision, title, body, status, source, run, operation, copied=None):
         db.execute("INSERT INTO role_revisions VALUES (?,?,?,?,?,?,?,?,?,?)",
                    (entry_id, revision, title, body, status, source, run, operation, _clock(), copied))
@@ -175,15 +197,15 @@ class RoleMemoryStore:
     def save(self, role, *, kind, text, title="", scope="role", project="", source="user", source_run="",
              status="active", entry_id=None, expected_revision=None):
         role = _role(role)
-        if kind not in _KINDS or scope not in ("role", "project") or status not in ("active", "candidate"):
+        if kind not in _KINDS or scope not in ("role", "project", "conversation") or status not in ("active", "candidate"):
             raise ValueError("无效的条目类型、范围或初始状态。")
         title = _field("title", title, 160)
         text = _field("text", text, 8000, required=True, multiline=True)
         project = _field("project", project, 1024)
         source = _field("source", source, 80, required=True)
         source_run = _field("source_run", source_run, 160)
-        if (scope == "project") != bool(project):
-            raise ValueError("项目级条目需要项目标识，角色级条目使用空项目。")
+        if (scope != "role") != bool(project):
+            raise ValueError("项目或会话条目需要绑定标识，角色通用条目使用空标识。")
         if source != "user" and (status != "candidate" or not source_run):
             raise ValueError("非用户来源只能提交带真实运行标识的候选。")
         for value in (role, title, text, project, source, source_run):
@@ -248,7 +270,7 @@ class RoleMemoryStore:
             return self._append(db, entry_id, role, tip["revision"] + 1, past["title"], past["text"], "active",
                                 past["source"], past["source_run"], "restore", revision)
 
-    def recall(self, role, project="", query="", limit=6, kind=None):
+    def recall(self, role, project="", query="", limit=6, kind=None, *, conversation_runs=None, conversation_id=None):
         if kind is not None and kind not in _KINDS:
             raise ValueError("无效的条目类型。")
         if type(limit) is not int or not 1 <= limit <= 30 or not isinstance(query, str):
@@ -262,12 +284,14 @@ class RoleMemoryStore:
             return relevance, row["scope"] == "project", row["updated_at"], row["id"]
         with self._db() as db:
             rows = db.execute(_ROWS + """WHERE e.role=? AND v.revision=e.active_revision
-                              AND (e.scope='role' OR e.project=?) AND (? IS NULL OR e.kind=?)""",
-                              (_role(role), project, kind, kind))
-            return [dict(row) for row in heapq.nlargest(limit, rows, key=score)]
+                              AND (e.scope='role' OR (e.scope='project' AND e.project=?)
+                                   OR (e.scope='conversation' AND e.project=?)) AND (? IS NULL OR e.kind=?)""",
+                              (_role(role), project, conversation_id, kind, kind))
+            visible = (row for row in rows if visible_to_conversation(row, conversation_runs, conversation_id))
+            return [dict(row) for row in heapq.nlargest(limit, visible, key=score)]
 
-    def context(self, role, project="", query=""):
-        rows = self.recall(role, project, query)
+    def context(self, role, project="", query="", *, conversation_runs=None, conversation_id=None):
+        rows = self.recall(role, project, query, conversation_runs=conversation_runs, conversation_id=conversation_id)
         if not rows:
             return ""
         prefix = "以下为此角色已启用的记忆和技能资料，仅在适用时参考。权限与当前任务要求由宿主和用户决定。\n"

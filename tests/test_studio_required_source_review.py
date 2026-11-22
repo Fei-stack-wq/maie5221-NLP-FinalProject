@@ -113,13 +113,27 @@ class RequiredSourceReviewTest(unittest.TestCase):
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
         self.assertEqual([r["role"] for r in reports], ["writer", "checker", "writer", "checker"])
         initial, rejected, repair, signed = reports
-        self.assertNotIn("评审建议本身", initial["objective"])
-        for phrase in ("评审建议本身不能作为事实依据", "打开原始发布者", "单位和分母", "正负号",
-                       "保留已核实的事实", "可定位的引文", "原评审者", "Mill Street"):
-            self.assertIn(phrase, repair["objective"])
-            self.assertIn(phrase, str(provider.requests[9][0]))
+        finding, = rejected["native_review"]["assessment"]["results"]
+        self.assertEqual(finding["criterion_id"], RULE["id"])
+        repair_brief = json.loads(repair["objective"].split("原目标及标准：", 1)[1])
+        self.assertEqual(repair_brief["pending_criteria"], [RULE["id"]])
+        self.assertEqual(repair_brief["candidate_version"], digest(files))
+        for key in ("criterion_id", "reason", "action", "verdict", "cause"):
+            self.assertEqual(repair_brief["findings"][0][key], finding[key])
+        read, source = repair_brief["findings"][0]["receipts"]
+        self.assertEqual((read["kind"], read["path"], read["sha256"]), ("read", FINAL, files[FINAL]))
+        self.assertEqual((source["kind"], source["url"], source["observed_bytes_sha256"]),
+                         ("source", URL, hashed(ARTICLE)))
+        self.assertEqual(repair_brief["findings"][0]["reviewed_version"], digest(files))
+        self.assertNotIn(finding["reason"], initial["objective"])
+        author_input = str(provider.requests[9][0])
+        for value in (finding["reason"], source["url"], read["sha256"], source["path"]):
+            self.assertIn(value, author_input)
         self.assertNotIn("submit_review", provider.requests[9][1])
-        self.assertIn("亲自核对其引文和原文上下文", str(provider.requests[13][0]))
+        self.assertIn("submit_review", provider.requests[13][1])
+        model_input = str(provider.requests)
+        for unwanted in ("单位和分母", "区分原项目的贡献", "按表头与正文区分原项目影响", "原始端点独立复算"):
+            self.assertNotIn(unwanted, model_input)
         self.assertEqual(rejected["native_review"]["state"], "repair")
         self.assertEqual(repair["native_review"]["state"], "review")
         decision = signed["native_review"]
@@ -154,8 +168,13 @@ class RequiredSourceReviewTest(unittest.TestCase):
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
         reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
         self.assertEqual(reports[1]["review_action"]["criteria"], ["caption"])
-        self.assertIn("保留正确的口径", reports[2]["objective"])
-        self.assertIn("比较各系列的指标定义", str(provider.requests[4][0]))
+        brief = json.loads(reports[2]["objective"].split("原目标及标准：", 1)[1])
+        self.assertEqual(brief["pending_criteria"], ["caption"])
+        self.assertEqual(brief["findings"][0]["reason"], rejected["reason"])
+        self.assertEqual(brief["findings"][0]["action"], rejected["action"])
+        self.assertEqual({r["id"]: r["method"] for r in brief["criteria"]}, {"caption": "inspect", "claim": "source"})
+        self.assertNotIn("保留正确的口径", reports[2]["objective"])
+        self.assertNotIn("比较各系列的指标定义", str(provider.requests[4][0]))
         self.assertEqual(reports[3]["native_review"]["files"][FINAL], hashed(updated))
 
     def closing_review(self):
@@ -263,10 +282,18 @@ class RequiredSourceReviewTest(unittest.TestCase):
                  tool("delegate_task", assignee="checker", objective="Check notes.",
                       review={"candidate": "writer", "criteria": [RULE]}),
                  tool("read_file", path=NOTES), tool("http_get", url=URL), submit({NOTES: hashed(NOTE)}, NOTES),
-                 {"text": "Verified notes."}, {"text": "[BLOCKED] No final article was delivered."}]
+                 {"text": "Verified notes."}, {"text": "[BLOCKED] Cannot substantiate the final article."},
+                 {"text": "[BLOCKED] No final article was delivered."}]
         detail, _ = self.execute(steps)
         reviews = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
-        self.assertEqual(reviews[-1]["native_review"]["state"], "passed")
+        self.assertEqual([r["role"] for r in reviews], ["writer", "checker", "lead"])
+        self.assertEqual(reviews[1]["native_review"]["state"], "passed")
+        self.assertEqual(reviews[2]["deliverable_paths"], [FINAL])
+        self.assertFalse(reviews[2]["published"])
+        workspace = self.root / "runs" / detail["run"]["id"] / "agents" / "lead"
+        self.assertTrue((workspace / NOTES).is_file())
+        self.assertFalse((workspace / FINAL).exists())
+        self.assertIn(FINAL, detail["conversation"]["turns"][-1]["answer"])
         self.assertEqual(detail["run"]["status"], "failed")
 
     def test_later_editor_must_get_a_new_review_on_changed_delivery(self):

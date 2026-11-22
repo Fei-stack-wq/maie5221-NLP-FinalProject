@@ -194,6 +194,61 @@ class LocalWorkspaceTest(unittest.TestCase):
         self.assertEqual(error.exception.code, "invalid_recovery_checkpoint")
         self.assertEqual((self.local / "b.md").read_text(), "private work from reviewer")
 
+    def test_same_room_read_only_followup_keeps_selected_author_draft_recoverable(self):
+        parent, ids, _ = self.blocked_drafts()
+        reader = RecordingProvider([{"text": "This conversation has a private draft."}])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=reader):
+            query = self.svc.start(request("single", objective="Explain the team's workflow.",
+                conversation={"parent_run_id": parent, "recipient": "lead", "intent": "question"}))
+            finished(self.svc, query["id"])
+        self.assertIn(ids["author"], {c["task_id"] for c in self.svc.detail(query["id"])["conversation"]["recovery_candidates"]})
+        model = RecordingProvider([tool("read_file", path="a.md"), {"text": "Done."}])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=model):
+            resumed = self.recover(query["id"], recover_task_id=ids["author"])
+            detail = finished(self.svc, resumed["id"])
+        self.assertEqual(detail["conversation"]["turns"][-1]["base_run_id"], parent)
+        self.assertIn("private work from author", str(model.requests[-1][0]))
+
+    def test_legacy_cancelled_status_only_skips_read_receipts_including_human_alias(self):
+        import json
+        root = self.svc.runs_dir / "legacy-status"
+        root.mkdir()
+        old = {"intent": "edit", "status": "failed", "run_id": "older"}
+        latest = {"intent": "edit", "status": "cancelled", "run_id": root.name}
+        (root / "studio.json").write_text(json.dumps({"title": "所以现在完成了吗"}))
+        trace = root / "trace.jsonl"
+        trace.write_text(json.dumps({"kind": "tool_result", "operation": "ask_human", "tool": "human"}))
+        self.assertEqual(self.svc._recoverable_group_turn([old, latest]), old)
+        with trace.open("a") as f:
+            f.write("\n" + json.dumps({"kind": "tool_start", "tool": "edit_file"}))
+        self.assertIsNone(self.svc._recoverable_group_turn([old, latest]))
+
+    def test_recovered_evidence_requires_the_frozen_bytes_and_independent_signer(self):
+        from miniagent.studio_reviews import digest
+        from miniagent.studio_conversations import SnapshotError
+        manifest = {"app.txt": "hash"}
+        version = digest(manifest)
+        author = {"task_id": "author-task", "role": "dev"}
+        signed = {"target": "author-task", "candidate_version": version, "evaluator": "qa", "attempt_id": "attempt-qa",
+                  "verdict": "passed", "results": [{"criterion_id": "smoke", "verdict": "passed",
+                      "reason": "Browser exercised the frozen file.", "receipts": [{"ref": "Eabc"}]}]}
+        author_event = {"kind": "member_report", "task_id": "author-task", "role": "dev",
+                        "handoff": {"reviewable_candidate": {"candidate_version": version}}}
+        peer = {"kind": "member_report", "role": "qa", "task_id": "qa-task",
+                "handoff": {"native_review": {"kind": "product", "state": "blocked", "author": "dev", "reviewer": "qa",
+                        "target": "author-task", "candidate_version": version, "assessment": signed}}}
+        with patch.object(self.svc, "room_events", return_value=[author_event, peer]):
+            receipt = self.svc._checkpoint_assessment(self.private, author, manifest)
+            self.assertEqual((receipt["review_task"], receipt["verdict"]), ("qa-task", "passed"))
+            self.assertEqual(receipt["findings"][0]["receipts"], ["Eabc"])
+            with self.assertRaises(SnapshotError):
+                self.svc._checkpoint_assessment(self.private, author, {"app.txt": "changed"})
+            signed["verdict"] = "changes_requested"
+            signed["results"][0]["verdict"] = "changes_requested"
+            self.assertEqual(self.svc._checkpoint_assessment(self.private, author, manifest)["verdict"], "changes_requested")
+            signed["evaluator"] = "dev"
+            self.assertIsNone(self.svc._checkpoint_assessment(self.private, author, manifest))
+
     def test_control_directory_credential_and_hidden_paths(self):
         for invalid in (str(self.svc.runs_dir), str(self.svc.runs_dir.parent), "relative"):
             with self.subTest(invalid=invalid), self.assertRaises(StudioError):

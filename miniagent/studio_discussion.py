@@ -39,7 +39,7 @@ class RoomDiscussion:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if kind in {"assistant_progress", "user_steer", "steer_seen", "assignment", "member_report", "human_question", "human_answer"}:
+            if kind in {"status_reply", "assistant_progress", "user_steer", "steer_seen", "assignment", "member_report", "human_question", "human_answer"}:
                 replies = self._reply_streams.get(run_id)
                 if replies:
                     replies.room_changed(kind, fields.get("task_id"), reply_id=fields.get("reply_id"))

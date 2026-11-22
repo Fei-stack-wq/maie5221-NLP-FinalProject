@@ -21,7 +21,7 @@ import traceback
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -44,6 +44,7 @@ from .task_store import StoreError, StoreTransaction, TaskStore, _schema
 from .tools import build_default_registry
 from .project_data import (PROJECT_CACHE_DIRS, SQLITE_EXTENSIONS, SQLITE_SIDECARS, is_database, is_png,
                            supported_project_file, validate_project_data)
+from . import studio_cancelled_checkout
 from .studio_superagent import ASSISTANT_INSTRUCTIONS, StudioAssistant
 from .studio_dispatch import StudioDispatch
 from .studio_roles import RoleSession, StudioRoles, knowledge_project
@@ -60,7 +61,10 @@ from .attachment_tools import attachment_tools
 from .studio_uploads import MAX_ATTACHMENTS, UploadError, open_upload, resolve_uploads, validate_upload_ids
 from .studio_crew import RoomCrew
 from .studio_artifacts import output_classifier
-from .studio_reviews import Rule
+from .studio_reviews import Rule, digest as review_digest
+from .studio_group_status import previous_status
+from . import studio_group_messages
+from .studio_group_queue import drain_group_queue
 from .studio_conversations import (ROLE_LABELS, SnapshotError, addressed_members, conversation_attachments, copy_project, member_profiles, project_context,
                                    thread_info, validate_conversation)
 
@@ -187,15 +191,21 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
         self._answers = threading.Condition(self._lock)
         self._questions = {}
         self._closed = False
+        self.role_memory.isolate_legacy_dm_notes(self._note_conversation)
+        self._upgrade_role_briefs()
         self._drain_studio_dispatches()
+        drain_group_queue(self)
 
-    def profiles(self):
+    def _profile_records(self):
         data, truncated = _read_file(self.runs_dir, "studio-profiles.json", 2 * 1024**2, missing=True)
         if truncated:
             raise StudioError("角色资料超过存储上限。", "profile_storage", 409)
         return json.loads(data) if data else []
 
-    def add_profile(self, profile):
+    def profiles(self):
+        return [{key: record[key] for key in ("id", "name", "prompt")} for record in self._profile_records()]
+
+    def add_profile(self, profile, *, source_run=None):
         if not isinstance(profile, dict):
             raise StudioError("请填写角色资料。")
         identity = profile.get("id")
@@ -205,16 +215,17 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
         except ValueError as exc:
             raise StudioError(str(exc)) from None
         with self._lock, self._admission():
-            rows = self.profiles()
-            if profile in rows:
-                return self._redact(profile)
+            rows = self._profile_records()
+            profile = self._redact(profile)
+            if any(all(row[key] == profile[key] for key in profile) for row in rows):
+                return profile
             if identity.lower() in {key.lower() for key in ROLE_LABELS} | {row["id"].lower() for row in rows}:
                 raise StudioError("角色 ID 已被使用。", "profile_conflict", 409)
-            updated = [*rows, self._redact(profile)]
+            updated = [*rows, {**profile, "source_run": source_run}]
             if len(json.dumps(updated, ensure_ascii=False).encode()) > 2 * 1024**2:
                 raise StudioError("角色资料超过存储上限。", "profile_storage", 409)
             _write_json(self.runs_dir, "studio-profiles.json", updated)
-            return updated[-1]
+            return profile
 
     def bootstrap(self) -> dict[str, Any]:
         return {"provider_ready": bool(self.settings.api_key.strip()), "model": self.settings.model,
@@ -222,7 +233,8 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 "limits": {"max_steps": self.settings.limits.max_steps,
                            "max_total_tokens": self.settings.limits.max_total_tokens,
                            "max_seconds": self.settings.limits.max_seconds},
-                "local_workspaces": True, "run_steering": True, "max_message_attachments": MAX_ATTACHMENTS, "custom_profiles": self.profiles(),
+                "local_workspaces": True, "run_steering": True, "message_thinking": True,
+                "max_message_attachments": MAX_ATTACHMENTS, "custom_profiles": self.profiles(),
                 "conversation_roles": [{"id": key, "label": label} for key, label in ROLE_LABELS.items()],
                 "modes": [dict(mode) for mode in _MODES]}
 
@@ -443,7 +455,7 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
             owned = path.name in self._active
         states = {task["status"] for task in roots}
         if (not owned and meta.get("state") in {"running", "queued"}
-                and (meta.get("thread", {}).get("superagent") or meta.get("studio_dispatch"))):
+                and (meta.get("thread", {}).get("superagent") or meta.get("thread", {}).get("kind") == "group" or meta.get("studio_dispatch"))):
             owned = self._assistant_elsewhere(path)
         if meta.get("mode") == "room":
             status = "ready"
@@ -470,7 +482,11 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
             title = next((event.get("goal") or event.get("task") for event in events
                           if isinstance(event.get("goal") or event.get("task"), str)), path.name)
         created = meta.get("created_at") or (roots[0]["created_at"] if roots else _now())
-        ended = meta.get("finished_at") or (max(task["updated_at"] for task in roots) if states and states <= _TERMINAL else None)
+        ended = meta.get("finished_at")
+        if status in {"running", "queued", "waiting_user"}:
+            ended = None
+        elif not ended and states and states <= _TERMINAL:
+            ended = max(task["updated_at"] for task in roots)
         end_time = datetime.fromisoformat((ended or _now()).replace("Z", "+00:00"))
         try:
             duration = max(0, (end_time - datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds() * 1000)
@@ -537,6 +553,13 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 for row in rows:
                     if row["kind"] == "group" and row["id"] in roots:
                         row["members"] = self._member_state(roots[row["id"]]["thread"])["members"]
+        for item in rows:
+            if item["kind"] == "group":
+                latest = studio_group_messages.read_messages(self, item["id"], latest_only=True)
+                if latest and latest[0]["at"] >= item["updated_at"]:
+                    item["updated_at"] = latest[0]["at"]
+                    if directory:
+                        item["last_message"] = latest[0]["question"][:200]
         ordered = sorted(rows, key=lambda item: (item["updated_at"], item["id"]), reverse=True)
         return self._redact(ordered)
 
@@ -550,7 +573,7 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 if row["mode"] != "room":
                     runs.append(row)
             except (StudioError, OSError, ValueError):
-                runs.append({"id": path.name, "title": path.name, "mode": "imported", "status": "failed",
+                runs.append({"id": path.name, "title": path.name, "mode": "imported", "status": "unknown",
                              "created_at": "", "finished_at": None, "duration_ms": None, "task_count": 0,
                              "completed_count": 0, "artifact_count": 0, "error": "运行记录无法读取；未修改原始数据。"})
         with self._lock:
@@ -563,8 +586,8 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
             events, truncated = self._events(path)
             return self._redact(self._activity(path, events, truncated))
 
-    def _activity(self, path, events, truncated):
-        return project_activity(events, path.name in self._active, truncated,
+    def _activity(self, path, events, truncated, *, active=None):
+        return project_activity(events, path.name in self._active if active is None else active, truncated,
                                 run_id=path.name, thread=self._meta(path).get("thread"))
 
     def detail(self, run_id: str) -> dict:
@@ -584,7 +607,8 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 "other_project_files": other_files,
                 "acceptance": acceptance, "summary": summarize(events), "summary_incomplete": log_truncated,
                 "report": report.decode("utf-8", errors="replace"), "report_truncated": report_truncated}
-        data["activity"] = self._activity(path, events, log_truncated)
+        active = data["run"]["status"] in {"running", "queued", "waiting_user"}
+        data["activity"] = self._activity(path, events, log_truncated, active=active)
         data["conversation"] = self._conversation(path)
         if not data["conversation"]:
             answer, truncated = _read_file(path, "conversation-answer.txt", MAX_PREVIEW_BYTES, missing=True)
@@ -595,14 +619,25 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                        if conversation.get("head_run_id") == run_id else [])
         data["room_events"] = self.room_events(run_id)
         data["diagnostics"] = diagnose(tasks, events, acceptance,
-                                       active=run_id in self._active, incomplete=log_truncated,
+                                       active=active, incomplete=log_truncated,
                                        recovery_candidates=recoverable,
-                                       room_events=data["room_events"] if data["run"]["status"] == "failed"
-                                       and not data["run"].get("error_code") else None)
+                                       room_events=data["room_events"],
+                                       diagnose_blocked_handoff=not data["run"].get("error_code"))
         data["pending_questions"] = [{key: row[key] for key in ("request_id", "role", "text")}
                                      for (rid, _), row in self._questions.items()
                                      if rid == run_id and row["answer"] is None]
         return self._redact(data)
+
+    def group_messages(self, room_id):
+        return studio_group_messages.read_messages(self, room_id)
+
+    def send_group_message(self, room_id, payload):
+        try:
+            return studio_group_messages.post_message(self, room_id, payload)
+        except sqlite3.OperationalError as exc:
+            if getattr(exc, "sqlite_errorcode", None) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                raise
+            raise StudioError("本群正在处理另一条消息，可以使用相同请求编号重试。", "room_busy", 503) from None
 
     def _conversation(self, path: Path, *, before: int | None = None, with_answers: bool = True) -> dict | None:
         initial = thread_info(path.name, self._meta(path))
@@ -643,13 +678,17 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 answer_text = answer.decode("utf-8", errors="ignore")
             state = meta.get("state", "interrupted")
             if state in {"running", "queued"} and directory.name not in self._active:
-                if not ((thread.get("superagent") or meta.get("studio_dispatch")) and self._assistant_elsewhere(directory)):
+                if not ((thread.get("superagent") or thread["kind"] == "group" or meta.get("studio_dispatch")) and self._assistant_elsewhere(directory)):
                     state = "interrupted"
             if thread.get("inherit_files") is False:
                 artifact_id = None
             if thread["intent"] == "edit" and state in {"completed", "unverified"}:
                 artifact_id = directory.name
-            public_events = self.room_events(directory.name) if with_answers or meta.get("has_steering") else []
+            cancelled_project = (thread["kind"] == "group" and thread["intent"] == "edit" and state == "cancelled"
+                                 and not meta.get("workspace_path"))
+            public_events = self.room_events(directory.name) if with_answers or meta.get("has_steering") or cancelled_project else []
+            if cancelled_project and next(studio_cancelled_checkout.published_edits(public_events, thread, directory.name), None):
+                artifact_id = directory.name
             steering = steering_rows(public_events) if meta.get("has_steering") else []
             events = []
             remaining = min(preview, 48_000) if with_answers else 0
@@ -670,7 +709,12 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                                for f in self._artifacts(directory, [], meta=meta)]
             dispatches = (studio_route_results.project_dispatches(self, directory.name)
                           if with_answers and thread.get("superagent") else [])
-            turns.append({**({"dispatches": dispatches} if thread.get("superagent") and with_answers else {}),
+            published = {}
+            if with_answers and thread["kind"] == "group":
+                from .studio_room_context import published_artifact_catalog
+                published["published_artifacts"] = published_artifact_catalog(
+                    self, directory, thread, meta, state, public_events)
+            turns.append({**published, **({"dispatches": dispatches} if thread.get("superagent") and with_answers else {}),
                           "artifacts": attachments, "workspace_delivery": meta.get("workspace_delivery"),
                           "workspace_member_delivery": meta.get("workspace_member_delivery"),
                           "recovery_source": thread.get("recovery_source"),
@@ -689,15 +733,18 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                           **({"error": meta["error"]} if state in {"failed", "blocked", "error"} and meta.get("error") else {})})
         head = turns[-1] if turns else {"run_id": previous, "status": "ready"}
         can_continue = head.get("status") in _TERMINAL or (anchor is not None and not turns)
-        if initial.get("superagent") and head.get("status") == "interrupted":
+        if (initial.get("superagent") or initial["kind"] == "group") and head.get("status") == "interrupted":
             # A new user message may continue from the last published files.
             # The interrupted operation is never replayed automatically.
             can_continue = True
         candidates = []
-        if (with_answers and before is None and initial["kind"] == "group"
-                and head.get("status") == "failed" and head["intent"] == "edit"):
-            candidates = [meta for _, meta in self._room_checkpoints(
-                related[-1][1], related[-1][3], public_events, verify=True)]
+        if with_answers and before is None and initial["kind"] == "group" and can_continue:
+            source = self._recoverable_group_turn(turns)
+            if source:
+                directory = self._directory(source["run_id"])
+                options = self._room_checkpoints(directory, thread_info(directory.name, self._meta(directory)),
+                                                 self.room_events(directory.name), verify=True)
+                candidates = [info for _, info in options]
         group_title = (self.channel_label(initial["id"], anchor[2] if anchor else {})
                        if initial["kind"] == "group" else None)
         roster = initial
@@ -718,8 +765,41 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 "profiles": roster.get("profiles", []),
                 "saved_roles": sorted((set(roster.get("saved_roles", [])) | set(linked)) & set(roster["members"])),
                 "knowledge_project_id": project_id,
+                **({"opening_messages": [e for e in self.room_events(anchor[1].name)
+                                          if e["kind"] == "status_reply"]} if with_answers and anchor else {}),
                 "workspace_path": (related[-1][2] if related else anchor[2] if anchor else {}).get("workspace_path"),
+                **({"messages": self.group_messages(initial["id"])} if initial["kind"] == "group" and before is None else {}),
                 "can_continue": can_continue, "turns": turns}
+
+    def _recoverable_group_turn(self, turns):
+        """Find the most recent failed edit, skipping only proven read-only followups."""
+        from .studio_group_status import is_status_only_turn
+        safe_reads = {"ask_human", "list_dir", "find_files", "search_files", "read_lines",
+                      "read_file", "recall_role_knowledge", "read_role_knowledge",
+                      "list_attachments", "read_attachment", "read_handoff_report"}
+        for turn in reversed(turns):
+            if turn["intent"] == "question":
+                continue
+            if turn["status"] == "failed":
+                return turn
+            if turn.get("inherit_files") is False or turn["status"] != "cancelled":
+                return None
+            directory = self._directory(turn["run_id"])
+            if not is_status_only_turn(self._meta(directory), self.room_events(directory.name)):
+                return None
+            # Older clients treated a status question as an edit. Check actual
+            # operations before crossing that turn, including ask_human's alias.
+            trace, truncated = _read_file(directory, "trace.jsonl", MAX_LOG_BYTES, missing=True)
+            if not trace or truncated:
+                return None
+            try:
+                for event in map(json.loads, trace.splitlines()):
+                    if (event["kind"] in {"tool_start", "tool_result"}
+                            and (event.get("operation") or event.get("tool")) not in safe_reads):
+                        return None
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
 
     def _next_turn(self, run_id: str, message: dict, *, mode: str) -> dict:
         parent = message.get("parent_run_id")
@@ -738,11 +818,13 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
         base = room["artifact_run_id"] if message.get("inherit_files", True) else None
         if message.get("recover_failed"):
             last = room["turns"][-1] if room["turns"] else {}
+            if message.get("recover_task_id") and room["kind"] == "group":
+                last = self._recoverable_group_turn(room["turns"]) or {}
             if last.get("status") != "failed" or last.get("intent") != "edit":
                 raise StudioError("只有最近一轮修改失败后，才能接续该轮文件。", "invalid_recovery")
             if message.get("recover_task_id") and room["kind"] != "group":
                 raise StudioError("成员草稿必须来自当前群组。", "invalid_recovery")
-            base = parent
+            base = last["run_id"]
         saved_roles = room.get("saved_roles", [])
         profiles = [self.current_role(p["id"]) if p["id"] in saved_roles else p for p in room["profiles"]]
         return {**message, **({"superagent": True} if room.get("superagent") else {}), "saved_roles": saved_roles, "id": room["id"], "kind": room["kind"], "members": room["members"],
@@ -1043,6 +1125,12 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 return self._redact(self._summary(path))
             if superagent and self.superagent_head()["head_run_id"] != request["conversation"].get("parent_run_id"):
                 raise StudioError("统一对话已更新，请读取最新消息后再发送。", "stale_head", 409)
+            message = request.get("conversation", {})
+            parent = self._directory(message["parent_run_id"]) if message.get("parent_run_id") else None
+            if parent and not routed and self._meta(parent).get("has_status_replies"):
+                replay = previous_status(self, parent, request["request_id"], request["objective"], fingerprint)
+                if replay:
+                    return {**self._redact(self._summary(parent)), "status_reply": replay}
             if request["mode"] in {"single", "team"} and not self.settings.api_key.strip():
                 raise StudioError("本机尚未配置 DeepSeek API key，请先配置后启动工作室。", "provider_unavailable", 409)
             run_id = routed["child_run_id"] if routed else "studio-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
@@ -1055,6 +1143,20 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                 # under the same inter-process lock that freezes the turn.
                 message = {**message, "recipient": roster["lead"]}
             thread = self._next_turn(run_id, message, mode=request["mode"]) if message else None
+            if thread and thread.get("saved_roles"):
+                source_run = None
+                if thread["kind"] == "dm":
+                    origin = (self._meta(self._directory(thread["id"])).get("studio_dispatch")
+                              if thread.get("parent_run_id") else routed)
+                    source_run = origin.get("source_run_id") if origin else None
+                thread["profiles"] = self.room_role_briefs(thread["id"], thread["profiles"], thread["saved_roles"],
+                                                          source_run=source_run)
+            if thread and thread["kind"] == "group" and thread.get("parent_run_id"):
+                dialogue = self.group_messages(thread["id"])
+                thread["prior_group_dialogue"] = studio_group_messages.recent_dialogue(dialogue)
+                if thread.get("inherit_files", True):
+                    thread["discussion_attachments"] = list({a["id"]: a for row in dialogue
+                        if row["disposition"] == "reply" for a in row.get("message_attachments", [])}.values())
             if superagent:
                 thread["superagent"] = True
             if thread and request["mode"] == "team" and thread["kind"] != "group":
@@ -1161,6 +1263,13 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                                 author = info["role"]
                                 inherited = self._copy_member_checkpoint(checkpoint, author, target)
                                 thread["recovery_source"] = {"role": author, "task_id": info["task_id"]}
+                                review = self._checkpoint_assessment(source, info, inherited)
+                                if review:
+                                    thread["recovery_review"] = review
+                            elif self._meta(source).get("state") == "cancelled":
+                                if source_thread["id"] != thread["id"]:
+                                    raise SnapshotError("取消轮的交接不属于当前群。")
+                                inherited = studio_cancelled_checkout.restore(self, source, source_thread, target, _EXTENSIONS)
                             else:
                                 copy_project(source, author, target, _EXTENSIONS, secret=self.settings.api_key,
                                              manifest=inherited)
@@ -1179,7 +1288,7 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                                objective=request["objective"], owner=assignee, assignee=assignee)
                 staged.rename(path)
                 published = True
-                if routed or (thread and thread.get("superagent")):
+                if routed or (thread and (thread.get("superagent") or thread["kind"] == "group")):
                     self._assistant_turns[run_id] = self._claim_assistant_turn(path)
                 self._active.add(run_id)
                 if "conversation" in request:
@@ -1265,6 +1374,40 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                         continue
                 candidates.append((checkpoint, {"task_id": task.task_id, "role": role, "objective": task.objective[:180]}))
         return candidates
+
+    def _checkpoint_assessment(self, source, candidate, manifest):
+        """Attach the actual independent finding for precisely these restored bytes."""
+        version = review_digest(manifest)
+        events = self.room_events(source.name)
+        for event in events:
+            if event["kind"] == "member_report" and event.get("task_id") == candidate["task_id"]:
+                frozen = (event.get("handoff") or {}).get("reviewable_candidate") or {}
+                if frozen.get("candidate_version") and frozen["candidate_version"] != version:
+                    raise SnapshotError("恢复副本与交接时冻结的候选版本不一致。")
+        for event in reversed(events):
+            if event["kind"] != "member_report":
+                continue
+            review = (event.get("handoff") or {}).get("native_review") or {}
+            if (review.get("kind") != "product" or review.get("target") != candidate["task_id"]
+                    or review.get("author") != candidate["role"] or review.get("candidate_version") != version):
+                continue
+            signed = review.get("assessment") or {}
+            findings = signed.get("results")
+            if (not isinstance(findings, list) or not findings
+                    or signed.get("verdict") not in {"passed", "changes_requested", "inconclusive"}
+                    or any(not isinstance(row, dict) or not row.get("criterion_id") or not row.get("verdict")
+                           for row in findings)
+                    or not signed.get("attempt_id") or review.get("reviewer") != event["role"]
+                    or signed.get("target") != candidate["task_id"] or signed.get("candidate_version") != version
+                    or signed.get("evaluator") != event["role"] or event["role"] == candidate["role"]):
+                return None
+            return {"run_id": source.name, "source_task": candidate["task_id"], "review_task": event["task_id"],
+                    "reviewer": event["role"], "candidate_version": version, "verdict": signed["verdict"],
+                    "findings": [{"criterion": row["criterion_id"], "verdict": row["verdict"],
+                                  "reason": row.get("reason", "")[:800],
+                                  "receipts": [r["ref"] for r in row.get("receipts", []) if r.get("ref")][:8]}
+                                 for row in findings]}
+        return None
 
     def _select_room_checkpoint(self, path, thread, requested):
         events = self.room_events(path.name)
@@ -1652,6 +1795,8 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                     self._cancellations.pop(run_id, None)
                     self._slots.release()
             self._drain_studio_dispatches()
+            if not self._closed:
+                drain_group_queue(self)
 
     def _execute(self, run_id: str, request: dict) -> dict:
         # Import the host-owned demo fixtures lazily to avoid the CLI entrypoint's
@@ -1685,7 +1830,7 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                                         max_output_tokens=settings.max_output_tokens, timeout=settings.request_timeout_seconds,
                                         deadline_seconds=settings.request_deadline_seconds, max_retries=settings.max_retries)
         service = TaskService(TaskStore(path / "tasks.sqlite3"))
-        with Tracer(path) as tracer:
+        with Tracer(path) as tracer, ExitStack() as tool_resources:
             tracer.event("studio_configuration", task_id=run_id,
                          configuration={"model": settings.model, "thinking": settings.thinking,
                                         "interaction_mode": settings.interaction_mode,
@@ -1716,16 +1861,19 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                              level="goal", task=request["objective"])
                 metadata = self._meta(path)
                 thread = thread_info(run_id, metadata)
-                roles = RoleSession(self.role_memory, thread, metadata.get("workspace_path"), run_id, settings.api_key)
+                room = self._conversation(path, before=thread["ordinal"]) if "conversation" in request else None
+                roles = RoleSession(self.role_memory, thread, metadata.get("workspace_path"), run_id,
+                                    settings.api_key, room["turns"] if room else ())
                 recipient = thread["recipient"]
                 question = thread["intent"] == "question"
                 context = ""
                 input_tools = []
                 steering = self._steering.get(run_id)
-                if "conversation" in request:
-                    room = self._conversation(path, before=thread["ordinal"])
+                if room:
                     context = project_context(thread, room["turns"])
                     visible = conversation_attachments(room["turns"], metadata)
+                    if thread.get("discussion_attachments"):
+                        visible = list({a["id"]: a for a in [*thread["discussion_attachments"], *visible]}.values())
                     input_tools = attachment_tools(visible, lambda identity: open_upload(self.runs_dir, identity)[1],
                                                    read_only=question, live_attachments=steering.attachments if steering else None)
                     if visible:
@@ -1767,9 +1915,14 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                         context += "\n本轮需实际参与的点名成员：" + "、".join(thread["addressed_roles"])
                     self._record_room_event(run_id, "user", "goal", "" if request.get("attachment_only") else request["objective"],
                                             recipient=recipient, task_id=run_id)
-                registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
-                for tool in input_tools:
-                    registry.add(tool)
+                if crew and not crew.direct:
+                    registry = crew.coordinator_registry
+                    if crew.workbench is not None:
+                        tool_resources.callback(crew.workbench.close)
+                else:
+                    registry = roles.registry(recipient, build_default_registry(read_only=question), read_only=question)
+                    for tool in input_tools:
+                        registry.add(tool)
                 prompt = COORDINATOR_PROMPT if crew and not crew.direct else None
                 step_policy = crew.coordinator_policy if crew else None
                 if thread.get("superagent") and not question:
@@ -1788,10 +1941,9 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                     assistant_policy = StepPolicy("work", allowed_tools=frozenset(registry.names()) | {"ask_human", "abort_task"})
                     def step_policy(_state, _budget):
                         return assistant_policy
-                if crew:
+                if crew and crew.direct:
                     registry.add(crew.diagnostics.tool())
-                    if crew.direct:
-                        crew.guard_probe_inputs(registry)
+                    crew.guard_probe_inputs(registry)
                 agent = Agent(name=recipient, provider=provider, registry=registry,
                               sandbox=sandbox, settings=settings, tracer=tracer, task_service=service,
                               human_handler=(self._human_handler(run_id, recipient, deadline=None if crew.deadline is None else crew.deadline - crew.close_seconds)
@@ -1808,6 +1960,7 @@ class StudioService(StudioSteering, RoomDiscussion, StudioRoles, StudioAssistant
                                    budget=crew.budget if crew else None, conversation_context=context,
                                    system_prompt=prompt,
                                    before_answer=crew.before_answer if crew else None,
+                                   advance_handoff=crew.advance_requested_review if crew else None,
                                    step_policy=step_policy,
                                    on_step=crew.observe_coordinator if crew else None,
                                    on_assistant_stream=stream_reply)

@@ -26,7 +26,7 @@
 | `DEEPSEEK_API_KEY` | `api_key: str` | 空值仅允许离线工作；真实调用前拒绝；不参与 Settings repr |
 | `DEEPSEEK_BASE_URL` | `base_url: str` | `https://api.deepseek.com`；HTTPS，无 userinfo/query/fragment，可使用官方 `/v1` 路径 |
 | `DEEPSEEK_MODEL` | `model: str` | `deepseek-flash`；另支持 `deepseek-v4-pro` |
-| `DEEPSEEK_THINKING` | `thinking: Literal['enabled','disabled']` | `disabled`；每次请求显式传 `thinking.type` |
+| `DEEPSEEK_THINKING` | `thinking: Literal['enabled','disabled']` | `enabled`；Studio 的消息输入框可为本轮选择开启或关闭。每次请求显式传 `thinking.type` |
 | `DEEPSEEK_REASONING_EFFORT` | `reasoning_effort: Literal['low','high','max']` | `high`；仅 thinking 开启时发送 |
 | `DEEPSEEK_MAX_TOKENS` | `max_output_tokens: int` | 300000；1..393216 |
 | `DEEPSEEK_TIMEOUT` | `request_timeout_seconds: float` | 120；有限正数，单次网络等待上限 |

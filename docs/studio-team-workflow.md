@@ -50,6 +50,18 @@
 
 ## 负责人如何结束一轮
 
+### 协调上下文和作者发起的复核
+
+负责人在协调时可以看到最近四个完整协调步骤的原始对话，包括公开正文、具有调用 ID 的工具请求和各自的返回。同一批工具调用一起保留，用户中途追加的要求按收到的顺序进入上下文。较早的协调步骤仍可由运行轨迹追溯。当前公共版本的空搜索按目录和查询条件登记，换版后重新取证。私有草稿的交接单独记录作者、任务、候选版本与文件。公共目录的空搜索只能说明该次公共查询的结果。
+
+开发者可以从成员任务调用 `request_peer_review`，说明理由并可指定本群评审人。宿主核对冻结的候选和可独立接单的成员，记录交接，并在下一次负责人推理前启动复核。同一份候选、接收人、阶段和证据对应同一次派工。评审人进入该候选的隔离副本，在原始失败仍开放的情况下执行检查。同一群的旧项目即使通过了测试，也不能为这份候选签署；实际缺陷按冻结版本返回作者修订。用户可以在协调期间继续发消息或停止运行。
+
+会议室案例中，旧脚本在打开页面前就重复启动了 Playwright，无法留下产品文件证据。旧版要求修正后的自测与每次旧失败覆盖相同文件才自动派人，导致本应调查的异常被挡在派工之前。新版也能接住这种已有的受阻交接。回归使用真实 Chromium，并让模拟 lead 在首次分工后持续选择公共搜索，检查 QA 是否实际接单、无关文件的正向检查能否被拒绝、正确版本何时发布。[会议室交接回归](../tests/test_unattributed_browser_handoff.py)
+
+本实现借鉴了 Pi 保留近期完整交互和压缩边界的做法，以及 DeepSeek dsh-superagent 用结构化报告向宿主移交成员状态的做法。Magentic-One 把下一位执行者作为协调结果写入进展记录。Studio 使用现有任务存储、草稿版本和独立签署规则，由宿主执行已经确定收件人的交接。[Pi 上下文设计](https://docs.pi.dev/latest/compaction) · [dsh-superagent 报告处理](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/src/app/tools/executor.ts#L75-L103) · [Magentic-One 协调器](https://github.com/microsoft/autogen/blob/8390985108cb1e3881f5f7297765758d8ad2540c/python/packages/autogen-agentchat/src/autogen_agentchat/teams/_group_chat/_magentic_one/_magentic_one_orchestrator.py#L272-L358)
+
+### 分工与收尾
+
 负责人先选择与目标相关的成员，通过委派工具的 `remaining_roles` 声明后续分工。负责人首次分工或处理受阻交接时，可在公共项目中只读查找、搜索和查看文件。下一次路由会携带最近查到的内容与行号。系统根据实测用量提醒负责人核对分工所需的资料和剩余预算。负责人可以继续查阅，也可以委派。每位成员在独立副本工作，回执包含分工目标、实际修改的路径与内容摘要、观察到的检查、剩余问题和实际用量。发布或受阻都会进入公共群记录。文件发布和用户配置的独立验收各自记录结论。
 
 协调者交替查询多个文件、目录和交接报告时，Studio 按同一公开版本记录最近 24 次查询。窗口内至少两次命中已读范围或相同结果，就在下一次请求中列出重复的工具、路径、次数及实际读到新内容的查询数。读文件和按行读共享字符范围，报告按成员任务 ID、文件摘要及字符范围单独核对。只要一页含有此前未读的字符，就计一次新增。提醒也列出完整公共清单中缺少的验收文件、本轮实际已派工的角色、未结独立评审与缺少来源签署的成稿。只有公共版本改变才重新累计。查询次数只影响这段反馈，后续行动仍由协调者选择。这一设计借鉴 OpenHands 在近期工具回执中识别交替操作的做法，Studio 用宿主记录的版本和区间核对每次查询。[OpenHands 交替操作检测](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/conversation/stuck_detector.py) · [上游近期事件与边界回归](https://github.com/OpenHands/software-agent-sdk/blob/main/tests/cross/test_stuck_detector.py) · [Studio 交错读取与换版回归](../tests/test_crew_diagnostics.py)
@@ -426,3 +438,43 @@ T2-06 原脚本与冻结 HTML 的授权离线副本已实测：原身份及双�
 消息行身份和手动展开状态参考 Zulip 对长消息的处理。Zulip 按消息 ID 在可见列表中更新相应行，跳过已移除的行，并尊重手动展开。Studio 用运行 ID 和只追加公开日志的序号标识一条消息，采用浏览器原生 disclosure，历史材料按需读取。这里复用交互思路，由 Studio 自行实现。[消息行模板](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/templates/single_message.hbs#L1-L3) · [折叠状态更新](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L81-L113) · [保留手动展开](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L278-L286) · [插入历史消息和移除消息的测试](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/message_list_data.test.cjs#L249-L272)
 
 群消息的来源身份和工作输入参考 AutoGen 的 `BaseGroupChatAgent.handle_message`，它让实际参与者收到带来源的正文。Studio 将派工短句交给接收成员本轮上下文，并继续通过既有调度执行完整任务。[AutoGen 群聊消息协议与接收器](https://microsoft.github.io/autogen/stable/user-guide/core-user-guide/design-patterns/group-chat.html#base-group-chat-agent)
+
+### 已签署草稿的续交与群内进度查询
+
+独立 QA 对冻结草稿执行 `submit_review` 并通过后，宿主用该条结构化回执结束这次评审。回执绑定作者任务、评审者、候选 SHA-256 及逐项依据。候选改变、未核销的检查和真实发布错误仍按原有门禁处理。各角色发布自己负责的文件，负责人交付时再对完整目录执行用户约定的全部检查。
+
+从失败任务续交时，在群聊的「本轮选项与预算 → 项目文件」选成员草稿。平台核对同群作者、实际冻结字节及独立签署，把原签署的逐项理由、证据编号与剩余工作交给这轮负责人和成员。案例如会议室系统，产品通过复核后还可欠两份文件：QA 验证报告与面向用户的发布说明。历史草稿和当时失败的根任务保留，续交产生自己可追踪的验收结果。中间的只读问答仍允许选择原草稿，已开始的新项目不能跳过。
+
+每个群有独立的消息时间线。网页把首条消息、后续追问和执行中的消息发到 `POST /api/groups/{group_id}/messages`，附带当前群的最新任务编号和本条消息的稳定请求号。服务端在本群记录问题、回复角色及相关任务。刷新页面后，已结束任务的追问显示在原交付后，任务执行时的问答按时间穿插在群消息中。每次阅读均维持原来的角色与任务归属。
+
+发「你都做了啥」时，角色根据本群最近对话、实际交付、签署和工作状态回答。它可以解释具体文件或回顾较早的任务。纯问答的处理路径没有写文件、委派和修改任务的工具。发「把取消按钮改明显一点」时，明确的新工作可以产生一个关联任务；在执行中发「取消按钮用红色」则可调整当前任务。需要指定处理方式时，可选「只读问答」「发起任务」或执行期间的「调整当前任务」。当前任务执行期间，另一项明确的新工作在原群排队，等待消息会给出回执。工作所需的验收、恢复草稿、角色和预算继续绑定到具体任务。
+
+前端按群消息身份保留对话，按任务身份打开工作记录和相应版本的交付。用户交办任务的原话保留在发送时的位置。启动后，原消息显示「查看任务」链接，后续问答仍在它之后。调整当前任务的要求出现在成员可见的任务指导记录里。回复中的 Markdown 文件可在阅读器打开。来自已读取材料的引用定位到对应的发布版本，多个已发布版本存在同名文件且无法确定来源时，点击文件名可选择轮次。时间线按消息身份去重、在既有历史中插入记录的交互参考 Zulip；Studio 另行记录消息和任务之间的关联。[Zulip 消息列表回归](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/tests/message_list_data.test.cjs#L249-L272) · [消息缺席及折叠状态的处理](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/condense.ts#L81-L113)
+
+群聊身份、角色身份和文件共享是独立的。Superagent 拉群不自动授予自己的本地目录；显式选定的共享目录和派工时选择的文件各自按原请求传入。角色在某群形成的项目记忆按来源会话过滤，主动召回和按编号读取使用相同的可见性规则。原有显式工作区绑定与冻结副本按原约定恢复。
+
+设计参照 LangGraph 通过线程身份查找工作检查点，以及 OpenAI Agents SDK 通过会话隔离消息历史。Studio 另行校验本地内容哈希，将签署与最终整包验收分别保存在宿主侧；这里未引入上游依赖。[LangGraph 线程与检查点](https://docs.langchain.com/oss/python/langgraph/persistence) · [OpenAI Agents SDK 会话](https://openai.github.io/openai-agents-python/sessions/) · [工具结果决定回合完成与验证分支](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/turn_resolution.py#L801-L834)
+
+群级数据和任务准入分别落盘。群的 `room-messages.sqlite3` 按发送顺序保存消息标识、用户原文、回复角色、回复正文和可选的关联运行。只读回复还保留提供方返回的模型名、请求编号与用量。重发相同请求返回原消息。独立工作在群内排队时，原消息即刻可见；当前任务结束后，宿主用相同的派工标识启动下一项，并将其运行编号写回群消息。验收、工件和成员交接继续归属于相应的任务运行。
+
+默认消息先由无执行权限的模型返回结构化判断。仅当前消息可以授权派工或更改要求；历史对话、工作回执和附件仅供解释。消息含糊时可以直接询问，模型返回格式无效时也不会启动工作。成员读取附件或已发布工件时，宿主核对当前群的材料来源与版本。新的工作和明确的要求变更可引用此前的讨论；一次普通问答不会写入执行成员的指导队列。
+
+群内分发与恢复历史的设计参考 AutoGen 对群主题和成员消息线程的校验。模型输出的本地验证参考 OpenAI Agents SDK 对输出类型、无效 JSON 与缺少字段的处理。Studio 将这些机制用在本地群消息、任务准入与验收记录之间，未引入上游依赖。[AutoGen 群消息管理器](https://github.com/microsoft/autogen/blob/python-v0.7.5/python/packages/autogen-agentchat/src/autogen_agentchat/teams/_group_chat/_base_group_chat_manager.py) · [AutoGen 群状态恢复测试](https://github.com/microsoft/autogen/blob/python-v0.7.5/python/packages/autogen-agentchat/tests/test_group_chat.py) · [Agents SDK 输出验证](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/agent_output.py#L142-L170) · [输出错误回归](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_output_tool.py#L109-L130)
+
+### 协调检查与签署
+
+负责人在协调阶段可直接查找或读取项目文件、检索新闻和论文、打开来源，运行 Shell、Python 和浏览器检查。检查使用本轮公开项目版本的临时副本，同一版本上的后续命令可以读取先前生成的测试材料。公开版本变化时宿主重新建立副本。正式文件的发布、冻结草稿的修改和独立签署继续由相应分工处理。普通群消息的只读答复仍只查本群记录、可见附件及已发布工件。
+
+macOS 使用系统 sandbox-exec 约束检查进程的写入。Linux 需要可用的 bubblewrap（发行版软件包名通常为 bubblewrap，命令为 bwrap）及运行它的内核权限。缺少这些条件时，进程工具返回错误；项目文件读取仍可用。这里保护的是已发布交付与运行历史。实现参考了 Anthropic 的按路径生成写入规则和 bubblewrap 对只读根目录、可写子目录与符号链接冲突的测试。[sandbox-runtime 写入规则](https://github.com/anthropics/sandbox-runtime/blob/main/src/sandbox/macos-sandbox-utils.ts) · [bubblewrap 挂载回归](https://github.com/containers/bubblewrap/blob/main/tests/test-run.sh) · [Studio 协调检查回归](../tests/test_coordinator_workspace.py)
+
+拒签回执按验收项列出缺失的证据。验证冻结产品时，回执只列能关联到对应文件版本的有效断言。首次拒签后评审可继续取证、纠正字段或提交有依据的其他结论。对同一候选、同一结论和相同证据再次提交时，宿主把未签稿和缺项交回负责人；同一批工具调用中新到的证据参与判断。交接保留冻结版本，后续可以补证复核。这个处理借鉴了 controller-runtime 按对象状态是否变化决定要不要再次调度的做法。Studio 比较候选版本、逐项依据与可用回执。[更新谓词](https://github.com/kubernetes-sigs/controller-runtime/blob/0f7927c52ef41f261195054ec7f01902357e2c33/pkg/predicate/predicate.go#L189-L207) · [相同及不同版本的测试](https://github.com/kubernetes-sigs/controller-runtime/blob/0f7927c52ef41f261195054ec7f01902357e2c33/pkg/predicate/predicate_test.go#L289-L380) · [Studio 拒签与恢复回归](../tests/test_review_refusal.py)
+
+### 作者请求的独立文档复核
+
+作者对文档草稿调用 `request_peer_review` 时，若没有预先约定的逐项标准，复核者会收到群任务原文、成员分工和冻结交付。复核者自行决定查什么、怎样查，用 `register_review_criteria` 记录条款、依据和相关文件。引用依据文件时，宿主核对该文件的版本、读取回执和引文。返工后沿用已登记的条款，在新版本上重新签署。
+
+宿主逐项核对复核者提交的结果。已登记的条款缺少所需回执、文件版本变化或存在未解决的失败时，当前版本不能凭一条总结获得通过。可在群成员交接的 `native_review` 中查看登记内容、证据和签署。复核者漏掉的业务要求仍有可能漏过；文件存在性验收也只证明交付路径存在。
+
+报告自主验收结果时，应保留实际发送的开场消息、角色设定和后续消息。原题及自带的角色说明可原样输入；评测者掌握的缺陷、反例、预期结论留在独立评分侧。给成员具体修改意见后成功交付，记录为定向返工结果。用脚本提供判据或代替评审员的回放，记录为平台回归。这个区分参考了 Inspect 将任务状态与预期答案分别传给评分器的接口。[Inspect 评分接口](https://github.com/UKGovernmentBEIS/inspect_ai/blob/main/src/inspect_ai/scorer/_scorer.py#L31-L51)
+
+此实现借鉴 Promptfoo 按断言保留结果、从断言聚合评估结果，以及 OpenAI Agents SDK 对各输出检查记录结果并处理触发项的做法。Studio 使用本地冻结字节、独立评审身份、证据回执和返工队列实现这些约束。[Promptfoo 结果实现](https://github.com/promptfoo/promptfoo/blob/9402e79a4ce447023cd94a71e40ff176307628ba/src/assertions/assertionsResult.ts#L252-L265) · [多条断言的测试](https://github.com/promptfoo/promptfoo/blob/9402e79a4ce447023cd94a71e40ff176307628ba/test/assertions/assertionsResult.test.ts#L328-L345) · [Agents SDK 输出检查](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/run_internal/guardrails.py#L197-L241)

@@ -52,7 +52,7 @@ class StudioConfigTest(unittest.TestCase):
         self.path.write_text('export DEEPSEEK_API_KEY="synthetic-local-key" # local only\n'
                              'DEEPSEEK_THINKING=enabled\nDEEPSEEK_MAX_TOKENS=2048\n'
                              'UNRELATED_CONFIGURATION=ignored\n')
-        original = Settings()
+        original = Settings(thinking="disabled")
         with patch.dict(os.environ, {}, clear=True):
             value = load_studio_settings(original, self.path)
         self.assertEqual(value.api_key, "synthetic-local-key")

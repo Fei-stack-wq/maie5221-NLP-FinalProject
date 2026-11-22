@@ -1,4 +1,5 @@
 """Local sidebar views group immutable turn history by its real conversation identity."""
+import json
 import threading
 import unittest
 import uuid
@@ -36,6 +37,29 @@ class ChannelsTest(unittest.TestCase):
         with patch("miniagent.studio_service.DeepSeekProvider", return_value=ScriptedProvider([{"text": "收到"}])):
             run = self.service.start(msg(objective, conversation))
             return finished(self.service, run["id"])
+
+    def test_initial_sidebar_choice_is_independent_of_current_pin_and_same_name_rooms(self):
+        ordinary = self.channel(pinned=False)
+        legacy = self.channel()  # Older clients omit pinned, which means initially pinned.
+        unpinned = self.service.create_channel(ordinary)
+        pinned = self.service.create_channel(legacy)
+        self.assertNotEqual(unpinned["id"], pinned["id"])
+        self.assertFalse(unpinned["pinned"])
+        self.assertTrue(pinned["pinned"])
+        old_file = self.service.runs_dir / pinned["id"] / "studio.json"
+        old_data = json.loads(old_file.read_text())
+        old_data.pop("initial_pinned")
+        old_file.write_text(json.dumps(old_data))  # Original pre-setting room metadata.
+        self.service.update_channel(unpinned["id"], {"pinned": True})
+        self.service.update_channel(pinned["id"], {"pinned": False})
+        self.assertTrue(self.service.create_channel(ordinary)["pinned"])
+        self.assertFalse(self.service.create_channel(legacy)["pinned"])
+        with self.assertRaises(StudioError) as conflict:
+            self.service.create_channel({**ordinary, "pinned": True})
+        self.assertEqual(conflict.exception.code, "group_conflict")
+        with self.assertRaises(StudioError):
+            self.service.create_channel(self.channel(pinned=0))
+        self.assertEqual([row["id"] for row in self.service.directory_chats()["channels"]], [unpinned["id"]])
 
     def test_named_rooms_are_open_before_the_first_message_and_keep_their_original_lead(self):
         payload = self.channel()

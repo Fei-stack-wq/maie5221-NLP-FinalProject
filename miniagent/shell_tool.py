@@ -81,6 +81,11 @@ def project_environment(ctx):
     marker = "MINIAGENT_MEMBER_PROCESS_SCOPE"
     if marker in ctx.sandbox.process_env:
         env[marker] = ctx.sandbox.process_env[marker]
+    if ctx.sandbox.command_tmpdir is not None:
+        env.update(TMPDIR=str(ctx.sandbox.command_tmpdir), TMP=str(ctx.sandbox.command_tmpdir),
+                   TEMP=str(ctx.sandbox.command_tmpdir))
+        if sys.platform == "darwin":
+            env["MAC_CHROMIUM_TMPDIR"] = str(ctx.sandbox.command_tmpdir)
     return env
 
 
@@ -201,6 +206,8 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
     if timeout <= 0 or ctx.should_cancel and ctx.should_cancel():
         return ToolResult.failure("时间已耗尽或已取消，未启动命令。")
     env = project_environment(ctx)
+    if ctx.sandbox.command_wrapper is not None:
+        argv = ctx.sandbox.command_wrapper(argv)
     # First use may bootstrap pip from Python's offline wheel. Recheck the
     # overall task deadline before starting the requested command.
     timeout = command_timeout(ctx, requested_timeout)

@@ -35,7 +35,7 @@ def run_browser(ctx, args: dict) -> ToolResult:
     if not cwd.is_dir():
         return ToolResult.failure("浏览器测试目录必须是项目中的目录。")
     runner = Path(__file__).with_name("playwright_runner.py").resolve()
-    with tempfile.TemporaryDirectory(prefix="miniagent-browser-") as temp_home:
+    with tempfile.TemporaryDirectory(prefix="miniagent-browser-", dir=ctx.sandbox.command_tmpdir) as temp_home:
         signing_key = secrets.token_bytes(32)
         Path(temp_home, "document-receipt.key").write_bytes(signing_key)
         argv = ["python", "-I", "-B", "-u", str(runner), _browser_cache(), temp_home, str(ctx.sandbox.root), code]
@@ -48,6 +48,12 @@ def run_browser(ctx, args: dict) -> ToolResult:
             if hmac.compare_digest(hmac.digest(signing_key, payload, "sha256"), signature):
                 claims = json.loads(payload)
                 status = "passed" if result.ok else "failed"
+                named = claims.get("named", {}).get(status, {})
+                if named:
+                    result.meta["browser_criterion_inputs"] = {
+                        key: [{"asserted_browser_files": {path: sha for path, sha in docs if path is not None},
+                               "asserted_browser_documents": [sha for path, sha in docs if path is None]}
+                              for docs in checks] for key, checks in named.items()}
                 documents = claims[status]
                 loopback = [sha for path, sha in documents if path is None]
                 files = {path:sha for path, sha in documents if path is not None}

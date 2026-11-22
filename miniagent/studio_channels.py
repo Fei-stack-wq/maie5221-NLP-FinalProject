@@ -26,8 +26,8 @@ class StudioChannels:
         if state["saved_roles"]:
             if saved is None:
                 saved = {p["id"]: p for p in self.profiles()}
-            state["profiles"] = [saved.get(p["id"], p) if p["id"] in state["saved_roles"] else p
-                                 for p in state["profiles"]]
+            active = [saved.get(p["id"], p) if p["id"] in state["saved_roles"] else p for p in state["profiles"]]
+            state["profiles"] = self.room_role_briefs(root["id"], active, state["saved_roles"])
         return state
 
     def _decode_roster(self, data, truncated):
@@ -92,7 +92,7 @@ class StudioChannels:
                 raise StudioError("群成员已被其他窗口修改，请刷新成员名单。", "stale_membership", 409)
             if state["members"] == members and state["lead"] == lead:
                 return self._roster_response(room_id, state)
-            saved = {p["id"]: p for p in self.profiles()}
+            saved = {p["id"]: p for p in self.model_role_briefs(room_id=room_id)}
             profiles = {p["id"]: p for p in state["profiles"]}
             linked = set(self.linked_roles(room_id))
             bound = set(state["saved_roles"]) | linked
@@ -157,7 +157,8 @@ class StudioChannels:
         anchor = root.get("mode") == "room"
         settings = self._display_settings(row["id"]) if row["kind"] == "group" and thread else {}
         return {**row, "superagent": bool(row.get("superagent")), "member_names": names,
-                "title": settings.get("name") or row["title"], "pinned": settings.get("pinned", anchor)}
+                "title": settings.get("name") or row["title"],
+                "pinned": settings.get("pinned", root.get("initial_pinned", anchor))}
 
     def directory_chats(self):
         rows = self._conversation_rows(directory=True)
@@ -194,8 +195,11 @@ class StudioChannels:
     def create_channel(self, payload):
         from .studio_service import StudioError
         if (not isinstance(payload, dict) or not {"request_id", "name", "members", "lead"} <= payload.keys()
-                <= {"request_id", "name", "members", "lead", "workspace_path"}):
+                <= {"request_id", "name", "members", "lead", "workspace_path", "pinned"}):
             raise StudioError("请提供群名、成员、负责人和请求 ID。")
+        pinned = payload.get("pinned", True)
+        if type(pinned) is not bool:
+            raise StudioError("初始固定状态须为布尔值。")
         try:
             request_id = str(uuid.UUID(payload["request_id"]))
         except (AttributeError, TypeError, ValueError):
@@ -207,7 +211,7 @@ class StudioChannels:
         identity = "group-" + uuid.uuid5(uuid.NAMESPACE_URL, "studio-channel/" + request_id).hex
         with self._lock, self._admission():
             self._publish_room(identity, self._channel_name(payload["name"]), payload["members"], payload["lead"],
-                               local, {"channel_request_id": request_id})
+                               local, {"channel_request_id": request_id}, pinned=pinned)
             return self._channel_row(identity)
 
     def _create_group(self, run_id, name, members, lead):
@@ -215,12 +219,22 @@ class StudioChannels:
         name = self._channel_name(name)
         identity = "group-" + uuid.uuid5(uuid.NAMESPACE_URL, run_id + "/" + name).hex
         with self._lock, self._admission():
-            local = self._meta(self._directory(run_id)).get("workspace_path")
+            source = self._meta(self._directory(run_id))
+            # A folder picked for this message is an explicit workspace binding. The
+            # assistant's remembered folder is private to its own conversation.
+            if source.get("request", {}).get("workspace_path"):
+                local = source.get("workspace_path")
+            elif (self.runs_dir / identity).exists():
+                # An idempotent replay must keep the binding of an existing legacy room.
+                local = self._meta(self._directory(identity)).get("workspace_path")
+            else:
+                local = None
             thread = self._publish_room(identity, name, members, lead, local, {"created_by_run_id": run_id})
+            self._claim_role_briefs(run_id, identity, members)
             roster = self._member_state(thread)
             return {"kind": "group", "id": identity, "name": name, "members": roster["members"], "lead": roster["lead"]}
 
-    def _publish_room(self, identity, name, members, lead, local, origin):
+    def _publish_room(self, identity, name, members, lead, local, origin, *, pinned=True):
         """Publish one native ordinal-zero room while holding the cross-server admission lock."""
         from .studio_service import StudioError, _now, _write_json
         destination = self.runs_dir / identity
@@ -238,15 +252,18 @@ class StudioChannels:
             thread = old.get("thread", {})
             if (old.get("mode") != "room" or any(old.get(key) != value for key, value in origin.items())
                     or old.get("title") != name or old.get("workspace_path") != local
+                    or old.get("initial_pinned", True) != pinned
                     or set(thread.get("members", [])) != set(members) or thread.get("recipient") != lead):
                 raise StudioError("本次请求已建群且配置不同，请重新提交。", "group_conflict", 409)
             return thread
         thread = {**self.bind_roles(message), "id": identity, "ordinal": 0, "parent_run_id": None,
                   "base_run_id": None, "knowledge_project_id": identity}
+        if thread["saved_roles"]:
+            thread["profiles"] = self.room_role_briefs(identity, thread["profiles"], thread["saved_roles"])
         with TemporaryDirectory(prefix=".studio-pending-", dir=self.runs_dir) as stage:
             staged = Path(stage)
             _write_json(staged, "studio.json", {
                 "schema_version": 1, "mode": "room", "state": "ready", "title": name, **origin,
-                "created_at": _now(), "thread": thread, "workspace_path": local})
+                "created_at": _now(), "thread": thread, "workspace_path": local, "initial_pinned": pinned})
             staged.rename(destination)
         return thread

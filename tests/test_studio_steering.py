@@ -48,6 +48,29 @@ class StudioSteeringTest(unittest.TestCase):
         self.service = StudioService(self.root, Settings(api_key="fixture-key"))
         self.addCleanup(self.service.close)
 
+    def test_live_group_status_is_recorded_without_consuming_a_human_question(self):
+        model = RecordingProvider([tool("ask_human", question="Which package should I use?", decision_kind="user_preference"),
+                                   {"text": "Continuing with the answer."}])
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=model):
+            run = self.service.start(msg("Select a package.", fresh(members=["worker", "reviewer"])))["id"]
+            try:
+                pending = finished(self.service, run, stop_on_question=True)
+                self.assertEqual(pending["run"]["status"], "waiting_user")
+                from tests.test_room_reply import output
+                query = {"request_id": str(uuid.uuid4()), "text": "具体卡在哪一步？", "parent_run_id": run}
+                with patch("miniagent.studio_room_reply.DeepSeekProvider.chat", return_value=output(answer="正在等你选择软件包。")) as chat:
+                    event = self.service.send_group_message(run, query)["message"]
+                    self.assertEqual(event["disposition"], "reply")
+                    self.assertEqual(self.service.send_group_message(run, query)["message"], event)
+                self.assertIn("Which package", str(chat.call_args.args))
+                self.assertFalse(self.service._steering[run].rows)
+                current = self.service.detail(run)
+                self.assertEqual(current["run"]["status"], "waiting_user")
+                self.assertNotIn("question_closed", [r["kind"] for r in current["room_events"]])
+            finally:
+                self.service.cancel(run)
+            finished(self.service, run)
+
     def test_stale_tool_batch_is_paired_but_never_executed_and_first_live_attachment_is_readable(self):
         ref = save_upload(self.root, "new.txt", io.BytesIO(b"file from chat"), 14)
         model = PausedModel([tool("write_file", path="obsolete.txt", content="old"),

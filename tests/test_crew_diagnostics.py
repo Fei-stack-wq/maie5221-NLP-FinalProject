@@ -15,6 +15,51 @@ from tests.test_studio_service import finished, request
 
 
 class DiagnosticReportTest(unittest.TestCase):
+    def test_empty_queries_keep_their_revision_scope_after_recent_messages_rotate(self):
+        missing = tool("find_files", pattern="**/booking.html")
+        same_page = tool("list_dir", path=".")
+        provider = RecordingProvider([
+            missing, missing, tool("find_files", pattern="**/different.html"),
+            tool("find_files", pattern="**/*.md", offset=50),
+            *[same_page for _ in range(6)],
+            tool("delegate_task", assignee="dev", objective="Publish the booking page",
+                 deliverable_paths=["booking.html"], remaining_roles=["qa"]),
+            write("booking.html", "<h1>Meeting room bookings</h1>"), {"text": "Published."},
+            tool("delegate_task", assignee="qa", objective="Read the booking page and document the result",
+                 deliverable_paths=["qa.md"], remaining_roles=[]),
+            tool("read_file", path="booking.html"), write("qa.md", "The booking heading is present."), {"text": "Read the page."},
+            {"text": "Delivered."},
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            project = base / "project"
+            project.mkdir()
+            (project / "notes.md").write_text("Existing file.")
+            service = StudioService(base / "runs", Settings(api_key="test-sentinel"))
+            self.addCleanup(service.close)
+            with patch("miniagent.studio_service.DeepSeekProvider", return_value=provider):
+                run = service.start(request("team", objective="Prepare a booking page and get a QA note",
+                                            workspace_path=str(project), conversation=roster("lead", "dev", "qa"),
+                                            acceptance_files=["booking.html", "qa.md"]))
+                detail = finished(service, run["id"])
+            self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+            prompt, offered = provider.requests[10]
+            self.assertFalse(any(m["role"] == "assistant" and "booking.html" in str(m) for m in prompt))
+            self.assertTrue({"find_files", "list_dir", "delegate_task"} <= set(offered))
+            facts = json.loads(next(line.split("：", 1)[1] for line in prompt[-1]["content"].splitlines()
+                                    if line.startswith("当前公共版本已核实的空查询：")))
+            self.assertEqual({f["filters"]["pattern"] for f in facts}, {"**/booking.html", "**/different.html"})
+            self.assertTrue(all(f["scope"] == "public" and f["revision"] == 0 and f["matches"] == 0 for f in facts))
+            trace = [json.loads(line) for line in (base / "runs" / run["id"] / "trace.jsonl").read_text().splitlines()]
+            persisted = [event["fact"] for event in trace if event["kind"] == "coordinator_fact"]
+            self.assertEqual(facts, list(reversed(persisted)))
+            # Old query tool messages can survive a publish as history. The
+            # host's current-version fact set must no longer assert absence.
+            new_state = provider.requests[13][0][-1]["content"]
+            self.assertNotIn("当前公共版本已核实的空查询", new_state)
+            self.assertIn('"published":true', new_state)
+            self.assertIn("booking.html", new_state)
+
     def test_alternating_public_queries_report_covered_pages_gaps_and_real_dispatch(self):
         class Reader(RecordingProvider):
             def chat(self, messages, tools=None, temperature=0):

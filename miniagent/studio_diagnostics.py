@@ -53,25 +53,86 @@ def _blocked_before_writing(room_events, events, ends, roots, recovery_candidate
             "missing_required_files": missing, "stop_reason": evidence["stop_reason"], "suggestion": suggestion}
 
 
+def _scope(event):
+    return (event.get("task_id") or event.get("root_id"),
+            event.get("attempt_id") or event.get("root_attempt_id"),
+            event.get("run_id") or event.get("root_run_id"))
+
+
+def current_activity(events):
+    """Open model steps, joined by task, attempt, run and call; tool spans are separate."""
+    starts = {}
+    roles = {}
+    for event in events:
+        kind = event.get("kind")
+        planning = kind in {"plan_start", "plan_usage"} or (kind == "provider_error" and event.get("step") is None)
+        if event.get("agent") and kind in {"task_start", "task_registered", "tool_start", "tool_result"}:
+            roles[_scope(event)] = event["agent"]
+        identity = (_scope(event), "planning" if planning else "step",
+                    event.get("call_id") if planning else event.get("step"))
+        if kind in {"step_start", "plan_start"}:
+            starts[identity] = event
+        elif kind in {"step", "plan_usage", "provider_error"}:
+            starts.pop(identity, None)
+        elif kind in {"task_end", "subtask_end", "orchestration_end"}:
+            starts = {key: value for key, value in starts.items() if _scope(value) != _scope(event)}
+
+    return [{"phase": "planning" if item["kind"] == "plan_start" else item.get("phase", "agent_step"),
+             "task_id": item.get("task_id") or item.get("root_id"), "role": item.get("agent") or roles.get(_scope(item)),
+             "step": item.get("step"), "started_at": item.get("iso"), "started_ts": item.get("ts")}
+            for item in starts.values()]
+
+
+def _recovered_members(room_events):
+    """Pair a failed handoff with its explicitly resumed, published replacement."""
+    latest_draft = {}
+    drafts = {}
+    parents = {}
+    recovered = {}
+    for row in room_events or ():
+        task, role = row.get("task_id"), row.get("role")
+        if not task:
+            continue
+        if row.get("kind") == "assignment" and row.get("resumed_private_draft") is True:
+            author = row.get("recover_from")
+            # Older receipts record the author of the latest private draft only.
+            parent = row.get("recovered_task_id", latest_draft.get(author))
+            if parent in drafts and drafts[parent][0] == author and parent != task:
+                parents[task] = (row.get("recipient"), parent)
+        if row.get("kind") != "member_report":
+            continue
+        paths = set((row.get("handoff") or {}).get("deliverable_paths") or [])
+        if row.get("published") is False:
+            latest_draft[role] = task
+            drafts[task] = (role, paths)
+        elif row.get("published") is True:
+            latest_draft.pop(role, None)
+            current = task
+            while current in parents:
+                recipient, parent = parents[current]
+                owner, required = drafts[parent]
+                if recipient != role or not required or not required <= paths or parent in recovered:
+                    break
+                recovered[parent] = task
+                current, role = parent, owner
+    return recovered
+
+
 def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
              *, active: bool = False, incomplete: bool = False,
-             recovery_candidates: list[dict] | None = None, room_events: list[dict] | None = None) -> dict[str, Any]:
-    def scope(event):
-        return (event.get("task_id") or event.get("root_id"),
-                event.get("attempt_id") or event.get("root_attempt_id"),
-                event.get("run_id") or event.get("root_run_id"))
-
+             recovery_candidates: list[dict] | None = None, room_events: list[dict] | None = None,
+             diagnose_blocked_handoff: bool = True) -> dict[str, Any]:
     def truncation_resolved(index, event, planning):
-        identity = scope(event)
+        identity = _scope(event)
         if not identity[0]:
             return False
-        related = [later for later in events[index + 1:] if scope(later)[0] == identity[0]]
+        related = [later for later in events[index + 1:] if _scope(later)[0] == identity[0]]
         # Older traces can omit attempt/run IDs. Never join an anonymous event
         # to a later plan when other events introduce a conflicting identity.
-        if any(identity[part] is None and scope(later)[part] is not None
+        if any(identity[part] is None and _scope(later)[part] is not None
                for later in related for part in (1, 2)):
             return False
-        same = [later for later in related if scope(later) == identity]
+        same = [later for later in related if _scope(later) == identity]
         accepted_plan = planning and any(later.get("kind") == "plan" for later in same)
         terminals = [later for later in same
                      if later.get("kind") in {"task_end", "orchestration_end"}]
@@ -102,32 +163,32 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
     for index, event in enumerate(events):
         if event.get("kind") != "provider_error" or event.get("http_status") != 402:
             continue
-        identity = scope(event)
+        identity = _scope(event)
         # New adapters classify official 402s without retaining response bodies.
         # Historical traces still identify the provider on the matching start.
         provider_config = next((prior.get("provider_config", {})
-            for prior in reversed(events[:index]) if scope(prior) == identity
+            for prior in reversed(events[:index]) if _scope(prior) == identity
             and isinstance(prior.get("provider_config"), dict)), {})
         provider = event.get("provider") or provider_config.get("provider")
         if event.get("code") != "insufficient_balance" and (provider != "deepseek"
                 or provider_config.get("official_api") is False):
             continue
-        later = [row for row in events[index + 1:] if scope(row)[0] == identity[0]]
+        later = [row for row in events[index + 1:] if _scope(row)[0] == identity[0]]
         # A late response from an older attempt or another task cannot resolve
         # this failure. A new attempt needs its own subsequent start and response.
         restarted, resolved = set(), False
-        prior_scopes = {scope(row) for row in events[:index] if scope(row)[0] == identity[0]}
+        prior_scopes = {_scope(row) for row in events[:index] if _scope(row)[0] == identity[0]}
         current_attempt = next((row.get("current_attempt_id") for row in tasks
                                 if row.get("task_id") == identity[0]), None)
-        ambiguous = any(identity[part] is None and scope(row)[part] is not None
+        ambiguous = any(identity[part] is None and _scope(row)[part] is not None
                         for row in later for part in (1, 2))
         for row in later:
-            if (row.get("kind") in {"step_start", "plan_start"} and scope(row) not in prior_scopes
-                    and (not current_attempt or scope(row)[1] == current_attempt)):
-                restarted.add(scope(row))
+            if (row.get("kind") in {"step_start", "plan_start"} and _scope(row) not in prior_scopes
+                    and (not current_attempt or _scope(row)[1] == current_attempt)):
+                restarted.add(_scope(row))
             if (identity[0] and not ambiguous and row.get("kind") in {"step", "plan_usage"}
                     and row.get("finish_reason") in {"stop", "tool_calls"} and not row.get("error_class")
-                    and (scope(row) == identity or all(scope(row)) and scope(row) in restarted)):
+                    and (_scope(row) == identity or all(_scope(row)) and _scope(row) in restarted)):
                 resolved = True
                 break
         drafts = [{"task_id": row["task_id"], "role": row.get("role", "")}
@@ -184,7 +245,7 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
                 if type(prompt) is int and type(output) is int:
                     error += f"。本次累计输入 {prompt:,}、输出 {output:,}，合计 {prompt + output:,} tokens。"
                 suggestion = "每轮重发的历史也计入累计用量。新一轮可将累计 token 预算设为 0（不限），继续使用保留的工件。"
-                if any(e.get("kind") == "token_budget_preflight" and scope(e) == scope(event) for e in events):
+                if any(e.get("kind") == "token_budget_preflight" and _scope(e) == _scope(event) for e in events):
                     title = "剩余 token 预算不足以发起下一轮"
             elif "时间" in error:
                 code, title = "time_budget", "已达到任务时间预算"
@@ -202,7 +263,7 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
             code, title = "context_limit", "上下文估计超过当前请求空间"
             suggestion = "旧历史已按完整工具批次裁剪；受保护的指令和最近批次仍过大，需要拆分任务或缩短输入。"
         if any(e.get("kind") == "provider_error" and e.get("code") == "context_length_exceeded"
-               and scope(e) == scope(event) and not e.get("recovery") for e in events):
+               and _scope(e) == _scope(event) and not e.get("recovery") for e in events):
             code, title = "provider_context_limit", "模型服务拒绝了超出窗口的请求"
             suggestion = "检查本轮输入和工具回执大小，以及是否已有缩小请求的重试。"
         issues.append({"code": code, "severity": "error", "task_id": identity,
@@ -231,25 +292,25 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
                        "severity": "error", "title": "独立验收未通过" if verification == "failed" else "验收检查异常",
                        "message": latest.get("report", {}).get("reason") or "查看验收报告中的逐项检查结果。",
                        "suggestion": "根据验收报告修正产物或检查器，再发起新任务。"})
-    starts = {}
-
-    for event in events:
-        kind = event.get("kind")
-        planning = kind in {"plan_start", "plan_usage"} or (kind == "provider_error" and event.get("step") is None)
-        identity = (scope(event), "planning" if planning else "step",
-                    event.get("call_id") if planning else event.get("step"))
-        if kind in {"step_start", "plan_start"}:
-            starts[identity] = event
-        elif kind in {"step", "plan_usage", "provider_error"}:
-            starts.pop(identity, None)
-        elif kind in {"task_end", "subtask_end", "orchestration_end"}:
-            starts = {key: value for key, value in starts.items() if scope(value) != scope(event)}
-    current = list(starts.values()) if active else []
-    if (room_events and not active and not incomplete and failed & roots
+    if (diagnose_blocked_handoff and room_events and not active and not incomplete and failed & roots
             and all(item["code"] == "execution_failed" or item["severity"] != "error" for item in issues)):
         member_issue = _blocked_before_writing(room_events, events, ends, roots, recovery_candidates or [])
         if member_issue:
             issues = [member_issue, *(issue for issue in issues if issue.get("task_id") != member_issue["task_id"])]
+    members = {task["task_id"]: task for task in tasks if task.get("parent_id") is not None}
+    recovered = _recovered_members(room_events)
+    for issue in issues:
+        identity = issue.get("task_id")
+        if identity not in members:
+            continue
+        issue["scope"] = "member"
+        issue["role"] = members[identity].get("assignee_profile_id")
+        if issue["code"] == "execution_failed":
+            issue["title"] = "成员的这次执行失败"
+            if identity in recovered:
+                issue.update(resolved=True, severity="warning", resolved_by=recovered[identity],
+                             title="成员已接续草稿并交付",
+                             suggestion="原失败保留在本轮记录中。接续成员已经发布了这项分工约定的文件。")
     delivered = (bool(roots) and verification == "passed"
                  and all(t.get("status") == "completed" for t in tasks if t["task_id"] in roots))
     if delivered:
@@ -261,18 +322,12 @@ def diagnose(tasks: list[dict], events: list[dict], acceptance: list[dict],
                     issue["superseded_by_delivery"] = True
                     issue["title"] = "此前 DeepSeek 额度不足，项目后续已交付"
                     issue["message"] = "该子任务曾收到 HTTP 402。项目后来已通过验收，账户当前额度需另行核实。"
-    has_error = bool((failed & roots if delivered else failed) or any(item["severity"] == "error" and item["code"] in {"studio_error", "output_truncated", "provider_balance_exhausted"}
+    has_error = bool((failed & roots if delivered else failed - recovered.keys()) or any(item["severity"] == "error" and item["code"] in {"studio_error", "output_truncated", "provider_balance_exhausted"}
                                  for item in issues))
     root_finished = any(identity in ends for identity in roots)
     execution = ("running" if active else "cancelled" if roots & cancelled else "failed" if has_error else "blocked" if blocked and not delivered
                  else "finished" if root_finished else "unknown")
     return {"execution_status": execution, "acceptance_status": verification,
             "issues": issues, "blocked_tasks": blocked,
-            # step_start covers Reason -> Act -> Observe, including tool time;
-            # it is not a provider-only request span.
-            "current_activity": [{"phase": "planning" if item["kind"] == "plan_start" else item.get("phase", "agent_step"),
-                                  "task_id": item.get("task_id") or item.get("root_id"),
-                                  "step": item.get("step"), "started_at": item.get("iso"),
-                                  "started_ts": item.get("ts")}
-                                 for item in current],
+            "current_activity": current_activity(events) if active else [],
             "configuration": config, "incomplete": incomplete}

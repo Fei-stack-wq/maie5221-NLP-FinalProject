@@ -41,6 +41,8 @@ class Sandbox:
         self.agent_name = agent_name
         self.process_env: dict[str, str] = {}
         self.command_sessions = None
+        self.command_tmpdir: Path | None = None
+        self.command_wrapper: Callable[[list[str]], list[str]] | None = None
         self.track_shell_group: Callable[[int], None] | None = None
         self._venv: Path | None = None
         self._venv_lock = threading.Lock()
@@ -52,7 +54,7 @@ class Sandbox:
         """Share an external, disposable Python environment between this member's commands."""
         with self._venv_lock:
             if self._venv is None:
-                storage = tempfile.TemporaryDirectory(prefix="miniagent-python-")
+                storage = tempfile.TemporaryDirectory(prefix="miniagent-python-", dir=self.command_tmpdir)
                 path = Path(storage.name).resolve() / "venv"
                 try:
                     inherited = dict.fromkeys(sysconfig.get_path(name) for name in ("purelib", "platlib"))

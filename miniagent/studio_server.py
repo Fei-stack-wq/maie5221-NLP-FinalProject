@@ -240,6 +240,10 @@ class StudioHandler(BaseHTTPRequestHandler):
             from .studio_steering import steering_rows
             updates = steering_rows(service.room_events(parts[3])) if meta.get("has_steering") else []
             refs = turn_attachments({"message_attachments": meta.get("attachments", []), "steering": updates})
+            thread = meta.get("thread", {})
+            if thread.get("kind") == "group" and thread["id"] == parts[3]:
+                refs.extend(a for message in service.group_messages(thread["id"])
+                            for a in message.get("message_attachments", []))
             if not any(ref["id"] == parts[5] for ref in refs):
                 raise StudioError("这条消息没有该附件。", "attachment_not_found", 404)
             ref, stream = open_upload(service.runs_dir, parts[5])
@@ -296,6 +300,7 @@ class StudioHandler(BaseHTTPRequestHandler):
             self._json(201, {"upload": ref})
             return
         parts = unquote(url.path).split("/")
+        group_message = len(parts) == 5 and parts[:3] == ["", "api", "groups"] and parts[4] == "messages"
         cancel = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "cancel"
         steer = len(parts) == 5 and parts[:3] == ["", "api", "runs"] and parts[4] == "steer"
         reply = len(parts) == 6 and parts[:3] == ["", "api", "runs"] and parts[4] == "questions"
@@ -306,7 +311,7 @@ class StudioHandler(BaseHTTPRequestHandler):
         channel_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) in (4, 5)
         members_op = parts[:4] == ["", "api", "directory", "channels"] and len(parts) == 6 and parts[5] == "members"
         if (url.path not in ("/api/runs", "/api/profiles", "/api/workspaces/pick", "/api/superagent/messages")
-                and not (cancel or steer or reply or review or profile_op or channel_op or members_op)) or url.query:
+                and not (cancel or steer or reply or review or profile_op or channel_op or members_op or group_message)) or url.query:
             raise StudioError("接口不存在。", "not_found", 404)
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -329,8 +334,23 @@ class StudioHandler(BaseHTTPRequestHandler):
         def constant(value):
             raise ValueError("non-finite JSON")
         payload = json.loads(body, object_pairs_hook=pairs, parse_constant=constant)
+        service = self.server.studio_service
+        if group_message:
+            self._json(200, service.send_group_message(parts[3], payload))
+            return
         if steer:
-            self._json(202, {"event": self.server.studio_service.steer(parts[3], payload)})
+            # Older group composers sent every in-flight message here.
+            # Use the same conversation semantics before mutating a worker inbox.
+            thread = service._meta(service._directory(parts[3])).get("thread", {})
+            if thread.get("kind") == "group" and isinstance(payload, dict):
+                if payload.keys() - {"message", "attachments", "request_id"}:
+                    raise StudioError("消息参数无效。")
+                result = service.send_group_message(thread["id"], {"request_id": payload.get("request_id"),
+                    "parent_run_id": parts[3], "text": payload.get("message", ""),
+                    "options": {"attachments": payload.get("attachments", [])}})
+                self._json(202, {"event": result["message"]})
+            else:
+                self._json(202, {"event": service.steer(parts[3], payload)})
             return
         if url.path == "/api/workspaces/pick":
             from .studio_workspace import WorkspaceError, pick_directory
@@ -381,6 +401,24 @@ class StudioHandler(BaseHTTPRequestHandler):
                 raise StudioError("停止请求必须是空 JSON 对象。")
             self._json(202, {"run": self.server.studio_service.cancel(parts[3])})
             return
+        # Compatibility with existing browsers whose default group composer
+        # posted team/edit to the task endpoint, including ordinary questions.
+        if isinstance(payload, dict) and payload.get("mode") == "team":
+            legacy = payload.get("conversation")
+            if isinstance(legacy, dict) and legacy.get("parent_run_id") and legacy.get("intent") == "edit":
+                checked = service._request(payload)
+                parent = service._directory(legacy["parent_run_id"])
+                thread = service._meta(parent).get("thread", {})
+                if thread.get("kind") == "group" and "workspace_path" not in checked:
+                    options = {k: v for k, v in checked.items() if k not in {"request_id", "objective", "scheduler", "conversation", "attachment_only"}}
+                    options["conversation"] = {k: v for k, v in legacy.items()
+                                               if k in {"inherit_files", "recover_failed", "recover_task_id"}}
+                    result = service.send_group_message(thread["id"], {"request_id": checked["request_id"],
+                        "parent_run_id": parent.name, "recipient": legacy["recipient"], "text": payload.get("objective", ""),
+                        "options": options})
+                    result.setdefault("run", {**service._redact(service._summary(parent)), "status_reply": result["message"]})
+                    self._json(202, result)
+                    return
         self._json(202, {"run": self.server.studio_service.start(payload)})
 
 

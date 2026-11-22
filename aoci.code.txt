@@ -1,0 +1,322 @@
+#AOCI-CODE-VOLUME: 1
+
+===/<repository>/===
+.env.example[FC6T]: F:给出模型连接、请求重试、上下文和任务累计预算的环境变量模板。 | R:code:miniagent/config.py | A:MA_MAX_STEPS,DEEPSEEK_MAX_TOKENS | S:Studio 解析本地配置时保留已设置的环境变量，其他执行命令读取进程环境。
+.gitattributes[FV4T]: F:统一 Git 检出文本的换行符，使不同系统上的源码字节可用同一指纹核验。 | R:- | A:eol=lf | S:二进制文件沿用 Git 自动判定。
+.gitignore[FV5T]: F:划出版本控制边界，排除本地任务输出、构建目录、环境密钥、虚拟环境和解释器缓存。 | R:code:.env.example | A:runs/,build/ | S:环境变量样例由单独的否定规则放行。
+.mcp.json[FC6T]: F:为当前仓库注册 AOCI MCP 服务进程及其启动参数。 | R:code:AGENTS.md | A:- | S:命令和仓库参数均为本机绝对路径；迁移检出位置时须一并核对。
+AGENTS.md[SC7S]: F:规定开发智能体如何取证、验证改动，以及如何读取和维护本仓库的 AOCI 索引。 | R:code:docs/agent-harness-research.md | A:开发约定 | S:平台回归、真实模型运行和原题交付验收须分别报告。
+README.md[SG7M]: F:提供本地 Studio 与 CLI 的启动、角色协作、调度、验收与证据目录的总入口。 | R:code:miniagent/cli.py,code:docs/architecture.md | A:python -m miniagent studio | S:串行演示使用带游标的脚本模型，并发运行须使用可独立调用的模型。
+Start Studio.command[EU5T]: F:从 macOS Finder 启动仓库的虚拟环境解释器，打开本地 Studio 页面。 | R:code:miniagent/cli.py | A:--open | S:找不到可执行的 .venv/bin/python 时显示安装提示并退出。
+requirements.txt[FV6T]: F:声明 Python 运行时、进程管理、检索、办公文档解析和浏览器执行所需的依赖区间。 | R:code:miniagent/attachment_tools.py,code:miniagent/playwright_runner.py | A:pydantic,playwright | S:模型 HTTP 请求由标准库实现，官方 SDK 仅作为注释中的可选项。
+
+===/<repository>/docs/===
+agent-harness-research.md[SR5T]: F:从会议室和仪表盘交付的实测缺口对照上游执行框架，提出隔离、证据与验收实验。 | R:code:docs/harness-foundations.md | A:- | S:记录分别保留公开交付与私有草稿的实测结果。
+agent-studio-development-plan.md[SW6L]: F:分里程碑定义个人角色工作室的对象契约、开发责任和各阶段出口验收，标出已接入能力。 | R:code:docs/agent-studio-integration.md | A:- | S:规划中的跨任务预算和组织授权与已实现能力分别标记。
+agent-studio-integration.md[SW5S]: F:记录首次接手版本的执行底座、个人角色接入差距以及从现有模块演进的方案。 | R:code:docs/agent-studio-development-plan.md | A:- | S:初始接入评估绑定文中指定的历史提交。
+architecture.md[SG8L]: F:描述本地网页工作室的服务边界、单步执行、任务图调度、消息传递与持久状态。 | R:code:miniagent/studio_service.py,code:miniagent/orchestrator.py | A:- | S:文档并列展示当前工作室和早期运行时基线，后续设想有单独标识。
+harness-foundations.md[SR6S]: F:从任务在轮数上限处中止的实例推导请求窗口、输出截断恢复、预算与工具验收门槛。 | R:code:miniagent/request_window.py,code:miniagent/agent.py | A:- | S:累计决策次数与每次模型请求的最大输出分别计量。
+local-studio-gui.md[SU6M]: F:说明 Studio 的角色、群与私聊导航、执行中发言、附件和文件验收阅读，以及负责人直接核查项目的环境。 | R:code:miniagent/web/app.js,code:miniagent/studio_dispatch.py,code:miniagent/coordinator_workspace.py | A:- | S:统一助手沿旧私聊继续需要选定原派工。协调命令在当前公开版本的临时副本运行，Linux 需可用的 bubblewrap 和用户命名空间。
+m0-01-computer-maintenance-example.md[SD4L]: F:用电脑维护任务示范从登记、授权与预算到验收记录的完整数据契约。 | R:code:docs/m0-01-data-contracts.md | A:- | S:本例使用虚构的时间、工具回执和用量。
+m0-01-data-contracts.md[SD7M]: F:定义角色、任务、尝试、预算、工件、人工决策及整份快照的校验边界。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/transitions.py | A:- | S:纯数据校验与持久事务由不同阶段实现。
+m0-02-acceptance-and-metrics.md[SQ6S]: F:定义可执行验收检查、未验证任务的处理及按逻辑任务汇总指标的口径。 | R:code:miniagent/acceptance.py,code:miniagent/metrics.py | A:- | S:任务图的子任务验收与根交付验收分别配置。
+m0-03-provider-protocol.md[SN6S]: F:描述 DeepSeek 多轮工具消息、推理字段回传、重试边界及官方接口探针的验收证据。 | R:code:miniagent/providers.py,code:miniagent/provider_smoke.py | A:- | S:线上协议通过须有真实探针记录。
+m0-04-task-store.md[SD7S]: F:说明 TaskService 如何将任务、尝试、运行与待投递事件事务性写入 SQLite，并供重启后查询。 | R:code:miniagent/task_store.py,code:miniagent/task_service.py | A:- | S:恢复读取持久状态不自动重放进程或外部工具动作。
+mid-test-status.md[SQ5T]: F:逐题登记课程 Mid_Test 的运行身份、平台结案和实际文件外验结果，跟踪单消息复测。 | R:code:docs/evidence/2026-11-19-mid-test-review-replay.md | A:- | S:各表按轮次留存，不能跨版本合并成功结论。
+personal-role-library.md[SU5T]: F:说明独立私聊、会话记忆、知识审核、项目范围，以及从一条私聊经验提炼可在其他会话使用的角色技能。 | R:code:miniagent/studio_roles.py,code:miniagent/web/app.js | A:- | S:同一目录可承载多个私聊。用户选定同一文件夹时可共享项目文件，两个私聊仍分别保留各自的消息、附件与会话记忆。
+rao-spec.md[SW8M]: F:定义推理、动作、观察三阶段的对象、错误分类、预算消耗、协议校正与终止条件。 | R:code:miniagent/rao.py,code:miniagent/agent.py | A:Reason,Act,Observe | S:持久动作身份与模型返回的工具调用 ID 各自承担独立职责。
+research-and-project-data.md[SD5T]: F:说明从资料搜索、取回证据到保存项目数据并交给核查员的工作流程。 | R:code:miniagent/research.py,code:miniagent/project_data.py | A:search_sources | S:新闻聚合结果记录来源站点和检索回退原因。
+scheduler.md[SW7M]: F:解释串行、按层并发和事件驱动的依赖解锁、预算、失败传播与调度指标。 | R:code:miniagent/orchestrator.py | A:- | S:未验证的依赖不能解锁下游；根目标有单独验收。
+studio-team-workflow.md[SW7L]: F:描述持续群聊、协调检查副本、工作树、冻结交接、独立签署、缺证返工及正式发布的关系。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py,code:miniagent/coordinator_workspace.py | A:- | S:协调检查只能产出观察。签署与候选及证据绑定，重复无进展的拒签交回负责人；补证后可对同一候选继续复核。
+
+===/<repository>/docs/evidence/===
+2026-11-18-blocked-member-reports.md[SR5T]: F:说明交接受阻时如何冻结指名诊断报告、保留失败状态并供负责人分页读取。 | R:code:miniagent/crew_diagnostics.py | A:read_handoff_report | S:诊断附件不并入公开项目。
+2026-11-18-command-timeouts.md[SR5T]: F:从前台测试超时案例解释命令提前返回、按句柄轮询、退出码领取与进程组清理。 | R:code:miniagent/member_processes.py | A:poll_process | S:领取终态只能进行一次，轮询不续期。
+2026-11-18-handoff-protocol.md[SW5T]: F:复盘末轮把工具协议写入正文的故障，以及如何在现有步数内预留一次交接纠正。 | R:code:miniagent/rao.py | A:- | S:协议文字只记入审计。
+2026-11-18-optional-turn-budget.md[SP5T]: F:说明 Studio 和 CLI 的不限累计轮数配置、父子预算传递与各维度消耗记录。 | R:code:miniagent/rao.py | A:MA_MAX_STEPS | S:内部用 None 表示不限，有限余额的零表示耗尽。
+2026-11-18-peer-check-at-handoff.md[SQ5T]: F:解释独立评审在交接前如何重跑同一候选绑定的作者脚本，并以当前回执核销检查。 | R:code:miniagent/peer_recheck.py | A:- | S:工作区后续变化会令已有通过回执失效。
+2026-11-18-private-candidate-review.md[SQ6T]: F:解释如何冻结作者私稿交给独立成员评审，再复核公共基线和硬性规则后发布。 | R:code:miniagent/studio_reviews.py,code:tests/test_private_candidate_review.py | A:- | S:交付取自作者冻结的字节，不包含评审者在私有副本中新增的代码。
+2026-11-18-private-probe-check-at-handoff.md[SQ5T]: F:说明独立裁决者如何在争议子评审结束前完成私稿遗留的指定验证命令并重新签署。 | R:code:tests/test_private_probe_closing.py | A:- | S:被拒的签署请求不构成有效评审结论。
+2026-11-18-semantic-compaction.md[SP5T]: F:记录 DeepSeek 滚动摘要实测及离线主请求对摘要、预算和报告用量的核对。 | R:code:miniagent/compaction.py,code:tests/test_semantic_compaction.py | A:- | S:-
+2026-11-19-adjudication-evidence-progress.md[SQ5T]: F:说明同一冻结候选的独立探针如何将失败断言、实际输出及必需标准绑定为可核查进展。 | R:code:miniagent/probe_coverage.py | A:- | S:未执行或被条件分支跳过的断言不能提供该项覆盖。
+2026-11-19-browser-layout-review.md[SU5T]: F:定义在实际视口中验收投影、滚动及可见控件的步骤，要求记录失败状态和几何证据。 | R:code:miniagent/browser_tool.py | A:- | S:-
+2026-11-19-corrected-file-checks.md[SQ5T]: F:复盘修订错误测试后怎样由独立成员重验原失败，并将真实浏览器断言绑定冻结应用。 | R:code:tests/test_corrected_file_check_handoff.py | A:- | S:-
+2026-11-19-independent-check-recovery.md[SR5T]: F:记录错误测试断言阻断交付时，如何选独立角色复查原探针和用户业务要求。 | R:code:miniagent/studio_reviews.py | A:- | S:原作者和原发布者受独立性约束。
+2026-11-19-interrupted-author-repair.md[SR5T]: F:描述作者返工遇到模型请求到期后从检查点恢复所需的证据进展和双方预算。 | R:code:tests/test_interrupted_review_repair.py | A:interrupted_repair | S:重复读取或更换调用编号不足以证明进展。
+2026-11-19-mid-test-review-replay.md[SQ5T]: F:对照第 1、6 题从空工作区重跑后的平台终态、用户目录交付、浏览器实测与资料核验。 | R:code:docs/mid-test-status.md | A:- | S:复测记录绑定每轮的提交和运行身份。
+2026-11-19-mixed-probe-review.md[SQ5T]: F:说明发生错误原生断言后如何保留同版本的成功反证，以独立复查裁决候选。 | R:code:tests/test_mixed_browser_script_handoff.py | A:- | S:历史反证可发起调查，发布仍需核验当前冻结文件。
+2026-11-19-private-reviewer-probes.md[SQ5T]: F:记录 QA 私稿中出现自身验证争议时，将冻结的探针和证据交给第三方独立裁决的过程。 | R:code:miniagent/studio_crew.py | A:- | S:-
+2026-11-19-review-coordination.md[SW5T]: F:说明签署结果已确定下一执行人时，宿主如何沿现有委派入口调度并记录新的动作。 | R:code:miniagent/studio_crew.py | A:bound_handoff_dispatched | S:同一候选与证据修订只接管一次。
+2026-11-19-review-revision-routing.md[SW5T]: F:复盘有效的产品退修意见怎样在评审附件未发布的情况下仍交回原作者，再由原评审者核验。 | R:code:tests/test_review_revision_routing.py | A:- | S:新候选需要重签全部必需项。
+2026-11-19-rework-budget.md[SP5T]: F:说明作者返工与独立复核怎样在群任务总时限下重新分配成员份额并保留收尾预算。 | R:code:tests/test_studio_rework_budget.py | A:- | S:-
+2026-11-19-signed-verification-handoff.md[SR5T]: F:说明签署取证未决后如何保留冻结输入、继续派给原裁决者并按剩余必要项判断进展。 | R:code:tests/test_signed_review_handoff.py | A:- | S:同一版本再次派工需要未决必要项集合严格缩小。
+2026-11-19-skipped-calls-and-embedded-apps.md[SQ5T]: F:区分未执行的工具和真实失败，说明如何把浏览器读到的内嵌主文档与冻结源码对应。 | R:code:tests/test_embedded_application_review.py | A:- | S:真实页面的证据仅覆盖已操作的业务行为。
+2026-11-19-source-review-repair.md[SQ5T]: F:说明来源争议导致退修时，作者如何回到原始发布材料核对期间、单位和数字口径。 | R:code:tests/test_studio_required_source_review.py | A:- | S:-
+2026-11-19-verbose-unittest-receipts.md[SQ5T]: F:解释如何用实际脚本、工作目录和参数识别独立执行的详细 unittest 回执并核销义务。 | R:code:miniagent/check_provenance.py | A:- | S:解释器、测试选择和工作目录参与命令身份。
+2026-11-20-chat-markdown.md[SU5T]: F:说明如何从群消息定位当时可见的 Markdown 文件及相对链接，并返回原阅读位置。 | R:code:miniagent/web/markdown-reader.js | A:- | S:冻结附件的相对引用按当次回执的清单解析。
+
+===/<repository>/docs/evidence/m0-03/2026-11-17/===
+manifest.json[SQ4T]: F:列出指定版本双轮工具协议线上探针的实现、运行环境、离线结果及源码摘要。 | R:code:miniagent/provider_smoke.py | A:source_sha256 | S:证明范围限于官方接口的非流式探针。
+probe-disabled.json[SQ4T]: F:保存关闭推理时的三次官方请求、工具结束原因、报告用量和协议结果。 | R:code:miniagent/provider_smoke.py | A:thinking,logical_calls | S:-
+probe-enabled.json[SQ4T]: F:保存启用推理时的三次官方请求、推理字段存在性、用量及多轮往返结论。 | R:code:miniagent/provider_smoke.py | A:thinking,has_reasoning | S:-
+
+===/<repository>/examples/===
+acceptance-file.json[FQ4T]: F:为离线示例的 result.md 约定关键短语、最小字节数和行数。 | R:code:examples/mock_task.json | A:min_bytes,min_lines | S:-
+acceptance-plan.json[FQ5T]: F:分别声明笔记与摘要子任务的验收，以及根工作区中两个交付文件的内容检查。 | R:code:examples/mock_plan.json | A:subtasks,root | S:根检查使用各子任务工作区的相对路径。
+mock_delegate.json[TW4T]: F:提供脚本模型响应，从父任务委派 writer 到子任务写出 notes.md 并回报。 | R:code:miniagent/orchestrator.py | A:delegate_task | S:-
+mock_plan.json[TW4T]: F:以固定模型响应将目标拆为有依赖的笔记、摘要任务并写入各自文件。 | R:code:examples/acceptance-plan.json | A:subtasks | S:-
+mock_task.json[TB4T]: F:定义依次列目录、写 result.md、回读和返回最终答复的离线模型响应。 | R:code:examples/acceptance-file.json | A:result.md | S:-
+tasks.jsonl[FQ4T]: F:提供三个逐行输入的批量评测题目，覆盖问候、技术要点与计算。 | R:code:miniagent/cli.py | A:task_id,task | S:这些题目未配置独立验收。
+verified_mock_tasks.jsonl[FQ4T]: F:为两道离线演示题分别指定 result.md 的内容断言，供批量指标评测。 | R:code:examples/mock_task.json | A:acceptance | S:-
+
+===/<repository>/miniagent/===
+__init__.py[LG4T]: F:用 __all__ 将 Agent、RAOUnit、Orchestrator、MessageBus 和任务存储等实现整理成包级 Python 接口，另导出 __version__。 | R:code:miniagent/rao.py,code:miniagent/orchestrator.py | A:__all__ | S:-
+__main__.py[EG4T]: F:当 Python 以模块方式启动时调用 cli.main，并把其返回值交给 SystemExit 作为进程退出状态。 | R:code:miniagent/cli.py | A:main | S:-
+acceptance.py[DQ8L]: F:bind 将任务、工作区和宿主提供的验收规则绑定，evaluate 执行已绑定的检查，为结果生成 AcceptanceEvaluation 及调用、文件观察等证据。 | R:code:miniagent/acceptance_evidence.py,code:miniagent/contracts/acceptance.py | A:evaluate | S:运行期回调的身份只在本进程有效；观察到的文件回执不能直接当成产物授权。
+acceptance_evidence.py[DQ8S]: F:validate_evidence 核对报告、规范及调用或文件观察回执间的引用与一致性，决定已记录的通过结论能否计为有效验收。 | R:code:miniagent/acceptance.py,code:miniagent/task_service.py | A:validate_evidence | S:只接受支持的调用和文件观察回执；每项检查必须引用自身对应的调用回执。
+agent.py[AW9L]: F:驱动模型、工具与验收循环，管理请求历史、协调回合、预算、核验后的交付以及带缺项的未签交接。 | R:code:miniagent/rao.py,code:miniagent/task_service.py,code:miniagent/studio_crew.py | A:Agent.run | S:收到未签工具交接时先处理在途指导，再以错误终止该成员并记录证据；不能由其答复推导验收通过。
+attachment_tools.py[IB6M]: F:attachment_tools 根据当前运行有权使用的附件构造列举、分页预览工具，并在可写模式下把原件复制到成员输入目录供工具读取。 | R:code:miniagent/studio_service.py,code:miniagent/research.py | A:attachment_tools | S:已物化的本地副本若被修改，再次物化会报错，避免覆盖成员修改。
+browser_tool.py[IQ6T]: F:把成员的浏览器脚本交给独立 Chromium 执行器，将可验证的文档观察与实际检查结果带回当前工作区。 | R:code:miniagent/playwright_runner.py,code:miniagent/shell_tool.py | A:run_browser | S:若工作区指定命令临时目录，浏览器凭证和进程运行材料须使用该目录，才能在协调写入隔离下运行。
+bus.py[MM7S]: F:MessageBus 接收发布或定向消息，按订阅派发，记录带顺序标识的消息并支持按频道、会话查询及落盘。 | R:code:miniagent/orchestrator.py | A:MessageBus | S:消息总线位于进程内；bus.jsonl 是消息记录，不能用来给另一进程实时投递。
+check_provenance.py[DQ6S]: F:shell_invocation、python_invocation 从命令本身提取执行方式和脚本身份，python_check_source 给出可核对的 Python 检查来源。 | R:code:miniagent/crew_progress.py,code:miniagent/peer_recheck.py | A:shell_invocation | S:-
+cli.py[EG7L]: F:main 解析命令参数并选择 demo、run、orchestrate、eval、report、studio 等入口，按命令构造模型、任务目录、验收条件或本地 HTTP 服务。 | R:code:miniagent/__main__.py,code:miniagent/studio_service.py | A:main | S:-
+compaction.py[KP7M]: F:RollingCompactor.update 针对已选定的历史消息边界增量生成语义摘要，保留可继续引用的检查点及原始执行历史。 | R:code:miniagent/agent.py,code:miniagent/context_window.py | A:RollingCompactor | S:摘要只覆盖由宿主选定的历史范围；截断或不完整的摘要响应不能成为有效检查点。
+config.py[FC7M]: F:Settings.from_env 解析运行环境中的模型与请求选项，Limits 和 configured_limits 表示并合成任务的时长、步数等工作预算。 | R:code:miniagent/rao.py,code:miniagent/studio_service.py | A:Settings | S:-
+context_window.py[KP8M]: F:project_history 将追加式历史投影为适合模型请求的消息序列，按完整 assistant/tool 批次选择可省略区间，保留估算与用量锚点。 | R:code:miniagent/request_window.py,code:miniagent/compaction.py | A:project_history | S:遇到未配对的工具结果、不匹配的调用标识或不完整批次会报错，不能删除半个批次凑足窗口。
+coordinator_workspace.py[RS8T]: F:为群负责人提供按公开版本重建的临时检查副本，包装文件、研究与执行工具，并记录查阅和实际命令结果。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_conversations.py,code:miniagent/member_processes.py | A:CoordinatorWorkspace,isolated_command | S:检查副本不是发布来源。版本变化关闭旧进程并重建目录，命令写限于临时范围，运行历史不可读；平台缺乏支持时进程检查报错。
+crew_diagnostics.py[DR6S]: F:RoomDiagnostics.capture 为受阻成员保存限定范围的诊断文件，提供按名只读的诊断工具，使接手者能核对失败现场。 | R:code:miniagent/studio_crew.py | A:RoomDiagnostics | S:诊断文件存于公开项目树之外；交付时不能将诊断附件自动视为产品文件。
+crew_progress.py[DQ8L]: F:MemberProgress 从成员每步的工具调用、读写范围和检查输出追踪文件版本、失败与复查证据，计算交接阶段与恢复提示。 | R:code:miniagent/studio_crew.py,code:miniagent/check_provenance.py | A:MemberProgress | S:-
+file_tools.py[RD7M]: F:read_file 提供有界文本读取；write_file、edit_file 和 append_file 核对期望版本后原子替换内容，向并发修改返回冲突。 | R:code:miniagent/tools.py,code:miniagent/project_navigation.py | A:edit_file | S:原子替换的临时文件与目标同卷；替换前重新核验目标版本，冲突必须重新读取。
+member_processes.py[RR7S]: F:managed_member_processes 为一次成员执行设置专属进程标记、命令会话及进程组追踪，在退出时清理存续进程和命令环境并返回回执。 | R:code:miniagent/studio_crew.py,code:miniagent/shell_tool.py | A:managed_member_processes | S:回收进程要核对成员范围及进程身份；进程清理状态独立于成员任务的验收结果。
+metrics.py[AO7L]: F:Tracer 将事件追加到 trace.jsonl；summarize 按逻辑任务、尝试、用量与验收证据聚合，render_report 据此生成运行报告。 | R:code:miniagent/acceptance_evidence.py,code:miniagent/studio_service.py | A:summarize | S:分母保留缺少终止事件的任务；历史 completed 标记缺少绑定报告时不能计为已核验成功。
+orchestrator.py[AW9L]: F:Orchestrator.run 获取或生成子任务计划，校验依赖并路由给角色；根据调度模式运行任务，以 Board 和 MessageBus 保存共享结果与消息。 | R:code:miniagent/agent.py,code:miniagent/bus.py | A:Orchestrator | S:无会话团队任务使用这套计划调度；Studio 房间中的负责人成员委派由 studio_crew.py 处理。
+peer_recheck.py[DQ6T]: F:ClosingPeerChecks.offer 向成员提出对同行冻结检查的一次复跑机会，并通过 restore_shell 管理临时包装的 shell 执行路径。 | R:code:miniagent/studio_crew.py,code:miniagent/check_provenance.py | A:ClosingPeerChecks | S:复跑必须匹配冻结候选的路径、摘要和检查范围；同一目标、候选版本、范围只提出一次。
+playwright_runner.py[RQ6M]: F:独立入口 main 启动 Chromium 并执行成员脚本，DocumentWitness 结合断言和浏览器文档观测记录供上层检查的证据。 | R:code:miniagent/browser_tool.py,code:miniagent/crew_progress.py | A:DocumentWitness | S:-
+probe_coverage.py[KQ6T]: F:corrected_assertion 由原失败回溯定位 Python 断言，通过 AST 及新执行的成功标记判断同一断言位置是否在修正脚本中得到覆盖。 | R:code:miniagent/studio_reviews.py | A:corrected_assertion | S:仅出现 PASS 字样不足以确认修复；须能从原回溯定位断言并与新脚本的对应观测匹配。
+project_data.py[DS7M]: F:对拟交接的项目文件应用类型、编码和内容校验；validate_project_data 区分 UTF-8 文本、受支持的 SQLite 与 PNG 数据并检查可识别凭据。 | R:code:miniagent/studio_conversations.py,code:miniagent/studio_route_results.py | A:validate_project_data | S:普通项目 SQLite 可以交接，Studio 控制数据库以及含已识别服务凭据的数据库须拒绝。
+project_navigation.py[ID6S]: F:search_files 和 find_files 在成员工作区调用 ripgrep 查询文字或文件，read_lines 按行分页读取并返回定位信息。 | R:code:miniagent/tools.py,code:miniagent/file_tools.py | A:search_files | S:-
+provider_http.py[IN8M]: F:post_json 在请求期限及重试上限内发送 HTTPS JSON 请求，读取普通 JSON 或 SSE 事件，映射传输和服务端失败为 ProviderError。 | R:code:miniagent/providers.py,code:miniagent/compaction.py | A:post_json | S:同步 DNS 等操作无法在任意指令点被强制打断；上层不能把 deadline 当作硬实时中断保证。
+provider_smoke.py[TQ5M]: F:run_provider_smoke 通过三次内存中的模型调用检查工具声明、工具调用与回执续接，输出调用元数据和协议探测结果。 | R:code:miniagent/cli.py,code:miniagent/providers.py | A:run_provider_smoke | S:探针只验证内存中的工具协议，不执行实际注册工具；live 标记需调用者保证提供者真实性。
+providers.py[IN8L]: F:DeepSeekProvider.chat 将消息和工具定义组装成 Chat Completions 请求并解析文本、工具调用与用量；ScriptedProvider 提供确定性的离线响应。 | R:code:miniagent/provider_http.py,code:miniagent/rao.py | A:DeepSeekProvider | S:HTTP 重试发生在工具执行之前，重试一次模型请求不会重放本地工具副作用。
+rao.py[DW9L]: F:组装模型请求，解析行动、执行工具与控制意图并生成观察；用结构化信号区分签署拒绝及其他执行错误。 | R:code:miniagent/agent.py,code:miniagent/tools.py,code:miniagent/studio_reviews.py | A:RAOUnit.step,StepPolicy,ToolCompletion | S:只有 submit_review 失败且带结构化拒签回执才分类为评审拒绝。交接可以携带未签缺项；协调历史保留原调用和配对结果。
+request_window.py[KP7T]: F:fit_history 为输出预留空间后适配模型请求容量，配合 prune_tool_results 缩短大工具结果；原始历史仍留在宿主侧。 | R:code:miniagent/agent.py,code:miniagent/context_window.py | A:fit_history | S:对大工具回执的裁剪仅作用于待发送请求，原始执行历史须保留。
+research.py[IN7L]: F:search_sources 发现公开资料，http_get 和 read_source 获取或分页读取受限制的来源正文，供成员在项目工作区保存、引用。 | R:code:miniagent/tools.py,code:miniagent/attachment_tools.py | A:search_sources | S:外部来源地址拒绝带凭据、内网或本机位置；正文获取及 PDF 读取有各自的大小限制。
+role_tools.py[DI6S]: F:绑定角色、项目和私聊身份，提供生效知识的召回、按 ID 读取和带来源的修订提案。 | R:code:miniagent/studio_roles.py,code:miniagent/studio_role_memory.py | A:attach_role_tools | S:工具不能自选角色或会话 ID；默认私聊建议绑定当前私聊。待审候选不可读，修订检索与直接读取遵循同一范围。
+sandbox.py[RS8S]: F:Sandbox 为每个角色维护工作目录，resolve 检查工具路径是否仍在根目录内，command_venv 管理执行命令使用的环境。 | R:code:miniagent/tools.py,code:miniagent/studio_crew.py | A:Sandbox | S:目录路径检查只覆盖经过 Sandbox 的文件操作；它不能限制成员代码子进程的系统访问权限。
+schemas.py[CG8S]: F:ToolSpec、ToolCall、ToolResult、LLMResponse、Usage、RunResult 规定工具协议、消息序列化、模型用量和任务结果的数据形状。 | R:code:miniagent/rao.py,code:miniagent/providers.py | A:ToolResult | S:-
+shell_tool.py[RR8M]: F:run_shell 与 run_posix_argv 设置项目环境、时限、输出限额及进程组处理；CommandSessions 支持分次轮询进行中的命令。 | R:code:miniagent/tools.py,code:miniagent/member_processes.py | A:CommandSessions | S:-
+studio_acceptance.py[DQ7T]: F:将 Studio 请求里的交付文件和声明式内容检查编译为可在工作区运行的验收器；单列文件路径要求文件非空，空规则返回 None。 | R:code:miniagent/studio_service.py,code:miniagent/acceptance.py | A:build_checks | S:JSON 相等按规范化 JSON 序列化结果比较，布尔 true 与整数 1 是不同的值。
+studio_artifacts.py[DD6S]: F:按本轮收件人、意图和实际检出基线比较文件摘要，将产物归为新增、修改或点名交付；提问轮跳过归属，历史基线缺失时只认显式交付。 | R:code:miniagent/studio_service.py,code:miniagent/studio_conversations.py | A:output_classifier | S:基线不可判定时仅把声明的文件算作产物；提问轮即便有继承文件也不列为本轮产物。
+studio_channels.py[AU7M]: F:创建可长期使用的群，管理侧栏、角色名单、负责人和群卡片，读取最近群消息以展示活动。 | R:code:miniagent/studio_group_messages.py,code:miniagent/studio_roles.py | A:StudioChannels | S:成员修订使用版本比较；旧任务保留当时名单，不受当前群成员变更影响。
+studio_config.py[FC6T]: F:从可选 .env 按字面读入服务器端设置，叠加到传入 Settings；已有环境变量优先，显式指定的文件须存在。 | R:code:miniagent/cli.py,code:miniagent/config.py | A:load_studio_settings | S:默认 .env 可以缺失，显式传入 env_file 则要求它存在；值不作 shell 展开。
+studio_conversations.py[DD8M]: F:校验新会话及续轮的收件人和意图，整理角色、附件和上下文；从指定角色工作树复制可交付文件或采集摘要清单，按类型和目录边界筛选。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_service.py | A:copy_project | S:会话最新回复可以是只读提问，继承项目文件时应依据本轮的 base_run_id。
+studio_crew.py[AW9L]: F:编排负责人与成员的群内对话、隔离工作树、冻结交接、独立评审、返工和公开发布。 | R:code:miniagent/studio_reviews.py,code:miniagent/studio_service.py | A:RoomCrew.delegate,RoomCrew.advance_requested_review | S:签署限定于冻结版本，正式发布仍核对当前基线。成员报告与根交付各自验收，后续普通发言不能推翻已核实的签署。
+studio_diagnostics.py[AO6M]: F:按任务、尝试和运行身份关联轨迹、验收和群记录，推导本次运行遇到的异常、已恢复情况及可用的恢复候选，保留原始任务状态。 | R:code:miniagent/studio_service.py,code:tests/test_studio_diagnostics.py | A:diagnose | S:旧轨迹缺少 attempt 或 run ID 且同任务存在歧义时，不能用后来规划事件消除先前错误。
+studio_discussion.py[PM7S]: F:持久化群内交接、进度问答和人工答复，通知实时回复流，并提供会话记录与交付材料导出。 | R:code:miniagent/studio_service.py,code:miniagent/studio_reply_stream.py | A:RoomDiscussion | S:公开事件追加并同步到磁盘后才通知订阅者，刷新时以对应运行的日志为准。
+studio_dispatch.py[AW8M]: F:记录工作室到角色或项目群的持久派工，检查目标与输入，跨进程启动子任务并查询被指派运行的进度。 | R:code:miniagent/studio_superagent.py,code:miniagent/studio_group_status.py | A:StudioDispatch.read_group_dispatch | S:只允许经派工凭据访问目标群中的那个子运行；群成员或侧栏关系本身不构成跨群读取授权。
+studio_group_messages.py[PM8S]: F:在群自己的 SQLite 消息表保存问题、回复、动作与运行关联，结合语义判断决定只读回复、排队或指导在途任务。 | R:code:miniagent/studio_room_reply.py,code:miniagent/studio_group_queue.py,code:miniagent/studio_steering.py | A:post_message,read_messages,recent_dialogue | S:同一请求号匹配原载荷才可重放；选定动作先持久化。模型回答期间任务也可能结束，接收指导前复查状态。
+studio_group_queue.py[AW8S]: F:按同一群内消息顺序持久排队，在槽位释放及服务启动时准入独立任务并把执行编号写回原消息。 | R:code:miniagent/studio_group_messages.py,code:miniagent/studio_service.py | A:record_queued,drain_group_queue | S:启动前冻结带稳定 UUID 的完整请求。在启动成功、回执未写的间隙重启仍会重放同一请求；容量不足保留队首。
+studio_preview.py[IS7S]: F:读取指定版本的 HTML 及允许的项目资源，将预览包装为只有脚本能力的沙箱 iframe，并提供配套内容安全策略。 | R:code:miniagent/studio_server.py,code:tests/test_studio_preview.py | A:html_preview | S:预览 iframe 只开放 allow-scripts；授予同源能力会破坏交付网页与 Studio 的隔离。
+studio_reply_stream.py[RM7S]: F:按 stream_id 聚合运行中的公开回复，处理分块脱敏、删除和房间更新；过期游标回传草稿快照，赶得上的客户端获取增量。 | R:code:miniagent/studio_server.py,code:miniagent/studio_discussion.py | A:ReplyStream | S:检测到可能跨 delta 拼出的密钥前缀时要延迟显示；历史运输帧淘汰后补发完整当前草稿。
+studio_reviews.py[DQ9L]: F:ReviewQueue 管理候选和评审责任，ReviewSession 依据冻结版本、逐项标准与真实工具凭据校验独立签署。 | R:code:miniagent/studio_crew.py,code:tests/test_unattributed_browser_handoff.py | A:ReviewQueue,ReviewSession | S:作者请求的浏览器检查即使在载入前失败，核销仍要求独立断言触及冻结产品。其他页面成功或仅报告退出码不能为当前断言签署。
+studio_role_directory.py[AD6S]: F:合并内置角色、保存的资料、房间角色快照和实际任务分派，形成角色目录、成员显示资料及可追溯的参与记录。 | R:code:miniagent/studio_roles.py,code:tests/test_studio_role_directory.py | A:role_directory | S:-
+studio_role_memory.py[PD7M]: F:用 SQLite 保存按角色和项目归属的知识与技能修订，为当前会话挑选允许召回的生效版本。 | R:code:miniagent/studio_roles.py,code:miniagent/role_tools.py | A:RoleMemoryStore,visible_to_conversation | S:条目与版本的运行来源均要可见；人工录入的项目知识可在同一项目共享。待审新版本不覆盖原生效版本。
+studio_roles.py[AI7M]: F:绑定个人角色、项目和当前会话的运行历史，投影群内职责、组装知识工具并维护角色资料与记忆。 | R:code:miniagent/studio_role_memory.py,code:miniagent/studio_channels.py | A:RoleSession,room_role_briefs | S:助手生成的职责初稿只供来源运行及其首先领取的群。编辑姓名或职责保留原范围，显式共享才开放；旧资料按原创建参数和成功回执识别。
+studio_room_context.py[AM8M]: F:为群内对话选择相关历史和最新交付，整理根验收、私稿签署、未交付文件与版本化产物目录。 | R:code:miniagent/studio_service.py,code:miniagent/studio_group_status.py,code:miniagent/studio_room_evidence.py | A:room_context,published_artifact_catalog | S:末轮取消不替换成功交付。根报告与成员复核各自绑定；发布目录以成员变更回执或正式投影相对基线的差异为准。
+studio_room_evidence.py[IS7T]: F:给群回复注册已发布文本的只读摘录工具，按运行与路径定位，有摘要校验后才返回版本引用。 | R:code:miniagent/studio_room_context.py,code:miniagent/studio_service.py | A:published_artifact_tool | S:最终发布若覆盖成员版本，要核对同一目录的投影与最初基线；原封继承、内容被改、二进制或含凭据文本都不能作为已读证据。
+studio_room_reply.py[AM8S]: F:以本群上下文向 DeepSeek 请求结构化回复、派工或改要求的决定，按需读取会话附件或已发布文件。 | R:code:miniagent/studio_room_context.py,code:miniagent/studio_room_evidence.py,code:miniagent/studio_group_messages.py | A:decide_room_message | S:执行授权须逐字来自当前用户消息；只读模式、格式错误和提供方不可用不会产生工作。引用随成功读取的版本回执保留。
+studio_route_results.py[AD8M]: F:为派工目标轮比较派发输入基线和结束时公开文件，固定可交付文件和摘要；按授权引用列出、读取并向下一次委派导入这些结果。 | R:code:miniagent/studio_dispatch.py,code:miniagent/studio_superagent.py | A:capture_delivery | S:输入只有裸文件名且工作区没有该文件时，同名历史交付多于一份必须提供具体 dispatch 引用。
+studio_server.py[EN8L]: F:提供本地网页与 JSON 接口，验证输入并分发群消息、运行、目录、派工、上传、公开工件与用户答复。 | R:code:miniagent/studio_service.py,code:miniagent/studio_group_messages.py | A:StudioHandler,create_server,serve | S:旧的群续聊和群执行中插话入口也经同一消息准入；群附件读取校验所属会话记录。
+studio_service.py[AW9L]: F:管理 Studio 运行、群与角色、服务并发、执行与恢复，整合持久记录、群对话、公开工作区投影和验收展示。 | R:code:miniagent/studio_group_queue.py,code:miniagent/studio_group_messages.py,code:miniagent/studio_room_context.py,code:miniagent/studio_crew.py | A:StudioService,StudioService.start | S:群详情保留按任务版本的发布引用；群运行持有进程所有权，任务收尾释放槽位后才唤醒排队工作。读取历史校验任务链及验收报告绑定。
+studio_steering.py[AM7S]: F:保存执行中的用户指导、附件与引用的群讨论，在每个订阅成员消费更新后记录确认。 | R:code:miniagent/studio_service.py,code:miniagent/studio_group_messages.py | A:StudioSteering.steer,RunSteering | S:恢复订阅不等于确认；旧工具批次可作废，已关停或属于其他进程的任务不能被本实例改写。
+studio_superagent.py[AW8M]: F:管理统一助手入口与运行所有权，提供查询或创建角色和群、派工、查看子结果及撤销排队派工的工具。 | R:code:miniagent/studio_channels.py,code:miniagent/studio_dispatch.py | A:StudioAssistant.send_superagent,StudioAssistant.add_superagent_tools | S:进程存活的 SQLite 写锁用于识别仍在执行的运行；群状态查询限于当前项目可访问的派工关系。
+studio_uploads.py[PD7S]: F:为用户附件生成独立标识，限制同次消息的引用，保存私有原件和元数据；打开时核实记录与大小，交回原件文件流或附件引用。 | R:code:miniagent/studio_server.py,code:miniagent/studio_service.py | A:open_upload | S:同条消息不能重复引用同一附件 ID；原件打开时须与保存的元数据大小一致。
+studio_workspace.py[IR8M]: F:将用户选择的本地目录检出至私有工作树并记录目录身份与文件摘要，发布时比较基线后逐文件更新，失败时尝试撤回已写入的改动。 | R:code:miniagent/studio_service.py,code:tests/test_studio_workspace_races.py | A:checkout | S:发布发现本机目录身份或目标文件已变须保留本机修改；补偿写入也须核对期望内容，避免覆盖并发编辑。
+task_service.py[AW8L]: F:TaskService 把任务创建、计划落库、尝试启动、验收登记和终态变更转换成事务中的记录与事件，并提供执行句柄给宿主。 | R:code:miniagent/task_store.py,code:miniagent/acceptance_evidence.py | A:TaskService | S:事务里只做校验和存储，不能在持锁期间调用模型、工具或外部验收器。
+task_store.py[PD9L]: F:TaskStore 和 StoreTransaction 使用 SQLite 持久化任务、尝试、运行、内容及待投递事件；写事务和修订检查维护记录与事件的共同提交。 | R:code:miniagent/task_service.py,code:miniagent/contracts/transitions.py | A:TaskStore | S:事务内同时提交记录和 outbox 事件；投递为至少一次，消费者须能处理重复事件。
+tool_activity.py[AO6S]: F:target_for 提取工具目标，project_activity 将执行开始、结束与结果事件投影为 Studio 公开时间线的紧凑条目。 | R:code:miniagent/studio_service.py,code:miniagent/agent.py | A:project_activity | S:公开时间线最多保留最近 100 个可见调用，不能据此统计完整历史。
+tool_progress.py[DO6S]: F:ToolProgress.observe_batch 按调用目标和结果归纳重复出现的工具表现，将近期模式作为反馈提供给下一步决策。 | R:code:miniagent/rao.py,code:miniagent/check_provenance.py | A:ToolProgress | S:重复工具结果只产生建议，不能作为验收通过凭据或强制决定下一动作。
+tools.py[RE8L]: F:ToolRegistry 绑定工具名称、参数模式与处理函数，dispatch 校验参数并返回 ToolResult；build_default_registry 组装文件、命令、浏览器和检索工具。 | R:code:miniagent/rao.py,code:miniagent/schemas.py | A:ToolRegistry | S:-
+studio_group_status.py[AD7S]: F:将指定群任务的冻结草稿、独立签署、恢复记录及公开区缺件整理成进度答复，也识别旧版误开的追问。 | R:code:miniagent/studio_service.py,code:miniagent/studio_dispatch.py | A:group_status,is_status_only_turn | S:旧问句规则用于辨认历史记录；签署仍要绑定评审员、目标和候选摘要。
+
+===/<repository>/miniagent/contracts/===
+__init__.py[LG4T]: F:汇总 M0 契约类型与校验函数；parse_record 根据记录的种类选择具体模型，将外部数据解析为类型化快照。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/transitions.py | A:parse_record | S:解析按 record_type 分派，未知种类、字段和版本会被拒绝。
+acceptance.py[DQ7S]: F:AcceptanceSpec 描述验收对象、条件和评估器，AcceptanceReport 保存逐项判定与证据；validate_report 核对报告是否对应指定规范。 | R:code:miniagent/acceptance.py,code:miniagent/contracts/snapshot.py | A:validate_report | S:仅验证已记录的规范和报告；运行评估器由宿主执行。
+artifacts.py[DD6T]: F:ArtifactRecord 保存固定版本产物和创建来源；ArtifactGrant 描述对确定产物集合的访问授权快照，validate_artifact_content 核验物料内容。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/base.py | A:ArtifactRecord | S:比对产物内容时必须传原始 bytes，大小及 SHA-256 两者都要匹配。
+base.py[CG8M]: F:ContractModel 统一约束记录、修订引用及不可变 JSON；canonical_bytes 和 canonical_hash 生成规范表示与内容摘要。 | R:code:miniagent/contracts/tasks.py,code:miniagent/task_store.py | A:ContractModel | S:时间戳要求 UTC，并将显式 +00:00 规范化为 Z；其他时区偏移会被拒绝。
+budget.py[DP6T]: F:Quantity、BudgetScope、BudgetLease 描述预算量、归属与租约状态，并对快照中的预留、使用及生命周期字段做一致性校验。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/base.py | A:BudgetLease | S:实际用量允许超出限额以保留真实记录；拒绝后续执行属于其他层的职责。
+human.py[DB6M]: F:HumanRequest、HumanReply 与 ActionRecord 表达询问、答复及动作；validate_approval 核对批准与请求及动作意图摘要。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/base.py | A:validate_approval | S:validate_approval 不读取时钟或认证用户；调用方需提供可信的时间和身份上下文。
+snapshot.py[DD7L]: F:ContractSnapshot 接收调用方给定的完整记录集合，通过 _Validation 交叉检查任务图、执行、证据、授权、预算及检查点之间的引用。 | R:code:miniagent/contracts/tasks.py,code:miniagent/contracts/artifacts.py | A:ContractSnapshot | S:跨记录校验依赖调用方给出的完整清单；历史检查点不能与当前最新版本机械比对。
+tasks.py[DW7M]: F:TaskRecord、AttemptRecord、RunRecord 和 Checkpoint 分别表达任务、尝试、运行及恢复位置，校验等待关系、状态与时序约束。 | R:code:miniagent/task_service.py,code:miniagent/task_store.py | A:TaskRecord | S:-
+transitions.py[DW7S]: F:validate_transition 检查同一记录前后版本的标识、修订及允许的状态变化；transition_record 产生通过校验的下一版本。 | R:code:miniagent/task_store.py,code:miniagent/task_service.py | A:validate_transition | S:这里的预期修订检查是纯计算，实际写入仍须在存储事务中执行修订比较。
+
+===/<repository>/miniagent/web/===
+activity.css[FU4T]: F:设置工具活动折叠组、调用列表、最新状态和图片预览的布局，控制长输出滚动与截图尺寸。 | R:code:miniagent/web/activity.js,code:miniagent/web/index.html | A:.activity-group | S:-
+activity.js[IU6S]: F:把每轮公开工具调用整理为可展开的活动记录，按需获取详情和截图，并支持失败后重试查看。 | R:code:miniagent/web/app.js,code:miniagent/web/activity.css | A:StudioActivity | S:-
+app.js[IU8L]: F:实现 Studio 的角色、频道、对话和任务界面，发送群消息、呈现执行过程、处理附件、阅读交付与验收。 | R:code:miniagent/studio_server.py,code:miniagent/web/markdown-reader.js | A:sendGroupMessage | S:任务排队和启动后仍在原消息处更新入口；点击群回复里引用的工件沿相应任务及版本打开。
+attachments.js[IU6S]: F:按输入框身份保存尚未发送的附件列表，限制数量、组织上传与提交，渲染附件标签和历史消息的原件下载入口。 | R:code:miniagent/web/app.js,code:miniagent/studio_uploads.py | A:studioMessageFiles | S:上传成功的条目保存在草稿中；同一消息失败重试应复用这些 ID。
+directory.css[FU4T]: F:定义侧栏固定群组、最近对话目录与管理界面的视觉布局，并适配小屏的会话卡片和导航滚动。 | R:code:miniagent/web/directory.js,code:miniagent/web/index.html | A:.side-channels | S:-
+directory.js[IU6S]: F:读取对话目录，维护侧栏固定群与筛选后的最近会话，通过目录接口创建群组或修改固定状态与显示名。 | R:code:miniagent/web/app.js,code:miniagent/studio_channels.py | A:chatDirectory | S:-
+index.html[EU7T]: F:提供 Studio 的静态应用外壳、导航、主内容和文件阅读对话框；按依赖顺序加载本地组件脚本、Markdown 解析器和样式。 | R:code:miniagent/web/app.js,code:miniagent/studio_server.py | A:id="main" | S:markdown-reader.js 在脚本执行时即取用 markdownit，需先加载浏览器构建。
+markdown-reader.css[FU4T]: F:设置群消息中的 Markdown 文件链接、版本选择按钮和阅读弹窗样式，并适配窄屏与长文档。 | R:code:miniagent/web/markdown-reader.js,code:miniagent/web/index.html | A:.md-file,.md-versions,.md-version-list,.md-reader | S:-
+markdown-reader.js[IU7M]: F:把聊天中的文件引用解析为对应版本的链接，在阅读器展示工件和上传附件，支持版本选择、文内跳转及返回。 | R:code:miniagent/web/app.js,code:miniagent/web/vendor/markdown-it.min.js,code:miniagent/studio_room_context.py | A:StudioMarkdown.render,StudioMarkdown.documentHTML,StudioMarkdown.openAttachment | S:群消息只能引用当时已可见的本群发布。实际读过的引用优先，同名且来源未定时须让用户选版本。冻结文档的相对链接回到同一快照。
+reply-stream.js[IM7S]: F:用 EventSource 按运行连接公开回复流，合并快照、增量、移除及房间更新；按草稿身份更新页面并在结束或页面离开时关掉连接。 | R:code:miniagent/studio_reply_stream.py,code:miniagent/web/app.js | A:studioReplyStreams | S:断线重新接收 snapshot 时需要替换旧连接的草稿状态，以避免重复显示。
+room-panel.css[FU4T]: F:为群聊提供对话区和成员栏双栏布局，定义名单编辑、提及按钮和小屏折叠栏的呈现。 | R:code:miniagent/web/room-panel.js,code:miniagent/web/index.html | A:.room-rail | S:-
+room-panel.js[IU6S]: F:渲染当前群的成员栏与头像，用成员 API 编辑名单和负责人，将提及插入输入框并维护跳至最新消息的控件。 | R:code:miniagent/web/app.js,code:miniagent/studio_channels.py | A:roomPanel | S:-
+style.css[FU6L]: F:建立页面的基础设计变量、通用组件、任务运行与聊天布局及响应式样式，覆盖文本、表单状态、文件和附件控件。 | R:code:miniagent/web/index.html,code:miniagent/web/app.js | A:--canvas | S:-
+superagent.css[FU5S]: F:定义统一助手的导航、对话阅读区和输入区域样式，并覆盖工作室界面的色彩与窄屏表现。 | R:code:miniagent/web/superagent.js,code:miniagent/web/index.html | A:.assistant-nav | S:-
+superagent.js[IU7M]: F:呈现统一助手输入、运行中的插话及派工结果，跟踪消息请求和子群进度回复，管理附件和目录选择。 | R:code:miniagent/web/app.js,code:miniagent/studio_superagent.py | A:studioAssistant | S:已路由到群时可以在模型未配置的情况下查询状态；界面据实际返回的事件区分状态回复与普通插话。
+
+===/<repository>/miniagent/web/vendor/===
+markdown-it.LICENSE[SV3T]: F:随本地 markdown-it 浏览器构建分发上游版权声明、MIT 使用授权、保留声明条件与免责条款。 | R:code:miniagent/web/vendor/markdown-it.min.js,code:docs/evidence/2026-11-20-chat-markdown.md | A:Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin. | S:副本或实质部分需保留版权和许可声明。
+markdown-it.NOTICES[SV3S]: F:汇集浏览器 Markdown 构建内所含依赖的名称、版本、署名和许可证，包括 mdurl、entities 及 linkify-it 等。 | R:code:miniagent/web/vendor/markdown-it.min.js,code:docs/evidence/2026-11-20-chat-markdown.md | A:mdurl 2.1.0 | S:-
+markdown-it.min.js[LU6T]: F:随仓库分发编译后的 Markdown 解析器，在浏览器注册 markdownit 构造函数，供本地离线页面解析 Markdown。 | R:code:miniagent/web/markdown-reader.js,code:miniagent/web/index.html | A:markdownit | S:-
+
+===/<repository>/tests/===
+__init__.py[TQ4T]: F:为 unittest 发现和按 tests.* 导入共享夹具提供包边界。 | R:- | A:unittest discover | S:只用于包发现与导入
+contracts_support.py[TQ4T]: F:从计算机维护设计文档的 JSON 代码块构造跨模块合同样例，按集合和标识选取记录。 | R:code:docs/m0-01-computer-maintenance-example.md | A:example_data | S:依赖设计文档中的 JSON 样例
+support.py[TQ4T]: F:创建 build/tmp 下的唯一目录并清理，为文件、数据库及服务的离线测试提供隔离。 | R:- | A:make_temp_dir | S:临时目录在仓库 build/tmp 下
+test_acceptance.py[TQ7M]: F:核对独立验收如何将任务、环境、判定规则及实际文件字节绑定到同一报告，同时区分失败、错误和未验证。 | R:code:miniagent/acceptance.py,code:miniagent/contracts/acceptance.py | A:test_modification_during_read_is_error_not_stale_pass | S:-
+test_agent.py[TW6S]: F:用脚本模型跑工具调用到最终答复，覆盖步数、耗时、错误参数及未知工具。 | R:code:miniagent/agent.py | A:test_completes_and_writes_file | S:使用脚本模型驱动工具和状态变化
+test_agent_acceptance.py[TQ7S]: F:在同一次尝试内演练提交、独立检查、修改和复检，校验答复、报告及任务身份。 | R:code:miniagent/agent.py,code:miniagent/acceptance.py | A:test_repair_then_recheck_captures_final_content_and_one_attempt | S:使用脚本模型驱动工具和状态变化
+test_attachment_tools.py[TU5S]: F:校验消息附件的只读范围、Unicode 分页、压缩包与 Office 内容读取，以及私有副本生成。 | R:code:miniagent/attachment_tools.py | A:test_unicode_text_cursor_and_read_only_scope | S:-
+test_bound_failure_output.py[TR5T]: F:比较截断展示与供同伴复核的完整失败输出，区分成功、过大和中断结果。 | R:code:miniagent/shell_tool.py,code:miniagent/tools.py | A:test_complete_failure_is_separate_from_unchanged_truncated_display | S:部分用例仅在 POSIX 环境执行
+test_bound_reviewer_browser.py[TQ5S]: F:让新仲裁者实际打开冻结入口，验证浏览器断言对原始页面与争议范围的归属。 | R:code:miniagent/crew_progress.py,code:miniagent/studio_reviews.py | A:test_signed_browser_verification_gap_returns_to_fresh_arbiter_after_blocked_handoff | S:-
+test_bound_reviewer_probe.py[TQ6L]: F:用冻结候选演练作者、评审者和第三方裁决者之间的探针复核、证据移交、重签和取消。 | R:code:miniagent/studio_crew.py,code:miniagent/probe_coverage.py | A:test_addressed_lead_resumes_same_adjudicator_before_touching_frozen_report | S:有效签署直接把控制权还给后续成员，无需追加评审者的结束语。
+test_browser_tool.py[TU5M]: F:检查真实本地表单交互、页面定位、断言失败与超时回收，并核对 DOM 断言对应的文件或服务字节。 | R:code:miniagent/browser_tool.py,code:miniagent/playwright_runner.py | A:test_missing_browser_points_to_install_and_other_launch_errors_surface | S:原生集成部分要求 POSIX 与可运行的本地 Chromium
+test_bus.py[TM5T]: F:核对按接收人订阅、通配订阅、递增消息编号、文本记录与 JSONL 持久化。 | R:code:miniagent/bus.py | A:test_ids_are_monotonic_and_timestamped | S:-
+test_cli.py[TU5S]: F:执行离线 demo、批量评估、报告与任务编排命令，检查额度参数、缺少密钥及调度模式。 | R:code:miniagent/cli.py | A:test_demo_succeeds_offline | S:-
+test_cli_acceptance.py[TQ5S]: F:通过 CLI 为单任务和批量用例设置文件内容验收，核对无检查、无效清单和初始化失败时的统计。 | R:code:miniagent/cli.py,code:miniagent/metrics.py | A:test_run_with_explicit_content_check_is_verified | S:使用脚本模型驱动工具和状态变化
+test_closing_peer_checks.py[TQ6S]: F:在收尾阶段让同伴重放作者检查，核对冻结参数、原工作目录、检查范围与版本。 | R:code:miniagent/peer_recheck.py,code:miniagent/check_provenance.py | A:test_verbose_booking_replay_uses_the_frozen_argv_and_working_directory | S:-
+test_coding_tools.py[TD6M]: F:检验 Unicode 分页读取、唯一片段编辑、哈希前置条件和并发原子写入，覆盖符号链接及文件大小限制。 | R:code:miniagent/file_tools.py | A:test_parallel_versioned_appends_commit_exactly_once | S:-
+test_compaction_runtime.py[TP5T]: F:运行上下文压缩后的下一轮请求并核对辅助模型调用的用量进入运行指标。 | R:code:miniagent/agent.py,code:miniagent/compaction.py | A:test_subsequent_request_and_run_metrics_include_auxiliary_usage | S:-
+test_config.py[TC5M]: F:验证默认值、进程环境覆盖、模型端点、严格类型与预算边界，检查错误信息屏蔽密钥。 | R:code:miniagent/config.py | A:test_defaults_work_without_credentials | S:-
+test_context_recovery.py[TR6T]: F:模拟服务端上下文溢出后缩小请求重试，核对最近工具回执与用户答复仍成对保留。 | R:code:miniagent/request_window.py,code:miniagent/agent.py | A:test_server_overflow_retries_smaller_envelope_without_reexecuting_a_tool | S:-
+test_context_window.py[TP5S]: F:以完整消息批次投影上下文，核对保留区、工具模式、输出余量及匹配快照的令牌实测。 | R:code:miniagent/context_window.py | A:test_omits_whole_old_batches_without_mutating_raw_history | S:-
+test_contract_acceptance_artifacts.py[TQ6M]: F:逐条验证验收规则与证据、判决优先级、产物字节摘要、版本来源和访问授权。 | R:code:miniagent/contracts/acceptance.py,code:miniagent/contracts/artifacts.py | A:test_valid_roundtrip_and_optional_failure_does_not_fail_report | S:-
+test_contract_human.py[TI5M]: F:核对人类请求与回复的身份、时间、类型及动作摘要，将批准、租约和实际执行记录关联。 | R:code:miniagent/contracts/human.py | A:test_exact_action_task_attempt_digest_and_tool_call_binding | S:-
+test_contract_tasks_budget.py[TD6M]: F:验证任务与尝试快照、暂停恢复游标、依赖引用、根预算及调用租约各状态的字段与时序。 | R:code:miniagent/contracts/tasks.py,code:miniagent/contracts/budget.py | A:test_documented_snapshots_round_trip_without_losing_nulls_or_arrays | S:-
+test_contracts.py[TD7M]: F:用整套设计样例验证公共解析器和状态转换，再检查跨记录依赖、引用、授权、时间顺序和访问权。 | R:code:miniagent/contracts/snapshot.py,code:miniagent/contracts/transitions.py | A:test_rejects_dependency_and_parent_cycles | S:-
+test_corrected_file_check_handoff.py[TQ5M]: F:复现修订检查脚本后的独立复核，要求同伴保留产品断言并直接重跑原有检查。 | R:code:miniagent/check_provenance.py,code:miniagent/studio_reviews.py | A:test_only_independent_product_assertion_and_both_direct_checks_promote_the_frozen_candidate | S:-
+test_crew_diagnostics.py[TO5S]: F:核验群任务的交接附件、查询覆盖范围、空查询记录与公共版本变化后的协调上下文。 | R:code:miniagent/studio_crew.py,code:miniagent/crew_diagnostics.py | A:DiagnosticReportTest | S:翻页末尾的空页不能证明整个范围无结果。公开版本变动会使旧查询结论退出当前状态。
+test_crew_progress.py[TR6L]: F:累积成员工具观察，跨工作区恢复失败、跟踪版本化分页与编辑，检验重复检查、真实修复及同伴复核的区别。 | R:code:miniagent/crew_progress.py | A:test_restored_failure_keeps_original_call_without_becoming_a_local_receipt | S:-
+test_embedded_application_review.py[TQ5S]: F:对嵌入式应用的浏览器检查建立文档归属，区分多个已观察失败、定位超时与无关端口。 | R:code:miniagent/studio_reviews.py,code:miniagent/crew_progress.py | A:test_unexecuted_call_after_signature_preserves_two_individually_cited_failures | S:使用脚本模型驱动工具和状态变化
+test_execute_review_guidance.py[TQ5S]: F:用脚本退出、错误摘要及有效断言推进复核，检查收尾期允许的工具与证据引用检索。 | R:code:miniagent/studio_reviews.py | A:test_script_exit_and_wrong_sha_recover_with_a_real_assertion_and_its_ref | S:-
+test_existing_python_check.py[TQ5M]: F:运行已有 Python 布尔检查，辨别实际执行的顶层断言、仅打印成功和候选脚本变更。 | R:code:miniagent/crew_progress.py,code:miniagent/studio_reviews.py | A:test_existing_boolean_functions_gain_receipt_only_after_real_top_level_assertions | S:-
+test_handoff_review.py[TQ5T]: F:核对同伴以同一版本、相同范围的快照和独立断言完成作者的检查交接。 | R:code:miniagent/studio_crew.py | A:test_peer_must_see_same_revision_run_checks_and_attest | S:-
+test_harness_runtime.py[TR6M]: F:在完整执行循环中覆盖长任务、输出截断恢复、上下文余量、运行中取消和真实预算消耗。 | R:code:miniagent/agent.py,code:miniagent/rao.py | A:test_thirteen_valid_tool_rounds_reach_acceptance | S:-
+test_interrupted_review_repair.py[TR6S]: F:恢复中断的私有修订，区分同一冻结版本上新取得的执行证据与重复读取、无关检查。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py | A:test_same_frozen_html_with_new_executed_evidence_can_resume_and_sign | S:-
+test_member_context.py[TP5T]: F:构造多次失败聊天并压缩当前成员上下文，核对历史隔离和本轮回执保留。 | R:code:miniagent/studio_crew.py,code:miniagent/compaction.py | A:test_four_failed_chats_stay_out_of_member_context_and_current_receipts_survive_compaction | S:-
+test_member_processes.py[TP5T]: F:核对成员启动的分离服务在连续工具调用间存活，在交接失败后回收，覆盖系统进程清单受限的环境。 | R:code:miniagent/member_processes.py | A:test_os_inventory_restriction_does_not_erase_the_handoff | S:-
+test_metrics.py[TO5S]: F:核对完成率、任务时长、步骤用量、空数据和报告落盘。 | R:code:miniagent/metrics.py | A:test_completion_rate_and_durations | S:-
+test_metrics_acceptance.py[TO6M]: F:从时序事件区分根目标与子任务，以当次尝试可解析的验收证据计算成功率和重试分母。 | R:code:miniagent/metrics.py,code:miniagent/acceptance_evidence.py | A:test_child_success_does_not_make_root_success | S:-
+test_mixed_browser_script_handoff.py[TQ5S]: F:让独立成员同时接手浏览器和脚本检查，重现房间容量回归时旧网页通过记录失效。 | R:code:miniagent/check_provenance.py,code:miniagent/peer_recheck.py | A:test_internal_scheduling_hands_both_obligations_to_the_independent_member | S:-
+test_open_turn_budget.py[TW6T]: F:运行超过一百轮和四百次动作的任务及十七次团队交接，核对无限模式、明确上限与取消。 | R:code:miniagent/rao.py,code:miniagent/studio_crew.py | A:test_default_runs_past_100_rounds_and_400_actions_and_measures_actual_usage | S:使用脚本模型驱动工具和状态变化
+test_orchestrator.py[TW7L]: F:验证计划解析、依赖分层、角色路由、三种调度方式及委派深度，用并行分支和失败后继检查执行顺序。 | R:code:miniagent/orchestrator.py | A:test_evented_unlocks_right_after_dependency | S:-
+test_orchestrator_acceptance.py[TW7M]: F:将根目标和子任务的文件检查与各自执行身份关联，覆盖子任务失败、根缺检查和派发中断。 | R:code:miniagent/orchestrator.py,code:miniagent/acceptance.py | A:test_file_content_reports_and_receipts_match_execution_identity | S:-
+test_private_candidate_review.py[TQ6L]: F:在作者私有候选上安排独立同伴复核，固定快照、重跑命名检查，验证候选字节与归属。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py | A:test_lead_can_send_first_unresolved_browser_probe_directly_to_independent_review | S:部分用例仅在 POSIX 环境执行
+test_private_probe_closing.py[TQ5S]: F:在私有来源检查收尾期执行精确绑定的探测并提交复核，覆盖替换脚本与无关命令。 | R:code:miniagent/studio_reviews.py,code:miniagent/check_provenance.py | A:test_private_source_probe_can_finish_exact_check_then_resubmit_in_closing | S:-
+test_project_data.py[TD5M]: F:往返复制 SQLite、CSV 等项目数据，校验缓存排除、数据库结构、敏感数据与下载范围。 | R:code:miniagent/project_data.py | A:test_sqlite_and_csv_round_trip_and_ignore_generated_cache | S:-
+test_project_navigation.py[TU5T]: F:验证目录、递归查找和带上下文的文本搜索在分页、过滤、符号链接及错误路径下的行为。 | R:code:miniagent/project_navigation.py | A:test_search_context_filters_pagination_and_errors | S:-
+test_provider_http.py[TN5L]: F:核对 JSON HTTPS 请求、超时重试、截止时间与错误信息清洗，验证地址约束。 | R:code:miniagent/provider_http.py | A:test_success_preserves_json_and_uses_https_post | S:-
+test_provider_runtime.py[TR6M]: F:把截断响应、不可用提供方和异常 HTTP 尝试送入真实执行路径，核对工具暴露、日志和 CLI 参数。 | R:code:miniagent/providers.py,code:miniagent/agent.py | A:test_recovery_tool_choice_respects_live_mode_and_disclosed_tools | S:-
+test_provider_smoke.py[TN5M]: F:以两轮完整工具交互验证协议健康，覆盖未知工具、重复调用编号与安全错误报告。 | R:code:miniagent/provider_smoke.py | A:test_offline_success_requires_two_real_tool_round_trips | S:离线使用 ProbeProvider，不产生线上模型调用
+test_provider_usage_metrics.py[TO5M]: F:区分已报告零用量、未知用量与尚未发请求的失败，核对 HTTP 尝试数。 | R:code:miniagent/metrics.py | A:test_default_source_preserves_numeric_usage_with_explicit_http_attempt | S:-
+test_providers.py[TN6M]: F:检验脚本提供方、DeepSeek 消息和工具批次编码、用量解析、无效响应及余额错误处理。 | R:code:miniagent/providers.py | A:test_tool_batch_must_close_before_user_or_next_request | S:-
+test_rao.py[TW7M]: F:验证决策到动作观察的映射、人工请求、委派、预算分配、失败分类和验收修复。 | R:code:miniagent/rao.py | A:test_act_observation_carries_artifacts | S:使用脚本模型驱动工具和状态变化
+test_rao_protocol.py[TN7M]: F:复演多工具轮次，从原始参数、思考字段到预算中断逐一核对请求与工具回复的配对。 | R:code:miniagent/rao.py,code:miniagent/providers.py | A:test_a01_two_tool_rounds_then_answer_keep_full_protocol_history | S:-
+test_research.py[TA5M]: F:验证公开索引、页面、PDF 和论文元数据的提取，核对来源回执及敏感内容过滤。 | R:code:miniagent/research.py | A:test_official_index_preserves_named_public_links_using_final_url_and_base | S:使用脚本模型驱动工具和状态变化
+test_review_revision_routing.py[TW5S]: F:将签署后的失败检查定向交回原作者，覆盖候选内容变化和复核者工作区的发布边界。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py | A:test_autonomous_rejection_hands_the_failed_check_straight_back_to_author | S:-
+test_role_tools.py[TI5S]: F:通过角色工具发现、读取已批准知识及提交草案，测试跨范围隔离、用户决定与并发修改。 | R:code:miniagent/role_tools.py | A:test_catalog_then_load_full_approved_skill | S:-
+test_room_context.py[TM6S]: F:验证群上下文的历史召回、取消任务后的发布识别、草稿与签署边界，以及详情提供的版本文件目录。 | R:code:miniagent/studio_room_context.py,code:miniagent/studio_discussion.py | A:RoomContextTest | S:同一私有候选的独立签署通过可以与根任务失败并存。首次随本轮交付的冻结文件应能在群详情中按已发布版本打开。
+test_room_reply.py[TM6M]: F:测试模型如何在群问答、派工和调整之间选择，并核实资料读取、引用归属、错误响应和显式只读约束。 | R:code:miniagent/studio_room_reply.py,code:miniagent/studio_room_evidence.py,code:miniagent/studio_uploads.py | A:RoomMessageDecisionTests | S:历史消息和附件即使包含交办原话也不能授权本轮执行。成功读取才可登记工件引用，被篡改文件、未修改的目录基线或其他群的材料不得进入摘录。
+test_sandbox.py[TS5T]: F:解析工作区根目录、相对路径及文件列表，并验证上级穿越、绝对路径和逃逸链接被拒绝。 | R:code:miniagent/sandbox.py | A:test_creates_root | S:-
+test_semantic_compaction.py[TP5S]: F:用新增消息批次递增生成摘要，核对最近工具配对、模型选项、额外用量及超时或失败后的状态。 | R:code:miniagent/compaction.py,code:miniagent/context_window.py | A:test_rolls_over_only_new_batch_and_keeps_recent_tool_pairs_and_user_message | S:-
+test_shell_sessions.py[TP5S]: F:检验前台命令时限与取消、归属句柄的单次领取、退出码、输出保存和结束时清理。 | R:code:miniagent/shell_tool.py,code:miniagent/member_processes.py | A:test_default_explicit_host_and_deadline | S:使用脚本模型驱动工具和状态变化
+test_shell_tool.py[TB5M]: F:以真实命令、管道和后台进程验证退出码、输出界限、超时清理、成员环境及依赖安装。 | R:code:miniagent/shell_tool.py | A:test_timeout_waits_for_its_detached_child_to_exit | S:部分用例仅在 POSIX 环境执行
+test_signed_review_handoff.py[TQ5S]: F:在来源复核签署后自动交接，遇到缺件、同批后续失败或候选哈希改变时阻止完成。 | R:code:miniagent/studio_reviews.py,code:miniagent/studio_crew.py | A:test_signed_source_review_finishes_without_requesting_a_blind_final_denial | S:使用脚本模型驱动工具和状态变化
+test_step_policy.py[TW6L]: F:检验工作、协调与交接阶段的历史投影、工具授权、人工输入、协议恢复和预算预留。 | R:code:miniagent/rao.py,code:miniagent/agent.py | A:StepPolicyTest | S:保留原调用和全部关联返回时还要保留其思考字段；无效工具正文不会作为已执行步骤回放。
+test_studio_addressing.py[TW5M]: F:在群聊中直接点名成员或负责人处理工作区变更，校验后续招募独立复核者并按实际字节重审。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_conversations.py | A:test_direct_member_and_lead_edit_the_selected_workspace_without_any_child_task | S:-
+test_studio_channels.py[TU5M]: F:验证建群、固定、修改成员与负责人、跨服务重试和旧版频道元数据兼容性。 | R:code:miniagent/studio_channels.py,code:miniagent/studio_service.py | A:ChannelsTest | S:旧客户端省略固定标志时按初始固定处理。重试建群须保留用户后来修改的固定状态，当前成员变更不能改写历史任务署名。
+test_studio_chat_http.py[TU5S]: F:经真实 HTTP 路由检验群聊收件人、只读问答、工作目录继承和任务修订，并核对重放与跨群隔离。 | R:code:miniagent/studio_server.py,code:miniagent/studio_group_messages.py | A:StudioChatHTTPTest | S:旧运行接口的群追问可返回原任务编号，群消息写入单独的时间线。同一请求异文应返回 409，不应额外创建任务。
+test_studio_config.py[TC5S]: F:解析引号、注释、export 和零额度设置，核对非法表达式与缺少配置文件的处理。 | R:code:miniagent/studio_config.py | A:test_zero_in_environment_or_file_removes_only_the_cumulative_cap | S:-
+test_studio_conversations.py[TD6M]: F:验证续聊继承模式、固定回复人、文件发布与提问分开，以及跨进程并发只产生一个后继。 | R:code:miniagent/studio_conversations.py | A:test_concurrent_process_handles_admit_only_one_successor | S:使用脚本模型驱动工具和状态变化
+test_studio_crew.py[TW7L]: F:通过软件协作、新闻取证等脚本情景跑组内委派、发布回执、私稿修复和独立复核，覆盖交接条件。 | R:code:miniagent/studio_crew.py | A:test_member_can_retry_its_original_browser_check_in_its_original_working_directory | S:-
+test_studio_diagnostics.py[TO5L]: F:根据宿主确认的失败、余额不足、取消与计划步骤生成诊断，核对草稿保留和出错位置。 | R:code:miniagent/studio_diagnostics.py | A:test_diagnoses_only_host_confirmed_blocked_handoff_before_writing | S:-
+test_studio_discussion.py[TU5S]: F:验证人工回复能唤醒原尝试，完整公开历史可分页、可导出，取消后拒绝迟到的回复。 | R:code:miniagent/studio_discussion.py | A:test_human_reply_stays_in_same_attempt_and_is_exportable | S:使用脚本模型驱动工具和状态变化
+test_studio_dispatch.py[TW6M]: F:跨会话验证统一助手的派工与恢复、具名资料传递、群任务执行及派工记录访问范围。 | R:code:miniagent/studio_dispatch.py,code:miniagent/studio_superagent.py | A:StudioDispatchTest | S:向群派工只授予读取该派工状态的能力，群内后续独立对话不能随回执泄露。单槽跨宿主竞争与重启恢复不能重复创建子任务。
+test_studio_duo.py[TW5S]: F:在双人小组中让负责人写作、同伴独立复核，并在三人组中验证更多角色选择与错误收件人反馈。 | R:code:miniagent/studio_crew.py | A:test_two_person_lead_can_author_then_collect_peers_independent_findings | S:-
+test_studio_group_messages.py[TM6S]: F:验证任务前后的持续群聊、并发重试、发布期间返回的问答和执行中的改要求如何进入群与原任务。 | R:code:miniagent/studio_group_messages.py,code:miniagent/studio_room_reply.py | A:GroupMessagesTests | S:复用已有验收或恢复选项不能把普通追问变成交办。若模型回复途中完成发布，持久消息按发布后展示，并保留实际引用。
+test_studio_group_queue.py[TW6S]: F:验证群内独立工作的先入先出、跨群共享执行槽的唤醒、并发追问和进程重启后的任务归并。 | R:code:miniagent/studio_group_queue.py,code:miniagent/studio_group_messages.py | A:GroupQueueTest | S:模拟任务已创建但消息尚未写回关联的崩溃点。恢复时重放保存的准入参数，应找回同一运行且不再次调用工作模型。
+test_studio_harness.py[TU5M]: F:经运行服务覆盖独立额度、取消、截图和压缩包导出，核验相对路径、容量和敏感文件排除。 | R:code:miniagent/studio_service.py,code:miniagent/studio_artifacts.py | A:test_bundle_rejects_binary_disguised_as_text_instead_of_corrupting_bytes | S:-
+test_studio_http.py[TN6M]: F:通过 HTTP 核对本机启动信息、同源与会话令牌、超级助手请求重放和错误响应脱敏。 | R:code:miniagent/studio_server.py | A:test_post_requires_both_same_origin_and_session_token | S:使用脚本模型驱动工具和状态变化
+test_studio_inherited_review.py[TQ5M]: F:让新轮次引用失败轮次中已发布的成员成果，检验确切版本、复核规则继承与作者资格。 | R:code:miniagent/studio_reviews.py,code:miniagent/studio_crew.py | A:test_published_member_in_failed_turn_can_be_reviewed_without_republishing | S:-
+test_studio_knowledge_projects.py[TD5S]: F:切换或重置角色的项目，核查共用目录的两个会话在提示注入、知识召回和按 ID 读取时使用同一来源范围。 | R:code:miniagent/studio_roles.py,code:miniagent/role_tools.py | A:test_two_rooms_sharing_role_and_folder_keep_run_sourced_notes_local | S:人工录入的目录知识可被两群使用；来源运行只属于一群的知识不会随文件夹共享。
+test_studio_loop_feedback.py[TR5T]: F:让脚本成员收到被过滤的失败结果后更换执行策略，核对交付探测提供的任务和检查路径。 | R:code:miniagent/tool_progress.py,code:miniagent/studio_acceptance.py | A:test_scripted_worker_can_change_strategy_after_a_filtered_failure | S:-
+test_studio_native_review.py[TQ7L]: F:验证结构化评审参数、冻结输入、来源和执行证据，演练签署、拒绝、修复及改版后的独立复核。 | R:code:miniagent/studio_reviews.py | A:test_submit_review_exposes_the_same_wire_constraints_that_parse_findings | S:-
+test_studio_peer_checks.py[TQ6M]: F:给合法的独立成员分配精确的待复检项，在版本重开、缺少签名或尚有其他义务时核验门槛。 | R:code:miniagent/peer_recheck.py,code:miniagent/studio_crew.py | A:test_briefing_identifies_separate_obligation_and_eligible_peers | S:-
+test_studio_preview.py[TU5T]: F:构造带本地依赖的隔离预览帧，检查越界资源、远程脚本、截断 HTML 或不完整依赖的处理。 | R:code:miniagent/studio_preview.py | A:test_local_dependencies_and_isolated_frame | S:-
+test_studio_progress_messages.py[TM5T]: F:交错输出文本和工具事件，在私聊、助手和群组委派间验证公开消息顺序及即时持久化。 | R:code:miniagent/studio_reply_stream.py,code:miniagent/studio_service.py | A:test_interleaved_stream_preserves_public_text_and_keeps_private_fields_separate | S:使用脚本模型驱动工具和状态变化
+test_studio_project_formats.py[TD5T]: F:导出含依赖、缓存、源码与构建产物的项目，核对排除项与成员进度只统计真实项目变更。 | R:code:miniagent/project_data.py,code:miniagent/studio_workspace.py | A:test_dependency_tree_excluded_while_sources_and_built_assets_reach_local_project | S:-
+test_studio_required_source_review.py[TQ7L]: F:在交付实际稿件前要求独立读取成品和对应来源，覆盖改稿、来源重取、引用冲突与签名失效。 | R:code:miniagent/studio_reviews.py,code:miniagent/research.py | A:test_final_file_requires_fresh_source_and_read_of_actual_manuscript | S:-
+test_studio_rework_budget.py[TW5S]: F:用有限预算执行返工和第二次签署，检验未启动工作的可用份额、必要成员及最终答复的预留。 | R:code:miniagent/studio_crew.py,code:miniagent/rao.py | A:test_bound_repair_and_second_signature_can_use_time_from_an_unstarted_release | S:-
+test_studio_role_directory.py[TU5S]: F:区分群成员与实际受派者，验证任务轮次链接、同名角色、旧版会话绑定与损坏任务库处理。 | R:code:miniagent/studio_role_directory.py | A:test_separates_group_membership_from_assignment_and_links_the_exact_turn | S:-
+test_studio_role_http.py[TU5S]: F:经浏览器协议编辑角色、提交待审知识、绑定旧私聊和切换项目，覆盖快照冲突与写入授权。 | R:code:miniagent/studio_server.py,code:miniagent/studio_roles.py | A:test_profile_edit_refuses_stale_snapshot_and_knowledge_writes_require_browser_token | S:使用脚本模型驱动工具和状态变化
+test_studio_role_memory.py[TD5S]: F:验证候选提案、用户拒绝或通过、历史恢复、角色和项目隔离及并发幂等修订。 | R:code:miniagent/studio_role_memory.py | A:test_active_candidate_rejection_and_historical_restoration | S:-
+test_studio_role_turns.py[TU5T]: F:重开角色私聊并修改职责，校验旧轮次身份保留、同名不同角色拒绝绑定与私有记忆隔离。 | R:code:miniagent/studio_roles.py,code:miniagent/studio_conversations.py | A:test_reopen_separate_dm_then_update_responsibility_without_rewriting_old_turn | S:-
+test_studio_route_results.py[TD5S]: F:把早先已交付的冻结文件转交下一轮，检查无歧义路径解析、版本摘要和伪造来源。 | R:code:miniagent/studio_route_results.py | A:test_next_turn_can_forward_frozen_output_and_observe_result | S:-
+test_studio_route_revisions.py[TW6T]: F:跨四轮修改同一成果，核验复核人复用、旧版本冻结，以及本地或其他作者的修改受保护。 | R:code:miniagent/studio_route_results.py,code:miniagent/studio_dispatch.py | A:test_four_turn_revision_reuses_reviewer_and_keeps_prior_file_frozen | S:-
+test_studio_routing_choices.py[TW5S]: F:核对首轮可见角色、受限交接工具、候选分页及工作区范围；需要独立角色时选择合适群组。 | R:code:miniagent/studio_superagent.py,code:miniagent/studio_dispatch.py | A:test_first_model_request_sees_roles_but_only_working_handoff_tools | S:-
+test_studio_service.py[TU7L]: F:经服务层创建及恢复任务，核对独立验收、请求幂等、后台执行、历史库兼容、诊断与产物预览范围。 | R:code:miniagent/studio_service.py | A:test_demo_uses_real_tools_acceptance_and_persisted_execution | S:使用脚本模型驱动工具和状态变化
+test_studio_steering.py[TW5M]: F:在派工、工具调用、验收和等待用户期间插入追问或更正，检验指导的送达、响应失效和安全重试。 | R:code:miniagent/studio_steering.py,code:miniagent/studio_group_messages.py | A:StudioSteeringTest,PausedModel | S:追问不关闭待答问题；过期工具调用要配对回执但不能执行。提供方失败也不能将指导记为已读。
+test_studio_superagent.py[TW6S]: F:验证超级助手创建的角色和空群可重用，覆盖首消息冲突、运行所有者恢复与工作目录切换。 | R:code:miniagent/studio_superagent.py | A:test_role_and_empty_group_are_real_linked_and_reusable_after_restart | S:使用脚本模型驱动工具和状态变化
+test_studio_tool_activity.py[TO5M]: F:核对工具时间线的调用身份、无操作原因、公开字段、终端回执及仅当前轮可见的输出。 | R:code:miniagent/tool_activity.py | A:test_no_change_has_no_artifact_and_reports_the_reason_in_the_timeline | S:使用脚本模型驱动工具和状态变化
+test_studio_upload_http.py[TU5S]: F:经 HTTP 上传同名二进制文件并绑定到指定消息，复验中断重试和非法请求保留原始内容。 | R:code:miniagent/studio_uploads.py,code:miniagent/studio_server.py | A:test_same_name_binary_files_bound_to_single_message_and_replayed | S:使用脚本模型驱动工具和状态变化
+test_studio_workspace.py[TD7M]: F:验证本地文件同步、成员检查点恢复、并发改动及跨只读问答复用与冻结版本绑定的独立评审。 | R:code:miniagent/studio_service.py,code:miniagent/studio_workspace.py | A:test_recovered_evidence_requires_the_frozen_bytes_and_independent_signer | S:旧问答如果实际调用了写工具就不能跳过。候选变化或签署者是作者时不能沿用通过结论。
+test_studio_workspace_members.py[TD6S]: F:对先后发布的两个成员成果检查即时可见性、根任务失败、重放、旧收据以及用户本地修改。 | R:code:miniagent/studio_workspace.py,code:miniagent/studio_crew.py | A:test_two_successive_member_publications_write_before_failed_root_finishes | S:-
+test_studio_workspace_races.py[TD5T]: F:在验证、落盘与回滚间制造并发新文件、打开数据库、取消及本地修改，核对既有数据受保护。 | R:code:miniagent/studio_workspace.py | A:test_concurrent_create_cannot_be_replaced_after_validation | S:-
+test_task_service.py[TD7L]: F:以请求键重放建图，用并发领取和错误注入验证任务、尝试、执行及验收报告同步提交。 | R:code:miniagent/task_service.py | A:test_two_processes_cannot_both_claim_the_same_revision | S:-
+test_task_store.py[TD7L]: F:核验 SQLite 中状态、绑定、二进制引用及发件箱一起提交或回滚，覆盖进程中断、并发和图约束。 | R:code:miniagent/task_store.py | A:test_two_process_compare_and_swap_commits_one_state_and_one_event | S:部分用例仅在 POSIX 环境执行
+test_task_store_orchestrator.py[TW6M]: F:运行各调度器并重新查询根子任务、执行标识及报告，注入依赖失败、领取冲突和重入。 | R:code:miniagent/task_store.py,code:miniagent/orchestrator.py | A:test_every_scheduler_persists_root_children_reports_and_execution_ids | S:-
+test_task_store_runtime.py[TD7M]: F:从单智能体和 CLI 的正常入口验证重开后的执行身份、文件验收、工具批次幂等及损坏数据库报错。 | R:code:miniagent/task_store.py,code:miniagent/agent.py | A:test_real_file_acceptance_and_execution_ids_survive_store_reopen | S:使用脚本模型驱动工具和状态变化
+test_task_token_replay.py[TP5T]: F:回放同一组已记录的模型用量，比较无限配置与显式额度下的累计令牌和执行状态。 | R:code:miniagent/agent.py,code:miniagent/rao.py | A:test_same_recorded_usage_with_unlimited_and_explicit_cap | S:使用已记录的用量序列回放
+test_tool_completion.py[TQ6S]: F:整批工具观察后由宿主触发完成，并逐项核对取消、发布门槛和硬验收失败仍能阻止交付。 | R:code:miniagent/agent.py,code:miniagent/rao.py | A:test_completion_observes_the_whole_batch_and_still_runs_publication_and_acceptance | S:-
+test_tool_progress.py[TR5S]: F:循环重放工具证据，核对同一失败范围、实际文件变化、缺少产物和匹配套件重跑的识别。 | R:code:miniagent/tool_progress.py | A:test_seven_step_cycle_reports_named_failure_unchanged_hash_and_missing_delivery | S:-
+test_tools.py[TB5S]: F:验证注册表、参数校验、文件工具、Python 执行和 HTTP 读取，覆盖删除授权与路径边界。 | R:code:miniagent/tools.py | A:test_validation_reports_missing_required | S:-
+test_author_review_request.py[TW6S]: F:从正常群聊验证作者冻结草稿、独立成员签署后自动交接、阶段发布、后续成员补件及整包验收。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py | A:AuthorReviewRequestTest | S:脚本模型在有效签署后若再次收到普通评审请求即报错；无关绿灯和不完整候选仍不能发布。
+test_unattributed_browser_handoff.py[TW7S]: F:复现浏览器载入前失败、作者更正自测而负责人只想搜索的路径，检验宿主直接派 QA 并按冻结产品的浏览器证据交付。 | R:code:miniagent/studio_crew.py,code:miniagent/studio_reviews.py | A:UnattributedBrowserHandoffTest | S:负责人的模型只主动委派一次。即使旧项目页面的断言通过，QA 也须实际检查此次候选，原失败才可核销。
+test_studio_role_briefs.py[TI6T]: F:通过真实角色与群服务检验自动生成职责在来源群、其他群和助手目录中的可见性，以及旧资料迁移和显式共享。 | R:code:miniagent/studio_roles.py,code:miniagent/studio_channels.py | A:RoleBriefScopeTests | S:只改名字不会把任务职责分享到其他群；群锚点和成员名册原始文件都不得留存其他群的职责全文。
+
+===/<repository>/tests/web/===
+browser_fixture.cjs[TQ4T]: F:启动 Python HTTP 夹具与 Chromium，把页面交给验证回调并在结束时关闭进程。 | R:code:tests/web/serve_room_fixture.py | A:withFixture | S:需要 Node.js、Playwright 和本地 Chromium
+chat_directory.cjs[TU4S]: F:用浏览器操作持久群聊列表、改名、置顶、加入成员与重开，核对界面焦点和实际服务端快照。 | R:code:miniagent/web/directory.js,code:miniagent/studio_channels.py | A:verify | S:需要 Node.js、Playwright 和本地 Chromium
+markdown_reader.cjs[TU5M]: F:在 Chromium 中操作 Markdown 阅读器，核对历史发布、继承文件、同名版本选择、嵌套链接、附件、下载和窄屏布局。 | R:code:miniagent/web/markdown-reader.js,code:tests/web/serve_markdown_fixture.py | A:withFixture | S:取消的最新轮不应改变旧引用。测试分别打开两个同名版本并检查不同正文，还覆盖迟到响应与无长度头附件的大小保护。
+preview_slides.cjs[TU4T]: F:操作本地幻灯片并检查样式和翻页，验证预览帧的不透明来源、脚本执行与外部网络限制。 | R:code:miniagent/studio_preview.py | A:withFixture | S:需要 Node.js、Playwright 和本地 Chromium
+role_library.cjs[TU4S]: F:在真实界面创建角色并打开独立私聊，核对表单请求、任务归属、项目标识与知识操作。 | R:code:miniagent/web/directory.js,code:miniagent/studio_role_directory.py | A:verify | S:需要 Node.js、Playwright 和本地 Chromium
+room_workflow.cjs[TU5M]: F:通过网页执行建群、定向派工、提问、失败草稿恢复和文件交付，并运行既有 DOM 稳定性回归。 | R:code:tests/web/serve_room_fixture.py,code:tests/web/studio_live_dom.js,code:miniagent/web/app.js | A:room,stability,checkSourceReviewRequest | S:用户交办原话只出现一次。未指定来源的同名文档可按轮次选择；仅当前轮要求的截图显示聊天缩略图。
+serve_markdown_fixture.py[TU4S]: F:创建带上传原件、冻结交接、未公开草稿及同名不同版本报告的临时 Studio 服务，供浏览器打开真实文件。 | R:code:tests/web/markdown_reader.cjs,code:miniagent/studio_server.py | A:main | S:冻结快照的清单含未出现在交接增量里的相对链接目标。
+serve_preview_fixture.py[TU4T]: F:在临时目录构造本地幻灯片和依赖并启动真实预览路由，供浏览器验证样式与交互。 | R:code:miniagent/studio_server.py,code:miniagent/studio_preview.py | A:main | S:本地临时幻灯片，无模型调用
+serve_role_fixture.py[TU4T]: F:用脚本模型、临时工作区和旧式内联角色启动真实 Studio，检验新建角色的独立聊天。 | R:code:miniagent/studio_server.py,code:miniagent/studio_roles.py | A:CheckIndependentChat | S:临时存储和脚本模型
+serve_room_fixture.py[TU4T]: F:用确定性模型在临时 HTTP 服务中重现团队询问、失败草稿恢复和随后的群问答，备有可下载的数据库与截图。 | R:code:tests/web/room_workflow.cjs,code:miniagent/studio_service.py | A:main,RoomReplyFixture | S:群问答使用单独的模型替身，避免消耗留给任务的回复。
+serve_stability_fixture.py[TU4T]: F:提供真实前端资源和本地浏览器检查入口，让固定快照驱动页面轮询和交互。 | R:code:miniagent/web/app.js,code:tests/web/studio_live_dom.js | A:Handler | S:本地夹具提供静态资产和模拟快照
+studio_live_dom.js[TU4S]: F:用随轮询变化的快照覆盖真实网页的滚动、焦点、输入重试、验收与历史签署呈现。 | R:code:miniagent/web/app.js,code:tests/web/serve_stability_fixture.py | A:fixturePolls | S:绑定有效的签署可与旧阻塞文字并存，但发布徽标需要真实发布。
+superagent_dispatch.cjs[TU4S]: F:在浏览器验证已完成与失败的委派卡片、历史分页、群聊链接及冻结文件预览。 | R:code:miniagent/web/superagent.js,code:miniagent/studio_dispatch.py | A:verify | S:浏览器中拦截 HTTP 并返回确定性响应
+superagent_ui.cjs[TU5M]: F:拦截浏览器 HTTP 请求验证统一助手的重试和角色导航，并从空群覆盖问答、定向工作、执行中调整与排队后的聊天顺序。 | R:code:miniagent/web/superagent.js,code:miniagent/web/app.js | A:verify | S:排队转为执行后，原请求只显示一次且仍早于随后追问。指向新任务的链接须留在原始消息处。
+
+===/<repository>/Mid_Test/===
+README.md[SQ5T]: F:汇总软件开发、新闻和模拟基金三组协作测试，链接各组身份、两道任务以及交付质量评估方式。 | R:code:docs/mid-test-status.md | A:- | S:每组先发布第一题，再在原群发送第二题，保留协作上下文。
+
+===/<repository>/Mid_Test/scenario_1_software_engineering 2/===
+01_role_initialization.md[SI4T]: F:规定软件开发群的技术负责人、软件开发者、测试工程师与发布经理各自的角色标识和职责。 | R:code:Mid_Test/scenario_1_software_engineering 2/02_task_1.md,code:Mid_Test/scenario_1_software_engineering 2/03_task_2.md | A:lead,dev,qa,release | S:-
+02_task_1.md[SQ5T]: F:提出用可运行的会议室预订系统取代共享表格，要求可查空闲、预订、取消，向用户展示成果并说明用法。 | R:code:Mid_Test/scenario_1_software_engineering 2/03_task_2.md | A:- | S:-
+03_task_2.md[SQ5T]: F:要求扩展同一会议室预订系统，用日期范围和图表展示预订频次、累计时长、繁忙时段及取消情况。 | R:code:Mid_Test/scenario_1_software_engineering 2/02_task_1.md | A:- | S:图表使用该系统的预约记录。
+
+===/<repository>/Mid_Test/scenario_2_newsroom 2/===
+01_role_initialization.md[SI4T]: F:定义新闻组主编、记者、事实核查员和编辑的角色身份，划分选题、采访、核查及编辑责任。 | R:code:Mid_Test/scenario_2_newsroom 2/02_task_1.md,code:Mid_Test/scenario_2_newsroom 2/03_task_2.md | A:chief_editor,reporter,fact_checker,editor | S:-
+02_task_1.md[SQ5T]: F:要求调查近期与港科大校园 AI 有关的具体事件，面向学生和教职员说明事件及意义，准备多渠道发布。 | R:code:Mid_Test/scenario_2_newsroom 2/01_role_initialization.md | A:- | S:-
+03_task_2.md[SQ5T]: F:要求调查 AI 写作检测工具能否可靠判定单份大学作业的作者，向师生解释证据、结论和仍存的不确定性。 | R:code:Mid_Test/scenario_2_newsroom 2/01_role_initialization.md | A:- | S:-
+
+===/<repository>/Mid_Test/scenario_3_securities_fund 2/===
+01_role_initialization.md[SI4T]: F:规定模拟证券基金群里基金经理、研究分析师、风控和客户沟通角色的 ID、决策与沟通责任。 | R:code:Mid_Test/scenario_3_securities_fund 2/02_task_1.md,code:Mid_Test/scenario_3_securities_fund 2/03_task_2.md | A:fund_manager,research,risk,marketing | S:-
+02_task_1.md[SQ5T]: F:设定一名 25 岁、持 100 万港元且希望投资美股的模拟客户，要求研究配置理由和风险并准备面向客户的介绍。 | R:code:Mid_Test/scenario_3_securities_fund 2/01_role_initialization.md | A:- | S:-
+03_task_2.md[SQ5T]: F:要求基金团队从 2026 年底视角研究半导体行业未来，在可逐页放映的浏览器 HTML 幻灯片中解释投资含义和主要风险。 | R:code:Mid_Test/scenario_3_securities_fund 2/01_role_initialization.md | A:- | S:-

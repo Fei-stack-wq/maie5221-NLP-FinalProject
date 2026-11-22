@@ -76,6 +76,19 @@ class StudioServiceTest(unittest.TestCase):
         self.assertTrue(tools)
         self.assertTrue(all(event["action_id"] and event["run_id"] for event in tools))
 
+    def test_active_worker_finishing_reports_has_no_finish_timestamp(self):
+        run_id, detail = self.demo()
+        meta = json.loads((self.service.runs_dir / run_id / "studio.json").read_text())
+        meta.update(state="running", finished_at=None)
+        with patch.object(self.service, "_meta", return_value=meta):
+            self.service._active.add(run_id)
+            try:
+                row = self.service._summary(self.service.runs_dir / run_id, tasks=detail["tasks"], events=[], artifacts=[])
+                self.assertEqual(row["status"], "running")
+                self.assertIsNone(row["finished_at"])
+            finally:
+                self.service._active.discard(run_id)
+
     def test_team_demo_persists_dependency_tree_and_independent_root_report(self):
         run = self.service.start(request("team-demo"))
         detail = finished(self.service, run["id"])
@@ -253,7 +266,8 @@ class StudioServiceTest(unittest.TestCase):
         with self.assertRaises(StudioError):
             self.service.detail(run_dir.name)
         self.assertEqual(database.read_bytes(), original)
-        self.assertNotIn("completed", {r["status"] for r in self.service.list_runs()["runs"]})
+        row, = self.service.list_runs()["runs"]
+        self.assertEqual(row["status"], "unknown")
 
     def test_passed_history_requires_exact_spec_and_evidence_closure(self):
         for kind in ("spec", "receipts", "latest_report"):
@@ -383,6 +397,8 @@ class StudioServiceTest(unittest.TestCase):
         try:
             value = service.bootstrap()
             self.assertTrue(value["provider_ready"])
+            self.assertTrue(value["message_thinking"])
+            self.assertEqual(value["thinking"], "enabled")
             self.assertNotIn("synthetic-key-not-for-browser", json.dumps(value))
             self.assertNotIn("api_key", value)
         finally:

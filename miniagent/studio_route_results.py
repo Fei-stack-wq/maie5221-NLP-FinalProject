@@ -245,6 +245,7 @@ def capture_delivery(service, child, meta):
 
 def project_dispatches(service, source_id):
     from .studio_conversations import member_profiles
+    from .studio_diagnostics import current_activity
     from .studio_service import _read_file
     from .studio_steering import steering_rows
     rows = service.studio_dispatches(source_id)
@@ -271,9 +272,12 @@ def project_dispatches(service, source_id):
             entry["member_names"] = {key: profile["name"] for key, profile in member_profiles(thread).items()}
         if row["status"] in {"running", "waiting_user"}:
             entry["archived_tasks"] = [r["task_id"] for r in public if r["kind"] == "member_report" and r.get("task_id")]
-            calls = service.tool_activity(child_id)["calls"]
-            if calls:
-                entry["current_call"] = calls[-1]
+            events, clipped = service._events(child)
+            entry["current_activity"] = current_activity(events)
+            calls = service._activity(child, events, clipped, active=True)["calls"]
+            current = next((call for call in reversed(calls) if call["status"] == "running"), None)
+            if current:
+                entry["current_call"] = current
         if row["status"] in {"completed", "unverified"}:
             answer, clipped = _read_file(child, "conversation-answer.txt", 8192, missing=True)
             entry.update(answer=answer.decode("utf-8", errors="ignore"), answer_truncated=clipped,

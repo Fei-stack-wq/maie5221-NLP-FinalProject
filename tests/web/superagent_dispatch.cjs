@@ -79,7 +79,10 @@ async function verify(page, url) {
   const card=sourceTurn.getByRole('region',{name:'小维的任务'});
   const status=card.locator('.dispatch-status');
   const input=page.getByLabel('给工作室助手发消息');
+  const progressBar=page.getByRole('status',{name:'任务进度',exact:true});
   await status.getByText('排队中').waitFor();
+  await progressBar.getByText('排队中').waitFor();
+  assert.equal(await progressBar.getByText('维护复核组').count(),0);
   assert.equal(await card.getByRole('link').count(),0);
   assert(await input.isEnabled());
   const failed=sourceTurn.getByRole('region',{name:'维护复核组的任务'});
@@ -95,6 +98,13 @@ async function verify(page, url) {
     events:[{kind:'assistant_progress',role:'caretaker',reply_id:'progress-1',text:'我在核对依赖版本。<input>'}]});
   await page.getByText('刚才是谁在处理？',{exact:true}).waitFor();
   await status.getByText('运行中').waitFor();
+  await progressBar.getByText('小维 · 读取文件 · pyproject.toml').waitFor();
+  assert.equal(await progressBar.getByText('已完成').count(),0);
+  await page.setViewportSize({width:375,height:780});
+  const panelBounds=await progressBar.boundingBox(), inputBounds=await input.boundingBox();
+  assert(panelBounds.y>=0 && panelBounds.y+panelBounds.height<=inputBounds.y && inputBounds.y+inputBounds.height<=780);
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.setViewportSize({width:1280,height:720});
   await sourceTurn.getByRole('button',{name:'查看更早消息'}).click();
   await sourceTurn.getByText(earlierSteer.text,{exact:true}).waitFor();
   await sourceTurn.getByText(earlierProgress.text,{exact:true}).waitFor();
@@ -124,6 +134,8 @@ async function verify(page, url) {
     {request_id:'choice',role:'caretaker',text:'需要检查 Python 吗？'}]});
   const question=card.locator('form[data-question="choice"]');
   await question.waitFor();
+  await progressBar.getByText('等待你的答复').waitFor();
+  assert.equal(await progressBar.getByText(/读取文件/).count(),0);
   assert(detailReads>priorReads);
   assert(await card.evaluate((node,previous)=>node===previous,stable));
   const answer=question.locator('textarea');
@@ -150,6 +162,7 @@ async function verify(page, url) {
   await card.getByRole('link',{name:'进入私聊'}).click();
   await page.waitForURL('**/#run/'+child+'/chat?latest=1');
   await page.locator('.reply-form').waitFor();
+  await progressBar.getByText('已结束 · 未独立验收').waitFor();
   assert.deepEqual(errors,[]);
 }
 

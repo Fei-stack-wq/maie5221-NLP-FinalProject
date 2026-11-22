@@ -196,7 +196,7 @@ def project_context(thread: dict, history: list[dict]) -> str:
                              if e["kind"] == "studio_entity" and isinstance(e.get("entity"), dict))
             for dispatch in turn.get("dispatches", [])[-8:]:
                 decisions.append({"派工": dispatch["objective"][:600], "收件人": dispatch["target_name"],
-                                  "目标 ID": dispatch["target_id"], "状态": dispatch["status"],
+                                  "目标 ID": dispatch["target_id"], "派工编号": dispatch.get("dispatch_id"), "状态": dispatch["status"],
                                   "答复节选": dispatch["answer"][:1600], "错误": dispatch.get("error", ""),
                                   "交付引用": [file["ref"] for file in dispatch["artifacts"][:24]]})
         if decisions:

@@ -48,6 +48,71 @@ class StudioCrewTest(unittest.TestCase):
             detail = finished(self.service, run["id"])
         return detail, provider
 
+    def test_completed_stages_route_the_unclaimed_final_file_to_the_leads_writable_workspace(self):
+        roles = ("fund_manager", "research", "risk", "marketing")
+        files = ["project/" + name for name in ("00-goals.md", "01-research.md", "02-risk.md", "03-intro.md")]
+        final = "project/PROPOSAL.md"
+        script = []
+        for i, (role, path) in enumerate(zip(roles, files)):
+            script.extend([tool("delegate_task", assignee=role, objective="Prepare stage " + path,
+                                deliverable_paths=[path], remaining_roles=list(roles[i+1:])),
+                           write(path, "Signed stage handoff for " + role), {"text":"Handed off."}])
+        script.extend([tool("run_shell", command="cat project/02-risk.md"),
+                       tool("read_file", path=files[2]), write(final, "Proposal incorporating the risk findings."),
+                       {"text":"Published the proposal."}, {"text":"Delivered."}])
+        workspace = self.root / "local"
+        workspace.mkdir()
+        detail, _ = self.execute(script, roster(*roles), objective="@research @risk @marketing complete the stages.",
+                                 acceptance_files=[*files, final], workspace_path=str(workspace), limits={"max_steps":0})
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        dispatched = [e for e in detail["room_events"] if e["kind"] == "assignment"]
+        self.assertEqual([e["recipient"] for e in dispatched], [*roles, "fund_manager"])
+        self.assertEqual(dispatched[-1]["deliverable_paths"], [final])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertIn(files[2], reports[-1]["evidence"]["inspected"])
+        self.assertEqual((workspace / final).read_text(), "Proposal incorporating the risk findings.")
+        for role, path in zip(roles, files):
+            self.assertEqual((workspace / path).read_text(), "Signed stage handoff for " + role)
+
+    def test_failed_final_handoff_closes_with_missing_path_without_a_second_assignment(self):
+        stage, final = "notes.md", "report.md"
+        script = [tool("delegate_task", assignee="research", objective="Prepare the source notes.",
+                       deliverable_paths=[stage], remaining_roles=[]),
+                  write(stage, "The required evidence is unavailable."), {"text":"Published notes."},
+                  tool("run_shell", command="cat notes.md"),
+                  {"text":"[BLOCKED] The primary document is missing."},
+                  {"text":"[BLOCKED] report.md requires an additional document."}]
+        detail, _ = self.execute(script, roster("lead", "research"), objective="Research and deliver the report.",
+                                 acceptance_files=[stage, final], limits={"max_steps":0})
+        self.assertEqual(detail["run"]["status"], "failed")
+        assignments = [e for e in detail["room_events"] if e["kind"] == "assignment"]
+        self.assertEqual([(e["recipient"], e["deliverable_paths"]) for e in assignments],
+                         [("research", [stage]), ("lead", [final])])
+        self.assertFalse((self.root / "runs" / detail["run"]["id"] / "agents" / "lead" / final).exists())
+        self.assertIn(final, detail["conversation"]["turns"][-1]["answer"])
+
+    def test_explicit_independent_review_keeps_its_frozen_input_before_final_delivery(self):
+        from tests.test_studio_native_review import PATH, RULE, submit
+        label = "Shipment destination: verified warehouse."
+        final = "release.md"
+        script = [tool("delegate_task", assignee="builder", objective="Create shipment label.",
+                       remaining_roles=[], deliverable_paths=[PATH]), write(PATH, label), {"text":"Label ready."},
+                  tool("delegate_task", assignee="auditor", objective="Check the label before release.",
+                       review={"candidate":PATH, "criteria":[RULE]}),
+                  write(PATH, "Overwritten during review."), tool("read_file", path=PATH), submit(label, "passed"),
+                  tool("run_shell", command="cat delivery.txt"),
+                  write(final, "Release notes for the independently checked label."), {"text":"Published."},
+                  {"text":"Released both documents."}]
+        detail, _ = self.execute(script, roster("lead", "builder", "auditor"), objective="Deliver the checked label.",
+                                 acceptance_files=[PATH, final])
+        self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
+        reports = [e["handoff"] for e in detail["room_events"] if e["kind"] == "member_report"]
+        self.assertEqual([r["role"] for r in reports], ["builder", "auditor", "lead"])
+        self.assertEqual(reports[1]["native_review"]["state"], "passed")
+        self.assertEqual(reports[-1]["deliverable_paths"], [final])
+        workspace = self.root / "runs" / detail["run"]["id"] / "agents" / "lead"
+        self.assertEqual((workspace / PATH).read_text(), label)
+
     def test_member_can_retry_its_original_browser_check_in_its_original_working_directory(self):
         original = ("from pathlib import Path\npage.goto(Path('index.html').resolve().as_uri())\n"
                     "assert page.locator('h1').inner_text() == 'Ready', 'page title mismatch'")
@@ -376,7 +441,9 @@ class StudioCrewTest(unittest.TestCase):
         goals = [e for e in detail["events"] if e["kind"] == "step_start" and e["level"] == "goal"]
         self.assertIn("read_lines",goals[0]["offered_tools"])
         for event in goals[1:]:
-            self.assertLessEqual(set(event["offered_tools"]), {"abort_task", "delegate_task", "ask_human"})
+            if event["phase"] == "coordinate":
+                self.assertIn("run_shell", event["offered_tools"])
+                self.assertNotIn("submit_review", event["offered_tools"])
         assignments = [e for e in detail["room_events"] if e["kind"] == "assignment"]
         self.assertEqual([e["recipient"] for e in assignments], ["writer", "reviewer"])
         first, last = assignments
@@ -598,6 +665,7 @@ class StudioCrewTest(unittest.TestCase):
                 self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])
                 rows = [e for e in detail["room_events"] if e["kind"] == "assignment" and e["recipient"] == "writer"]
                 self.assertEqual(rows[1]["resumed_private_draft"], not published_in_between)
+                self.assertEqual(rows[1]["recovered_task_id"], rows[0]["task_id"] if not published_in_between else None)
                 reports = [e for e in detail["room_events"] if e["kind"] == "member_report" and e["role"] == "writer"]
                 self.assertFalse(reports[0]["published"])
                 self.assertEqual({c["path"] for c in reports[1]["handoff"]["changed_files"]}, {"draft.md", "guide.md"})
@@ -763,7 +831,7 @@ class StudioCrewTest(unittest.TestCase):
         self.assertEqual(detail["run"]["status"],"completed",detail["diagnostics"])
         first, initial_tools = provider.requests[0]
         self.assertIn("find_files",initial_tools)
-        self.assertNotIn("run_shell",initial_tools)
+        self.assertIn("run_shell",initial_tools)
         self.assertNotIn("write_file",initial_tools)
         self.assertNotIn(secret_line,str(first))
         self.assertIn("module.py",str(provider.requests[1][0][-1]["content"].split("负责人已核实的公开工作区内容")[1]))
@@ -835,7 +903,7 @@ class StudioCrewTest(unittest.TestCase):
         initial_prompt = str(provider.requests[0][0])
         self.assertIn("search_sources", initial_prompt)
         self.assertIn("http_get", initial_prompt)
-        self.assertNotIn("http_get", provider.requests[0][1])
+        self.assertIn("http_get", provider.requests[0][1])
 
     def test_unanswered_member_question_cannot_consume_the_leads_deadline(self):
         service_handler = self.service._human_handler

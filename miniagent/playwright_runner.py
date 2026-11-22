@@ -47,8 +47,9 @@ class DocumentWitness:
         self.workspace = workspace
         self.digests = {}
         self.checked = {"passed": set(), "failed": set()}
+        self.named = {"passed": {}, "failed": {}}
         self.reads = set()
-        self.expectations = weakref.WeakSet()
+        self.expectations = weakref.WeakKeyDictionary()
         self.failed_read = None
         page.on("response", self.navigation)
         for target in (page, page.main_frame):
@@ -91,15 +92,22 @@ class DocumentWitness:
                 return None
         return self.digests[response]
 
-    def record(self, digest, status):
-        if digest and len(self.checked[status]) < 16:
-            self.checked[status].add(digest)
+    def record(self, digests, status, label=None):
+        docs = frozenset(d for d in digests if d)
+        for digest in docs:
+            if len(self.checked[status]) < 16:
+                self.checked[status].add(digest)
+        if (docs and isinstance(label, str) and 0 < len(label) <= 80
+                and (label in self.named[status] or len(self.named[status]) < 24)):
+            checks = self.named[status].setdefault(label, set())
+            if len(checks) < 16:
+                checks.add(docs)
 
     def check(self, factory, *args, **kwargs):
         result = factory(*args, **kwargs)
         actual = args[0] if args else kwargs.get("actual")
         if factory is self.api.expect and isinstance(actual, self.api.Locator) and actual.page is self.page:
-            self.expectations.add(result)
+            self.expectations[result] = args[1] if len(args) > 1 else kwargs.get("message")
         return result
 
     def assertion(self, method, *args, **kwargs):
@@ -111,10 +119,10 @@ class DocumentWitness:
             value = method(*args, **kwargs)
         except AssertionError:
             if document is self.document:
-                self.record(self.current_digest(), "failed")
+                self.record([self.current_digest()], "failed", self.expectations[assertion])
             raise
         if document is self.document:
-            self.record(self.current_digest(), "passed")
+            self.record([self.current_digest()], "passed", self.expectations[assertion])
         return value
 
     def read(self, checked, method, *args, **kwargs):
@@ -135,10 +143,9 @@ class DocumentWitness:
     def begin(self):
         self.reads.clear()
 
-    def outcome(self, condition):
+    def outcome(self, condition, label=None):
         condition = bool(condition)
-        for digest in self.reads:
-            self.record(digest, "passed" if condition else "failed")
+        self.record(self.reads, "passed" if condition else "failed", label)
         return condition
 
 
@@ -171,7 +178,8 @@ class AssertionCalls(ast.NodeTransformer):
         self.in_assert = False
         # Later assertions cannot inherit a DOM read from a caught exception.
         reset = ast.Expr(self.invoke("begin", []))
-        node.test = self.invoke("outcome", [node.test])
+        label = node.msg.value if isinstance(node.msg, ast.Constant) and isinstance(node.msg.value, str) else None
+        node.test = self.invoke("outcome", [node.test, ast.Constant(label)])
         return [ast.copy_location(reset, node), node]
 
 
@@ -217,11 +225,14 @@ def main():
                         # before the script reaches its next assert. Only retain
                         # the uncaught timeout from this actual page.
                         if witness.failed_read and exc is witness.failed_read[0]:
-                            witness.record(witness.failed_read[1], "failed")
+                            witness.record([witness.failed_read[1]], "failed")
                         raise
                     finally:
-                        payload = json.dumps({key: sorted(values, key=lambda v: (v[0] or "",v[1])) for key, values in witness.checked.items()},
-                                             separators=(",", ":")).encode()
+                        order = lambda pair: (pair[0] or "", pair[1])
+                        claims = {key: sorted(values, key=order) for key, values in witness.checked.items()}
+                        claims["named"] = {status: {k: [sorted(docs, key=order) for docs in checks] for k, checks in by_id.items()}
+                                           for status, by_id in witness.named.items()}
+                        payload = json.dumps(claims, separators=(",", ":")).encode()
                         receipt.seek(0)
                         receipt.truncate()
                         receipt.write(hmac.digest(signing_key, payload, "sha256") + payload)

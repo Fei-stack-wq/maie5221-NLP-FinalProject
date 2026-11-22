@@ -21,6 +21,42 @@
     return state.route === 'assistant' ? studioAssistant.turns() : state.detail?.conversation?.turns || [];
   }
 
+  function groupFileIndex(row) {
+    const turns = knownTurns();
+    const horizon = turns.slice(0,turns.findIndex(turn => turn.run_id === row.parent_run_id) + 1);
+    const ordinals = new Map(horizon.map((turn,index) => [turn.run_id, turn.ordinal || index + 1]));
+    const candidates = new Map(), cited = new Map();
+    function index(entry, byName) {
+      const {run_id:run, path:name, ref:path} = entry;
+      if (!ordinals.has(run) || typeof name !== 'string' || !isMarkdown(name) ||
+          typeof path !== 'string' || !rootPattern.test(path) || projectPath(path) !== name) return;
+      const ref = {run, path, name, ordinal:ordinals.get(run)};
+      for (const key of [name, name.split('/').pop(), path]) {
+        if (!byName.has(key)) byName.set(key, new Map());
+        byName.get(key).set(run + '/' + path, ref);
+      }
+    }
+    for (const turn of horizon) {
+      if (turn.run_id === row.parent_run_id && row.after_turn === false) {
+        for (const event of turn.events || []) {
+          if (!event.handoff?.published || !event.at || event.at > row.at) continue;
+          for (const file of event.artifacts || []) {
+            index({run_id:turn.run_id,path:file.project_path,ref:file.path},candidates);
+          }
+        }
+      } else {
+        for (const item of turn.published_artifacts || []) index(item,candidates);
+      }
+    }
+    for (const item of row.cited_artifacts || []) index(item,cited);
+    const files = new Map();
+    for (const [name, versions] of [...candidates, ...cited]) {
+      const refs = [...versions.values()];
+      files.set(name, refs.length === 1 ? refs[0] : {choices:refs});
+    }
+    return {files, names:[...files.keys()].sort((a,b) => b.length-a.length)};
+  }
+
   function scope(turn, row) {
     const files = new Map();
     // A later group publication supersedes its predecessor. Files returned side
@@ -61,6 +97,9 @@
       if (event === row) return files;
     }
     if (!row) {
+      addBatch((turn.published_artifacts || []).map(item => ({
+        run_id:item.run_id, artifacts:[{path:item.ref, project_path:item.path}]
+      })));
       addBatch([turn,...(turn.dispatches || []).map(child => ({run_id:child.child_run_id, artifacts:child.artifacts}))]);
     }
     return files;
@@ -100,6 +139,13 @@
     return env.files.get(relative) || null;
   }
 
+  function linkOpen(ref, fragment = '') {
+    if (ref.choices) return '<button type="button" class="md-file md-versions" title="选择文件版本" data-md-versions="' +
+      escape(JSON.stringify(ref.choices)) + '"' + fragment + '>';
+    return '<a class="md-file" ' + attributes(ref) + fragment + '>';
+  }
+  const linkTag = ref => ref.choices ? 'button' : 'a';
+
   function fileText(content, env) {
     if (env.inLink || !env.names.length) return escape(content);
     let html = '', offset = 0;
@@ -115,8 +161,8 @@
         const path = content.slice(start,end);
         const ref = resolve(path, env);
         if (!ref && env.files.get(name) !== null) continue;
-        html += escape(content.slice(offset,start)) + (ref ? '<a class="md-file" ' + attributes(ref) + '>' + escape(path) +
-          '</a>' : '<span class="md-unavailable" title="有多个同名附件，请在交付材料中选择">' + escape(path) + '</span>');
+        html += escape(content.slice(offset,start)) + (ref ? linkOpen(ref) + escape(path) +
+          '</' + linkTag(ref) + '>' : '<span class="md-unavailable" title="有多个同名附件，请在交付材料中选择">' + escape(path) + '</span>');
         offset = end;
         break;
       }
@@ -129,7 +175,7 @@
     const text = tokens[i].content;
     const code = '<code>' + escape(text) + '</code>';
     const ref = env.inLink ? null : resolve(text, env);
-    if (ref) return '<a class="md-file" ' + attributes(ref) + '>' + code + '</a>';
+    if (ref) return linkOpen(ref) + code + '</' + linkTag(ref) + '>';
     const reason = env.files.get(text) === null ? '有多个同名附件，请在交付材料中选择' : '本条消息没有可打开的对应附件';
     return !env.inLink && isMarkdown(text) ? '<code title="' + reason + '">' + escape(text) + '</code>' : code;
   };
@@ -141,7 +187,7 @@
     const ref = resolve(path, env, true);
     const bookmark = fragment && ' data-md-fragment="' + escape(fragment) + '"';
     env.inLink = 'a';
-    if (ref) return '<a class="md-file" ' + attributes(ref) + bookmark + '>';
+    if (ref) { env.inLink = linkTag(ref); return linkOpen(ref,bookmark); }
     if (!path && fragment && env.source) return '<a href="#' + escape(encodeURIComponent(fragment)) + '"' + bookmark + '>';
     if (/^https?:\/\//i.test(href)) return '<a href="' + escape(href) + '" target="_blank" rel="noopener noreferrer">';
     env.inLink = 'span';
@@ -174,6 +220,11 @@
     if (!cache) { cache = new WeakMap(); indices.set(turn, cache); }
     const key = row || turn;
     if (cache.has(key)) return cache.get(key);
+    if (row?.kind === 'group_message') {
+      const index = groupFileIndex(row);
+      cache.set(key,index);
+      return index;
+    }
     const files = scope(turn, row);
     const basenames = new Map();
     for (const [name, ref] of files) {
@@ -259,6 +310,19 @@
     attachmentController?.abort();
     attachmentController = null;
     const request = ++generation;
+    if (ref.choices) {
+      dialog.querySelector('h2').textContent = ref.name;
+      dialog.querySelector('.md-origin').textContent = '选择文件版本';
+      dialog.querySelector('.md-path').hidden = true;
+      dialog.querySelector('[download]').hidden = true;
+      back.hidden = true;
+      const fragment = ref.fragment ? ' data-md-fragment="' + escape(ref.fragment) + '"' : '';
+      body.innerHTML = '<ul class="md-version-list">' + ref.choices.map(option =>
+        '<li><a ' + attributes(option) + fragment + '>第 ' + escape(String(option.ordinal)) + ' 轮 · ' +
+        escape(option.name) + '</a></li>').join('') + '</ul>';
+      if (!dialog.open) dialog.showModal();
+      return;
+    }
     const name = projectPath(ref.path);
     dialog.querySelector('h2').textContent = name.split('/').pop();
     const pathLabel = dialog.querySelector('.md-path');
@@ -288,6 +352,12 @@
     }
   }
   document.addEventListener('click', event => {
+    const versions = event.target.closest?.('button[data-md-versions]');
+    if (versions) {
+      stack = [{name:versions.textContent, choices:JSON.parse(versions.dataset.mdVersions), fragment:versions.dataset.mdFragment}];
+      show(stack[0]);
+      return;
+    }
     const link = event.target.closest?.('a[data-md-path], a[data-md-fragment]');
     if (!link || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
     event.preventDefault();

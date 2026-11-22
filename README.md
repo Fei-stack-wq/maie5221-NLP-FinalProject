@@ -73,7 +73,7 @@ python -m miniagent run "调研 ReAct 并写一份 notes.md"
 python -m miniagent orchestrate "调研并写报告" --scheduler evented --max-parallel 2
 ```
 
-默认 `deepseek-flash`、显式关闭 thinking、每次最多输出 300000 token；请求重试与 deadline 可配置。任务默认持续到完成、取消或出现执行错误，持续计量耗时、轮数与 token。CLI 可用 `--max-seconds 1800` 设置半小时时限，也可用 `--max-steps N` 设置轮数。两项传 0 均表示不限。网页可逐轮选择不限或填写正数；网页选项可按任务设置预算，运行时可请求停止，结束后可下载保留相对目录的产物 ZIP。输出截断最多恢复两次，上下文按完整工具批次裁剪，大文件支持分页读取、局部编辑及追加；详见 [Harness 基础能力](docs/harness-foundations.md)。除 `studio` 的本地配置加载入口外，`.env` 不自动加载；变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
+默认使用 `deepseek-flash` 并开启 thinking。统一助手、私聊和群聊的输入框旁均可为下一条消息选择“思考开启”或“思考关闭”。群聊派工和统一助手委派的成员沿用该轮设置。执行中追加的消息沿用正在运行任务的配置。服务默认值可通过项目 `.env` 的 `DEEPSEEK_THINKING=enabled` 或 `disabled` 设置，保存并重启 Studio 后生效，进程环境变量优先。每次最多输出 300000 token；请求重试与 deadline 可配置。任务默认持续到完成、取消或出现执行错误，持续计量耗时、轮数与 token。CLI 可用 `--max-seconds 1800` 设置半小时时限，也可用 `--max-steps N` 设置轮数。两项传 0 均表示不限。网页可逐轮选择不限或填写正数；网页选项可按任务设置预算，运行时可请求停止，结束后可下载保留相对目录的产物 ZIP。输出截断最多恢复两次，上下文按完整工具批次裁剪，大文件支持分页读取、局部编辑及追加；详见 [Harness 基础能力](docs/harness-foundations.md)。除 `studio` 的本地配置加载入口外，`.env` 不自动加载；变量模板见 [.env.example](.env.example)，完整字段、探针退出码和线上证据限制见 [M0-03](docs/m0-03-provider-protocol.md)。
 
 > `--mock` 只能配 `--scheduler serial`：`ScriptedProvider` 带游标、不是线程安全的，
 > 并发/事件驱动请用真实模型（或用 `agent_factory` 注入独立 provider）。

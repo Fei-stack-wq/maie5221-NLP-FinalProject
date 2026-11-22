@@ -15,6 +15,11 @@ def call(name, **arguments):
     return {"tool_calls": [{"name": name, "arguments": arguments}]}
 
 
+class RoomReplyFixture(ScriptedProvider):
+    def chat(self, messages, tools=None, temperature=0, *, required_tool=None):
+        return super().chat(messages, tools, temperature)
+
+
 def main():
     with TemporaryDirectory() as scratch:
         project = (Path(scratch) / "fixture project").resolve()
@@ -40,7 +45,9 @@ def main():
             call("append_file", path="working.md", content="\nThe follow-up revision is complete."),
             {"text": "已接续并完成修订。"},
         ])
+        chat = RoomReplyFixture([call("room_response", action="reply", answer="这次交付了 working.md 和截图。", authorization_quote="")])
         with (patch("miniagent.studio_service.DeepSeekProvider", side_effect=[first, followup]),
+              patch("miniagent.studio_room_reply.DeepSeekProvider", return_value=chat),
               patch("miniagent.studio_workspace.pick_directory", return_value=str(project))):
             print(f"http://127.0.0.1:{server.server_port}/", flush=True)
             try:

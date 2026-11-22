@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from miniagent.config import Settings
-from miniagent.studio_route_results import delivery_catalog, imported_review_candidate, read_delivery
+from miniagent.studio_route_results import delivery_catalog, imported_review_candidate, project_dispatches, read_delivery
 from miniagent.studio_service import StudioError, StudioService
 from tests.test_studio_conversations import RecordingProvider
 from tests.test_studio_superagent import message, tool
@@ -41,6 +41,37 @@ class ReturnedFilesTest(unittest.TestCase):
                     return rid, latest[0], providers
                 time.sleep(.01)
         self.fail("No terminal dispatch receipt")
+
+    def test_running_dispatch_projects_open_model_step_after_a_tool_error(self):
+        rid, row, _ = self.routed([dispatch("worker", "Write a note"), {"text": "已交接"}], [{"text": "Done"}])
+        child = self.service.runs_dir / row["child_run_id"]
+        meta_file = child / "studio.json"
+        meta = json.loads(meta_file.read_text())
+        meta["state"] = "running"
+        meta_file.write_text(json.dumps(meta))
+        common = {"task_id": child.name, "attempt_id": "a", "run_id": "r"}
+        events = [{**common, "kind": "tool_result", "step": 1, "operation": "read_file", "action_id": "one",
+                   "agent": "worker", "ok": False},
+                  {**common, "kind": "step_start", "step": 2, "phase": "work"}]
+        self.service._active.add(child.name)
+        try:
+            with patch.object(self.service, "_events", return_value=(events, False)):
+                entry, = project_dispatches(self.service, rid)
+                self.assertEqual(entry["status"], "running")
+                self.assertNotIn("current_call", entry)
+                phase, = entry["current_activity"]
+                self.assertEqual((phase["role"], phase["step"]), ("worker", 2))
+                events.append({**common, "kind": "tool_start", "step": 2, "tool": "write_file", "agent": "worker",
+                               "action_id": "two"})
+                entry, = project_dispatches(self.service, rid)
+                self.assertEqual(entry["current_call"]["tool"], "write_file")
+            meta["studio_dispatch"]["source_run_id"] = "unrelated"
+            meta_file.write_text(json.dumps(meta))
+            entry, = project_dispatches(self.service, rid)
+            self.assertEqual(entry["status"], "unknown")
+            self.assertIsNone(entry["child_run_id"])
+        finally:
+            self.service._active.discard(child.name)
 
     def test_next_turn_can_forward_frozen_output_and_observe_result(self):
         parent, produced, _ = self.routed(

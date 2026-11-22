@@ -70,10 +70,9 @@ class ExecuteReviewGuidanceTest(unittest.TestCase):
                        and '"evidence": []' in msg["content"])
         self.assertEqual(catalog["total"], 0)
         actions = catalog["execute"]["actions"]
-        self.assertIn("顶层 assert", actions["run_python"])
-        self.assertIn("expect", actions["run_browser"])
-        self.assertIn("to_be_in_viewport(ratio=1)", actions["run_browser"])
-        self.assertIn("滚动并验证可达", actions["run_browser"])
+        self.assertEqual(set(actions), {"run_python", "run_browser", "run_shell"})
+        self.assertNotIn("to_be_in_viewport(ratio=1)", str(catalog))
+        self.assertNotIn("单屏投影", str(catalog))
         self.assertEqual(set(actions), {option["tool"] for option in catalog["needs"]["quantity"]})
         correction = str(provider.requests[8][0])
         self.assertIn('"passed_checks": []', correction)
@@ -94,6 +93,11 @@ class ExecuteReviewGuidanceTest(unittest.TestCase):
         session = ReviewSession(review, files, Mock(), "attempt")
         session._add("pass:quantity", {"kind": "passed_check", "label": "Quantity checked"}, None)
         self.assertEqual(session.closing_options(), {"submit_review", "list_review_evidence"})
+        briefing = session.context()
+        self.assertIn(rule.description, briefing)
+        self.assertIn(PATH, briefing)
+        self.assertNotIn("runpy.run_path('实际模块.py')", briefing)
+        self.assertNotIn("内嵌的完整 HTML", briefing)
 
     def test_closing_offers_only_the_roles_registered_execution_tools(self):
         files = {PATH: SHA}

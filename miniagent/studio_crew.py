@@ -18,6 +18,7 @@ from pathlib import Path
 from .acceptance import _relative_name
 from .agent import Agent
 from .context_window import estimate_tokens
+from .coordinator_workspace import CoordinatorWorkspace
 from .crew_diagnostics import REVIEW_SCRIPT_SUFFIXES, RoomDiagnostics
 from .crew_progress import MemberProgress, _cover
 from .member_processes import managed_member_processes
@@ -29,11 +30,15 @@ from .schemas import ToolResult
 from .studio_acceptance import build_checks
 from .studio_reviews import CandidateLookupError, InheritedCriteriaConflict, Review, ReviewQueue, ReviewRequest, ReviewSession, Rule, digest, manifest_issue
 from .studio_conversations import SnapshotError, UnsupportedProjectFile, copy_project, member_profiles, snapshot_location
-from .tools import build_default_registry
+from .tools import Tool, ToolRegistry, build_default_registry
 
 
 _KNOWLEDGE_READS = frozenset({"recall_role_knowledge", "read_role_knowledge"})
 _PROJECT_READS = frozenset({"find_files", "list_dir", "search_files", "read_file", "read_lines"})
+_CHECK_TOOLS = frozenset({"read_source", "search_sources", "http_get", "run_shell", "poll_process", "run_python", "run_browser"})
+_MAX_ASSIGNMENT_FILES = 32
+_RUNNABLE_SUFFIXES = REVIEW_SCRIPT_SUFFIXES | {".html", ".htm", ".css", ".jsx", ".tsx", ".sql", ".cxx", ".cmake", ".mk"}
+_REVIEW_DOCUMENT_SUFFIXES = frozenset({".md", ".rst", ".txt", ".csv", ".tsv", ".json"})
 _INCIDENTAL_DATA = SQLITE_EXTENSIONS | {".log", ".csv", ".tsv", ".jsonl"}
 
 
@@ -148,6 +153,7 @@ class RoomCrew:
         self.private_read = ""
         self.navigation = []
         self.navigation_seen = set()
+        self.public_query_facts = {}
         self.navigation_ranges = {}
         self.navigation_recent = deque(maxlen=24)
         self.navigation_version = self.project_version
@@ -157,6 +163,7 @@ class RoomCrew:
         self.nested_seconds = 0.0
         self.read_only = thread.get("intent") == "question"
         self.direct = bool(thread.get("direct_execution"))
+        self.workbench = None if self.direct or self.read_only else CoordinatorWorkspace(self)
         self.direct_baseline = {}
         self.direct_candidate = None
         if self.direct:
@@ -259,9 +266,9 @@ class RoomCrew:
         return ("你是群负责人 " + self.lead + "。群成员和职责：" + _json(roster) +
                 "。本轮可选 assignee ID：" + _json(self.delegate_recipients) + "。"
                 "\n负责人也可以执行具体分工。用户或任务给你本人安排了调研、撰写或修订文件时，"
-                "用 delegate_task，assignee 填你自己的 ID，deliverable_paths 列出你的文件；宿主会为你开启可写的独立成员任务。"
+                "可在协调阶段的临时检查副本直接读、搜、调研、跑命令和操作浏览器。需发布文件时，用 delegate_task 认领对应文件。"
                 "将其他成员的工作留给相应角色，独立验收交给不同的成员。"
-                "\n" + self.capabilities + " 这份清单来自执行成员的工具注册表。成员可检索并读取公开来源时，请委派调查；来源能否访问以实际回执为准。" +
+                "\n" + self.capabilities + " 这份清单来自执行成员的工具注册表。协调检查副本随公开版本更新，验证脚本和临时输出留在副本中。已有验证可据实答复；正式评审由获派的独立角色签署。" +
                 "\n依据用户目标和角色职责选人。首次 delegate_task 须用 remaining_roles 列出这次后续需要的角色 ID，"
                 "一人能完成时填 []。按任务需要邀请协作者；需要独立复核时，交给实际作者之外的成员。"
                 "复核继承的成稿时可以直接用 delegate_task.review.candidate 填成稿路径、原作者任务 ID 或唯一作者角色，"
@@ -283,8 +290,7 @@ class RoomCrew:
                    if self.settings.interaction_mode == "autonomous" else
                    "仅当用户掌握的业务需求、偏好、数据或权限确实缺失时 ask_human，并说明 decision_kind。")
                 + ("\n用户要求独立核查指定成稿。继承的成稿可直接引用路径。若为本轮新增或修订，作者用 deliverable_paths 列出最终文件。委派另一成员，"
-                 "用 delegate_task.review 引用作者的最新候选，列出必需的 source 标准。逐条核对重要主张，主动找反证；"
-                 "区分正式规则和建议，注明研究样本与结论适用范围。核对笔记或旧版本不能代替对成稿的评审。"
+                 "用 delegate_task.review 引用作者的最新候选，列出本次 source 标准。"
                  if self.native_reviews.required_source_paths else "") +
                 "\n用户指定的最终验收：" + _json(self.delivery) +
                 "\n用户指定的成员验收：" + _json(self.child_checks))
@@ -341,13 +347,28 @@ class RoomCrew:
         rows = {}
         for r in self.reports:
             rows[r["role"]] = {
-                "role": r["role"], "published": r["published"], "status": r["status"],
+                "role": r["role"], "task_id": r["task_id"], "published": r["published"], "status": r["status"],
+                **({"promoted_candidate": r["promoted_candidate"]} if r.get("promoted_candidate") else {}),
                 "files": [f["path"] for f in r["changed_files"][:12]],
                 "checks": _clip(_json(r["evidence"].get("check_signals", [])), 430),
                 "summary": _clip(r["summary"], 850), "issue": _clip(r["remaining_issue"], 600),
             }
             if r.get("reviewable_candidate"):
-                rows[r["role"]]["reviewable_candidate"] = r["reviewable_candidate"]
+                candidate = r["reviewable_candidate"]
+                draft = self.private_drafts.get(r["role"])
+                rows[r["role"]]["reviewable_candidate"] = {
+                    **candidate, "scope": "private", "owner": r["role"],
+                    "current": bool(draft and draft["task_id"] == candidate["task_id"]
+                                    and draft["version"] == self.project_version),
+                }
+                registration = r.get("author_probe_review")
+                review = self.native_reviews.items.get(registration["target"]) if registration else None
+                if review and review.version == candidate["candidate_version"]:
+                    rows[r["role"]]["reviewable_candidate"]["review"] = {
+                        "target": review.target, "reviewer": review.reviewer, "state": review.state}
+                if draft and draft["task_id"] == candidate["task_id"]:
+                    rows[r["role"]]["reviewable_candidate"]["files"] = [
+                        path for path in draft["required"] if path in draft["manifest"]]
                 if r["reviewable_candidate"].get("unresolved_after_repair"):
                     rows[r["role"]]["next_step"] = ("缺口未因返工减少，请按照群成员的职责，选择已计划成员中最适合独立验收的人。"
                         "用 delegate_task.review 指定这个已冻结的任务和真实验收标准。")
@@ -367,6 +388,9 @@ class RoomCrew:
                  "\n已计划成员：" + _json(sorted(self.planned) if self.planned is not None else None) +
                  "\n可接手返工的已选成员：" + _json(self._eligible_repairs(None)) +
                  "\n本轮用户决定：" + _clip(decisions, 1800) + "\n公开交接：" + receipts)
+        if self.workbench and self.workbench.revision == self.project_version:
+            state += "\n协调检查副本的宿主记录（查阅和实际命令分列；独立签署见正式评审）：" + _json({
+                "inspection_tools": sorted(self.workbench.inspections), "executions": self.workbench.executions})
         if self.pending_check_reviews:
             state += "\n已通过且仍匹配当前文件的产品评审：" + _json(self._passed_review_receipts())
         diagnostics = self._diagnostic_context()
@@ -403,11 +427,12 @@ class RoomCrew:
         self.navigation_version = self.project_version
         self.navigation.clear()
         self.navigation_seen.clear()
+        self.public_query_facts.clear()
         self.navigation_ranges.clear()
         self.navigation_recent.clear()
         return True
 
-    def _navigation_outcome(self, obs, path, report_task):
+    def _navigation_outcome(self, obs, path, report_task, parameters):
         if not obs.ok:
             return "failed"
         meta = obs.meta
@@ -430,11 +455,28 @@ class RoomCrew:
             # Handoff reports belong to their own immutable task and file.
             ranges = self.navigation_ranges.setdefault((report_task, path, version), [])
             return "new" if _cover(ranges, start, end) else "covered"
-        signature = (obs.source, report_task, path, hashlib.sha256(obs.content.encode()).digest())
+        # Distinct search predicates can both return zero rows. An empty
+        # result only covers the particular query and page that were checked.
+        signature = (obs.source, report_task, path, parameters, hashlib.sha256(obs.content.encode()).digest())
         if signature in self.navigation_seen:
             return "covered"
         self.navigation_seen.add(signature)
         return "new"
+
+    def _remember_query(self, obs, path, parameters):
+        if (obs.source not in {"find_files", "search_files"} or not obs.ok
+                or obs.meta.get("count") != 0 or obs.meta.get("offset") != 0
+                or obs.meta.get("next_offset") is not None):
+            return
+        filters = {k: v for k, v in parameters.items() if k not in {"path", "offset", "limit", "context"}}
+        key = (obs.source, path, json.dumps(filters, sort_keys=True))
+        if key in self.public_query_facts:
+            return
+        fact = {"scope": "public", "revision": self.project_version, "tool": obs.source,
+                "path": path, "filters": filters, "matches": 0, "call_id": obs.tool_call_id}
+        self.public_query_facts[key] = fact
+        if self.tracer:
+            self.tracer.event("coordinator_fact", root_id=self.run_id, task_id=self.run_id, fact=fact)
 
     def _navigation_feedback(self):
         outcomes = Counter(status for _, status in self.navigation_recent)
@@ -442,8 +484,9 @@ class RoomCrew:
             return ""
         repeats = Counter(key for key, status in self.navigation_recent if status == "covered")
         targets = []
-        for (tool, path, task), count in repeats.most_common(8):
-            targets.append({"tool": tool, "path": path, "repeat": count, **({"task": task} if task else {})})
+        for (tool, path, task, params), count in repeats.most_common(8):
+            targets.append({"tool": tool, "path": path, "repeat": count, **({"task": task} if task else {}),
+                            **({"parameters": json.loads(params)} if params else {})})
         reviews = [{"target": r.target, "state": r.state, "reviewer": r.reviewer}
                    for r in self.native_reviews.items.values() if r.state != "passed"]
         for item in self.reviewer_probe_reviews.values():
@@ -469,7 +512,7 @@ class RoomCrew:
             # A member may publish during this same tool batch.
             return
         observations = [o for o in record.observations
-                        if o.source in _PROJECT_READS | _KNOWLEDGE_READS | self.input_reads | {"read_handoff_report"}]
+                        if o.source in _PROJECT_READS | _CHECK_TOOLS | _KNOWLEDGE_READS | self.input_reads | {"read_handoff_report"}]
         if not observations:
             return
         # Step latency includes synchronous member runs; only the lead's own
@@ -501,12 +544,22 @@ class RoomCrew:
             task = parameters.get("task_id") if obs.source == "read_handoff_report" else None
             if not isinstance(task, str):
                 task = None
-            outcome = self._navigation_outcome(obs, path, task)
-            self.navigation_recent.append(((obs.source, path, task), outcome))
+            private_copy = obs.meta.get("coordinator_private_copy")
+            if not private_copy:
+                self._remember_query(obs, path, parameters)
+            search = {k: v for k, v in parameters.items() if k != "path"} if obs.source in {
+                "search_files", "find_files", "list_dir"} else {}
+            query = json.dumps(search, sort_keys=True) if search else ""
+            outcome = self._navigation_outcome(obs, path, task, query)
+            self.navigation_recent.append(((obs.source, path, task, query), outcome))
             excerpt = _clip(body, 1800)
             if len(body.encode()) > 1800:
                 excerpt += " … " + _clip(body[-280:], 400)
             entry = {"tool": obs.source, "path": path, "ok": obs.ok, "excerpt": excerpt}
+            if private_copy:
+                entry["scope"] = "coordinator_check"
+            if task:
+                entry["task_id"] = task
             for key in ("query", "pattern", "start_line", "offset"):
                 if key in parameters:
                     entry[key] = _clip(str(parameters[key]), 180)
@@ -542,14 +595,26 @@ class RoomCrew:
         })
 
     @cached_property
-    def coordinator_schemas(self):
-        registry = build_default_registry(read_only=True)
+    def coordinator_registry(self):
+        default = build_default_registry(read_only=self.read_only)
+        names = set(_PROJECT_READS) | {"read_source"}
+        if self.workbench is not None:
+            names.update(_CHECK_TOOLS)
+        tools = [default.get(name) for name in sorted(names)]
+        if self.workbench is not None:
+            tools = [self.workbench.wrap(tool) for tool in tools]
+        registry = ToolRegistry(tools)
         for tool in self.input_tools:
             if tool.name in self.input_reads:
                 registry.add(tool)
         registry.add(self.diagnostics.tool())
         if self.role_session:
             registry = self.role_session.registry(self.lead, registry, read_only=True)
+        return registry
+
+    @cached_property
+    def coordinator_schemas(self):
+        registry = self.coordinator_registry
         specs = [*registry.specs(), *CONTROL_TOOLS.values()]
         return {s.name:(self.delegate_spec if s.name == "delegate_task" else s).to_api() for s in specs}
 
@@ -581,7 +646,8 @@ class RoomCrew:
         return chosen
 
     def _prior_context(self, *, include_model_answers=True):
-        if not self.history:
+        dialogue = self.thread.get("prior_group_dialogue", [])
+        if not self.history and not dialogue:
             return ""
         recent = []
         decisions = []
@@ -602,8 +668,12 @@ class RoomCrew:
             if receipts:
                 row["published"] = receipts[-4:]
             recent.append(row)
-        background = {"initial_request": _clip(self.history[0]["user"], 850),
+        background = {"initial_request": _clip(self.history[0]["user"], 850) if self.history else "",
                       "user_decisions": decisions[-4:], "recent": recent}
+        if dialogue:
+            background["previous_group_dialogue"] = dialogue
+        if signed := self.thread.get("recovery_review"):
+            background["restored_candidate_assessment"] = signed
         return "\n历史用户要求、明确答复和已发布回执（当前任务和工作区清单优先）：" + _json(background)
 
     def _member_context(self, role, group_goal, expectations, required, spec, repair, review=None):
@@ -639,7 +709,7 @@ class RoomCrew:
         landmarks = []
         if self.navigation_version == self.project_version:
             for row in reversed(self.navigation):
-                if not row["ok"] or row["tool"] in {"list_dir", "find_files", "read_handoff_report"}:
+                if not row["ok"] or row.get("scope") == "coordinator_check" or row["tool"] in {"list_dir", "find_files", "read_handoff_report"}:
                     continue
                 location = {k: row[k] for k in ("tool", "path", "query", "start_line", "offset") if k in row}
                 entry = {**location, "excerpt": _clip(row["excerpt"], 650)}
@@ -671,7 +741,13 @@ class RoomCrew:
             if (item.state != "passed" or item.latest.get("candidate_version") != item.version
                     or any(self.native_reviews.public_versions.get(p) != sha for p, sha in item.files.items())):
                 return ()
-            files = {p: sha for p, sha in item.files.items() if p in expected and sha}
+            scope = expected
+            if item.requirements:
+                if not item.contract:
+                    return ()
+                scope = expected.intersection(path for rule in item.criteria if rule.required
+                                              for path in (rule.artifact_paths or ()))
+            files = {p: sha for p, sha in item.files.items() if p in scope and sha}
             if files:
                 covered.update(files)
                 receipts.append({"target": item.target, "reviewer": item.reviewer, "state": item.state,
@@ -692,12 +768,42 @@ class RoomCrew:
 
     @staticmethod
     def _bound_review_handoff(review):
-        if not review or review.state not in {"review", "repair"} or not (review.latest or review.probes):
+        if not review or review.state not in {"review", "repair"} or not (review.latest or review.probes or review.author_requested):
             return None
         objective = ("按原验收反馈修订冻结候选并重新交接。" if review.state == "repair"
                      else "对绑定的候选和未决标准独立取证并签署。")
         return BoundHandoff(review.target, review.version, review.state, review.owner, objective,
                             digest([len(review.visited), review.draft_task, review.peer_recheck]))
+
+    def advance_requested_review(self):
+        """Deliver a member's accepted review request before asking the lead to plan again."""
+        if not self.native_reviews.items or self.should_cancel():
+            return False
+        review = self._next_review()
+        if not review or not review.author_requested:
+            return False
+        handoff = self._bound_review_handoff(review)
+        if not handoff:
+            return False
+        # Same candidate, owner, phase and evidence means the same assignment.
+        # The dispatcher's cache and the TaskStore creation key use this identity.
+        action = "review-" + digest(asdict(handoff))
+        if action in self.handoffs:
+            return False
+        sender = review.author if handoff.state == "review" else review.reviewer
+        outcome = self.delegate({"assignee": handoff.owner, "objective": handoff.objective,
+                                 "__runtime_action_id": action}, routed_from=sender)
+        # Admission failures can occur before a child is created. Never turn a
+        # failed transfer into another look around the unchanged public tree.
+        if self._bound_review_handoff(review) == handoff and not self.should_cancel():
+            review.state = "blocked"
+            review.host_issue = (self.last_dispatch_error or review.host_issue or
+                                 "独立交接结束，候选版本和验收证据均未变化。")
+        if self.tracer:
+            self.tracer.event("bound_handoff_dispatched", task_id=self.run_id, root_id=self.run_id,
+                              target=handoff.target, version=handoff.version, state=handoff.state,
+                              owner=handoff.owner, call_id=action, origin="author_request", ok=outcome.ok)
+        return True
 
     def _probe_dispatch_hint(self, pending):
         if not pending:
@@ -879,35 +985,52 @@ class RoomCrew:
             remaining -= len(data)
         return extra
 
-    def _queue_author_probes(self, review, report, draft, support, reviewer):
-        """A corrected author check can freeze the draft for a peer, never publish it or clear a failure."""
+    def _queue_author_probes(self, review, report, draft, support, reviewer, *, request=None, group_goal=""):
+        """Register investigation of an immutable candidate. Only its reviewer can resolve the findings."""
         probes = draft["inline_failures"]
         support = self._transferable_probe_support(probes, support)
         if (self.should_cancel() or self.budget.exhausted or (self.deadline is not None and time.monotonic() >= self.deadline)
-                or not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or not support or not probes
-                or probes.keys() != draft["failed_checks"].keys() or report["role"] == reviewer):
+                or not draft["checkpoint"] or not draft["manifest"] or draft["missing"] or report["role"] == reviewer
+                or request and not draft["reviewable"]):
             return False
         files = draft["manifest"]
         corrected = [s for s in support if s.get("kind") == "corrected_file_check"]
         file_scopes = {k for k, p in probes.items() if p.get("kind") == "edited_script"}
         matched = {scope for receipt in support for scope, call in receipt.get("original_calls", {}).items()
                    if scope in probes and probes[scope]["tool_call_id"] == call}
-        if not probes.keys() <= matched:
+        if not request and (not probes or not support or probes.keys() != draft["failed_checks"].keys()
+                            or not probes.keys() <= matched):
             return False
         if file_scopes:
             frozen_version = digest(files)
             covered = {key for s in corrected if files.get(s["path"]) == s["current_sha256"] and s["input_version"] == frozen_version
                        for key in s["original_calls"]}
             if not file_scopes <= covered:
-                return False
+                if not request:
+                    return False
+                # Original file-backed commands still gate promotion. A generic
+                # alternative assertion cannot settle an unbound script change.
+                probes = {k: p for k, p in probes.items() if k not in file_scopes - covered}
         if review is None:
             sources = set(files) & self.native_reviews.required_source_paths
-            rules = [Rule(id="independent_recheck", method="execute", description=
-                          _clip(report["acceptance_expectation"] or report["objective"], 1200))]
+            # A document can be read and checked directly. Runnable deliveries
+            # and outstanding execution evidence need a fresh product assertion.
+            evidence = draft["evidence"]
+            checked_product = bool(draft["failed_checks"] or evidence.get("check_signals") or evidence.get("pending_verification"))
+            runnable_product = any(Path(p).suffix.lower() in _RUNNABLE_SUFFIXES or Path(p).name in {"Makefile", "Dockerfile"}
+                                   for p in draft["required"])
+            method = "execute" if (not request or request.get("method") == "execute" or checked_product or runnable_product) else "inspect"
+            rules = [Rule(id="independent_recheck", method=method,
+                          description=_clip(report["acceptance_expectation"] or report["objective"], 1200))]
             if sources:
                 rules.append(Rule(id="required_sources", method="source", description="核对用户指定文件中的核心事实及原始来源。"))
             review = Review(report["task_id"], report["role"], reviewer, report["objective"], rules, dict(files),
                             required_source_paths=sources)
+            required_paths = tuple(sorted(draft["required"]))
+            if (group_goal and request and request.get("source") == "request_peer_review" and required_paths
+                    and all(Path(path).suffix.lower() in _REVIEW_DOCUMENT_SUFFIXES for path in required_paths)):
+                review.requirements = group_goal
+                review.delivery_paths = required_paths
         if (review.kind != "product" or review.author != report["role"] or review.reviewer != reviewer
                 or review.probes or len(review.criteria) + len(probes) > 24
                 or any("probe_" + key == rule.id for key in probes for rule in review.criteria)):
@@ -915,21 +1038,25 @@ class RoomCrew:
         # A localhost URL does not identify source bytes. When the candidate has
         # a single product HTML entry the independent browser check can compare
         # the actual HTTP response bytes to that frozen file.
-        html = sorted(p for p in files if Path(p).suffix.lower() in {".html", ".htm"})
-        probes = {key: ({**p, "input_paths": p.get("investigation_paths") or (html if len(html) == 1 else [])}
+        entries = draft["required"] if request else files
+        html = sorted(p for p in entries if Path(p).suffix.lower() in {".html", ".htm"})
+        probes = {key: ({**p, "input_paths": p.get("investigation_paths") or (html if request or len(html) == 1 else [])}
                         if p["tool"] == "run_browser" and not p.get("input_paths") else p) for key, p in probes.items()}
         targets = set(draft["required"])
         targets.update(p for probe in probes.values() for p in probe.get("input_paths", ()))
         product = {p: files[p] for p in targets if p in files}
         if not product:
             return False
+        review.author_requested = bool(request) or review.author_requested
         review.probes = dict(probes)
         review.probe_support = support
         review.probe_product_files = product
         review.files = dict(files)
         review.draft_task = report["task_id"]
         review.state = "review"
-        review.host_issue = "候选已冻结，作者失败与后来检查均已留存，等待独立成员逐项签署。"
+        review.host_issue = "候选已冻结，等待独立成员逐项签署。"
+        if request:
+            review.host_issue += "作者请求核实：" + request["reason"]
         review.criteria.extend(Rule(id="probe_" + key, method="execute", description=
             f"对照本次产品要求，独立执行能区分正确与错误行为的断言，核对原失败 {probe['tool_call_id']} 的原因。")
             for key, probe in probes.items())
@@ -939,10 +1066,13 @@ class RoomCrew:
                           "candidate_version": review.version, "files_total": len(files)})
         report["author_probe_review"] = {"target": review.target, "reviewer": reviewer,
             "candidate_version": review.version, "original_calls": {k:p["tool_call_id"] for k,p in probes.items()},
-            "corrected_calls": [s["tool_call_id"] for s in support],
-            "supporting_receipts": [{k:s[k] for k in ("tool_call_id", "original_calls", "input_version")}
+            "corrected_calls": [s["tool_call_id"] for s in support if s.get("original_calls")],
+            "supporting_receipts": [{k:s[k] for k in ("tool_call_id", "original_calls", "input_version") if k in s}
                                     for s in support],
             "pending_verification": draft["evidence"].get("pending_verification", [])}
+        if request:
+            report["author_probe_review"]["request"] = request
+            report["author_probe_review"]["unbound_failures"] = sorted(draft["failed_checks"].keys() - probes.keys())
         if corrected:
             report["author_probe_review"]["corrected_scripts"] = [
                 {k:v for k,v in s.items() if k not in {"prior_source", "prior_error", "output"}} for s in corrected]
@@ -1084,7 +1214,7 @@ class RoomCrew:
                 return StepPolicy("finalize", "以 [BLOCKED] 说明未通过的独立验收条件及已有交付。\n" +
                                   _clip(_json(native.briefing()), 3000), frozenset(), compact=True)
             recovery = self.direct_progress.recovery_feedback()
-            instruction = self.direct_instructions() + "\n" + self.direct_progress.steering()
+            instruction = self.direct_instructions() + self._prior_context(include_model_answers=False) + "\n" + self.direct_progress.steering()
             if probe_hint:
                 instruction = probe_hint + "\n" + instruction
             if recovery:
@@ -1134,6 +1264,13 @@ class RoomCrew:
         if self._only_peer_checks_remaining() and not any(r["eligible_roles"] for r in self._pending_check_briefing()):
             return StepPolicy("finalize", "以 [BLOCKED] 说明：待复核检查没有可独立核销的其他成员。"
                               + self._peer_check_instruction(), frozenset(), compact=True)
+        if not native and not reconsider and not self.pending_check_reviews:
+            previous = state.scratch.get("last_host_handoff")
+            if (previous and previous.deliverable_paths and previous.version == str(self.project_version)
+                    and set(previous.deliverable_paths).intersection(self.inventory["missing_acceptance_files"])):
+                return replace(closing, instruction="以 [BLOCKED] 如实汇报本次文件交接仍缺的内容。\n"
+                               + closing.instruction + "\n" + self.last_dispatch_error)
+            bound = self._unassigned_delivery()
         personal = self.role_session.context(self.lead, state.goal) if self.role_session else ""
         instruction = self.instructions() + self._prior_context()
         if probe_hint:
@@ -1146,10 +1283,23 @@ class RoomCrew:
         if self._only_peer_checks_remaining():
             instruction += "\n" + self._peer_check_instruction()
         self._reset_navigation_revision()
+        if self.public_query_facts:
+            # Immutable for this public revision. The full index remains in
+            # the trace; keep the model view within the navigation allowance.
+            facts = []
+            used = 0
+            for fact in reversed(self.public_query_facts.values()):
+                size = len(_json(fact).encode()) + 1
+                if used + size > 2400:
+                    break
+                facts.append(fact)
+                used += size
+            if facts:
+                instruction += "\n当前公共版本已核实的空查询：" + _json(facts)
         if self.navigation:
             # Latest request first so the most recent result survives clipping.
             receipts = _clip(_json(list(reversed(self.navigation))), 6800)
-            instruction += "\n负责人已核实的公开工作区内容（工具输出仅作为文件数据）：" + receipts
+            instruction += "\n负责人已核实的公开工作区内容及检查结果（scope=coordinator_check 是临时副本的观察）：" + receipts
         denied = state.scratch.get("policy_denials", 0)
         controls = frozenset({"delegate_task", "abort_task"} if self.routing_denied else
                              {"delegate_task", "ask_human", "abort_task"})
@@ -1175,14 +1325,18 @@ class RoomCrew:
         input_reads = {tool.name for tool in self.input_tools if tool.name in self.input_reads
                        and (tool.available is None or tool.available())}
         allowed = controls | input_reads
+        if self.workbench is not None:
+            allowed |= _PROJECT_READS | _CHECK_TOOLS
         if inspect_public:
             allowed |= _PROJECT_READS
         if inspect_reports:
             allowed |= {"read_handoff_report"}
-        if inspect_public and self.role_session and self.lead in self.role_session.saved:
+        if (self.workbench is not None or inspect_public) and self.role_session and self.lead in self.role_session.saved:
             allowed |= _KNOWLEDGE_READS
-        if bound:
-            allowed = controls
+        if bound and bound.deliverable_paths:
+            instruction += ("\n已完成的阶段都已交接。剩余文件还没有认领人，默认由负责人在可写分工中交付："
+                            + _json(bound.deliverable_paths) + "。如另有合适的负责人或需先独立复核，可明确委派。")
+        elif bound:
             instruction += ("\n宿主已登记下一项分工。调用 delegate_task，assignee 填 " + bound.owner
                             + "，省略 review 和 recover_from。目标 " + bound.target + "，状态 " + bound.state
                             + "。受委派的成员可查阅资料并核实具体问题。")
@@ -1191,15 +1345,18 @@ class RoomCrew:
         def input_cost(names):
             return message_cost + estimate_tokens([self.coordinator_schemas[n] for n in sorted(names)])
         decision_input = input_cost(allowed)
-        if can_inspect and not budget.has_tokens(self.close_tokens + decision_input + 1):
-            allowed = controls
-            decision_input = input_cost(controls)
+        # A large historical response must not spend the money set aside for
+        # the decision or suppress a tool. Shed whole old envelopes first.
+        while (not budget.has_tokens(self.close_tokens + decision_input + 1)
+               and decision.omit_coordination_turns < len(state._coordination_turns)):
+            decision = replace(decision, omit_coordination_turns=decision.omit_coordination_turns + 1)
+            message_cost = estimate_tokens(policy_messages(state, decision)) + 768
+            decision_input = input_cost(allowed)
         if (not budget.has_steps(3 if self.assigned else 2) or not budget.has_time(self.close_seconds)
                 or not budget.has_tokens(self.close_tokens + decision_input + 1)):
             return closing
         dispatch_limit = decision_input + 8192
-        return StepPolicy("coordinate", instruction, allowed, compact=True,
-                          bound_handoff=bound,
+        return replace(decision, allowed_tools=allowed, bound_handoff=bound,
                           token_reserve=0 if budget.tokens_left is None else max(self.close_tokens, budget.tokens_left - dispatch_limit),
                           seconds_reserve=self.close_seconds)
 
@@ -1209,6 +1366,31 @@ class RoomCrew:
             return ""
         return "宿主核对的公开工作区仍缺少这些约定交付：" + _json(missing) + "。请逐项列为未交付。\n"
 
+    def _unassigned_delivery(self):
+        """Route the unclaimed remainder of a completed room plan into a writable assignment."""
+        if self.read_only or self.direct or self.pending_check_reviews or not self.reports:
+            return None
+        accepted = self.approved_roles | self.covered_roles
+        planned = self.planned if self.planned is not None else set(self.profiles) - {self.lead}
+        if (planned | self.assigned | set(self.child_checks) | set(self.thread.get("addressed_roles", []))) - accepted:
+            return None
+        if not any(report["published"] for report in self.reports):
+            return None
+        required = set(self.delivery.get("files", [])) | {c["path"] for c in self.delivery.get("checks", [])}
+        missing = set(self.inventory["missing_acceptance_files"])
+        if set(self.native_reviews.missing_source_reviews()) - missing:
+            return None
+        if self.workbench and self.workbench.sandbox and self.workbench.sandbox.command_sessions.pending_reason():
+            return None
+        claimed = {path for report in self.reports for path in report.get("deliverable_paths", [])}
+        paths = tuple(sorted((required & missing) - claimed)[:_MAX_ASSIGNMENT_FILES])
+        if not paths:
+            return None
+        objective = ("根据本轮用户要求和已发布成员交接，完成尚未认领的交付文件并在工作区落盘。"
+                     "材料中尚未解决的异议和限制应体现在交付中。指定路径：" + _json(paths))
+        return BoundHandoff(self.run_id, str(self.project_version), "deliver", self.lead,
+                            objective, digest(paths), paths)
+
     def _blocked_review_record(self, review):
         if not review or review.state != "blocked":
             return ""
@@ -1216,6 +1398,8 @@ class RoomCrew:
             native = report.get("native_review") or {}
             if native.get("target") != review.target or native.get("candidate_version") != review.version:
                 continue
+            if native.get("evidence_required"):
+                return _clip(report["remaining_issue"], 1500) + "\n"
             signed = native.get("assessment") or {}
             if (signed.get("target") != review.target or signed.get("candidate_version") != review.version
                     or signed.get("evaluator") != review.reviewer):
@@ -1317,10 +1501,21 @@ class RoomCrew:
                         ("。用 delegate_task 委派原验收者，省略 review 以沿用原标准；有新的可复核来源时告诉验收者。"
                          if pending_review.verification_gaps() else "。") + "当前目标与缺口：" + _clip(_json(pending_review.briefing()), 1900))
         published = [r for r in self.reports if r["published"]]
-        if not published and not self.direct:
+        bench = self.workbench
+        if bench and bench.sandbox:
+            pending_command = bench.sandbox.command_sessions.pending_reason()
+            if pending_command:
+                return pending_command
+        can_report_observations = (
+            bench is not None and bench.revision == self.project_version and bool(bench.inspections or bench.executions)
+            and not self.reports and not self.delivery.get("files") and not self.delivery.get("checks")
+        )
+        if not published and not self.direct and not can_report_observations:
+            if self.reports:
+                return "已有成员交接，公共工作区尚无本轮已发布的交付。"
             return "本次群任务还没有成员完成交接。请使用 delegate_task 邀请合适成员，再汇总交付。"
         missing = set(self.thread.get("addressed_roles", [])) - {r["role"] for r in published}
-        if self.direct:
+        if self.direct or can_report_observations:
             missing.discard(self.lead)
         if missing:
             return "用户点名的成员仍需完成此次分工：" + "、".join(sorted(missing)) + "。"
@@ -1691,19 +1886,6 @@ class RoomCrew:
             review_instruction = "对同一目标的当前候选执行独立验收，使用 submit_review 提交逐项判断。"
             if review.state == "repair":
                 review_instruction = "针对原目标返工，处理独立评估发现的产品缺口。"
-                changes = review.required_product_changes(review.latest)
-                if any(rule.method == "source" and rule.id in changes for rule in review.criteria):
-                    review_instruction += (
-                        "\n来源退修：评审建议本身不能作为事实依据。用 http_get 打开原始发布者的具体材料，"
-                        "逐条将争议断言与原文、表头或脚注对照。有数字时说明对象、期间、单位和分母；"
-                        "涉及正负号时区分原项目的贡献和为剔除它所作的调整。"
-                        "原文支持修改就更正；原文支持现稿则保留已核实的事实，在新版补上可定位的引文、"
-                        "表格行或计算依据及原始链接，并在交接里解释分歧。证据不足就明确标记待核实。"
-                        "由原评审者按同一标准独立核查新版并重新签署。")
-                elif changes and review.required_source_paths:
-                    review_instruction += (
-                        "\n修改图例、标签或表述若会改变事实含义，按原始材料核对指标、期间及实绩或预测；"
-                        "保留正确的口径并向评审解释有分歧的建议。")
             objective = (review_instruction +
                          ("\n本次复核线索（仅供核对，验收标准沿用原件）：" + _clip(objective, 1600) if retry_gaps else "") +
                          "\n原目标及标准：" + _clip(_json(review.briefing()), 7000))
@@ -1720,7 +1902,7 @@ class RoomCrew:
         requested_paths = payload.get("deliverable_paths", [])
         if review and review.state == "repair" and not review.draft_task:
             requested_paths = [p for p,v in review.files.items() if v is not None]
-        if (not isinstance(requested_paths, list) or len(requested_paths) > 32
+        if (not isinstance(requested_paths, list) or len(requested_paths) > _MAX_ASSIGNMENT_FILES
                 or any(not isinstance(path, str) or len(path) > 256 for path in requested_paths)):
             return self._observation(False, "deliverable_paths 需要最多 32 个项目内的相对文件名。")
         try:
@@ -1823,6 +2005,9 @@ class RoomCrew:
         if not (isinstance(chat_message, str) and chat_message.strip() and len(chat_message) <= 300
                 and not routed_from and role == payload.get("assignee")):
             chat_message = None
+        if routed_from and review and review.author_requested and action.startswith("review-"):
+            chat_message = ("请独立检查这份冻结草稿，并签署实际核实的结果。" if review.state == "review"
+                            else "请根据独立复核的结果修订这份草稿。")
         try:
             outcome = self._dispatch(role, objective, expectations, action, allocated, reserved, paths,
                                      draft, routed_from, review, chat_message=chat_message)
@@ -1898,6 +2083,7 @@ class RoomCrew:
                           expectation=expectations, allocation=allocated.model_dump(), reserved=reserved.model_dump(),
                           planned=sorted(self.planned) if self.planned is not None else None,
                           deliverable_paths=paths, resumed_private_draft=recovered,
+                          recovered_task_id=draft["task_id"] if recovered else None,
                           recover_from=draft["role"] if recovered else None,
                           protected_peer_shares={k:v.model_dump() for k,v in self.untapped_shares.items()})
         execution = self.service.start(record.task_id, expected_revision=record.revision,
@@ -2012,7 +2198,35 @@ class RoomCrew:
             session.guard_file_tools(registry)
             registry.add(session.tool())
             registry.add(session.catalog_tool())
+            if review.requirements:
+                registry.add(session.criteria_tool())
         requested_peer = False
+        review_request = None
+
+        def request_peer(_ctx, args):
+            nonlocal review_request
+            reason = args["reason"].strip()
+            requested_reviewer = args.get("reviewer")
+            if not reason:
+                return ToolResult.failure("请说明希望同伴独立核实的问题。")
+            reviewer = author_probe_reviewer(investigation=True, preferred=requested_reviewer)
+            if not reviewer:
+                return ToolResult.failure("尚无完整候选，或未选定合适的独立成员。"
+                                          "请保存分工要求的文件，reviewer 可明确指定本群其他成员。")
+            review_request = {"reviewer": reviewer, "reason": reason, "source": "request_peer_review"}
+            if args.get("method"):
+                review_request["method"] = args["method"]
+            return ToolResult.success("已请求将当前候选冻结并交给 " + reviewer + " 独立复核。")
+
+        if not self.read_only and not inspecting and required and len(self.profiles) > 1:
+            registry.add(Tool("request_peer_review", "把完整私有草稿交给群内另一成员独立复核。"
+                "写明要查的问题；旧检查和当前版本随交接保留。", {
+                    "type": "object", "properties": {
+                        "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
+                        "reviewer": {"type": "string", "enum": [p for p in self.profiles if p != role]},
+                        "method": {"type": "string", "enum": ["inspect", "execute"],
+                                   "description": "纯文档可直接阅读核对；可执行交付及失败检查须运行验证。"}},
+                    "required": ["reason"], "additionalProperties": False}, request_peer))
 
         def member_question(payload):
             nonlocal requested_peer
@@ -2270,29 +2484,50 @@ class RoomCrew:
                     return None
             return progress.blocked_reason()
 
-        def author_probe_reviewer():
-            # On an existing repair keep the original owner of the review and
-            # its product standards. Never let an inspector decide their own probe.
-            if (session or self.read_only or progress.pending_paths() or self.should_cancel()
-                    or not progress.project_versions() or not progress.corrected_probe_support()):
+        def author_probe_reviewer(*, investigation=False, preferred=None):
+            if session or self.read_only or self.should_cancel():
+                return None
+            versions = progress.project_versions()
+            if investigation:
+                if (not required or set(required) - versions.keys()
+                        or not any(versions[p] != original.get(p) for p in required)):
+                    return None
+            elif progress.pending_paths() or not versions or not progress.corrected_probe_support():
                 return None
             if review:
-                return review.reviewer if review.kind == "product" and not review.probes and review.author == role else None
-            # A QA member operating an existing delivery owns the bad check,
-            # not the product. Its original publisher cannot arbitrate it either.
+                if review.kind == "product" and not review.probes and review.author == role:
+                    return review.reviewer if preferred in (None, review.reviewer) else None
+                return None
             paths = {p for probe in progress.inline_failures().values()
                      for p in probe.get("input_paths") or probe.get("investigation_paths", ())}
             if not paths:
                 paths = set(required) or set(original)
             owners = {self.native_reviews.path_candidates[p][0] for p in paths if p in self.native_reviews.path_candidates}
-            excluded = {r["role"] for r in self.reports if r["task_id"] in owners}
-            return next((peer for peer in self._eligible_repairs(role) if peer not in excluded), None)
+            excluded = {r["role"] for r in self.reports if r["task_id"] in owners} | {role}
+            if preferred:
+                return preferred if preferred in self.profiles and preferred not in excluded else None
+            eligible = [peer for peer in self._eligible_repairs(role) if peer not in excluded]
+            if not investigation:
+                return next(iter(eligible), None)
+            # A declared reviewer wins over an unrelated earlier role in the
+            # plan. Free-form roles can instead be addressed by their exact ID.
+            peers = [peer for peer in self.profiles if peer not in excluded]
+            reviewers = [peer for peer in peers if re.search(
+                r"(?i)\b(qa|reviewer|inspector|tester|quality assurance)\b|测试|质检|审阅|评审",
+                peer.replace("_", " ") + " " + self.profiles[peer]["name"])]
+            for choices in ([p for p in eligible if p in reviewers], reviewers,
+                            [p for p in eligible if p != self.lead], peers):
+                if choices:
+                    return choices[0] if len(choices) == 1 else None
+            return None
 
         author_handoff = None
 
         def preflight_publication():
             nonlocal author_handoff
             issue = handoff_issue()
+            if review_request:
+                return PendingPeerReview(review_request["reason"])
             if issue and (author_handoff := author_probe_reviewer()):
                 return PendingPeerReview("原检查和修订断言已留证。请独立复核当前冻结候选及每项待执行的原命令。")
             if issue or private:
@@ -2311,12 +2546,25 @@ class RoomCrew:
 
         def complete_signed_review(record):
             nonlocal signed_handoff
+            if review_request and any(o.ok and o.source == "request_peer_review" for o in record.observations):
+                return ToolCompletion(review_request["reason"], dict(review_request))
             if requested_peer and author_probe_reviewer():
                 # The member explicitly selected internal routing. before_answer
                 # freezes the current files for review without signing or publishing.
                 return ToolCompletion("请独立核对原失败和修订断言，并在冻结候选上复验。",
                     {"original_calls": {scope:p["tool_call_id"] for scope,p in progress.inline_failures().items()},
                      "supporting_calls": [r["tool_call_id"] for r in progress.corrected_probe_support()]})
+            if session and session.evidence_handoff and not self.should_cancel():
+                refusal = session.evidence_handoff
+                gaps = []
+                for item in refusal["issues"]:
+                    gap = (item.get("criterion_id", "提交") + "：" + item["message"])
+                    next_action = item.get("next_action") or item.get("missing")
+                    if next_action:
+                        gap += " " + (next_action if isinstance(next_action, str) else _json(next_action))
+                    gaps.append(gap)
+                return ToolCompletion("冻结版本 " + review.version + " 的复核仍缺证据，已交回负责人。\n"
+                                      + "\n".join(gaps), refusal, blocked=True)
             if (not session or not session.assessment or self.should_cancel() or not record.observations
                     or any(not obs.ok for obs in record.observations)):
                 return None
@@ -2325,8 +2573,7 @@ class RoomCrew:
             # this version. Red results are evidence for the author to act on.
             repair_requested = (self.settings.interaction_mode == "autonomous"
                                 and bool(review.required_product_changes(assessment)))
-            if not repair_requested and (assessment["verdict"] != "passed"
-                    or private and not self._bound_probe_conflicts(review, session, progress)):
+            if not repair_requested and assessment["verdict"] != "passed":
                 return None
             # A signed submission closes the review contract. Later tool actions
             # in that batch can introduce new evidence; never silently ignore it.
@@ -2560,9 +2807,26 @@ class RoomCrew:
                         review, report, frozen, assessment, progress.probe_support())
                     if queued_probe_review and private:
                         review.revision_reports.update(paths)
-                elif reviewer := author_handoff or (text.startswith("[BLOCKED]") and author_probe_reviewer()):
-                    queued_probe_review = self._queue_author_probes(
-                        review, report, self.private_drafts[role], progress.corrected_probe_support(), reviewer)
+                else:
+                    if not review_request and not frozen["review_after_repair"] and text.startswith("[BLOCKED]") and any(
+                            p["tool"] == "run_browser" and not (p.get("input_paths") or p.get("investigation_paths"))
+                            for p in frozen["inline_failures"].values()):
+                        # A legacy blocked browser handoff can have no page
+                        # receipt if setup failed before navigation. Queue the
+                        # uncertainty for investigation without classifying it.
+                        reviewer = author_probe_reviewer(investigation=True)
+                        if reviewer:
+                            review_request = {"reviewer": reviewer, "reason": _clip(text, 1600),
+                                              "source": "blocked_browser_handoff"}
+                    reviewer = (review_request["reviewer"] if review_request else
+                                author_handoff or (text.startswith("[BLOCKED]") and author_probe_reviewer()))
+                    if reviewer:
+                        support = progress.corrected_probe_support()
+                        if review_request:
+                            bound_calls = {row["tool_call_id"] for row in support}
+                            support += [row for row in progress.probe_support() if row["tool_call_id"] not in bound_calls]
+                        queued_probe_review = self._queue_author_probes(
+                            review, report, frozen, support, reviewer, request=review_request, group_goal=parent.objective)
             if interrupted_repair:
                 report["interrupted_repair"] = self._resume_interrupted_repair(review, frozen, progress)
             elif private_repair and not queued_probe_review and not terminal_repair_error:
@@ -2584,6 +2848,8 @@ class RoomCrew:
             if review.kind == "reviewer_probe":
                 self._finish_reviewer_probes(review, assessment, published, issue, changes, record.task_id)
             report["native_review"] = {**review.describe(), "assessment": assessment}
+            if session and session.evidence_handoff:
+                report["native_review"]["evidence_required"] = session.evidence_handoff
             if session and session.execution_history:
                 report["native_review"]["historical_execution_receipts"] = list(session.execution_history.values())
         self.reports.append(report)
@@ -2622,12 +2888,18 @@ class RoomCrew:
                     ok, reason = check(staged)
                     if not ok:
                         raise CandidateAcceptanceError("成员验收失败：" + reason)
-            # An adjudicator closes a disputed check on an already published product.
-            # The coordinator still owns its outstanding delivery requirements.
+            # Promote this reviewed stage; the root contract also covers files
+            # that later members have yet to produce. Check every root rule
+            # touching this assignment or a changed/deleted file before promotion.
             if self.check_delivery and not reviewer_probe:
-                ok, reason = self.check_delivery(staged)
-                if not ok:
-                    raise CandidateAcceptanceError("用户指定验收失败：" + reason)
+                scope = set(candidate["required"])
+                scope.update(p for p in original.keys() | manifest.keys() if original.get(p) != manifest.get(p))
+                scoped_check = build_checks([p for p in self.delivery.get("files", []) if p in scope],
+                                            [r for r in self.delivery.get("checks", []) if r["path"] in scope])
+                if scoped_check:
+                    ok, reason = scoped_check(staged)
+                    if not ok:
+                        raise CandidateAcceptanceError("用户指定验收失败：" + reason)
         changes = []
         for path in sorted(original.keys() | manifest.keys()):
             if original.get(path) == manifest.get(path):

@@ -981,7 +981,8 @@ class BoundReviewerProbeTest(unittest.TestCase):
         steps = prefix + self.start_bound_review(final_reply=False) + first + [{"text":"The quantity needs independent remeasurement."},
             tool("append_file", path="inspection.md", content="Premature coordinator edit."),
             tool("edit_file", path=PATH, old_text="10", new_text="11"), tool("read_file", path="inspection.md")]
-        steps += self.peer_steps() + [{"text":"Confirmed the frozen quantity."},
+        # The signed arbiter step returns control to the coordinator immediately.
+        steps += self.peer_steps() + [
             tool("append_file", path="inspection.md", content=" Coordinator recorded the closure."), {"text":"Delivered."}]
         detail, reports, provider = self.run_steps(steps, objective="@lead Coordinate the label and its independent review.")
         self.assertEqual(detail["run"]["status"], "completed", detail["diagnostics"])

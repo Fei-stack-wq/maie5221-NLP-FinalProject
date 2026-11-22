@@ -21,7 +21,7 @@ def main():
         service = StudioService(Path(scratch), Settings(api_key="offline-fixture"))
         first = ScriptedProvider([
             call("write_file", path="docs/Report.md", content="# Published edition"),
-            {"text": "已发布 docs/Report.md。另有 ledger.md 和 agents/reviewer/ledger.md，搜索来源 https://example.org/?file=Report.md。长文 Long.md、Giant.md。"},
+            {"text": "已发布 docs/Report.md。另有 ledger.md 和 agents/worker/reviewer/ledger.md，搜索来源 https://example.org/?file=Report.md。长文 Long.md、Giant.md。"},
         ])
         second = ScriptedProvider([{"text": "已核对上一版。"}])
         inputs = {
@@ -77,10 +77,17 @@ def main():
             next_run = service.start(request("single", objective="请核对 docs/Report.md。",
                                              conversation=reply(run["id"], "worker", "question")))
             finished(service, next_run["id"])
+            later = Path(scratch) / next_run["id"] / "handoffs" / ("b" * 32)
+            later_file = later / "project/docs/Report.md"
+            later_file.parent.mkdir(parents=True)
+            later_file.write_text("# Revised publication")
+            (later / "manifest.json").write_text(json.dumps({
+                "docs/Report.md": hashlib.sha256(later_file.read_bytes()).hexdigest(),
+            }))
             root = Path(scratch) / run["id"] / "agents"
             for role in ("worker", "reviewer"):
-                (root / role).mkdir(exist_ok=True)
-                (root / role / "ledger.md").write_text("# " + role + " ledger")
+                (root / "worker" / role).mkdir(exist_ok=True)
+                (root / "worker" / role / "ledger.md").write_text("# " + role + " ledger")
             (root / "worker" / "Long.md").write_text("# Long bulletin\n\n" + "detail. " * 35000 + "\n\nLAST LINE")
             (root / "worker" / "Giant.md").write_text("# Giant bulletin\n\n" + "detail. " * 1050000)
         server = create_server(service, port=0)

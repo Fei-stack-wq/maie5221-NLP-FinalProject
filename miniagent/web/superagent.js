@@ -9,7 +9,7 @@ const studioAssistant = (() => {
  const indexedRoles = new Set();
  const attachmentKey = 'assistant';
  let detail=null, head=null, loaded=false, sending=false, reading=false, choosing=false;
- let epoch=0, loadError='', sendError='', request=null, draft='', workspace='', selectedInteraction='';
+ let epoch=0, loadError='', sendError='', request=null, draft='', workspace='', selectedInteraction='', selectedThinking='';
  let selectedChild=null;
  const active = () => Boolean(detail && runActive(detail.run));
  const onPage = () => state.route === 'assistant';
@@ -17,12 +17,15 @@ const studioAssistant = (() => {
  const field = () => document.getElementById('assistant-message');
  const interactionMode = () => selectedInteraction || (head ? detail?.run?.interaction_mode || 'interactive' : 'autonomous');
 
- function targets() {
-  if (!state.config?.run_steering) return [];
+ function workspaceDispatches() {
   const turns=messages();
   let start=turns.length-1;
   while (start>0 && turns[start].inherit_files!==false) start--;
-  return turns.slice(Math.max(0,start)).flatMap(turn=>turn.dispatches || []).filter(job=>
+  return turns.slice(Math.max(0,start)).flatMap(turn=>turn.dispatches || []);
+ }
+ function targets() {
+  if (!state.config?.run_steering) return [];
+  return workspaceDispatches().filter(job=>
    job.child_run_id && (canSteer(job) || job.child_run_id===selectedChild));
  }
  function currentChild(jobs) {
@@ -101,14 +104,16 @@ const studioAssistant = (() => {
   const child=currentChild(jobs);
   const running=child || detail?.run;
   const steering=canSteer(running);
-  const locked = !ready || sending || !loaded || (runActive(running) && !steering) || Boolean(loadError);
+  const locked = (!ready && child?.target_kind!=='group') || sending || !loaded || (runActive(running) && !steering) || Boolean(loadError);
   const path = workspace || detail?.conversation?.workspace_path;
   const folder = path ? path.split(/[\\/]/).filter(Boolean).at(-1) || path : '选择工作区';
   const destination=child?.child_run_id || '';
   const recipientPicker=jobs.length ? `<label class="assistant-destination">发给
    <select name="destination" aria-label="消息接收任务" ${sending?'disabled':''}><option value="" ${!child?'selected':''}>统一助手</option>
    ${jobs.map(job=>`<option value="${e(job.child_run_id)}" ${job===child?'selected':''}>${e(job.target_name || job.target_id)} · ${e(job.objective)}</option>`).join('')}</select></label>` : '';
-  return `<form class="assistant-composer" id="assistant-form" data-key="assistant-form" data-child="${e(destination)}" data-steer="${e(steering ? destination || head : '')}">
+  const activeJobs=workspaceDispatches().filter(runActive);
+  const visibleJobs=activeJobs.length ? activeJobs : child ? [child] : messages().at(-1)?.dispatches || [];
+  return `${StudioActivity.composerProgress(detail,visibleJobs)}<form class="assistant-composer" id="assistant-form" data-key="assistant-form" data-child="${e(destination)}" data-steer="${e(steering ? destination || head : '')}">
    <label class="sr-only" for="assistant-message">给工作室助手发消息</label>
    ${recipientPicker}
    <div class="assistant-input-row"><span class="prompt-sign" aria-hidden="true">›</span><textarea id="assistant-message" name="message" rows="2" maxlength="8000" ${sending?'readonly':''} placeholder="${steering?'给执行中的角色提问，或补充本轮要求…':child?'在接手方的对话中发送后续消息…':'描述你的目标，也可以点名角色或群聊…'}"></textarea></div>
@@ -116,6 +121,7 @@ const studioAssistant = (() => {
    <div class="assistant-tools"><div class="assistant-context">
    <button type="button" class="assistant-folder" data-assist-pick aria-label="选择工作区" title="${e(path || '选择本机项目文件夹')}" ${choosing||sending||active()||child?'disabled':''}>${icon('folder')}<span>${e(choosing?'正在选择…':folder)}</span></button>
    <select name="interaction_mode" class="assistant-interaction" aria-label="执行方式" ${sending||active()||child?'disabled':''}>${interactionOptions(interactionMode())}</select>
+   ${!steering && ready?thinkingControl(selectedThinking, !child):''}
    ${ready && state.config.model ? `<span class="assistant-model" title="当前模型"><i></i>${e(state.config.model)}</span>`:''}
    </div><div class="assistant-send-tools">${steering?'<span class="assistant-state">发给当前任务</span>':child?'<span class="assistant-shortcut">继续接手方的对话</span>':'<span class="assistant-shortcut">Shift + Enter 换行</span>'}
    <button class="assistant-send" type="submit" aria-label="发送消息" title="发送消息（Enter）" ${locked || (!draft.trim() && !studioAttachments.count(attachmentKey))?'disabled':''}>${icon('arrow')}</button></div></div>
@@ -186,49 +192,51 @@ const studioAssistant = (() => {
  }
 
  async function send(form) {
-  if (sending || !loaded || loadError || !state.config?.provider_ready) return;
+  if (sending || !loaded || loadError || (!state.config?.provider_ready && !form.dataset.child)) return;
   const childId=form.dataset.child, steerId=form.dataset.steer;
   if (active() && !childId && !steerId) return;
   const message=form.elements.message.value.trim();
   if (!message && !studioAttachments.count(attachmentKey)) return;
   const path = workspace;
   const mode=form.elements.interaction_mode.value;
+  const thinking=form.elements.thinking?.value;
   selectedChild=childId || '';
   epoch++; sending=true; sendError=''; draw();
   try {
    const attachments=await studioAttachments.prepare(attachmentKey);
    const ids=attachments.map(item=>item.id);
-   if (await sendRunSteer(attachmentKey,steerId,message,ids)) {
+   const liveEvent=await sendRunSteer(attachmentKey,steerId,message,ids);
+   if (liveEvent) {
     studioAttachments.clear(attachmentKey);
     if (draft.trim()===message) draft='';
     if (!draft) selectedChild=null;
     request=null;
-    toast('消息已加入当前任务。');
+    toast(liveEvent.kind==='status_reply' ? '已查询本群任务。' : '消息已加入当前任务。');
     return;
    }
-   const fingerprint=JSON.stringify([childId,message,path,mode,ids]);
+   const fingerprint=JSON.stringify([childId,message,path,mode,thinking,ids]);
    if (request?.fingerprint!==fingerprint) request={id:crypto.randomUUID(),parent:head,fingerprint};
    if (childId) {
     if (!request.payload) {
      const room=(await api('/api/runs/'+encodeURIComponent(childId))).conversation;
      if (!room?.can_continue || room.head_run_id!==childId) throw new Error('接手方已有更新，请进入对应对话查看最新消息。');
-     request.payload={request_id:request.id,objective:message,mode:room.kind==='group'?'team':'single',
+     request.payload={request_id:request.id,objective:message,thinking,mode:room.kind==='group'?'team':'single',
       conversation:{parent_run_id:childId,intent:'edit',recipient:room.lead || room.recipient},
       ...(ids.length?{attachments:ids}:{})};
     }
     const next=await api('/api/runs',{method:'POST',body:JSON.stringify(request.payload)});
     studioAttachments.clear(attachmentKey);
-    draft=''; selectedChild=null; request=null;
+    draft=''; selectedChild=null; selectedThinking=''; request=null;
     location.hash=latestChatLink(next.run.id);
     return;
    }
-   const payload={request_id:request.id,message,parent_run_id:request.parent,interaction_mode:mode};
+   const payload={request_id:request.id,message,parent_run_id:request.parent,interaction_mode:mode,thinking};
    if (path) payload.workspace_path=path;
    if (ids.length) payload.attachments=ids;
    const data=await api('/api/superagent/messages',{method:'POST',body:JSON.stringify(payload)});
    studioAttachments.clear(attachmentKey);
    if (draft.trim()===message) draft='';
-   request=null; head=data.run.id; selectedInteraction=''; selectedChild=null;
+   request=null; head=data.run.id; selectedInteraction=''; selectedThinking=''; selectedChild=null;
    // Keep earlier turns and display the accepted message while the first poll arrives.
    const turns=messages().filter(turn=>turn.run_id!==head);
    detail={run:{interaction_mode:mode,...data.run},conversation:{...detail?.conversation,workspace_path:workspace || detail?.conversation?.workspace_path,
@@ -264,6 +272,7 @@ const studioAssistant = (() => {
   if (event.target.name==='destination' && event.target.form?.id==='assistant-form') {
    selectedChild=event.target.value; sendError=''; draw(); field()?.focus(); return;
   }
+  if (event.target.name==='thinking' && event.target.form?.id==='assistant-form') selectedThinking=event.target.value;
   if (event.target.name==='interaction_mode' && event.target.form?.id==='assistant-form') {
    selectedInteraction=event.target.value;
   }

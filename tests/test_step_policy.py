@@ -31,6 +31,66 @@ class StepPolicyTest(unittest.TestCase):
                       Settings(), **kwargs)
         return agent, provider
 
+    def test_coordinator_replays_completed_turns_and_interleaved_steering(self):
+        from threading import Lock
+        from miniagent.studio_steering import RunSteering
+
+        ops = frozenset({"list_dir", "ask_human"})
+        browse = {"name": "list_dir", "arguments": {}}
+        script = [
+            {"text": "I will check both scopes.", "tool_calls": [browse, browse]},
+            {"text": "<｜tool▁calls▁begin｜> never-ran"},
+            {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Which room?"}}]},
+            *[{"text": f"Inspect {i}", "tool_calls": [browse]} for i in range(4)],
+            {"text": "Done"},
+        ]
+        agent, provider = self.agent(script, human_handler=lambda _: "A101")
+        inbox = RunSteering(Lock(), lambda *args, **kwargs: None)
+        def observe(record, _state):
+            if record.step == 1:
+                inbox.rows.append({"request_id": "scope", "text": "Include the private handoff."})
+        result = agent.run("Inspect scopes", step_policy=lambda *_: StepPolicy("coordinate", allowed_tools=ops, compact=True),
+                           steering=inbox.subscribe("lead", "run", owner=True), on_step=observe)
+        self.assertEqual(result.status, "unverified", result.error)
+        repaired = provider.requests[2][0]
+        self.assertNotIn("never-ran", str(repaired))
+        first = next(i for i, message in enumerate(repaired) if message["role"] == "assistant")
+        self.assertEqual(repaired[first]["content"], script[0]["text"])
+        self.assertEqual([r["tool_call_id"] for r in repaired[first+1:first+3]], ["call_1_0", "call_1_1"])
+        self.assertEqual(repaired[first+3]["content"], "Include the private handoff.")
+        self.assertIn("工具协议纠正", str(repaired))
+        # Recent answers stay paired with the real question. When the pair
+        # rolls out, its authenticated answer and the steering survive once.
+        after_question = provider.requests[3][0]
+        self.assertEqual(sum("A101" in (m.get("content") or "") for m in after_question), 1)
+        final = provider.requests[-1][0]
+        self.assertEqual(sum("A101" in (m.get("content") or "") for m in final), 1)
+        self.assertEqual(sum(m.get("content") == "Include the private handoff." for m in final), 1)
+        self.assertNotIn(script[0]["text"], str(final))
+        self.assertEqual([m["content"] for m in final if m["role"] == "assistant"], [f"Inspect {i}" for i in range(4)])
+        for messages, offered in provider.requests:
+            DeepSeekProvider._validate_history(messages, require_reasoning=False)
+            self.assertEqual(set(offered), ops)
+
+    def test_coordinator_preserves_thinking_with_its_original_tool_call(self):
+        class ThinkingProvider(RecordingProvider):
+            def chat(self, messages, tools=None, temperature=0.0):
+                DeepSeekProvider._validate_history(messages, require_reasoning=True)
+                answer = super().chat(messages, tools, temperature)
+                return answer.model_copy(update={"reasoning_content": f"reasoning turn {self.cursor}"})
+
+        script = [{"text": "Check the public room.",
+                   "tool_calls": [{"name": "list_dir", "arguments": {}}]}, {"text": "Done"}]
+        agent, _ = self.agent(script)
+        provider = ThinkingProvider(script)
+        agent.provider = agent.unit.provider = provider
+        result = agent.run("Review public room", step_policy=lambda *_: StepPolicy(
+            "coordinate", allowed_tools=frozenset({"list_dir"}), compact=True))
+        self.assertEqual(result.status, "unverified", result.error)
+        [first] = [row for row in provider.requests[1][0] if row["role"] == "assistant"]
+        self.assertEqual(first["reasoning_content"], "reasoning turn 1")
+        self.assertEqual(first["content"], "Check the public room.")
+
     def test_compact_work_keeps_assignment_and_authenticated_answer_then_can_write(self):
         operations = frozenset({"ask_human", "run_python", "write_file"})
         script = [

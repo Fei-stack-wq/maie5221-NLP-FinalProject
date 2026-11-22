@@ -23,3 +23,7 @@ Thumbs.db
 
 # 临时探针文件（可随时删除）
 .dsh-probe.txt
+
+# AOCI agent host integration (machine-bound; do not commit)
+.mcp.json
+.mcp.json.backup.*

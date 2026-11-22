@@ -98,6 +98,20 @@ class StudioAssistantTest(unittest.TestCase):
         self.assertEqual(rejected.exception.code, "invalid_group_lead")
         self.assertEqual(self.service.detail(room_id)["conversation"]["head_run_id"], review["id"])
 
+    def test_provider_receives_each_turns_thinking_setting(self):
+        parent = None
+        for selection, expected in [(None, "enabled"), ("disabled", "disabled"), (None, "enabled")]:
+            with self.subTest(selection=selection):
+                payload = message("你好", parent)
+                if selection:
+                    payload["thinking"] = selection
+                with patch("miniagent.studio_service.DeepSeekProvider",
+                           return_value=RecordingProvider([{"text": "你好"}])) as provider:
+                    parent = self.service.send_superagent(payload)["id"]
+                    detail = finished(self.service, parent)
+                self.assertEqual(provider.call_args.kwargs["thinking"], expected)
+                self.assertEqual(detail["diagnostics"]["configuration"]["thinking"], expected)
+
     def test_stale_first_message_or_foreign_parent_cannot_fork_or_hijack(self):
         barrier = threading.Barrier(2)
         def submit():

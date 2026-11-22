@@ -34,6 +34,40 @@ def event(kind, identity="root", **fields):
 
 
 class StudioDiagnosticsTest(unittest.TestCase):
+    def test_resumed_member_file_recovers_only_the_matching_failure(self):
+        tasks = [task(status="running"), {**task("first", "failed", "root"), "assignee_profile_id": "research"},
+                 task("second", "unverified", "root")]
+        events = [event("task_end", "first", status="error", error="[BLOCKED] missing source"),
+                  event("task_start", agent="lead"), event("step_start", step=27, phase="coordinate")]
+        failure = {"kind": "member_report", "role": "research", "task_id": "first",
+                   "published": False, "handoff": {"deliverable_paths": ["research.md"]}}
+        retry = {"kind": "assignment", "recipient": "research", "task_id": "second",
+                 "resumed_private_draft": True, "recover_from": "research"}
+        success = {"kind": "member_report", "role": "research", "task_id": "second",
+                   "published": True, "handoff": {"deliverable_paths": ["research.md"]}}
+        for assignment in (retry, {**retry, "recovered_task_id": "first"}):
+            result = diagnose(tasks, events, [], active=True, room_events=[failure, assignment, success])
+            self.assertEqual((result["execution_status"], result["acceptance_status"]), ("running", "pending"))
+            self.assertEqual(result["current_activity"][0]["role"], "lead")
+            issue, = result["issues"]
+            self.assertEqual((issue["scope"], issue["role"], issue["resolved_by"], issue["severity"]),
+                             ("member", "research", "second", "warning"))
+            self.assertTrue(issue["resolved"])
+            finished = diagnose([{**tasks[0], "status": "unverified"}, *tasks[1:]],
+                                [*events, event("task_end", status="unverified")], [report()],
+                                room_events=[failure, assignment, success])
+            self.assertEqual(finished["execution_status"], "finished")
+        for records in ([failure, success], [failure, {**retry, "recovered_task_id": "different"}, success],
+                        [failure, retry, {**success, "task_id": "unrelated"}],
+                        [failure, retry, {**success, "handoff": {"deliverable_paths": ["different.md"]}}],
+                        [failure, retry, {**success, "role": "unrelated"}],
+                        [failure, retry, {**success, "published": False}]):
+            with self.subTest(records=records):
+                issue, = diagnose(tasks, events, [], active=True, room_events=records)["issues"]
+                self.assertEqual(issue["scope"], "member")
+                self.assertFalse(issue.get("resolved"))
+                self.assertEqual(issue["severity"], "error")
+
     def test_diagnoses_only_host_confirmed_blocked_handoff_before_writing(self):
         tasks = [task(status="failed"), task("child", "failed", "root")]
         identity = {"root_id": "root", "attempt_id": "a", "run_id": "r"}
@@ -176,7 +210,8 @@ class StudioDiagnosticsTest(unittest.TestCase):
         secret = "private-balance-key"
         service = StudioService(root / "runs",Settings(api_key=secret))
         def response(call_id, name, arguments):
-            return HTTPResult({"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{
+            return HTTPResult({"choices":[{"message":{"role":"assistant","content":"","reasoning_content":"",
+                "tool_calls":[{
                 "id":call_id,"type":"function","function":{"name":name,"arguments":json.dumps(arguments)}}]},
                 "finish_reason":"tool_calls"}],"usage":{"prompt_tokens":12,"completion_tokens":5}},1)
         transport = [response("delegate","delegate_task",{"assignee":"risk","objective":"Write a recoverable draft.",
@@ -211,7 +246,8 @@ class StudioDiagnosticsTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node is needed to exercise the existing GUI renderer")
     def test_gui_shows_balance_cause_during_shutdown_and_resolved_history_afterwards(self):
         source = (Path(__file__).parents[1]/"miniagent/web/app.js").read_text()
-        renderer = source[source.index("function diagnosis(detail){"):source.index("function roomMessages(")]
+        renderer = source[source.index("function diagnosis(detail){"):source.index("const roomHistory =")]
+        labels = next(line for line in source.splitlines() if line.startswith("const labels ="))
         current = diagnose([task(status="running")],[event("provider_error",code="insufficient_balance",
             http_status=402,retryable=False,request_attempts=1)],[],active=True)
         historical = diagnose([task(status="completed")],[event("provider_error",code="insufficient_balance",http_status=402),
@@ -220,14 +256,17 @@ class StudioDiagnosticsTest(unittest.TestCase):
                   for status,value in [("running",current),("completed",historical)]]
         javascript = ("const runActive=r=>r.status==='running',runStatus=r=>r.status,endedWithoutChecks=()=>false;\n"
                       "const e=v=>String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');\n"
-                      "const icon=()=>'',duration=()=>'';\n" + renderer +
+                      "const icon=()=>'',duration=()=>'',roleLabel=id=>id;\n" + labels + "\n" + renderer +
                       "console.log(JSON.stringify(" + json.dumps(fixtures,ensure_ascii=False) + ".map(diagnosis)));\n")
         result=subprocess.run([shutil.which("node")],input=javascript,text=True,capture_output=True,check=True)
         live,old=json.loads(result.stdout)
-        self.assertIn("DeepSeek 账户额度不足",live)
-        self.assertIn("HTTP 402",live)
-        self.assertIn("重试需要可用",live)
-        self.assertNotIn("正在执行 Agent",live)
+        headline, evidence = live.split("<summary>查看诊断记录与运行配置</summary>")
+        self.assertIn("<h2>正在执行任务</h2>",headline)
+        self.assertIn("运行中",headline)
+        self.assertNotIn("额度不足",headline)
+        self.assertIn("DeepSeek 账户额度不足",evidence)
+        self.assertIn("HTTP 402",evidence)
+        self.assertIn("重试需要可用",evidence)
         self.assertIn("后续请求已成功",old)
         self.assertNotIn("重试需要可用",old)
 

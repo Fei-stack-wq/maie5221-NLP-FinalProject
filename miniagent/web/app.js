@@ -20,7 +20,7 @@ const icons = {
 const icon = (name) => `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${icons[name] || icons.circle}"></path></svg>`;
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const e = escapeHTML;
-const labels = {completed:'已完成',passed:'通过',succeeded:'已完成',running:'运行中',queued:'排队中',verifying:'验收中',created:'已创建',ready:'待执行',failed:'失败',error:'错误',cancelled:'已取消',cancel_requested:'正在取消',unverified:'未验证',interrupted:'待核实',blocked:'受阻',waiting_user:'等待回复',ended:'已结束'};
+const labels = {completed:'已完成',passed:'通过',succeeded:'已完成',running:'运行中',queued:'排队中',verifying:'验收中',created:'已创建',ready:'待执行',failed:'失败',error:'错误',cancelled:'已取消',cancel_requested:'正在取消',unverified:'未验证',interrupted:'待核实',unknown:'状态待核实',blocked:'受阻',waiting_user:'等待回复',ended:'已结束'};
 const modeLabels = {demo:'单 Agent 演示','team-demo':'协作演示',single:'单 Agent',team:'多 Agent 协作',cli:'CLI 运行',imported:'历史 CLI 运行'};
 const state = {config:null,chats:null,runs:[],detail:null,route:'assistant',runId:null,tab:'overview',search:'',filter:'all',logFilter:'all',selectedFile:null,fileData:null,expanded:new Set(),logOpen:new Set(),polling:false,online:true,initialized:false,detailSignature:'',cancelling:new Set(),downloads:new Set()};
 let toastTimer;
@@ -141,15 +141,15 @@ async function sendRunSteer(composer, runId, message, attachments) {
   steerAttempts.set(composer,attempt);
  }
  try {
-  await api('/api/runs/'+encodeURIComponent(attempt.runId)+'/steer',{method:'POST',body:JSON.stringify({
+  const data = await api('/api/runs/'+encodeURIComponent(attempt.runId)+'/steer',{method:'POST',body:JSON.stringify({
    request_id:attempt.id,message,...(attachments.length?{attachments}:{}),
   })});
+  steerAttempts.delete(composer);
+  return data.event;
  } catch (error) {
   if (error.status>=400 && error.status<500) steerAttempts.delete(composer);
   throw error;
  }
- steerAttempts.delete(composer);
- return true;
 }
 const chatRoles = () => [...(state.config?.conversation_roles || []),
  ...(state.config?.custom_profiles || []).map(profile => ({id:profile.id,label:profile.name}))];
@@ -199,6 +199,12 @@ function intentOptions(intent) {
          <option value="question" ${intent === 'question' ? 'selected' : ''}>只读问答</option>`;
 }
 
+function roomIntentOptions(intent, active=false) {
+ const options = [['auto','群消息'],['question','只读问答'],[active?'steer':'work',active?'调整当前任务':'发起任务']];
+ return options.map(([value,label])=>`<option value="${value}" ${value===intent?'selected':''}>${label}</option>`).join('');
+}
+const groupMessagesURL = id => '/api/groups/'+encodeURIComponent(id)+'/messages';
+
 function interactionOptions(selected='autonomous') {
  return `<option value="autonomous" ${selected==='autonomous'?'selected':''}>自动完成</option>
          <option value="interactive" ${selected==='interactive'?'selected':''}>允许中途询问</option>`;
@@ -242,7 +248,7 @@ function newConversationFields(mode) {
  return `<div class="chat-setup">${groupFields}${mode==="group"?dispatchField():""}
   <label class="field-label">${mode === 'group' ? '负责人或回复角色' : '私聊角色'}
    <select name="recipient" required>${roleOptions(members,members[0])}</select></label>
-  <label class="field-label">消息类型<select name="intent">${intentOptions('edit')}</select></label></div>`;
+  <label class="field-label">消息类型<select name="intent">${mode==='group'?roomIntentOptions('auto'):intentOptions('edit')}</select></label></div>`;
 }
 
 function updateMemberPicker(form) {
@@ -325,8 +331,10 @@ function legacyConversations(rooms) {
 function knowledgeCard(row, conversations, latest) {
  const key = e(entryId(row));
  const label = knowledgeKinds[row.kind];
- const project = conversations.find(c=>c.project===row.project || c.id===row.project);
- const scope = row.scope==='project' ? '项目 · '+(project?.title || row.project) : '角色通用';
+ const room = conversations.find(c=>c.id===row.project);
+ const project = conversations.find(c=>c.project===row.project);
+ const scope = row.scope==='conversation' ? '仅此私聊 · '+(room?.title || row.project)
+  : row.scope==='project' ? '项目 · '+(project?.title || row.project) : '角色通用';
  const change = (status,name) => `<button type="button" class="text-button" data-role-action="entry-status" data-entry="${key}" data-status="${status}">${name}</button>`;
  const sourceRun = row.origin_run || row.source_run;
  const older = latest && row.revision!==latest.revision;
@@ -336,7 +344,7 @@ function knowledgeCard(row, conversations, latest) {
   <div class="entry-meta"><span title="${e(row.project)}">${e(scope)}</span><span>v${e(row.revision)}</span><span>${(row.origin_source || row.source)==='agent'?'角色建议':'用户添加'}</span>
    ${row.active_revision && row.active_revision!==row.revision?`<span>正在使用 v${e(row.active_revision)}</span>`:''}
    ${sourceRun?`<a href="${chatLink(sourceRun)}">来源对话 ${icon('link')}</a>`:''}</div>
-  <div class="entry-actions">${older?`<small>最新修订 v${e(latest.revision)} · ${e(knowledgeStates[latest.status])}</small>
+  <div class="entry-actions">${row.scope==='conversation' && row.status==='active'? `<button type="button" class="text-button" data-role-action="derive-skill" data-entry="${key}">提炼为通用技能</button>`:''}${older?`<small>最新修订 v${e(latest.revision)} · ${e(knowledgeStates[latest.status])}</small>
    <button type="button" class="text-button" data-role-action="edit-active" data-entry="${key}">编辑当前版本</button>${change('archived','归档整个条目')}`:`
    ${row.status==='candidate'?change('active','确认启用')+change('rejected','拒绝'):''}
    ${['active','candidate'].includes(row.status)?`<button class="text-button" data-role-action="edit-entry" data-entry="${key}" aria-label="编辑${e(row.title || label)}">编辑</button>`:''}
@@ -432,7 +440,7 @@ async function loadRole() {
    const library=await api(profileURL(data.role.id)+'/knowledge');
    if (state.route!=='roles' || serial!==roleView.serial) return;
    const projects=new Map(library.conversations.map(c=>[c.id,c.project]));
-   roleView.detail={...data,entries:library.entries,active_entries:library.active_entries,
+   roleView.detail={...data,brief_scope:library.brief_scope,entries:library.entries,active_entries:library.active_entries,
     unbound_conversations:library.unbound_conversations,conversations:data.conversations.map(c=>({...c,project:projects.get(c.id)}))};
    const profiles=state.config.custom_profiles || [];
    state.config.custom_profiles=[...profiles.filter(p=>p.id!==id),library.role];
@@ -453,31 +461,39 @@ async function loadRole() {
  render();
 }
 
-function openRoleEditor(type, entry) {
+function openRoleEditor(type, entry, privateSource) {
  const profile = roleView.detail?.role;
  const copy=type==='new-role' && entry?.source==='historical' ? entry : null;
  const profileForm = type==='new-role' || type==='edit-role';
  const editing = type==='edit-role' || type==='edit-entry';
- const kind = entry?.kind || roleView.kind;
- const title = profileForm ? (editing?'编辑角色':'创建角色') : (editing?'编辑':'添加')+knowledgeKinds[kind];
+ const deriving = type==='derive-skill';
+ const kind = deriving ? 'skill' : entry?.kind || roleView.kind;
+ const title = deriving ? '提炼为通用技能' : profileForm ? (editing?'编辑角色':'创建角色') : (editing?'编辑':'添加')+knowledgeKinds[kind];
  const formRole = (profileForm && !editing) ? '' : profile.id;
  const profileFields = () => `<label class="field-label">角色名称<input name="name" required maxlength="100" value="${e(editing?profile.name:copy?.name)}" placeholder="例如，电脑维护助手"></label>
    <label class="field-label">角色职责<textarea name="prompt" required maxlength="4000" rows="5" placeholder="它长期负责什么？哪些情况需要先和你确认？">${e(editing?profile.prompt:copy?.prompt)}</textarea></label>
+   ${editing && roleView.detail.brief_scope==='source'?'<label><input type="checkbox" name="share_brief"> 将这段职责从来源会话共享到所有群和私聊</label>':''}
    ${editing?`<div class="entry-meta">固定角色 ID <code>${e(profile.id)}</code></div>`:
     '<details class="role-id-option"><summary>自定义角色 ID（选填）</summary><label class="field-label">角色 ID<input name="id" maxlength="48" pattern="[A-Za-z][A-Za-z0-9_\\-]{0,47}" placeholder="留空以自动生成"><small>以字母开头，可使用字母、数字、下划线和连字符。</small></label></details>'}`;
  const knowledgeFields = () => {
   const projects = new Map((roleView.detail.conversations || []).map(c=>[c.project,c.title]).filter(([key])=>key));
-  if (entry?.project && !projects.has(entry.project)) projects.set(entry.project,entry.project);
+  const rooms = new Map((roleView.detail.conversations || []).filter(c=>c.kind==='dm').map(c=>[c.id,c.title]));
+  const selected = entry?.scope==='conversation' ? rooms : projects;
+  if (entry?.project && !selected.has(entry.project)) selected.set(entry.project,entry.project);
   return `<label class="field-label">标题（选填）<input name="title" value="${e(entry?.title)}" maxlength="160" placeholder="${kind==='memory'?'例如，软件安装偏好':'例如，检查磁盘空间'}"></label>
    <label class="field-label">${kind==='memory'?'记忆内容':'操作步骤'}<textarea name="text" required maxlength="8000" rows="6" placeholder="${kind==='memory'?'记录角色以后需要遵循的信息。':'写下适用条件、操作顺序和检查结果的方法。'}">${e(entry?.text)}</textarea></label>
-   <label class="field-label">适用范围<select name="scope" ${editing?'disabled':''}><option value="role">角色通用 · 跨项目使用</option>
-   <option value="project" ${entry?.scope==='project'?'selected':''} ${projects.size?'':'disabled'}>仅指定项目</option></select></label>
+   <label class="field-label">适用范围<select name="scope" ${editing || deriving?'disabled':''}><option value="role">角色通用 · 跨项目使用</option>
+   <option value="project" ${entry?.scope==='project'?'selected':''} ${projects.size?'':'disabled'}>仅指定项目</option>
+   <option value="conversation" ${entry?.scope==='conversation'?'selected':''} ${rooms.size?'':'disabled'}>仅此私聊</option></select></label>
    <label class="field-label" data-project-choice ${entry?.scope==='project'?'':'hidden'}>项目<select name="project" ${editing?'disabled':''}>
-    ${[...projects].map(([id,name])=>`<option value="${e(id)}" ${entry?.project===id?'selected':''}>${e(name)} · ${e(id)}</option>`).join('')}</select></label>`;
+    ${[...projects].map(([id,name])=>`<option value="${e(id)}" ${entry?.project===id?'selected':''}>${e(name)} · ${e(id)}</option>`).join('')}</select></label>
+   <label class="field-label" data-room-choice ${entry?.scope==='conversation'?'':'hidden'}>私聊<select name="conversation" ${editing?'disabled':''}>
+    ${[...rooms].map(([id,name])=>`<option value="${e(id)}" ${entry?.project===id?'selected':''}>${e(name)} · ${e(id)}</option>`).join('')}</select></label>`;
  };
  $('#role-dialog-title').textContent=title;
  $('#role-editor').innerHTML=`<form class="role-editor" data-type="${type}" data-role="${e(formRole)}" data-kind="${e(kind)}"
     data-entry="${e(entry && entryId(entry))}" data-revision="${e(entry?.revision)}">
+   ${deriving?`<details><summary>查看私聊原记录</summary><p>${e(privateSource.text)}</p></details><p>写下可在其他会话使用的操作步骤。保存后，这段技能对该角色的所有会话可用。</p>`:''}
    ${profileForm?profileFields():knowledgeFields()}<p class="form-error" role="alert" hidden></p>
    <div class="editor-actions"><button type="button" class="secondary" data-role-action="dismiss">取消</button>
     <button type="submit" class="primary">${profileForm?'保存角色':entry?.status==='candidate'?'保存并启用':editing?'保存修改':'保存'+knowledgeKinds[kind]}</button></div></form>`;
@@ -491,7 +507,7 @@ function openRoleEditor(type, entry) {
   editor.querySelector('.editor-actions').before(note);
  }
  $('#role-dialog').showModal();
- if (type==='edit-role') $('#role-editor form').previousProfile={name:profile.name,prompt:profile.prompt};
+ if (type==='edit-role') $('#role-editor form').previousProfile={name:profile.name,prompt:profile.prompt,brief_scope:roleView.detail.brief_scope};
  $('#role-editor input:not([disabled])')?.focus();
 }
 
@@ -507,10 +523,12 @@ async function saveRoleEditor(form) {
   path=type==='new-role'?'/api/profiles':profileURL(role)+'/edit';
   if (!role) payload.id=fields.id.value.trim() || 'assistant-'+crypto.randomUUID().slice(0,8);
   else payload.previous=form.previousProfile;
+  if (fields.share_brief?.checked) payload.share_brief=true;
  } else {
   path=profileURL(role)+'/knowledge';
   payload={kind,title:fields.title.value.trim(),text:fields.text.value.trim(),scope:fields.scope.value};
   if (payload.scope==='project') payload.project=fields.project.value;
+  if (payload.scope==='conversation') payload.project=fields.conversation.value;
   if (entry) payload.entry_id=entry;
  }
  if (revision) payload.expected_revision=Number(revision);
@@ -525,7 +543,10 @@ async function saveRoleEditor(form) {
    state.config.custom_profiles=[...(state.config.custom_profiles||[]).filter(p=>p.id!==saved.id),saved];
    if (roleView.id!==saved.id || state.route!=='roles') location.hash=roleLink(saved.id);
    else await loadRole();
-  } else if (state.route==='roles' && roleView.id===role) await loadRole();
+  } else if (state.route==='roles' && roleView.id===role) {
+   if (type==='derive-skill') {roleView.kind='skill';roleView.filter='current';}
+   await loadRole();
+  }
   toast(isProfile?'角色已保存。':'已保存。');
  } catch (error) {
   if (error.status===409 && role && state.route==='roles' && role===roleView.id) await loadRole();
@@ -572,6 +593,11 @@ async function runRoleAction(button) {
  }
  const row=roleView.detail?.entries?.find(item=>entryId(item)===button.dataset.entry);
  if (!row) return;
+ if (action==='derive-skill') {
+  const source=roleView.detail.active_entries.find(item=>entryId(item)===button.dataset.entry);
+  if (source?.scope==='conversation') openRoleEditor(action,undefined,source);
+  return;
+ }
  if (action==='edit-active') {
   const active=roleView.detail.active_entries.find(x=>entryId(x)===entryId(row));
   if (active) openRoleEditor('edit-entry',{...active,revision:row.revision});
@@ -598,19 +624,30 @@ function chatTransitionNotice(thread, run) {
   return `<div class="chat-notice"><span>你正在查看较早的一轮。</span>
    <a class="secondary" href="${chatLink(thread.head_run_id)}">继续最新对话 ${icon('arrow')}</a></div>`;
  }
- if (canSteer(run) || run.status==='waiting_user') return '';
+ if (thread.kind==='group' || canSteer(run) || run.status==='waiting_user') return '';
  if (runActive(run)) return '<p class="chat-notice" role="status">本轮正在执行或收尾。</p>';
  if (!thread.can_continue) return '<p class="chat-notice">当前运行的执行状态有待核实，暂时无法继续。</p>';
  return '';
 }
 
+function thinkingControl(choice, needsMessageSupport=false) {
+ if (needsMessageSupport && !state.config?.message_thinking) {
+  const current=({enabled:'思考已开启',disabled:'思考已关闭'})[state.config?.thinking] || '模型思考';
+  return `<small class="thinking-legacy" title="当前 Studio 服务沿用启动配置">${current} · 重启后可调</small>`;
+ }
+ const mode = choice || state.config?.thinking || 'enabled';
+ return `<select name="thinking" class="assistant-interaction" aria-label="本轮模型思考" title="本轮模型思考">
+  <option value="enabled" ${mode==='enabled'?'selected':''}>思考开启</option>
+  <option value="disabled" ${mode==='disabled'?'selected':''}>思考关闭</option></select>`;
+}
+
 function conversationComposer(thread,run) {
- if (run.status==='waiting_user' && thread.head_run_id===run.id && !canSteer(run)) return '';
+ if (thread.kind!=='group' && run.status==='waiting_user' && thread.head_run_id===run.id && !canSteer(run)) return '';
  if (thread.kind==='group' && !thread.members.length && thread.head_run_id===run.id && !runActive(run)) return '<p class="chat-notice">添加群成员后即可发送消息。<button type="button" class="text-button" data-edit-members>添加成员</button></p>';
  const unavailable = chatTransitionNotice(thread,run);
  if (unavailable) return unavailable;
  const draft = chatDrafts.get(thread.id) || {};
- if (canSteer(run)) {
+ if (thread.kind!=='group' && canSteer(run)) {
   const sending=pendingChat.has(thread.id);
   return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}" data-steer="${e(run.id)}">
    <fieldset ${sending?'disabled':''}><label class="composer-label" for="chat-reply">给当前任务发消息</label>
@@ -623,27 +660,31 @@ function conversationComposer(thread,run) {
  const last = thread.turns.at(-1);
  const dispatch = draft.dispatch || (thread.kind==='group' ? 'team' : 'single');
  const status = pendingChat.has(thread.id);
- const intent = draft.intent || 'edit';
- const teamLead = dispatch==='team' && intent==='edit' ? thread.lead : null;
+ const group = thread.kind==='group';
+ const active = runActive(run);
+ const intent = group && ((draft.intent==='work' && active) || (draft.intent==='steer' && !active)) ? 'auto'
+  : draft.intent || (group?'auto':'edit');
+ const taskOptions = intent!=='question' && !active;
+ const teamLead = dispatch==='team' && taskOptions ? thread.lead : null;
  const recipient = teamLead || [draft.recipient,last?.recipient,thread.recipient].find(id=>thread.members.includes(id)) || thread.members[0];
  const hasProvider = state.config?.provider_ready;
- return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}">
+ return `<form class="reply-form" data-key="composer-${e(thread.id)}" data-thread="${e(thread.id)}" data-parent="${e(run.id)}" ${group?'data-group-message':''}>
    <fieldset ${status ? 'disabled' : ''}>
     <label class="composer-label" for="chat-reply">继续对话</label>
     <textarea id="chat-reply" name="message" maxlength="8000" ${status?'readonly':''} placeholder="${thread.kind==='group'?'发送群消息，或在开头 @角色 点名处理…':'提出问题，或描述下一步要修改的地方…'}">${e(draft.message || '')}</textarea>
     ${studioAttachments.picker('reply-'+thread.id,status)}
     <div class="reply-options">
-     ${thread.kind==='group' && intent==='edit'?dispatchField(dispatch):''}
+     ${group && taskOptions?dispatchField(dispatch):''}
      <label class="field-label"><span id="reply-recipient-label">${teamLead?'负责人':'回复角色'}</span>
       <select name="recipient" aria-labelledby="reply-recipient-label" ${teamLead || thread.kind==='dm' ? 'disabled' : ''}>
       ${roleOptions(teamLead?[teamLead]:thread.members,recipient)}</select></label>
-     <label class="field-label">消息类型<select name="intent">${intentOptions(intent)}</select></label>
-     <label class="field-label" ${intent === 'question' ? 'hidden' : ''}>本轮验收文件（选填）
-      <input name="acceptance_files" ${intent === 'question' ? 'disabled' : ''} placeholder="例如 snake/game.js" value="${e(draft.files || '')}"></label>
+     <label class="field-label">消息类型<select name="intent">${group?roomIntentOptions(intent,active):intentOptions(intent)}</select></label>
+     <label class="field-label" ${!taskOptions ? 'hidden' : ''}>本轮验收文件（选填）
+      <input name="acceptance_files" ${!taskOptions ? 'disabled' : ''} placeholder="例如 snake/game.js" value="${e(draft.files || '')}"></label>
     </div>
     <details class="studio-disclosure"><summary>本轮选项与预算</summary>
      ${interactionField(draft.interactionMode || (last ? run.interaction_mode || 'interactive' : 'autonomous'))}
-     ${intent==='edit'?`<label class="field-label">项目文件<select name="base">
+     ${taskOptions?`<label class="field-label">项目文件<select name="base">
        <option value="published" ${draft.base==='published'?'selected':''}>沿用最近发布版本</option>
        ${run.status==='failed' && last?.intent==='edit'?`<option value="failed" ${draft.base==='failed'?'selected':''}>接着本轮未完成文件</option>`:''}
        ${(thread.recovery_candidates || []).map(c => {
@@ -653,8 +694,8 @@ function conversationComposer(thread,run) {
        <option value="empty" ${draft.base==='empty'?'selected':''}>新任务，使用空工作区</option></select></label>
        ${ruleFields(draft.rules||'')}${thread.kind==='group'?sourceReviewField(draft.sourcePaths,dispatch==='team'):''}${thread.kind==='group' && dispatch==='team'?childFields(draft.children):''}`:''}
      ${limitFields(false,draft.limits || run.limits || {})}</details>
-    <div class="reply-footer"><span class="muted-note">${hasProvider ? (intent === 'question' ? '仅查询项目文件与对话记录。' : '基于最近可用的项目版本修改，旧版可随时查看。') : '继续对话需要配置本机 DeepSeek API key。'}</span>
-     <button type="submit" class="primary" ${!hasProvider || status ? 'disabled' : ''}>${status ? '正在发送…' : '发送'}${icon('arrow')}</button></div>
+    <div class="reply-footer">${intent!=='steer'?thinkingControl(draft.thinking, group && intent!=='work'):''}<span class="muted-note">${group ? (active?'可以追问，也可以调整当前任务。':'群成员可以直接回复，也可以接手新任务。') : hasProvider ? (intent==='question'?'仅查询项目文件与对话记录。':'基于最近可用的项目版本修改。') : '继续对话需要配置本机 DeepSeek API key。'}</span>
+     <button type="submit" class="primary" ${!hasProvider && thread.kind!=='group' || status ? 'disabled' : ''}>${status ? '正在发送…' : '发送'}${icon('arrow')}</button></div>
    </fieldset>${draft.error ? `<p class="form-error" role="alert">${e(draft.error)}</p>` : ''}</form>`;
 }
 
@@ -664,18 +705,24 @@ function conversationPanel(detail) {
  useRoomHistory(thread.id);
  const group = thread.kind==='group';
  const latestVersion = thread.artifact_run_id;
+ // Work stays where the user requested it, even when a queued item starts later.
+ const roomReplies = (thread.messages || []).filter(row=>row.disposition!=='steer' || !row.linked_run_id);
+ const linkedWork = new Set(roomReplies.filter(row=>row.disposition==='work').map(row=>row.linked_run_id));
+ const opening = [...(thread.opening_messages || []), ...roomReplies.filter(row=>row.parent_run_id===thread.id && !thread.turns.some(turn=>turn.run_id===thread.id))];
  const history = thread.turns.map(entry => {
   const turn = roomPage(entry,detail);
+  const replies = roomReplies.filter(row=>row.parent_run_id===turn.run_id);
   const link = turn.run_id === detail.run.id
    ? '<button class="text-button" data-tab="overview">本轮详情</button>'
    : `<a class="text-button" href="#run/${encodeURIComponent(turn.run_id)}">查看本轮</a>`;
   return `<article class="chat-turn" data-key="turn-${e(turn.run_id)}">
-   <div class="chat-user"><div class="speaker">你 <small>发给 ${e(turn.member_names?.[turn.recipient] || roleLabel(turn.recipient))}</small></div>
-   ${turn.user?`<p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p>`:''}${studioAttachments.history(turn)}</div>
-   ${roomMessages(turn,detail,group)}
+   ${linkedWork.has(turn.run_id) ? '' : `<div class="chat-user"><div class="speaker">你 <small>发给 ${e(turn.member_names?.[turn.recipient] || roleLabel(turn.recipient))}</small></div>
+   ${turn.user?`<p>${inlineMarkdown(turn.user,turn,{kind:'goal'})}</p>`:''}${studioAttachments.history(turn)}</div>`}
+   ${roomMessages(turn,detail,group,replies.filter(row=>row.after_turn===false))}
    ${studioReplyStreams.slot(turn)}
    <div class="chat-agent">${turn.answer ? `<div class="speaker">${group?roomAvatar(turn,turn.recipient):icon('cpu')} ${memberLink(turn.role_keys?turn:thread,turn.recipient)} ${link}</div>
-    ${roomReply(turn,group)}` : roomStatus(turn,detail,link)}${turnFiles(turn,group)}</div></article>`;
+    ${roomReply(turn,group)}` : roomStatus(turn,detail,link)}${turnFiles(turn,group)}</div>
+   ${(turn.events || []).filter(row=>row.kind==='status_reply' && row.after_turn).map(row=>statusReply(row,turn)).join('')}${replies.filter(row=>row.after_turn!==false).map(row=>groupReply(row,turn)).join('')}</article>`;
  }).join('');
  const versionLink = latestVersion === detail.run.id
   ? '<button class="text-button" data-tab="artifacts">查看当前产物</button>'
@@ -685,7 +732,8 @@ function conversationPanel(detail) {
     ${group?'':`<p>${thread.members.map(id=>memberLink(thread,id)).join('、')}</p>`}
     ${thread.workspace_path?`<p class="thread-workspace">${icon('folder')}工作区 <code>${e(thread.workspace_path)}</code></p>`:''}</div><div class="chat-actions">${versionLink}
    <a class="text-button" href="/api/runs/${encodeURIComponent(detail.run.id)}/room.zip" download>导出完整会话</a></div></header>
-   <div class="chat-history">${history || (group?'<p class="room-first-message">还没有群消息。</p>':'')}${history?roomPanel.endMarker():''}</div>${history?roomPanel.jumpButton():''}${conversationComposer(thread,detail.run)}</section>
+   <div class="chat-history">${opening.map(row=>groupReply(row,{run_id:thread.id})).join('')}${history || (group && !opening.length?'<p class="room-first-message">还没有群消息。</p>':'')}${history || opening.length?roomPanel.endMarker():''}</div>${history || opening.length?roomPanel.jumpButton():''}
+   ${StudioActivity.composerProgress(detail)}${conversationComposer(thread,detail.run)}</section>
    ${group?roomPanel.rail(thread,thread.head_run_id===detail.run.id && !runActive(detail.run) && thread.can_continue):''}</div>`;
 }
 
@@ -696,7 +744,7 @@ function rememberReply(form) {
   chatDrafts.set(form.dataset.thread,draft);
   return draft;
  }
- const draft = {interactionMode:fields.interaction_mode.value,message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
+ const draft = {thinking:fields.thinking?.value,interactionMode:fields.interaction_mode.value,message:fields.message.value,recipient:fields.recipient.value,intent:fields.intent.value,files:fields.acceptance_files.value,
   sourcePaths:fields.required_source_review_paths?.value ?? chatDrafts.get(form.dataset.thread)?.sourcePaths,
   rules:fields.acceptance_checks?.value,children:fields.child_checks?.value,base:fields.base?.value,dispatch:fields.dispatch?.value,
   limits:Object.fromEntries(runLimitFields.map(k=>[k.name, Number(fields[k.name].value)]))};
@@ -709,16 +757,17 @@ async function sendReply(form) {
  if (pendingChat.has(id) || !form.reportValidity()) return;
  const draft = rememberReply(form);
  const targetRun=form.dataset.steer;
+ const group=form.hasAttribute('data-group-message');
  const attachmentKey = studioAttachments.keyFor(form);
  if (!draft.message.trim() && !studioAttachments.count(attachmentKey)) {
   draft.error = '请填写消息或添加附件。';
   render();
   return;
  }
- const payload = {interaction_mode:draft.interactionMode,mode:draft.intent==='edit'&&draft.dispatch==='team'?'team':'single',limits:draft.limits,objective:draft.message.trim(),conversation:{
+ const payload = {thinking:draft.thinking,interaction_mode:draft.interactionMode,mode:draft.dispatch==='team' && draft.intent!=='question'?'team':'single',limits:draft.limits,objective:draft.message.trim(),conversation:{
   parent_run_id:form.dataset.parent,recipient:draft.recipient,intent:draft.intent
  }};
- if (!targetRun && draft.intent === 'edit') {
+ if (!targetRun && (draft.intent==='edit' || (group && ['auto','work'].includes(draft.intent) && !runActive(state.detail.run)))) {
   payload.acceptance_files = parseFiles(draft.files);
   if (payload.mode==='team' && draft.sourcePaths?.trim()) payload.required_source_review_paths=parseFiles(draft.sourcePaths);
   if (draft.base==='failed') payload.conversation.recover_failed=true;
@@ -737,12 +786,13 @@ async function sendReply(form) {
  try {
   const attachments = await studioAttachments.prepare(attachmentKey);
   if (attachments.length) payload.attachments=attachments.map(item=>item.id);
-  if (await sendRunSteer(attachmentKey,targetRun,payload.objective,payload.attachments || [])) {
+  const liveEvent = !group && await sendRunSteer(attachmentKey,targetRun,payload.objective,payload.attachments || []);
+  if (liveEvent) {
    studioAttachments.clear(attachmentKey);
    chatDrafts.delete(id);
    // Clear the live textarea as well as its draft while preserving its focus.
    if (form.isConnected) form.elements.message.value='';
-   toast('消息已加入当前任务。');
+   toast(liveEvent.kind === 'status_reply' ? '已查询本群任务。' : '消息已加入当前任务。');
    await refreshDetail();
    return;
   }
@@ -753,14 +803,18 @@ async function sendReply(form) {
    chatSubmissions.set(id,submission);
   }
   payload.request_id = submission.id;
-  const data = await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
+  const data = group ? await sendGroupMessage(id,payload) : await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
   studioAttachments.clear(attachmentKey);
   chatDrafts.delete(id);
   chatSubmissions.delete(id);
-  if (state.runId === form.dataset.parent) {
+  if (form.isConnected) form.elements.message.value='';
+  if (data.run?.id && data.run.id!==form.dataset.parent && state.runId===form.dataset.parent) {
    location.hash = state.followLatest ? latestChatLink(data.run.id) : chatLink(data.run.id);
+  } else if (state.detail?.conversation?.id===id) {
+   await refreshDetail();
   }
-  toast('消息已发送。');
+  const queued=data.message?.queue_state==='queued';
+  toast(queued?'新任务已排队。':data.message?.disposition==='steer' && data.message.linked_run_id?'已调整当前任务。':'消息已发送。');
  } catch(error) {
   draft.error = error.message;
   if (error.code === 'forbidden') state.config = null;
@@ -770,6 +824,13 @@ async function sendReply(form) {
   pendingChat.delete(id);
   if (state.detail?.conversation?.id === id) render();
  }
+}
+
+function sendGroupMessage(id,payload) {
+ const {request_id, objective:text, conversation, ...options}=payload;
+ const {parent_run_id,recipient,intent,kind,members,...inheritance}=conversation;
+ if (Object.keys(inheritance).length) options.conversation=inheritance;
+ return api(groupMessagesURL(id),{method:'POST',body:JSON.stringify({request_id,text,parent_run_id,recipient,intent,options})});
 }
 
 function parseFiles(value) {
@@ -814,8 +875,6 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
   <div class="advanced" id="${prefix}-advanced" hidden>
    ${!demo ? interactionField() : ''}
    ${mode==='team' ? '<label class="field-label">调度方式<select name="scheduler"><option value="serial">串行 · 按依赖执行</option><option value="parallel">分层并发</option><option value="evented">事件驱动</option></select></label>' : ''}
-   <label class="field-label">模型思考<select name="thinking" ${demo?'disabled':''}><option value="disabled">关闭</option>
-     <option value="enabled" ${state.config?.thinking==='enabled'?'selected':''}>开启</option></select></label>
    ${(chat||mode==='team') ? '<label class="field-label">本轮验收文件（选填）<input name="acceptance_files" placeholder="例如 snake/index.html, snake/game.js"><small>填写工作区相对路径，多个文件用逗号分隔。</small></label>' : ''}
    ${!demo?ruleFields():''}
    ${mode==='group'?sourceReviewField():''}
@@ -825,6 +884,7 @@ function formHTML(prefix='home',mode='team-demo',objective='') {
   <div class="composer-footer"><div class="composer-controls">
    <label class="mode-control">${icon(mode==='group'?'users':demo?'bolt':'cpu')}
     <select name="mode" aria-label="执行模式">${options.map(([value,label])=>`<option value="${value}" ${value===mode?'selected':''}>${label}</option>`).join('')}</select></label>
+   ${demo?'':thinkingControl(null, mode==='group')}
    <button type="button" class="text-button" data-action="advanced" aria-expanded="false" aria-controls="${prefix}-advanced">${icon('tune')}选项</button>
   </div><button class="primary" type="submit">${demo?'运行演示':chat?'发送':'开始任务'}${icon('arrow')}</button></div>
   <p class="form-error" role="alert" hidden></p></div><p class="form-note">${icon('shield')}<span>${note}</span></p></form>`;
@@ -910,8 +970,8 @@ function acceptance(detail){const reports=detail.acceptance||[];const passed=rep
 function diagnosis(detail){
  const d=detail.diagnostics;if(!d)return '';
  const issue=d.issues?.find(item=>item.severity==='error')||d.issues?.[0];
- const providerBlocked=issue?.code==='provider_balance_exhausted'&&!issue.resolved;
- const active=runActive(detail.run)&&!providerBlocked;
+ const active=runActive(detail.run);
+ const status=runStatus(detail.run);
  const cancelling=runStatus(detail.run)==='cancel_requested';
  if(!issue&&!active)return '';
  const task=(detail.tasks||[]).find(t=>t.task_id===issue?.task_id);
@@ -920,8 +980,12 @@ function diagnosis(detail){
  const activity=d.current_activity||[];
  const seconds=d.configuration?.max_task_seconds ?? d.configuration?.max_seconds;
  const timeBudget=seconds===0?'不限':seconds==null?'未记录':seconds+' 秒';
- const title=cancelling?'正在取消任务':active?(activity.length?activity.some(a=>a.phase==='planning')?'正在规划任务':'正在执行 Agent 步骤':'正在执行任务'):issue.title;
- return `<section class="diagnosis ${active?'running':issue?.severity==='warning'&&!endedWithoutChecks(detail)?'warning':''}" data-key="diagnosis"><div class="diagnosis-header"><h2>${e(title)}</h2><button class="secondary" data-action="download-diagnostics">${icon('download')}导出诊断</button></div>${active?`<p class="activity-live"><span class="dot"></span>${activity.length?activity.map(a=>`${e(({coordinate:'负责人分工',work:'执行任务',deliver:'写入分工文件',handoff:'成员交接',finalize:'负责人收尾',planning:'规划任务'})[a.phase]||a.task_id?.split(':').pop()||'整体目标')}${a.step?' 第 '+e(a.step)+' 轮':''}，已用时 ${duration(typeof a.started_ts==='number'?Date.now()-a.started_ts*1000:null)}`).join('；'):'任务状态会自动更新。'}</p>`:`<p>${task?`${e(task.assignee_profile_id||'Agent')}${issue.step?' 第 '+e(issue.step)+' 轮':''}：`:''}${e(issue.message)}</p>`}<div class="diagnosis-facts">${seconds!=null?`<span>时间预算 <strong>${e(timeBudget)}</strong></span>`:''}<span>执行 <strong>${e(cancelling?'正在取消':execution[d.execution_status]||d.execution_status)}</strong></span><span>验收 <strong>${e(verification[d.acceptance_status]||d.acceptance_status)}</strong></span>${d.configuration?.max_steps!=null?`<span>轮数上限 <strong>${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps)}</strong></span>`:''}${d.configuration?.max_total_tokens!=null?`<span>累计 token 预算 <strong>${d.configuration.max_total_tokens===0?'不限':Number(d.configuration.max_total_tokens).toLocaleString()}</strong></span>`:''}${d.blocked_tasks?.length?`<span>后续受阻 <strong>${d.blocked_tasks.length} 个任务</strong></span>`:''}${issue?.completion_tokens!=null?`<span>本轮输出 <strong>${Number(issue.completion_tokens).toLocaleString()} token</strong></span>`:''}</div>${!active&&issue?.suggestion?`<p class="next-step">下一步：${e(issue.suggestion)}</p>`:''}${!active&&d.acceptance_status==='not_configured'&&issue?.code!=='no_acceptance'?'<p>此外，本次未配置独立验收，不能判定目标已达成。</p>':''}${detail.run.status==='unverified'&&d.execution_status==='failed'?'<p>旧版总状态保存为“未验证”；日志确认存在执行失败。原始记录保持不变。</p>':''}<details data-key="diagnostic-evidence"><summary>查看失败证据、阻塞链与运行配置</summary>${issue?.request_id?`<p>模型请求 <code>${e(issue.request_id)}</code></p>`:''}${issue?.finish_reason?`<p>结束原因 <code>${e(issue.finish_reason)}</code>；输出上限 ${e(issue.max_output_tokens??'旧记录未保存')}；耗时 ${duration(issue.latency_ms)}</p>`:''}${(d.blocked_tasks||[]).map(t=>`<p>${e(t.task_id?.split(':').pop())} / ${e(t.assignee)}：${e(t.reason)}</p>`).join('')}<p>${Object.keys(d.configuration||{}).length?`模型 ${e(d.configuration.model)}；thinking ${e(d.configuration.thinking)}；单次输出上限 ${e(d.configuration.max_output_tokens)} token；执行轮数上限 ${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps??'未记录')}；累计 token 预算 ${e(d.configuration.max_total_tokens??'未记录')}；任务时限 ${e(timeBudget)}。`:'旧运行没有保存配置快照；当前服务配置不代表当时配置。'}</p>${d.incomplete?'<p>日志已截断，此诊断只基于保留的记录。</p>':''}</details></section>`;
+ const issueHistory=(d.issues || []).map(item=>{
+  const actor=(detail.tasks || []).find(t=>t.task_id===item.task_id)?.assignee_profile_id;
+  return `<li><strong>${e(item.title || item.code)}</strong>${actor?' · '+e(roleLabel(actor)):''}${item.resolved?' · 已处理':''}${item.message?`<p>${e(item.message)}</p>`:''}${active && !item.resolved && item.suggestion?`<p>${e(item.suggestion)}</p>`:''}</li>`;
+ }).join('');
+ const title=cancelling?'正在取消任务':status==='waiting_user'?'正在等待你的答复':status==='queued'?'任务已排队':status==='verifying'?'正在验收':active?(activity.length?activity.some(a=>a.phase==='planning')?'正在规划任务':'正在执行 Agent 步骤':'正在执行任务'):issue.title;
+ return `<section class="diagnosis ${active?'running':issue?.severity==='warning'&&!endedWithoutChecks(detail)?'warning':''}" data-key="diagnosis"><div class="diagnosis-header"><h2>${e(title)}</h2><button class="secondary" data-action="download-diagnostics">${icon('download')}导出诊断</button></div>${active?`<p class="activity-live"><span class="dot"></span>${activity.length?activity.map(a=>`${e(({coordinate:'负责人分工',work:'执行任务',deliver:'写入分工文件',handoff:'成员交接',finalize:'负责人收尾',planning:'规划任务'})[a.phase]||a.task_id?.split(':').pop()||'整体目标')}${a.step?' 第 '+e(a.step)+' 轮':''}，已用时 ${duration(typeof a.started_ts==='number'?Date.now()-a.started_ts*1000:null)}`).join('；'):'任务状态会自动更新。'}</p>`:`<p>${task?`${e(task.assignee_profile_id||'Agent')}${issue.step?' 第 '+e(issue.step)+' 轮':''}：`:''}${e(issue.message)}</p>`}<div class="diagnosis-facts">${seconds!=null?`<span>时间预算 <strong>${e(timeBudget)}</strong></span>`:''}<span>执行 <strong>${e(active?labels[status]:execution[d.execution_status]||d.execution_status)}</strong></span><span>验收 <strong>${e(verification[d.acceptance_status]||d.acceptance_status)}</strong></span>${d.configuration?.max_steps!=null?`<span>轮数上限 <strong>${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps)}</strong></span>`:''}${d.configuration?.max_total_tokens!=null?`<span>累计 token 预算 <strong>${d.configuration.max_total_tokens===0?'不限':Number(d.configuration.max_total_tokens).toLocaleString()}</strong></span>`:''}${d.blocked_tasks?.length?`<span>后续受阻 <strong>${d.blocked_tasks.length} 个任务</strong></span>`:''}${issue?.completion_tokens!=null?`<span>本轮输出 <strong>${Number(issue.completion_tokens).toLocaleString()} token</strong></span>`:''}</div>${!active&&issue?.suggestion?`<p class="next-step">下一步：${e(issue.suggestion)}</p>`:''}${!active&&d.acceptance_status==='not_configured'&&issue?.code!=='no_acceptance'?'<p>此外，本次未配置独立验收，不能判定目标已达成。</p>':''}${detail.run.status==='unverified'&&d.execution_status==='failed'?'<p>旧版总状态保存为“未验证”；日志确认存在执行失败。原始记录保持不变。</p>':''}<details data-key="diagnostic-evidence"><summary>查看诊断记录与运行配置</summary>${issueHistory?`<ul>${issueHistory}</ul>`:''}${issue?.request_id?`<p>模型请求 <code>${e(issue.request_id)}</code></p>`:''}${issue?.finish_reason?`<p>结束原因 <code>${e(issue.finish_reason)}</code>；输出上限 ${e(issue.max_output_tokens??'旧记录未保存')}；耗时 ${duration(issue.latency_ms)}</p>`:''}${(d.blocked_tasks||[]).map(t=>`<p>${e(t.task_id?.split(':').pop())} / ${e(t.assignee)}：${e(t.reason)}</p>`).join('')}<p>${Object.keys(d.configuration||{}).length?`模型 ${e(d.configuration.model)}；thinking ${e(d.configuration.thinking)}；单次输出上限 ${e(d.configuration.max_output_tokens)} token；执行轮数上限 ${e(d.configuration.max_steps===0?'不限':d.configuration.max_steps??'未记录')}；累计 token 预算 ${e(d.configuration.max_total_tokens??'未记录')}；任务时限 ${e(timeBudget)}。`:'旧运行没有保存配置快照；当前服务配置不代表当时配置。'}</p>${d.incomplete?'<p>日志已截断，此诊断只基于保留的记录。</p>':''}</details></section>`;
 }
 const roomHistory = new Map();
 let historyThread;
@@ -933,6 +997,7 @@ function useRoomHistory(threadId) {
 }
 
 function roomPage(turn, detail) {
+ if (turn.run_id === detail.run.id) turn = {...turn,status:runStatus(detail.run)};
  if (turn.run_id === detail.run.id && Array.isArray(detail.room_events))
   return {...turn, events:detail.room_events, events_start:0};
  const saved = roomHistory.get(turn.run_id);
@@ -1010,7 +1075,10 @@ function roomName(turn,id) {
 
 function roomSignedReview(row) {
  const handoff = row.handoff, review = handoff?.native_review, signed = review?.assessment;
- if (row.kind!=='member_report' || !['assessed','published'].includes(row.disposition) || !signed
+ // Older hosts could mark a signed draft handoff blocked after the reviewer's final prose.
+ const historicalDraft = row.disposition==='blocked' && review?.kind==='product' && review.state==='blocked'
+  && review.author && review.author!==row.role && review.private_candidate_task===review.target;
+ if (row.kind!=='member_report' || (!historicalDraft && !['assessed','published'].includes(row.disposition)) || !signed
      || !row.task_id || row.task_id!==handoff.task_id || !row.role || row.role!==handoff.role
      || row.role!==review.reviewer || row.role!==signed.evaluator || !signed.attempt_id
      || !review.target || review.target!==signed.target || !/^[a-f0-9]{64}$/.test(signed.candidate_version)
@@ -1081,16 +1149,35 @@ function roomMessage(row,index,turn) {
   ${receipt?`<small class="room-disposition">${e(receipt)}</small>`:''}${materials}</div>`;
 }
 
-function roomMessages(turn,detail,group) {
+function statusReply(row,turn) {
+ return `<div class="chat-update chat-update-user" data-key="query-${e(row.request_id)}"><div class="chat-update-byline">你</div><div class="prose">${markdown(row.question,turn,row)}</div></div>
+  <div class="chat-update" data-key="status-${e(row.request_id)}"><div class="chat-update-byline">Studio · 任务状态</div><div class="prose">${markdown(row.text,turn,row)}</div></div>`;
+}
+
+function groupReply(row,turn) {
+ if (row.kind==='status_reply') return statusReply(row,turn);
+ const taskLink=row.disposition==='work' && row.linked_run_id ? ` <a class="text-button" href="#run/${encodeURIComponent(row.linked_run_id)}/chat">查看任务</a>` : '';
+ return `<div class="chat-update chat-update-user" data-key="query-${e(row.request_id)}"><div class="chat-update-byline">你</div><div class="prose">${markdown(row.question,turn,row)}</div>${studioAttachments.history({run_id:state.detail.conversation.id,message_attachments:row.message_attachments})}</div>
+  <div class="chat-update" data-kind="group_message" data-key="group-reply-${e(row.request_id)}"><div class="chat-update-byline">${row.disposition==='reply'?roomName(turn,row.role):'Studio'}</div><div class="prose">${markdown(row.text,turn,row)}${taskLink}</div></div>`;
+}
+
+function roomMessages(turn,detail,group,replies=[]) {
  const events = turn.events || [];
  const start = turn.events_start || 0;
  const conversation = [], records = [];
+ let nextReply=0;
  for (const [offset,row] of events.entries()) {
+  while (nextReply<replies.length && replies[nextReply].at<=row.at)
+   conversation.push(groupReply(replies[nextReply++],turn));
   const index = turn.event_indices?.[offset] ?? start+offset;
   if (offset && turn.event_indices && index>turn.event_indices[offset-1]+1)
    conversation.push(historyButton(turn.run_id,index,'查看此处更早的消息'));
   // The goal is already displayed as the user's message at the top of the turn.
   if (row.kind==='goal' || row.kind==='steer_seen') continue;
+  if (row.kind==='status_reply') {
+   if (!row.after_turn) conversation.push(statusReply(row,turn));
+   continue;
+  }
   if (row.kind==='assistant_progress' || row.kind==='user_steer') {
    conversation.push(studioReplyStreams.message(row,turn));
    if (row.text_truncated) conversation.push(historyButton(turn.run_id,index+1,'读取完整原文'));
@@ -1103,6 +1190,7 @@ function roomMessages(turn,detail,group) {
     <pre>${e(JSON.stringify(row,null,2))}</pre>${row.text_truncated?historyButton(turn.run_id,index+1,'读取完整原文'):''}</details>`);
   }
  }
+ for (const reply of replies.slice(nextReply)) conversation.push(groupReply(reply,turn));
  const activity = window.StudioActivity?.renderTurn(turn,detail) || '';
  const diagnostics = records.length || group && activity ? `<details class="room-records" data-key="room-records">
   <summary>运行记录</summary>${records.join('')}${group?activity:''}</details>`:'';
@@ -1122,7 +1210,8 @@ function roomStatus(turn,detail,link) {
   const handoff = last?.kind==='member_report' && (last.disposition==='blocked' || (!last.disposition && last.handoff?.published===false))
    ? last.handoff?.remaining_issue : '';
   const cause = specific?.message || handoff || issues[0]?.message || turn.error || (current && detail.run.error);
-  message = cause ? roomLine(cause).split(/(?<=[。！？])/u)[0] : '本轮执行失败，未收到负责人的最终答复。';
+  message = cause ? roomLine(cause).split(/(?<=[。！？])/u)[0] :
+   turn.status==='blocked' ? '本轮任务受阻，查看运行记录了解待解决的问题。' : '本轮执行失败，未收到负责人的最终答复。';
  } else {
   message = ({cancelled:'本轮已取消。',interrupted:'本轮执行状态待核实。',unverified:'本轮已结束，验收状态为未验证。',
    completed:'本轮已完成。'})[turn.status] || '本轮没有保存最终答复。';
@@ -1172,7 +1261,7 @@ function chatDiagnostics(detail) {
  const content = diagnosis(detail);
  if (!content) return '';
  const issue = detail.diagnostics?.issues?.find(item => !item.resolved && item.severity === 'error');
- const label = issue?.title || '查看运行状态';
+ const label = (!runActive(detail.run) && issue?.title) || '查看运行状态';
  return `<details class="chat-diagnostics" data-key="chat-diagnostics"><summary>${e(label)}</summary>${content}</details>`;
 }
 
@@ -1301,7 +1390,8 @@ async function submit(form) {
  const chat = chatMode(mode);
  const attachmentKey = studioAttachments.keyFor(form);
  const payload = {mode:chat?'single':mode,objective:String(fields.get('objective')||'').trim(),
-  scheduler:fields.get('scheduler')||'serial',thinking:fields.get('thinking')||'disabled'};
+  scheduler:fields.get('scheduler')||'serial'};
+ if (fields.has('thinking')) payload.thinking=fields.get('thinking');
  const workspace = String(fields.get('workspace_path') || '').trim();
  if (workspace) payload.workspace_path = workspace;
  const errorBox = form.querySelector('.form-error');
@@ -1328,7 +1418,7 @@ async function submit(form) {
   if (mode === 'group' && !members.length) return showError('请先选择本轮处理消息的群成员。');
   if (!recipient || !members.includes(recipient)) return showError('请选择本轮回复的群成员或私聊角色。');
   payload.conversation = {kind:mode==='group'?'group':'dm',members,recipient,intent};
-  if (mode==='group' && intent==='edit' && fields.get('dispatch')==='team') payload.mode='team';
+  if (mode==='group' && intent!=='question' && fields.get('dispatch')==='team') payload.mode='team';
  }
  if ((chat||mode==='team') && fields.get('intent')!=='question') {
   payload.acceptance_files=parseFiles(fields.get('acceptance_files'));
@@ -1355,13 +1445,32 @@ async function submit(form) {
    newChatSubmissions.set(form,submission);
   }
   payload.request_id=submission.id;
-  const response=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
+  let nextId;
+  if (mode==='group') {
+   const {members,recipient}=payload.conversation;
+   const roomRequest={name:members.slice(0,3).map(roleLabel).join('、').slice(0,100),members,lead:recipient,pinned:false,
+    ...(workspace?{workspace_path:workspace}:{})};
+   const roomKey=JSON.stringify(roomRequest);
+   if (form.dataset.roomKey!==roomKey) {
+    form.dataset.roomKey=roomKey;
+    form.dataset.roomRequestId=crypto.randomUUID();
+   }
+   const {channel}=await api('/api/directory/channels',{method:'POST',body:JSON.stringify({...roomRequest,request_id:form.dataset.roomRequestId})});
+   delete payload.workspace_path;
+   delete payload.scheduler;
+   payload.conversation.parent_run_id=channel.id;
+   const sent=await sendGroupMessage(channel.id,payload);
+   nextId=sent.run?.id || channel.head_run_id;
+  } else {
+   const response=await api('/api/runs',{method:'POST',body:JSON.stringify(payload)});
+   nextId=response.run.id;
+  }
   studioAttachments.clear(attachmentKey);
   newChatSubmissions.delete(form);
   const dialog=form.closest('#task-dialog');
   if (form.isConnected && (!dialog || dialog.open)) {
    if (dialog) dialog.close();
-   location.hash = chat ? chatLink(response.run.id) : '#run/'+encodeURIComponent(response.run.id);
+   location.hash = chat ? chatLink(nextId) : '#run/'+encodeURIComponent(nextId);
   }
   toast(chat?'消息已发送。':'任务已发起。');
   await refresh();
@@ -1415,7 +1524,8 @@ document.addEventListener('change',event=>{const form=event.target.closest('form
   return;
  }
  if(form?.matches('.role-editor') && event.target.name==='scope'){
-  form.querySelector('[data-project-choice]').hidden=event.target.value!=='project';return;
+  form.querySelector('[data-project-choice]').hidden=event.target.value!=='project';
+  form.querySelector('[data-room-choice]').hidden=event.target.value!=='conversation';return;
  }
  if(form?.matches('.reply-form')){rememberReply(form);if(event.target.name==='intent'||event.target.name==='dispatch')render();return;}if(event.target.name==='member'){if(form.matches('.channel-form'))chatDirectory.updateChannelLead(form);else updateMemberPicker(form);}if(event.target.name==='intent'||event.target.name==='dispatch')syncIntent(form);if(event.target.name==='mode')swapMode(event.target.closest('form'),event.target.value);if(event.target.id==='run-filter'){state.filter=event.target.value;patchHTML($('#all-runs'),runList());}if(event.target.id==='log-filter'){state.logFilter=event.target.value;render();}});
 document.addEventListener('input',event=>{

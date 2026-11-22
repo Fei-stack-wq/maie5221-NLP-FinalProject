@@ -151,7 +151,7 @@ class Settings:
     runs_dir: Path = Path("runs")
     """每个 run 一个目录：<runs_dir>/<run_id>/trace.jsonl + agents/<name>/ 产物。"""
 
-    thinking: Literal["enabled", "disabled"] = "disabled"
+    thinking: Literal["enabled", "disabled"] = "enabled"
     reasoning_effort: Literal["low", "high", "max"] = "high"
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
@@ -186,7 +186,7 @@ class Settings:
             base_url=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL),
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
             temperature=_env_number("MA_TEMPERATURE", "0"),
-            thinking=os.environ.get("DEEPSEEK_THINKING", "disabled"),
+            thinking=os.environ.get("DEEPSEEK_THINKING", "enabled"),
             reasoning_effort=os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),
             max_output_tokens=_env_integer("DEEPSEEK_MAX_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS)),
             request_timeout_seconds=_env_number("DEEPSEEK_TIMEOUT", str(DEFAULT_REQUEST_TIMEOUT_SECONDS)),

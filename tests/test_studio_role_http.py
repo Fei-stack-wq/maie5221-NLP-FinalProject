@@ -51,6 +51,26 @@ class StudioRoleHTTPTest(unittest.TestCase):
             self.token = token
         self.assertEqual(self.get(path)["entries"],[])
 
+    def test_user_can_bind_notes_to_one_of_two_private_chats_and_curate_a_shared_skill(self):
+        self.profile("accounting")
+        self.profile("engineer")
+        path = "/api/profiles/accounting/knowledge"
+        room = {"kind": "dm", "members": ["accounting"], "recipient": "accounting", "intent": "edit"}
+        first, _ = self.chat("处理第一份账簿", room)
+        second, _ = self.chat("独立处理第二份账簿", room)
+        note = {"kind": "memory", "text": "private-ledger-marker-G6", "scope": "conversation", "project": first}
+        row = self.post(path, note)["entry"]
+        self.post("/api/profiles/engineer/knowledge", note, 400)
+        self.post(path, {**note, "text": "private-ledger-marker-G7", "entry_id": row["id"], "expected_revision": 1})
+        skill = self.post(path, {"kind": "skill", "scope": "role", "title": "对账", "text": "Compare signed totals."})["entry"]
+        a, prompt_a = self.chat("复述资料", {"parent_run_id": first, "recipient": "accounting", "intent": "question"})
+        _, prompt_b = self.chat("复述资料", {"parent_run_id": second, "recipient": "accounting", "intent": "question"})
+        self.post(path, {**note, "project": a}, 400)  # A turn ID cannot name a different conversation.
+        self.assertIn("private-ledger-marker-G7", prompt_a)
+        self.assertNotIn("private-ledger-marker-G7", prompt_b)
+        self.assertIn(skill["text"], prompt_a)
+        self.assertIn(skill["text"], prompt_b)
+
     def test_real_model_proposal_has_host_source_and_stays_private_until_review(self):
         self.profile("auditor")
         self.profile("engineer")

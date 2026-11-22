@@ -29,6 +29,9 @@ const signedEvents = [reviewEvent(assessment),reviewEvent({...assessment,verdict
 const publishedReview = reviewEvent(assessment,'published');
 publishedReview.published = publishedReview.handoff.published = true;
 signedEvents.push(publishedReview);
+const historical = reviewEvent({...assessment,verdict:'passed',results:assessment.results.slice(0,4)},'blocked');
+Object.assign(historical.handoff.native_review,{kind:'product',state:'blocked',author:'worker',private_candidate_task:nativeReview.target});
+signedEvents.push(historical);
 const unboundEvents = [null,{...assessment,evaluator:'worker'},{...assessment,target:'other-task'},
  {...assessment,candidate_version:'e'.repeat(64)}].map(s=>reviewEvent(s));
 unboundEvents.push(reviewEvent(assessment,'blocked'));
@@ -48,7 +51,9 @@ window.fetch=async(path, options={})=>{
  let ok=true;
  if(path==='/api/bootstrap') data={provider_ready:true,model:'offline fixture',thinking:'disabled',csrf_token:'fixture',conversation_roles:roles};
  else if(path==='/api/directory/chats') data={channels:[],recent:[{...completeThread,title:'测试项目',turn_count:1}]};
- else if(path==='/api/runs' && options.method==='POST'){
+ else if(path==='/api/directory/channels' && options.method==='POST'){
+  window.fixtureGroup=JSON.parse(options.body);data={channel:{id:'demo-project',head_run_id:'demo-project'}};
+ }else if(path==='/api/groups/demo-project/messages' && options.method==='POST'){
   fixturePosts.push(JSON.parse(options.body));
   ok=false;data={error:'测试网络错误。',code:'fixture_error'};
  }else if(path==='/api/runs') data={runs:[fixtureRun]};
@@ -112,7 +117,7 @@ window.addEventListener('load',async()=>{
   fixtureChat=true;
   await waitFor(()=>document.querySelector('#tab-chat'));
   document.querySelector('#tab-chat').click();
-  const [candidate,blocked,changes,unresolved,passed,published,...unbound]=document.querySelectorAll('.room-message[data-kind="member_report"]');
+  const [candidate,blocked,changes,unresolved,passed,published,legacy,...unbound]=document.querySelectorAll('.room-message[data-kind="member_report"]');
   check('frozen candidate shows its review option and retains original receipt',
    candidate.querySelector('.room-disposition').textContent==='候选已保存 · 可独立复核'&&
    candidate.querySelector('.room-line').textContent.includes('请复核重复预订')&&
@@ -134,7 +139,9 @@ window.addEventListener('load',async()=>{
   check('inconclusive and passing signed reviews keep their distinct verdicts',badge(unresolved)==='评审已签署 · 暂未定论'&&
    line(unresolved).includes('CHECK 待补证')&&badge(passed)==='评审已签署 · 通过'&&line(passed).includes('4 项通过')&&!badge(passed).includes('交接'));
   check('publication is displayed separately when the signed event also published files',badge(published).includes('要求修改 · 本次交接已发布'));
-  check('absent mismatched and blocked receipts never count as a signed assessment',unbound.length===5&&
+  check('legacy blocked prose cannot erase a signed review of a bound frozen draft',
+   badge(legacy)==='评审已签署 · 通过'&&line(legacy).includes('4 项通过')&&!badge(legacy).includes('已发布'));
+  check('absent mismatched and unbound receipts never count as a signed assessment',unbound.length===5&&
    unbound.every(message=>!badge(message).includes('已签署')&&!line(message).includes('4 项通过'))&&
    unbound.slice(0,4).every(message=>line(message).includes('签署记录待核对')));
   const form=document.querySelector('.reply-form'),draft=form.elements.message;
@@ -151,7 +158,7 @@ window.addEventListener('load',async()=>{
   await waitFor(()=>fixturePosts.length===2&&!form.querySelector('fieldset').disabled);
   const [one,two]=fixturePosts;
   check('failed send retains draft and idempotency key',draft.value==='请解释速度计算。'&&one.request_id===two.request_id);
-  check('question submits to a single chosen member',one.conversation.parent_run_id==='fixture'&&one.conversation.recipient==='reviewer'&&one.conversation.intent==='question'&&!one.acceptance_files);
+  check('question submits to a single chosen member',one.parent_run_id==='fixture'&&one.recipient==='reviewer'&&one.intent==='question'&&!one.options.acceptance_files);
   check('finished execution explicitly reports missing checks',document.querySelector('.detail-actions').textContent.includes('执行已结束 · 未配置验收'));
   fixtureStop=true;
   await waitFor(()=>document.querySelectorAll('.turn-system').length===3);
@@ -170,7 +177,7 @@ window.addEventListener('load',async()=>{
   for(const box of group.querySelectorAll('[name=member]'))box.checked=true;reviewer.dispatchEvent(new Event('change',{bubbles:true}));
   group.elements.recipient.value='reviewer';group.requestSubmit();
   await waitFor(()=>fixturePosts.length===3);
-  check('new group includes roster and explicit responder',fixturePosts[2].conversation.kind==='group'&&fixturePosts[2].conversation.members.length===2&&fixturePosts[2].conversation.recipient==='reviewer');
+  check('new group includes roster and explicit responder',window.fixtureGroup.members.length===2&&window.fixtureGroup.lead==='reviewer'&&fixturePosts[2].recipient==='reviewer'&&fixturePosts[2].parent_run_id==='demo-project'&&fixturePosts[2].intent==='auto');
     result.dataset.finished='true';result.dataset.passed=String(results.every(r=>r.passed));
  }catch(error){check(error.message,false);result.dataset.finished='true';result.dataset.passed='false';}
 });

@@ -9,6 +9,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime
 
 from .studio_conversations import ROLE_LABELS
+from .studio_group_status import group_status
 
 
 class StudioDispatch:
@@ -76,8 +77,43 @@ class StudioDispatch:
         return json.dumps([thread['id'], source.get('workspace_path'), thread.get('knowledge_project_id')],
                           ensure_ascii=False)
 
+    def _active_dispatch_source(self, source_run_id):
+        from .studio_service import StudioError
+        source = self._meta(self._directory(source_run_id))
+        if (source.get("thread", {}).get("superagent") is not True or source_run_id not in self._active
+                or self._cancellations[source_run_id].is_set()):
+            raise StudioError("只有正在执行的统一对话可以访问派工。", "inactive_source", 409)
+        return source
+
+    def read_group_dispatch(self, source_run_id, group_id, *, dispatch_id=None):
+        """Inspect a child bound to this assistant project, never a group's other turns."""
+        from .studio_service import StudioError
+        with self._lock:
+            source = self._active_dispatch_source(source_run_id)
+            self._dispatch_target(source, "group", group_id)
+            query = "SELECT * FROM dispatches WHERE scope=? AND target_kind='group' AND target_id=?"
+            params = (self._dispatch_scope(source), group_id)
+            if dispatch_id is not None:
+                query += " AND id=?"
+                params += (dispatch_id,)
+            rows = self._read_dispatch_rows(query + " ORDER BY rowid DESC LIMIT 1", params)
+            if not rows:
+                return {"status": "answered", "answer": "当前项目没有对应的群派工记录。"}
+            receipt = self._dispatch_receipt(rows[0])
+            child = receipt["child_run_id"]
+            if not child:
+                return {"status": "answered", "receipt": receipt}
+            if receipt["conversation_id"] != group_id:
+                raise StudioError("无法核对派工目标。", "unknown_route", 409)
+            room = self._conversation(self._directory(child), with_answers=False)
+            if not room or room["id"] != group_id:
+                raise StudioError("无法核对派工目标。", "unknown_route", 409)
+            progress = group_status(self, room, source_run_id=child)
+            return {"status": "answered", "answer": progress["answer"], "status_snapshot": progress}
+
     def request_studio_dispatch(self, source_run_id, *, target_kind, target_id, objective,
-                                acceptance_files=None, input_files=None, required_participants=None, attachment_ids=None):
+                                acceptance_files=None, input_files=None, required_participants=None, attachment_ids=None,
+                                continue_dispatch_id=None):
         from .studio_conversations import conversation_attachments, turn_attachments
         from .studio_route_results import bind_inputs
         from .studio_service import StudioError, _relative
@@ -91,11 +127,8 @@ class StudioDispatch:
         if len(inputs) != len(set(inputs)):
             raise StudioError('派工输入包含重复文件。')
         with self._lock:
-            source = self._meta(self._directory(source_run_id))
-            thread = source.get('thread', {})
-            if (thread.get('superagent') is not True or source_run_id not in self._active
-                    or self._cancellations[source_run_id].is_set()):
-                raise StudioError('派工只能由正在执行的统一对话发起。', 'inactive_source', 409)
+            source = self._active_dispatch_source(source_run_id)
+            thread = source["thread"]
             inbox = self._steering.get(source_run_id)
             current = turn_attachments({'message_attachments': source.get('attachments', []),
                                         'steering': inbox.rows if inbox else []})
@@ -116,7 +149,12 @@ class StudioDispatch:
             checked = self._request({'mode': 'single', 'request_id': str(uuid.uuid4()),
                                      'objective': objective, 'acceptance_files': acceptance})
             objective = checked['objective']
-            signature = json.dumps([source_run_id, target_kind, target_id, objective], ensure_ascii=False)
+            identity_parts = [source_run_id, target_kind, target_id, objective]
+            if continue_dispatch_id is not None:
+                if target_kind != 'role' or not isinstance(continue_dispatch_id, str) or not continue_dispatch_id:
+                    raise StudioError('继续私聊需要该角色在本项目中的派工编号。', 'unknown_route')
+                identity_parts.append(continue_dispatch_id)
+            signature = json.dumps(identity_parts, ensure_ascii=False)
             identity = str(uuid.uuid5(uuid.NAMESPACE_URL, signature))
             scope = self._dispatch_scope(source)
             with self._dispatch_db(write=True) as db:
@@ -134,12 +172,20 @@ class StudioDispatch:
                     if row['state'] == 'queued' and row['participants'] is None:
                         db.execute('UPDATE dispatches SET participants=? WHERE id=?', (json.dumps(participants), identity))
                 else:
+                    room_id = None
+                    if continue_dispatch_id is not None:
+                        previous = db.execute("""SELECT room FROM dispatches WHERE id=? AND scope=?
+                            AND target_kind='role' AND target_id=? AND state='started'""",
+                            (continue_dispatch_id, scope, target_id)).fetchone()
+                        if previous is None or not previous['room']:
+                            raise StudioError('找不到本项目中该角色的指定私聊派工。', 'unknown_route', 409)
+                        room_id = previous['room']
                     child = 'studio-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:12]
                     db.execute('''INSERT INTO dispatches
-                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,participants,attachment_ids,state)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
+                        (id,source,scope,target_kind,target_id,target_name,objective,inputs,acceptance,child,participants,attachment_ids,room,state)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'queued')''', (identity, source_run_id, scope, target_kind,
                             target_id, name, objective, json.dumps(inputs), json.dumps(acceptance), child, json.dumps(participants),
-                            json.dumps(attached)))
+                            json.dumps(attached), room_id))
                     row = db.execute('SELECT * FROM dispatches WHERE id=?', (identity,)).fetchone()
                 return self._dispatch_receipt(row)
 
@@ -174,7 +220,7 @@ class StudioDispatch:
                         status = 'waiting_user'
                 error = meta.get('error', '')
             except (StudioError, KeyError):
-                child, status, error = None, 'failed', '无法核对已派发的运行记录。'
+                child, status, error = None, 'unknown', '暂时无法核对已派发的运行记录。'
         return self._redact({'dispatch_id': row['id'], 'source_run_id': row['source'],
             'target_kind': row['target_kind'], 'target_id': row['target_id'], 'target_name': row['target_name'],
             'objective': row['objective'], 'input_files': json.loads(row['inputs']),
@@ -204,24 +250,22 @@ class StudioDispatch:
                                             (dispatch_id, self._dispatch_scope(source_meta)))
             return self._dispatch_receipt(rows[0]) if rows else None
 
-    def _dispatch_conversation(self, db, row, source, recipient):
+    def _dispatch_conversation(self, row, source, recipient):
         from .studio_service import StudioError
         if row['target_kind'] == 'group':
             room_id = row['target_id']
         else:
-            # Look up only DMs established by a previous handoff for this project.
-            # A role's unrelated private conversations must never enter this context.
-            previous = db.execute('''SELECT room FROM dispatches WHERE scope=? AND target_kind='role'
-                AND target_id=? AND state='started' ORDER BY rowid DESC LIMIT 1''',
-                (row['scope'], row['target_id'])).fetchone()
-            if previous is None:
+            # A bare role address starts a fresh DM. A continuation was bound
+            # to a specific prior handoff before it entered the queue.
+            room_id = row['room']
+            if room_id is None:
                 return {'intent': 'edit', 'kind': 'dm', 'members': [recipient], 'recipient': recipient}
-            room_id = previous['room']
         room = self._conversation(self._directory(room_id), with_answers=False)
         if room and row['target_kind'] == 'group':
             recipient = room['lead']
         if (not room or room.get('superagent') or recipient not in room['members']
-                or room['workspace_path'] != source.get('workspace_path')):
+                or ((row['target_kind'] == 'role' or room['workspace_path'])
+                    and room['workspace_path'] != source.get('workspace_path'))):
             raise StudioError('派工目标会话与当前项目不一致。', 'unknown_route', 409)
         if not room['can_continue']:
             if room['turns'] and room['turns'][-1]['status'] in {'queued', 'running', 'waiting_user'}:
@@ -253,13 +297,13 @@ class StudioDispatch:
             if source['state'] not in {'completed', 'unverified'}:
                 raise StudioError('派工来源执行失败，尚未派发。', 'failed_source', 409)
             _, recipient = self._dispatch_target(source, row['target_kind'], row['target_id'])
-            message = self._dispatch_conversation(db, row, source, recipient)
+            message = self._dispatch_conversation(row, source, recipient)
             payload = {'request_id': row['id'], 'mode': 'team' if row['target_kind'] == 'group' else 'single',
                        'objective': row['objective'], 'acceptance_files': json.loads(row['acceptance']),
                        'conversation': message, 'thinking': source['request'].get('thinking', self.settings.thinking),
                        'limits': source['request'].get('limits', {}),
                        'interaction_mode': source['request'].get('interaction_mode', 'interactive')}
-            if source.get('workspace_path'):
+            if row['target_kind'] == 'role' and source.get('workspace_path'):
                 payload['workspace_path'] = source['workspace_path']
             if attachment_ids := json.loads(row['attachment_ids']):
                 payload['attachments'] = attachment_ids

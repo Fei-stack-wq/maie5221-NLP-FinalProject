@@ -27,6 +27,7 @@ class StudioChatHTTPTest(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         service = StudioService(Path(folder.name) / "runs", Settings(api_key="unit-test-model"))
         self.addCleanup(service.close)
+        self.service = service
         server = create_server(service, port=0)
         self.addCleanup(server.server_close)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -71,6 +72,55 @@ class StudioChatHTTPTest(unittest.TestCase):
         artifact = next(a for a in detail["artifacts"] if a["name"] == "game.js")
         query = urlencode({"path": artifact["path"]})
         return self.get(f"/api/runs/{run_id}/artifact?{query}")["content"]
+
+    def test_status_uses_group_receipts_in_edit_mode_without_starting_a_run(self):
+        room = {"kind": "group", "members": ["worker", "reviewer"], "recipient": "worker", "intent": "edit"}
+        with patch("miniagent.studio_service.DeepSeekProvider", side_effect=[
+                ScriptedProvider([{"text": "draft"}]), ScriptedProvider([{"text": "other"}])]) as provider:
+            original, _ = self.send("Ship the booking app", room, files=["index.html", "qa.md"])
+            other, _ = self.send("Private other group task", room)
+            workspace = self.service.runs_dir / original / "agents" / "worker"
+            workspace.mkdir(parents=True, exist_ok=True)
+            (workspace / "qa.md").touch()  # An empty placeholder fails Studio's file acceptance.
+            version = "b" * 64
+            record = self.service._record_room_event
+            record(original, "worker", "assignment", "implement", task_id="dev-1", recipient="worker")
+            record(original, "worker", "member_report", "draft", task_id="dev-1", published=False,
+                   handoff={"task_id": "dev-1", "role": "worker", "deliverable_paths": ["index.html"],
+                            "reviewable_candidate": {"task_id": "dev-1", "candidate_version": version}})
+            record(original, "worker", "assignment", "review", task_id="qa-1", recipient="reviewer")
+            record(original, "reviewer", "member_report", "[BLOCKED]", task_id="qa-1",
+                   disposition="blocked", handoff={"task_id": "qa-1", "role": "reviewer", "native_review": {
+                       "state": "blocked", "target": "dev-1", "author": "worker", "reviewer": "reviewer",
+                       "files": {"index.html": "a"*64}, "candidate_version": version,
+                       "assessment": {"target": "dev-1", "candidate_version": version, "evaluator": "reviewer",
+                                      "attempt_id": "attempt-qa", "verdict": "passed",
+                                      "results": [{"criterion_id": "opens", "verdict": "passed"}]}}})
+            payload = {"request_id": str(uuid.uuid4()), "mode": "team", "objective": "所以现在完成了吗？",
+                       "conversation": {"parent_run_id": original, "recipient": "worker", "intent": "edit"}}
+            from miniagent.studio_group_status import group_status
+            from tests.test_room_reply import output
+            room_view = self.service._conversation(self.service._directory(original), with_answers=False)
+            snapshot = group_status(self.service, room_view)
+            with patch("miniagent.studio_room_reply.DeepSeekProvider.chat", return_value=output(answer=snapshot["answer"])) as classify:
+                status, read = self.exchange("POST", "/api/runs", payload)
+                self.assertEqual(status, 202, read)
+                self.assertEqual(read["run"]["id"], original)
+                reply = read["message"]
+                self.assertEqual(reply["disposition"], "reply")
+                self.assertIn("reviewer 已签署通过", reply["text"])
+                self.assertIn("仍待公开发布", reply["text"])
+                self.assertIn("qa.md", reply["text"])
+                self.assertNotIn("Private other", str(classify.call_args.args))
+                self.assertEqual(self.exchange("POST", "/api/runs", payload)[1]["message"], reply)
+                self.assertEqual(classify.call_count, 1)
+                conflict, _ = self.exchange("POST", "/api/runs", {**payload, "objective": "Build something else"})
+                self.assertEqual(conflict, 409)
+            view = self.get("/api/runs/" + original)
+            self.assertEqual(len(view["conversation"]["turns"]), 1)
+            self.assertEqual(view["conversation"]["messages"], [reply])
+            self.assertEqual(self.get("/api/runs/" + other)["conversation"]["messages"], [])
+            self.assertEqual(provider.call_count, 2)
 
     def test_group_directs_one_responder_per_turn_and_revises_original_files_after_question(self):
         first_source = "const speed = 140; // milliseconds\n"

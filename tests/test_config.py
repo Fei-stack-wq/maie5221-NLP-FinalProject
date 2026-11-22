@@ -16,7 +16,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.model, "deepseek-flash")
         self.assertEqual(settings.base_url, "https://api.deepseek.com")
         self.assertEqual(settings.api_key, "")
-        self.assertEqual(settings.thinking, "disabled")
+        self.assertEqual(settings.thinking, "enabled")
         self.assertEqual(settings.reasoning_effort, "high")
         self.assertEqual(settings.max_output_tokens, 300_000)
         self.assertEqual(settings.request_timeout_seconds, 120)
@@ -32,7 +32,7 @@ class SettingsTest(unittest.TestCase):
             "DEEPSEEK_API_KEY": "unit-test-secret-not-a-real-key",
             "DEEPSEEK_MODEL": "deepseek-v4-pro",
             "DEEPSEEK_BASE_URL": "https://api.deepseek.com/v1",
-            "DEEPSEEK_THINKING": "enabled",
+            "DEEPSEEK_THINKING": "disabled",
             "DEEPSEEK_REASONING_EFFORT": "max",
             "DEEPSEEK_MAX_TOKENS": "8192",
             "DEEPSEEK_TIMEOUT": "5.5",
@@ -45,7 +45,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.api_key, values["DEEPSEEK_API_KEY"])
         self.assertEqual(settings.model, "deepseek-v4-pro")
         self.assertEqual(settings.base_url, "https://api.deepseek.com/v1")
-        self.assertEqual(settings.thinking, "enabled")
+        self.assertEqual(settings.thinking, "disabled")
         self.assertEqual(settings.reasoning_effort, "max")
         self.assertEqual(settings.max_output_tokens, 8192)
         self.assertEqual(settings.request_timeout_seconds, 5.5)

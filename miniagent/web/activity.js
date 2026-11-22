@@ -19,15 +19,61 @@
   const minutes = ms => ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(1) + ' s';
   const cache = new Map();
 
+  const phases = {coordinate:'协调分工',work:'执行任务',deliver:'准备交付',handoff:'交接成果',
+    finalize:'整理最终交付',planning:'规划任务',agent_step:'处理任务'};
+  const progressStates = {running:'运行中',queued:'排队中',verifying:'正在验收',waiting_user:'等待你的答复',
+    cancel_requested:'正在取消',completed:'已完成',failed:'执行失败',error:'执行出错',blocked:'任务受阻',
+    unverified:'已结束 · 未独立验收',cancelled:'已取消',interrupted:'已中断 · 待核实'};
+
+  function liveAction(turn, detail) {
+    const calls = detail?.activity?.calls || [];
+    const call = calls.findLast(item => item.status === 'running') ||
+      (turn.current_call?.status === 'running' ? turn.current_call : null);
+    const actor = id => turn.member_names?.[id] || roleLabel(id);
+    if (call) return [actor(call.role), labels[call.tool] || call.tool, call.summary].filter(Boolean).join(' · ');
+    const steps = detail?.diagnostics?.current_activity || turn.current_activity || [];
+    return steps.map(step => {
+      const task = detail?.tasks?.find(item => item.task_id === step.task_id);
+      return [actor(step.role || task?.assignee_profile_id),phases[step.phase] || '处理任务',
+        step.step != null ? '第 ' + step.step + ' 步' : ''].filter(Boolean).join(' · ');
+    }).join(' / ');
+  }
+
   function current(turn, detail) {
-    if (!runActive(turn) || turn.status==='waiting_user') return '';
-    const call = turn.current_call || (turn.run_id===detail?.run?.id ? detail?.activity?.calls?.at(-1) : null);
-    if (!call) return '';
-    const role = call.role && (turn.member_names?.[call.role] || roleLabel(call.role));
-    const action = Object.hasOwn(labels,call.tool) ? labels[call.tool] : call.tool;
-    const status = states[call.status] || '';
-    const caption = [role,action,call.summary,status].filter(Boolean).join(' · ');
+    if (turn.status !== 'running') return '';
+    const action = liveAction(turn, turn.run_id===detail?.run?.id ? detail : null);
+    if (!action) return '';
+    const caption = action + ' · 执行中';
     return `<div class="live-action" data-key="current-action" role="status">${escape(caption)}</div>`;
+  }
+
+  function progressRow(turn, status, name, detail) {
+    const id = turn.child_run_id || turn.dispatch_id || turn.run_id;
+    const action = status === 'running' ? liveAction(turn,detail) : '';
+    const thinking = detail?.diagnostics?.configuration?.thinking;
+    const modelMode = runActive({status}) && ({enabled:'思考已开启', disabled:'思考已关闭'})[thinking];
+    return `<div class="composer-progress-row" data-key="progress-${escape(id)}" data-status="${escape(status)}">
+      <i aria-hidden="true"></i><strong>${escape(name)}</strong><span>${escape(progressStates[status] || '状态待核实')}</span>
+      ${turn.dispatch_id && turn.objective ? `<span class="composer-job" title="${escape(turn.objective)}">${escape(turn.objective)}</span>` : ''}
+      ${action ? `<small>${escape(action)}</small>` : ''}${modelMode ? `<small>${escape(modelMode)}</small>` : ''}</div>`;
+  }
+
+  function composerProgress(detail, dispatches = []) {
+    const run = detail?.run;
+    if (!run || run.mode === 'room') return '';
+    const thread = detail.conversation;
+    const turn = thread?.turns?.find(item => item.run_id === run.id);
+    if (thread?.head_run_id && thread.head_run_id !== run.id) return '';
+    const rows = [];
+    if (!dispatches.length || runActive(run)) {
+      rows.push(progressRow(turn || {run_id:run.id},runStatus(run),thread?.superagent ? '统一助手' : '本轮任务',detail));
+    }
+    for (const job of dispatches) {
+      rows.push(progressRow(job,job.status,job.target_name || roleLabel(job.target_id)));
+    }
+    const waiting = (thread?.messages || []).filter(message => message.queue_state === 'queued').length;
+    if (waiting) rows.push(`<small class="composer-queue">另有 ${waiting} 项工作排队中</small>`);
+    return `<div class="composer-progress" role="status" aria-label="任务进度" data-key="composer-progress">${rows.join('')}</div>`;
   }
 
   function render(activity, memberNames={}) {
@@ -160,5 +206,5 @@
     const retry = event.target.closest?.('[data-activity-retry]');
     if (retry) load(retry.closest('.activity-lazy'), true);
   });
-  window.StudioActivity = {render, renderTurn, preview, current};
+  window.StudioActivity = {render, renderTurn, preview, current, composerProgress};
 })();

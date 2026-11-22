@@ -157,7 +157,7 @@ def _script_inputs(code: str) -> tuple[set[str], str, int | None, bool]:
     return paths, command, exit_position, reader_seen or output_only
 
 
-def _asserted_inputs(code: str, *, process_output=False) -> set[str]:
+def _asserted_inputs(code: str, *, process_output=False, cases=None, failed_site=None) -> set[str]:
     """Conservatively bind an executed top-level assertion to literal file inputs.
 
     This is provenance, not a proof that an assertion implements a business rule.
@@ -190,9 +190,30 @@ def _asserted_inputs(code: str, *, process_output=False) -> set[str]:
             return _python_entry_point(node)
         return None
 
-    def inputs(node):
+    def inputs(node, *, assertion=False):
         paths = set()
-        for part in ast.walk(node):
+        pending = [node]
+        while pending:
+            part = pending.pop()
+            if cases is not None and isinstance(part, ast.BoolOp):
+                conjunction = isinstance(part.op, ast.And)
+                # A constant that decides the expression makes it unsuitable as a check.
+                if any(isinstance(x, ast.Constant) and bool(x.value) != conjunction for x in part.values):
+                    continue
+                alternatives = [inputs(x) for x in part.values if not isinstance(x, ast.Constant)]
+                if alternatives:
+                    examined_all = part is node and assertion and conjunction == (failed_site is None)
+                    merge = set.union if examined_all else set.intersection
+                    paths.update(merge(*alternatives))
+                continue
+            if cases is not None and isinstance(part, ast.IfExp):
+                if isinstance(part.test, ast.Constant):
+                    pending.append(part.body if part.test.value else part.orelse)
+                else:
+                    paths.update(inputs(part.body) & inputs(part.orelse))
+                    pending.append(part.test)
+                continue
+            pending.extend(ast.iter_child_nodes(part))
             if isinstance(part, ast.Name):
                 paths.update(dependencies.get(part.id, ()))
             if (isinstance(part, ast.Attribute) and part.attr in {"stdout", "stderr"}
@@ -234,8 +255,38 @@ def _asserted_inputs(code: str, *, process_output=False) -> set[str]:
                     runpy_modules.discard(target.id)
                     subprocess_modules.discard(target.id)
         elif isinstance(node, ast.Assert) and (not process_output or isinstance(node.test, ast.Compare)):
-            checked.update(inputs(node.test))
+            used = inputs(node.test, assertion=True)
+            checked.update(used)
+            if (cases is not None and used and isinstance(node.msg, ast.Constant)
+                    and isinstance(node.msg.value, str) and 0 < len(node.msg.value) <= 80
+                    and (failed_site is None or failed_site == (node.lineno, node.msg.value))):
+                cases.setdefault(node.msg.value, set()).add(frozenset(used))
     return checked
+
+
+def _criterion_inputs(observation, code, manifest, embedded_html):
+    """Bind each executed, named assertion to the artifacts that particular check used."""
+    if observation.source == "run_browser":
+        by_rule = observation.meta.get("browser_criterion_inputs", {})
+        return {key: [{p: manifest[p] for p in _observed_browser_files(evidence, manifest, embedded_html)}
+                      for evidence in checks] for key, checks in by_rule.items()}
+    if observation.source != "run_python":
+        return {}
+    failed = None
+    if not observation.ok:
+        # A failed first assert cannot attest other checks later in the script.
+        frames = re.findall(r'File "<string>", line (\d+), in <module>', observation.content)
+        error = re.search(r"(?m)^AssertionError: ([^\r\n]+)\s*\Z", observation.content)
+        if frames and error:
+            failed = int(frames[-1]), error.group(1).strip()
+        else:
+            return {}
+    elif not observation.meta.get("review_script_completed"):
+        return {}
+    cases = {}
+    _asserted_inputs(code, cases=cases, failed_site=failed)
+    return {key: [{p: manifest[p] for p in paths if p in manifest} for paths in sorted(map(sorted, checks))]
+            for key, checks in cases.items()}
 
 
 def _python_entry_point(call):
@@ -1244,9 +1295,12 @@ class MemberProgress:
                             failures[suite_key] = label
                         advances |= not failures.keys() <= self._failures.keys()
                         self._failures.update(failures)
+                        named_inputs = _criterion_inputs(failure_obs, parameters.get("code", ""), self._current, self._embedded_html)
                         for key, failure in failures.items():
                             self._review_evidence["fail:" + key] = {
                                 "kind":"failed_check","label":failure,"scope":key,"tool_call_id":obs.tool_call_id}
+                            if named_inputs:
+                                self._review_evidence["fail:" + key]["criterion_inputs"] = named_inputs
                             if obs.source == "run_browser":
                                 self._review_evidence["fail:" + key]["browser_inputs"] = {
                                     p: self._current[p] for p in _observed_browser_files(obs.meta, self._current, self._embedded_html)}
@@ -1365,6 +1419,9 @@ class MemberProgress:
                                     inputs.update(browser_inputs)
                                 self._review_evidence["pass:" + suite_key]["asserted_inputs"] = {
                                     p: self._current[p] for p in inputs if p in self._current}
+                                named_inputs = _criterion_inputs(obs, code, self._current, self._embedded_html)
+                                if named_inputs:
+                                    self._review_evidence["pass:" + suite_key]["criterion_inputs"] = named_inputs
                             if (status != "runner_exit" and obs.tool_call_id and obs.ok
                                     and obs.source in {"run_python", "run_browser"}
                                     and type(exit_code) is int and exit_code == 0

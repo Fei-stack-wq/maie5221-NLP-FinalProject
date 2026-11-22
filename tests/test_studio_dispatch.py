@@ -1,6 +1,7 @@
 """A handoff accepted in the assistant must produce one identifiable native child."""
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
+import json
 import sqlite3
 from io import BytesIO
 import threading
@@ -70,12 +71,75 @@ class StudioDispatchTest(unittest.TestCase):
         self.assertNotIn('private-unrelated-dm', str(child.requests))
         self.assertIn('原始盘点', str(child.requests))
         self.assertEqual(self.service.artifact(row['child_run_id'], 'agents/maintainer/report.md')['content'], '开发环境各项检查已完成。')
+        separate = RecordingProvider([{'text': '仅此对话的第二项目。'}])
         with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[
-                RecordingProvider([route(), {'text': '已交接。'}]), RecordingProvider([{'text': '复核完毕。'}])]):
-            again = self.service.send_superagent(message('请小维继续。', source))['id']
+                RecordingProvider([route(), {'text': '已另开私聊。'}]), separate]):
+            another = self.service.send_superagent(message('让小维单独处理第二个项目。', source))['id']
+            second, = self.settled(another)
+        self.assertNotEqual(second['conversation_id'], row['conversation_id'])
+        self.assertNotIn('原始盘点', str(separate.requests))
+        reply = RecordingProvider([{'text': '复核完毕。'}])
+        with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[
+                RecordingProvider([route(continue_dispatch_id=row['dispatch_id']), {'text': '已交接。'}]), reply]):
+            again = self.service.send_superagent(message('请小维继续第一份盘点。', another))['id']
             follow, = self.settled(again)
         self.assertEqual(follow['conversation_id'], row['conversation_id'])
+        self.assertNotIn('仅此对话的第二项目', str(reply.requests))
         self.assertEqual(self.service.detail(follow['child_run_id'])['conversation']['turns'][0]['run_id'], row['child_run_id'])
+
+        wrong_role = RecordingProvider([route(target='reviewer', continue_dispatch_id=row['dispatch_id']),
+                                        {'text': '没有给评审员的对应私聊。'}])
+        with patch('miniagent.studio_service.DeepSeekProvider', return_value=wrong_role):
+            invalid = self.service.send_superagent(message('让另一位成员沿用该私聊。', again))['id']
+            finished(self.service, invalid)
+        self.assertIn('指定私聊', str(wrong_role.requests[-1][0]))
+        self.assertEqual(self.service.studio_dispatches(invalid), [])
+
+    def test_new_group_in_inherited_workspace_gets_only_named_inputs(self):
+        folder = self.root / "old-project"
+        folder.mkdir()
+        (folder / "private.txt").write_text("unrelated previous project")
+        (folder / "spec.txt").write_text("transferred requirements")
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=RecordingProvider([{"text": "ok"}])):
+            first = self.service.send_superagent({**message("在所选目录处理旧项目"), "workspace_path": str(folder)})["id"]
+            finished(self.service, first)
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=RecordingProvider([
+                tool("create_studio_group", name="新业务组", members=["maintainer"], lead="maintainer"),
+                {"text": "已建群。"}])):
+            creator = self.service.send_superagent(message("建群处理新的业务", first))["id"]
+            done = finished(self.service, creator)
+        group = done["conversation"]["turns"][-1]["events"][0]["entity"]["id"]
+        self.assertIsNone(self.service.detail(group)["conversation"]["workspace_path"])
+        team = RecordingProvider([tool("read_file", path="spec.txt"),
+                                  tool("write_file", path="group-only.txt", content="fresh work"),
+                                  {"text": "收到材料。"}])
+        parent = RecordingProvider([tool("dispatch_studio_task", target_kind="group", target_id=group,
+            required_participants=["maintainer"], objective="使用指定材料", input_files=["spec.txt"],
+            acceptance_files=["group-only.txt"]), {"text": "已转交。"}])
+        with patch("miniagent.studio_service.DeepSeekProvider", side_effect=[parent, team]):
+            source = self.service.send_superagent(message("把资料交给新业务组。", creator))["id"]
+            dispatch, = self.settled(source)
+        self.assertEqual(dispatch["status"], "completed", dispatch)
+        self.assertIn("transferred requirements", str(team.requests))
+        self.assertNotIn("在所选目录处理旧项目", str(team.requests))
+        child = self.runs / dispatch["child_run_id"]
+        checkout = self.service._workspace(child, self.service._meta(child)["thread"])
+        self.assertFalse((checkout / "private.txt").exists())
+        self.assertTrue((checkout / "group-only.txt").is_file())
+        self.assertFalse((folder / "group-only.txt").exists())
+        # Moving the same assistant conversation to a new project revokes this route.
+        other = self.root / "other"
+        other.mkdir()
+        with patch("miniagent.studio_service.DeepSeekProvider", return_value=RecordingProvider([{"text": "ok"}])):
+            switch = self.service.send_superagent({**message("切换项目", source), "workspace_path": str(other)})["id"]
+            finished(self.service, switch)
+        self.assertIsNone(self.service.studio_routing_group(self.service._meta(self.runs / switch), group))
+        # A replay of a legacy tool call must return the exact, already-bound room.
+        anchor = self.runs / group / "studio.json"
+        record = json.loads(anchor.read_text())
+        anchor.write_text(json.dumps({**record, "workspace_path": str(folder.resolve())}))
+        replay = self.service._create_group(creator, "新业务组", ["maintainer"], "maintainer")
+        self.assertEqual(replay["id"], group)
 
     def test_dispatch_forwards_current_originals_or_explicit_earlier_files(self):
         earlier = save_upload(self.runs, '旧资料.txt', BytesIO(b'earlier original'), 16)
@@ -188,13 +252,15 @@ class StudioDispatchTest(unittest.TestCase):
             creator = self.service.send_superagent(message('创建开发组。'))['id']
             history = finished(self.service, creator)['conversation']['turns'][0]['events']
         group = next(event['entity']['id'] for event in history if event.get('entity'))
+        # Dispatch is an explicit command even when its assigned objective has
+        # the exact wording of an ordinary status question.
         parent = RecordingProvider([tool('dispatch_studio_task', target_kind='group', target_id=group,
                                          required_participants=['maintainer','reviewer'],
-                                         objective='由负责人安排审阅。'), {'text': '已派发。'}])
+                                         objective='完成了吗？'), {'text': '已派发。'}])
         team = RecordingProvider([tool('delegate_task', assignee='reviewer', objective='审阅说明。'),
                                   {'text': '我已审阅。'}, {'text': '已收到审阅。'}])
         with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[parent,team]):
-            source = self.service.send_superagent({**message('让开发组进行审阅。', creator),
+            source = self.service.send_superagent({**message('派一项正式验收给开发组，任务题目为「完成了吗？」。', creator),
                                                   'interaction_mode': 'autonomous'})['id']
             child, = self.settled(source)
         native = self.service.detail(child['child_run_id'])
@@ -206,7 +272,27 @@ class StudioDispatchTest(unittest.TestCase):
         self.assertIn(child['status'], {'completed', 'unverified'}, child)
         self.assertEqual(native['conversation']['head_run_id'], child['child_run_id'])
         self.assertTrue(any(e['kind'] == 'assignment' and e['recipient'] == 'reviewer' for e in native['room_events']))
-        self.assertNotIn('dispatch_studio_task', team.requests[0][1])
+        self.assertFalse({'dispatch_studio_task', 'read_group_dispatch'} & set(team.requests[0][1]))
+        # A new native turn in the same room is private to that chat. The assistant can
+        # read its own original dispatch without starting another group task.
+        private = RecordingProvider([{'text': '已记录。'}])
+        reader = RecordingProvider([tool('read_group_dispatch', group_id=group, dispatch_id='unbound'),
+                                    tool('read_group_dispatch', group_id=group, dispatch_id=child['dispatch_id']),
+                                    {'text': '已读取派工状态。'}])
+        with patch('miniagent.studio_service.DeepSeekProvider', side_effect=[private, reader]) as models:
+            later = self.service.start({'mode':'single', 'request_id':str(uuid.uuid4()), 'objective':'内部私有业务',
+                'conversation':{'parent_run_id':child['child_run_id'], 'recipient':'maintainer', 'intent':'edit'}})
+            finished(self.service, later['id'])
+            query = self.service.send_superagent(message('上次派给开发组的任务完成了吗？', source))['id']
+            finished(self.service, query)
+            self.assertEqual(self.service.studio_dispatches(query), [])
+            self.assertIn('当前项目没有对应的群派工记录', str(reader.requests[1][0][-1]))
+            received = str(reader.requests[-1][0])
+            self.assertIn(child['child_run_id'], received)
+            self.assertIn('status_snapshot', received)
+            self.assertNotIn('内部私有业务', received)
+            self.assertEqual(models.call_count, 2)
+
 
     def test_queued_handoff_keeps_required_participants_until_the_group_takes_the_task(self):
         # An existing Studio opens an outbox created before membership was mutable.
@@ -254,13 +340,16 @@ class StudioDispatchTest(unittest.TestCase):
                 entered.set()
                 release.wait(6)
                 return super().chat(messages, tools, temperature)
+        followup = RecordingProvider([])
         scripts = [RecordingProvider([route(), {'text': '已交接。'}]), WaitingRole([{'text': '第一次处理完毕。'}]),
-                   RecordingProvider([route(), {'text': '已再次交接。'}]), RecordingProvider([{'text': '第二次处理完毕。'}])]
+                   followup, RecordingProvider([{'text': '第二次处理完毕。'}])]
         with patch('miniagent.studio_service.DeepSeekProvider', side_effect=scripts) as provider:
             first = self.service.send_superagent(message('交给小维。'))['id']
             self.assertTrue(entered.wait(3))
             other = StudioService(self.runs, self.settings, max_workers=1)
             try:
+                previous, = other.studio_dispatches(first)
+                followup.script.extend([route(continue_dispatch_id=previous['dispatch_id']), {'text': '已再次交接。'}])
                 later = other.send_superagent(message('再做一次。', first))['id']
                 finished(other, later)
                 self.assertEqual(other.studio_dispatches(later)[0]['status'], 'queued')

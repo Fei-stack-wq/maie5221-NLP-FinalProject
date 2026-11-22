@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 
+from .studio_group_status import previous_status
 from .studio_uploads import UploadError, resolve_uploads, validate_upload_ids
 
 
@@ -48,7 +49,8 @@ class SteeringCursor:
             self.position += len(rows)
             if finishing and self.owner and not rows:
                 self.inbox.sealed = True
-            return [row["text"] + ("\n随本次补充发送的附件：" + json.dumps(row["message_attachments"], ensure_ascii=False)
+            return [row["text"] + ("\n此次调整引用的群内讨论（历史资料）：" + json.dumps(row["preceding_dialogue"], ensure_ascii=False)
+                                   if row.get("preceding_dialogue") else "") + ("\n随本次补充发送的附件：" + json.dumps(row["message_attachments"], ensure_ascii=False)
                                    if row.get("message_attachments") else "") for row in rows]
 
     def acknowledge(self):
@@ -72,7 +74,7 @@ class StudioSteering:
             inbox = self._steering.get(run_id)
             return bool(inbox and not inbox.sealed and not self._closed and not self._cancellations[run_id].is_set())
 
-    def steer(self, run_id, payload):
+    def steer(self, run_id, payload, *, dialogue=()):
         from .studio_service import StudioError
 
         if not isinstance(payload, dict) or set(payload) - {"request_id", "message", "attachments"}:
@@ -92,6 +94,10 @@ class StudioSteering:
         text = self._redact(text.strip())
         with self._answers:
             path = self._directory(run_id)
+            if self._meta(path).get("has_status_replies"):
+                replay = previous_status(self, path, identity, text, attachments=bool(ids))
+                if replay:
+                    return replay
             inbox = self._steering.get(run_id)
             rows = inbox.rows if inbox else [row for row in self.room_events(run_id) if row["kind"] == "user_steer"]
             for row in rows:
@@ -116,7 +122,8 @@ class StudioSteering:
                 # Publish the inexpensive index before the durable entry. An
                 # interrupted append may leave an empty indexed journal, never a hidden message.
                 self._update_meta(run_id, has_steering=True)
-            row = inbox.record("user", "user_steer", text, request_id=identity, message_attachments=refs)
+            row = inbox.record("user", "user_steer", text, request_id=identity, message_attachments=refs,
+                               **({"preceding_dialogue": dialogue} if dialogue else {}))
             inbox.rows.append(row)
             for (rid, _), waiting in self._questions.items():
                 if rid == run_id and waiting["answer"] is None:
