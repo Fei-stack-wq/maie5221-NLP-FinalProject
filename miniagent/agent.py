@@ -1,1013 +1,368 @@
-"""Agent 运行时（L1）：驱动 RAO 单元，负责预算、验收与终止。
+"""One agent run: a bounded Reason–Act–Observe loop over tool calls.
 
-职责划分：
-- ``rao.py`` 负责**一步**（Reason → Act → Observe）。
-- 这个文件负责**一路**（循环、预算、验收、终态映射、trace）。
+The loop is deliberately small. Its guarantees are what the old runtime
+lacked:
 
-课程要求里几乎所有概念都长在这个循环上：
-  - 2.1b 自主委派 -> RAO 的 ``delegate_task`` 决策（等编排器接管）
-  - 2.1c HITL     -> RAO 的 ``ask_human`` 决策 + 工具层的 ``approve`` 回调
-  - 2.2a 记忆演化 -> 循环开始前检索记忆注入，结束后写入
-  - 评估指标      -> 每步 token/耗时/错误分类都进 tracer
+1. **It always terminates.** ``Limits.max_steps`` is finite. When the budget
+   (steps, wall clock, tokens) runs out or the loop guard reports a stuck
+   pattern, the model gets one final request without tools and must write its
+   report. The caller always receives an answer text plus an honest status.
+2. **It never forgets silently.** The full conversation is sent every step.
+   When it grows past ``compact_at_tokens`` the :class:`ContextManager` prunes
+   old tool output and, if needed, replaces the older span with a structured
+   checkpoint summary (Pi-style). No sliding window, no "last 4 turns".
+3. **Every tool result is answered.** Each assistant tool call receives
+   exactly one tool message, including refused, invalid and over-limit calls,
+   so the provider history is always valid.
+4. **Steering is cooperative.** Messages the user sends while the agent works
+   are appended at the next step boundary; the agent is never interrupted in
+   the middle of a tool batch.
+
+Loop structure follows OpenAI Agents SDK ``Runner`` (max_turns → final
+handling) and Pi ``agent-loop.ts`` (tool batch → steering check → next
+turn); see docs/architecture.md for pinned links.
 """
 
 from __future__ import annotations
 
-import copy
+import os
+import shutil
+import signal
+import tempfile
 import time
 import uuid
-from typing import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Literal, Protocol
 
-from .config import Settings
-from .shell_tool import CommandSessions
-from .compaction import RollingCompactor
-from .request_window import fit_history, output_headroom
-from .context_window import ContextLimitError, TaskTokenLimitError, UsageAnchor
-from .acceptance import AcceptanceInput, bind, evaluate, missing_file_probe
-from .metrics import Tracer
-from .providers import Provider, ProviderError, provider_configuration
-from .rao import (
-    Budget,
-    ErrorClass,
-    PendingPeerReview,
-    RAO_SYSTEM_SUFFIX,
-    RAOState,
-    RAOUnit,
-    StepPolicy,
-    StepRecord,
-    ToolCompletion,
-    CoordinationTurn,
-    WorkCheckpoint,
-    policy_messages,
-)
+import psutil
+
+from .config import Limits, Settings
+from .context import ContextManager
+from .loop_guard import LoopGuard
+from .provider_http import ProviderError
+from .providers import DeepSeekProvider, Provider
 from .sandbox import Sandbox
-from .schemas import RunResult, Usage
-from .tool_activity import created_name, target_for
-from .tools import ToolRegistry
-from .task_service import ExecutionHandle, TaskService
-from .task_store import StoreError
+from .schemas import LLMResponse, ToolCall, Usage
+from .shell_tool import CommandSessions
+from .tools import ToolContext, ToolRegistry
 
+Status = Literal["completed", "max_steps", "stuck", "budget", "cancelled", "error"]
 
-class _AssistantPreview:
-    """Ephemeral text for one model turn. A retry gets a fresh message identity."""
-
-    def __init__(self, emit, role, task_id, step):
-        self.emit = emit
-        self.identity = {"role": role, "task_id": task_id, "step": step}
-        self.stream_id = None
-        self.tail = ""
-        self.deferred = []
-
-    def _send(self, kind, text=""):
-        if self.emit is None:
-            return
-        if kind in {"delta", "progress"} and not self.stream_id:
-            self.stream_id = uuid.uuid4().hex
-        if self.stream_id:
-            try:
-                self.emit({**self.identity, "stream_id": self.stream_id, "kind": kind,
-                           **({"text": text} if kind in {"delta", "progress"} else {})})
-            except Exception:
-                # An unavailable preview consumer must not repeat or stop tools.
-                self.emit = None
-
-    def receive(self, kind, text):
-        if kind == "discard":
-            self.close()
-            return
-        if kind == "progress":
-            # The validated completion is authoritative, including for a
-            # provider which delivered no transport deltas.
-            self._send("progress", text)
-            self.stream_id = None
-            self.tail = ""
-            self.deferred.clear()
-            return
-        if self.deferred:
-            self.deferred.append(text)
-            return
-        text = self.tail + text
-        self.tail = ""
-        # DeepSeek sometimes writes an invocation marker into ordinary text.
-        # RAO judges it in context (including fenced examples) at completion.
-        boundary = min((i for token in ("<|", "<｜") if (i := text.find(token)) >= 0), default=len(text))
-        if boundary < len(text):
-            self.deferred.append(text[boundary:])
-            text = text[:boundary]
-        elif text.endswith("<"):
-            self.tail, text = "<", text[:-1]
-        if text:
-            self._send("delta", text)
-
-    def close(self, *, accepted=False):
-        if accepted:
-            final = self.tail + "".join(self.deferred)
-            if final:
-                self._send("delta", final)
-        self._send("end" if accepted else "discard")
-        self.stream_id = None
-        self.tail = ""
-        self.deferred.clear()
-
-
-SYSTEM_PROMPT = (
-    """你是「{agent}」，一个多智能体系统中的成员。
-
-你有一个私有工作区（沙箱），所有文件路径都是相对路径；禁止使用绝对路径或 ".."。
-文档使用 Markdown (.md) 或纯文本 (.txt)，代码按任务选择扩展名。
-控制单轮输出长度，较大产物按任务拆成多个较小文件。write_file 会覆盖同名文件。
-修改已有代码优先使用 edit_file；大文件分块创建后使用 append_file 续写。
-已有项目先用 find_files / search_files 定位入口、定义、调用点与测试，用 read_lines 按行查看相关实现。
-使用 run_shell 在项目目录执行其原生构建和测试，run_python 可做结构化数据核对。网页流程可用 run_browser 直接操作浏览器控件并验证结果。
-在工作副本中局部修改并复测，依据实际退出码、断言结果和文件交接。
-不要假装自己执行过工具。
-"""
-    + RAO_SYSTEM_SUFFIX
+MAX_TOOL_RESULT_CHARS = 24_000
+WRAP_UP_INSTRUCTION = (
+    "[{reason}] Stop working now — no more tool calls are possible. Write your final report for the "
+    "person who assigned this work: what you completed (exact file paths), what you verified and how, "
+    "what is still unfinished or uncertain, and what should happen next."
 )
 
 
-COORDINATOR_PROMPT = """你是本项目群的技术负责人。通过本轮 API 提供的工具协调团队。
-用户的目标由团队共同完成。负责人根据所选角色的专长决定分工，使用 delegate_task 交给合适的成员。
-你会收到项目目录清单、成员的发布记录、检查证据和剩余问题。规划时可以查阅与分工有关的片段。
-已有足够背景就委派，收到完整交付后向用户总结实际成果、使用方法和验证情况。
-业务偏好或外部授权确需用户决定时，通过 ask_human 询问。宿主提供的统计、执行权限和团队路由由工作室处理。
-历史公开消息中的工具说法只代表当时的上下文。每个回合以当轮提供的工具定义和宿主回执为准。
-"""
+class Inbox(Protocol):
+    def take(self, agent: str) -> list[str]: ...
+
+
+@dataclass
+class AgentResult:
+    agent: str
+    status: Status
+    answer: str
+    error: str = ""
+    steps: int = 0
+    tool_calls: int = 0
+    usage: Usage = field(default_factory=Usage)
+    duration_s: float = 0.0
+    compactions: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "completed"
+
+
+class ProcessScope:
+    """Background processes started by one agent's shell commands; all killed at the end."""
+
+    def __init__(self) -> None:
+        self.groups: set[int] = set()
+
+    def track(self, pgid: int) -> None:
+        self.groups.add(pgid)
+
+    def close(self) -> None:
+        for pgid in list(self.groups):
+            try:
+                members = [p for p in psutil.process_iter(["pid"]) if _pgid(p.pid) == pgid]
+            except psutil.Error:
+                members = []
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            _, alive = psutil.wait_procs(members, timeout=2)
+            for process in alive:
+                try:
+                    process.kill()
+                except psutil.Error:
+                    pass
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.groups.clear()
+
+
+def _pgid(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return None
 
 
 class Agent:
-    """一个智能体的运行时。一个 Agent 实例只跑一个任务（状态不复用）。"""
+    """Runs one task to completion inside one sandbox."""
 
-    def __init__(
-        self,
-        name: str,
-        provider: Provider,
-        registry: ToolRegistry,
-        sandbox: Sandbox,
-        settings: Settings,
-        tracer: Tracer | None = None,
-        approve: Callable[[str], bool] | None = None,
-        human_handler: Callable[[str], str | None] | None = None,
-        delegate_handler: Callable[[dict], object] | None = None,
-        max_acceptance_retries: int = 1,
-        task_service: TaskService | None = None,
-        should_cancel: Callable[[], bool] | None = None,
-        human_request_gate: Callable[[dict], str | None] | None = None,
-    ) -> None:
+    def __init__(self, name: str, provider: Provider, registry: ToolRegistry, sandbox: Sandbox,
+                 settings: Settings, *, system_prompt: str, limits: Limits | None = None,
+                 on_event: Callable[[dict], None] | None = None,
+                 should_cancel: Callable[[], bool] | None = None,
+                 inbox: Inbox | None = None, stream: bool = False) -> None:
         self.name = name
-        self.task_service = task_service
         self.provider = provider
         self.registry = registry
         self.sandbox = sandbox
         self.settings = settings
-        self.tracer = tracer
-        self.approve = approve
-        self.max_acceptance_retries = max_acceptance_retries
-        self.should_cancel = should_cancel
-        limits = settings.limits
-        self.unit = RAOUnit(
-            name=name,
-            provider=provider,
-            registry=registry,
-            sandbox=sandbox,
-            limits=limits,
-            temperature=settings.temperature,
-            approve=approve,
-            human_handler=human_handler,
-            autonomous=settings.interaction_mode == "autonomous",
-            contains_configured_secret=(lambda text: settings.api_key in text) if settings.api_key else None,
-            human_request_gate=human_request_gate,
-            delegate_handler=delegate_handler,  # type: ignore[arg-type]
-            max_actions_per_step=limits.max_tool_calls_per_step,
-            should_cancel=should_cancel,
-        )
+        self.system_prompt = system_prompt
+        self.limits = limits or settings.limits
+        self.on_event = on_event
+        self.should_cancel = should_cancel or (lambda: False)
+        self.inbox = inbox
+        self.stream = stream
 
     # ------------------------------------------------------------------
-    def run(
-        self,
-        task: str,
-        task_id: str | None = None,
-        acceptance: AcceptanceInput = None,
-        budget: Budget | None = None,
-        on_step: Callable[[StepRecord, RAOState], None] | None = None,
-        root_id: str | None = None,
-        parent_task_id: str | None = None,
-        attempt_id: str | None = None,
-        execution: ExecutionHandle | None = None,
-        *,
-        conversation_context: str = "",
-        deliverable_paths: tuple[str, ...] = (),
-        system_prompt: str | None = None,
-        before_answer: Callable[[], str | PendingPeerReview | None] | None = None,
-        step_policy: Callable[[RAOState, Budget], StepPolicy] | None = None,
-        advance_handoff: Callable[[], bool] | None = None,
-        preflight_handoff: Callable[[RAOState, Budget], StepPolicy] | None = None,
-        tool_completion: Callable[[StepRecord], ToolCompletion | None] | None = None,
-        on_assistant_stream: Callable[[dict], None] | None = None,
-        steering=None,
-    ) -> RunResult:
-        """跑完一个任务。
+    def emit(self, event_type: str, **fields: Any) -> None:
+        """Report progress to the caller. A failing observer never breaks the run."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event({"type": event_type, "agent": self.name, **fields})
+        except Exception:  # noqa: BLE001 - UI/trace sinks are best effort
+            pass
 
-        ``budget`` 由调度器注入（编排一个多子任务计划时共享大局预算）；
-        不传则按 ``settings.limits`` 新建。
-        ``on_step`` 是给调度器的钩子：每步结束立刻回调，用于写黑板、检查依赖。
-        ``on_assistant_stream`` 接收临时正文事件。每项带 stream_id、role、task_id 与 step；
-        delta 的 text 是新增文字，progress 是经过协议校验的整段工具回合正文。end 与 discard 分别结束与撤销预览。
-        """
-        task_id = task_id or (execution.task.task_id if execution else f"task-{uuid.uuid4().hex}")
-        durable_task = None
-        if execution is not None and self.task_service is None:
-            raise ValueError("an execution handle requires its TaskService")
-        if self.task_service is not None:
-            if execution is None:
-                if parent_task_id is not None or (root_id is not None and root_id != task_id):
-                    raise ValueError("persisted children must be registered and claimed by their coordinator")
-                registered = self.task_service.create(
-                    task_id=task_id, creation_key=f"root:{task_id}", objective=task,
-                    owner=self.name, assignee=self.name,
-                )
-                execution = self.task_service.start(
-                    task_id, expected_revision=registered.revision,
-                    context={"objective": task, "agent": self.name,
-                             "workspace": self.sandbox.root.as_posix()},
-                    attempt_id=attempt_id,
-                )
-            durable_task = self.task_service.store.get(task_id)
-            if (durable_task != execution.task or durable_task.status != "running"
-                    or execution.task.objective != task
-                    or execution.attempt.task_id != task_id
-                    or durable_task.current_attempt_id != execution.attempt.attempt_id
-                    or (attempt_id is not None and attempt_id != execution.attempt.attempt_id)
-                    or (root_id is not None and root_id != durable_task.root_id)
-                    or (parent_task_id is not None and parent_task_id != durable_task.parent_id)):
-                raise StoreError("execution handle does not match claimed work", code="conflict")
-            stored_attempt = self.task_service.store.get_record("AttemptRecord", execution.attempt.attempt_id)
-            stored_run = self.task_service.store.get_record("RunRecord", execution.run.run_id)
-            if (stored_attempt != execution.attempt or stored_attempt.state != "running"
-                    or stored_run != execution.run or stored_run.state != "running"
-                    or stored_run.task_id != task_id or stored_run.attempt_id != stored_attempt.attempt_id):
-                raise StoreError("execution task/attempt/run binding is not active", code="conflict")
-            # A claim handle is consumed once. Reusing it in another executor
-            # cannot replay the same action identities and duplicate effects.
-            self.task_service.attach_execution(execution)
-            root_id, parent_task_id = durable_task.root_id, durable_task.parent_id
-            attempt_id = execution.attempt.attempt_id
-
-            def record_actions(state, actions):
-                rows = self.task_service.action_identities(
-                    task_id, attempt_id=attempt_id, run_id=execution.run.run_id,
-                    step=state.step_index, calls=[
-                        {"tool_call_id": action.id, "operation": action.tool,
-                         "arguments": action.arguments, "raw_arguments": action.raw_arguments}
-                        for action in actions
-                    ],
-                )
-                return [row["action_id"] for row in rows]
-
-            self.unit.action_recorder = record_actions
-        else:
-            self.unit.action_recorder = None
-        attempt_id = attempt_id or f"attempt-{uuid.uuid4().hex}"
-        run_id = execution.run.run_id if execution else f"run-{uuid.uuid4().hex}"
-        identity = {
-            "schema_version": 2, "task_id": task_id,
-            "root_id": root_id or task_id, "attempt_id": attempt_id, "run_id": run_id,
-            "parent_task_id": parent_task_id,
-            "level": "subtask" if root_id is not None and root_id != task_id else "goal",
-        }
-        if self.tracer:
-            def tool_started(step, action):
-                self.tracer.event("tool_start", **identity, agent=self.name, step=step, tool=action.tool,
-                                  action_id=action.action_id, tool_call_id=action.id,
-                                  target=target_for(action.tool, action.arguments))
-            self.unit.tool_started = tool_started
-            self.unit.tool_observed = lambda step, action, obs: self._trace_tool(identity, step, obs, action.tool)
-        else:
-            self.unit.tool_started = self.unit.tool_observed = None
-        limits = self.settings.limits
-        started = time.perf_counter()
-
-        instructions = system_prompt or SYSTEM_PROMPT.format(agent=self.name)
-        if on_assistant_stream:
-            instructions += ("\n多步任务开始、取得重要结果或改变安排时，在调用工具的同一条消息中用一两句公开正文"
-                             "告诉用户你正在做什么或已经确认什么。")
-        if steering is not None:
-            instructions += ("\n执行中收到用户追问时，在公开回复里简短回答并继续当前任务。"
-                             "收到新要求时调整后续行动，任务完成或用户要求结束时再给最终答复。")
-        if self.unit.autonomous:
-            instructions += ("\n本轮采用自主完成模式。直接执行到最终交付，同时遵循用户在执行中主动发来的新要求。"
-                             "分工、可逆偏好、模拟任务的情景参数由团队决定，在交接和最终答复中注明重要假设与理由。"
-                             "查证事实，实际风险、缺少的私有数据和对外操作所需的授权均不能假定。"
-                             "完成获准部分；若必需条件仍无法满足，以 [BLOCKED] 开头列明已完成工作和具体限制。"
-                             "不要提出等待用户回复的问题，或把团队选择写成用户的答复。")
-        history = [{"role": "system", "content": instructions}]
-        if conversation_context:
-            # Past public turns are background. The new request remains the durable objective.
-            history.append({"role": "user", "content": conversation_context})
-        history.append({"role": "user", "content": task})
-        state = RAOState(
-            goal=task,
-            task_id=task_id,
-            history=history,
-        )
-        if conversation_context:
-            state.scratch["work_context"] = conversation_context
-
-        def receive_steering(*, finishing=False):
-            if steering is None:
-                return False
-            additions = steering.take(finishing=finishing)
-            if additions:
-                if preview:
-                    preview.close()
-                messages = [{"role": "user", "content": text} for text in additions]
-                state.history.extend(messages)
-                state.scratch.setdefault("live_user_messages", []).extend(messages)
-            return bool(additions)
-
-        self.unit.steering_pending = steering.pending if steering else None
-        budget = budget or Budget.from_limits(limits)
-        initial_seconds = budget.capped_seconds(limits.max_seconds or None)
-
-        def remaining_seconds(reserve: float = 0) -> float | None:
-            if initial_seconds is None:
-                return None
-            return initial_seconds - (time.perf_counter() - started) - reserve
-
-        initial_steps, initial_tokens = budget.steps_left, budget.tokens_left
-        initial_actions = budget.actions_left
-        excluded_ranges: list[tuple[int, int]] = []
-        compactor = RollingCompactor()
-        overflow_used = False
-        retry_envelope = None
-        output_recoveries = 0
-        last_omitted = 0
-        warned_budgets: set[str] = set()
-        usage_anchor: UsageAnchor | None = None
-        reported_assistant_tokens: dict[int, tuple[dict, int]] = {}
-
+    def run(self, task: str, *, context: str = "") -> AgentResult:
+        started = time.monotonic()
+        deadline = started + self.limits.max_seconds if self.limits.max_seconds else None
+        first = (context.strip() + "\n\n---\n\n# Your task\n" + task) if context.strip() else task
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": first},
+        ]
+        ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
+        guard = LoopGuard()
         usage = Usage()
         tool_calls = 0
-        acceptance_failures = 0
-        blocked_handoff_retries = 0
-        reviewed_close_retried = False
-        rejected_text_turns = 0
-        status = "limit_exceeded"
-        answer = ""
+        recoveries = 0
+        empty_answers = 0
+        warned = False
+        status: Status = "max_steps"
         error = ""
-        provider_error_code = None
-        acceptance_spec = None
-        acceptance_report = None
-        acceptance_evidence = []
-
-        if self.tracer:
-            self.tracer.event("task_registered", **identity, agent=self.name, task=task)
-            self.tracer.event(
-                "task_start",
-                **identity,
-                agent=self.name,
-                task=task,
-                sandbox=self.sandbox.root.as_posix(),
-                acceptance="custom" if acceptance else "none",
-                provider_config=provider_configuration(self.provider),
-            )
-
-        step_started = None
-
-        def cancellation_observed() -> bool:
-            if not self.should_cancel or not self.should_cancel():
-                return False
-            if self.tracer:
-                self.tracer.event("cancel_observed", **identity, step=state.step_index)
-            return True
-
-        preflight_handoff_used = False
-        # A malformed work action and a malformed final handoff have distinct
-        # protocols. Each may be corrected once, within the original budget.
-        corrected_protocols: set[str] = set()
-
-        def budget_reason() -> str:
-            if not budget.has_time():
-                return f"超过时间上限 {initial_seconds:.0f}s"
-            if not budget.has_tokens(0):
-                return f"超过 token 预算 {initial_tokens}"
-            if not budget.has_steps(1):
-                return f"超过最大步数 {initial_steps}"
-            if not budget.has_actions(1):
-                return f"超过动作总数上限 {initial_actions}"
-            return budget.reason(limits)
-
-        preview = None
-        owned_commands = self.sandbox.command_sessions is None
-        if owned_commands:
-            self.sandbox.command_sessions = CommandSessions()
-        try:
-            acceptance = bind(acceptance, self.sandbox.root, task_id=task_id, objective=task)
-            self.unit.missing_deliverables = missing_file_probe(acceptance, self.sandbox.root, deliverable_paths)
-            while True:
-                if preview:
-                    preview.close()
-                    preview = None
-                budget.seconds_left = remaining_seconds()
-                if cancellation_observed():
-                    status, error = "aborted", "用户请求停止"
-                    break
-                # A queued user message gets a model turn before scheduled work.
-                # Otherwise an accepted member handoff needs no coordinator inference.
-                if not receive_steering() and advance_handoff and advance_handoff():
-                    continue
-                policy = step_policy(state, budget) if step_policy else StepPolicy(phase="work")
-                offered = self.unit.tool_specs(policy.allowed_tools, policy.allowed_write_paths)
-                text_only = step_policy is not None and not offered
-                # The final text needs a model step, but consumes no tool actions.
-                if (not budget.has_steps(1) or not budget.has_tokens(0) or not budget.has_time()
-                        or (not budget.has_actions(1) and not text_only)):
-                    error = budget_reason()
-                    break
-
-                for dimension, remaining, initial in (
-                    ("steps", budget.steps_left, initial_steps),
-                    ("tokens", budget.tokens_left, initial_tokens),
-                ):
-                    if remaining is not None and dimension not in warned_budgets and remaining <= max(1, initial * 0.2):
-                        warned_budgets.add(dimension)
-                        state.history.append({
-                            "role": "user", "content": (
-                                f"[预算提醒] 当前任务剩余{remaining} {'步' if dimension == 'steps' else 'tokens'}。"
-                                "请优先完成必要修复、验证与交付，避免重复读取或重写整个文件；"
-                                "仍须如实说明未完成项。"
-                            ),
-                        })
-                        if self.tracer:
-                            self.tracer.event("budget_warning", **identity, dimension=dimension,
-                                              remaining=remaining, initial=initial)
-                output_reserve = provider_configuration(self.provider).get("max_output_tokens")
-                if not isinstance(output_reserve, int):
-                    output_reserve = self.settings.max_output_tokens
-                def project(policy, offered):
-                    schemas = [spec.to_api() for spec in offered]
-                    available = budget.available_tokens(policy.token_reserve)
-                    excluded, measured = excluded_ranges, reported_assistant_tokens
-                    if not policy.compact and (checkpoint := state.scratch.get("work_checkpoint")):
-                        excluded, measured = checkpoint.rebase_indices(excluded, measured)
-                    view, pruned = fit_history(
-                        policy_messages(state, policy), tool_schemas=schemas,
-                        window=self.settings.context_window_tokens, ceiling=output_reserve,
-                        replay_target=retry_envelope[0] // 2 if retry_envelope else None,
-                        excluded_ranges=None if policy.compact else excluded,
-                        usage_anchor=None if policy.compact else usage_anchor,
-                        reported_assistant_tokens=None if policy.compact else measured,
-                        available=available, steps_left=budget.steps_left,
-                    )
-                    return schemas, available, view, pruned
-
-                try:
-                    tool_schemas, spendable_tokens, projection, pruned = project(policy, offered)
-                except TaskTokenLimitError as exc:
-                    if (preflight_handoff is None or preflight_handoff_used or text_only
-                            or not policy.token_reserve):
-                        raise
-                    closing = preflight_handoff(state, budget)
-                    if not closing.compact or closing.allowed_tools != frozenset() or closing.token_reserve:
-                        raise
-                    preflight_handoff_used = True
-                    if self.tracer:
-                        self.tracer.event("handoff_preflight_recovery", **identity, step=state.step_index+1,
-                                          work_phase=policy.phase, work_tokens=budget.available_tokens(policy.token_reserve),
-                                          tokens_remaining=budget.tokens_left, reason=str(exc))
-                    policy, offered, text_only = closing, [], True
-                    tool_schemas, spendable_tokens, projection, pruned = project(policy, offered)
-                if not policy.compact:
-                    summary = compactor.update(
-                        policy_messages(state, policy), projection, self.provider,
-                        context_window_tokens=self.settings.context_window_tokens,
-                        available_tokens=spendable_tokens,
-                        seconds_left=remaining_seconds(policy.seconds_reserve),
-                        force=retry_envelope is not None,
-                    )
-                    projection = summary.projection
-                    if summary.attempted:
-                        usage = usage.merged(summary.usage)
-                        budget.spend(tokens=summary.usage.total)
-                        spendable_tokens = budget.available_tokens(policy.token_reserve)
-                        if self.tracer:
-                            self.tracer.event("compaction_usage", **identity, call_id=f"summary-{uuid.uuid4().hex}",
-                                              step=state.step_index + 1, transport=self.provider.transport,
-                                              status=summary.status, covered_groups=summary.covered_groups,
-                                              new_groups=summary.new_groups, usage=summary.usage.model_dump(),
-                                              usage_source=summary.usage.source, request_attempts=summary.request_attempts)
-                window = self.settings.context_window_tokens
-                capacity = window - max(256, window // 100) - projection.estimated_input_tokens
-                request_output_limit = min(output_reserve, capacity)
-                if spendable_tokens is not None:
-                    request_output_limit = min(request_output_limit, spendable_tokens - projection.estimated_input_tokens)
-                    if request_output_limit <= 0:
-                        raise TaskTokenLimitError("累计 token 预算不足以支付当前请求及答复。")
-                if retry_envelope:
-                    old_input, old_output = retry_envelope
-                    request_output_limit = min(request_output_limit, max(1, old_output // 2))
-                    if projection.estimated_input_tokens + request_output_limit >= old_input + old_output:
-                        raise ContextLimitError("服务端报告上下文过长，保留当前用户要求后无法再缩小请求。")
-                if request_output_limit <= 0:
-                    raise ContextLimitError("保留当前指令后没有可用的单次输出空间。")
-                if projection.omitted_groups != last_omitted:
-                    if self.tracer:
-                        self.tracer.event(
-                            "context_compacted", **identity, step=state.step_index + 1,
-                            strategy="semantic_summary" if not policy.compact and summary.status in {"applied", "cached"} else "deterministic_omission", omitted_groups=projection.omitted_groups,
-                            omitted_messages=projection.omitted_messages,
-                            original_input_tokens=projection.original_input_tokens,
-                            estimated_input_tokens=projection.estimated_input_tokens,
-                            input_estimate_source=projection.estimate_source,
-                        )
-                    last_omitted = projection.omitted_groups
-                budget.seconds_left = remaining_seconds()
-                if not budget.has_time(policy.seconds_reserve):
-                    error = budget_reason() if not budget.has_time() else "本轮请求已无可用时间，剩余时间已预留给收尾。"
-                    break
-                if steering is not None and steering.pending():
-                    continue
-                budget.spend(steps=1)
-                step_started = time.perf_counter()
-                history_start = len(state.history)
-                checkpoint = state.scratch.get("work_checkpoint")
-                reset_work_view = policy.compact and policy.phase == "work"
-                if reset_work_view:
-                    # Every earlier tool batch is complete here. Only commit
-                    # the new boundary after the provider turn actually runs.
-                    prefix = projection.messages
-                    if state.scratch.get("tool_protocol_feedback") and policy.allowed_tools != frozenset():
-                        prefix = prefix[:-1]  # A one-turn protocol correction has no place in later requests.
-                    checkpoint = WorkCheckpoint(history_start, prefix)
-                if self.tracer:
-                    self.tracer.event(
-                        "step_start", **identity, step=state.step_index + 1,
-                        phase=policy.phase, compact=policy.compact, tokens_reserved=policy.token_reserve,
-                        **({"work_history_start": checkpoint.history_end,
-                            "work_history_tail_messages": history_start - checkpoint.history_end}
-                           if checkpoint and policy.phase == "work" else {}),
-                        seconds_reserved=policy.seconds_reserve,
-                        offered_tools=[spec.name for spec in offered], requested_tool=policy.required_tool,
-                        allowed_write_paths=sorted(policy.allowed_write_paths) if policy.allowed_write_paths is not None else None,
-                        provider_config=provider_configuration(self.provider),
-                        seconds_remaining=None if budget.seconds_left is None else round(max(0, budget.seconds_left), 2),
-                        tokens_remaining=budget.tokens_left, tokens_used=budget.tokens_used,
-                        steps_remaining=budget.steps_left,
-                        context_window_tokens=self.settings.context_window_tokens,
-                        output_reserve_tokens=output_headroom(window, output_reserve),
-                        output_ceiling_tokens=output_reserve, tool_results_pruned=pruned,
-                        request_output_limit=request_output_limit,
-                        estimated_input_tokens=projection.estimated_input_tokens,
-                        input_limit_tokens=projection.input_limit,
-                        input_estimate_source=projection.estimate_source,
-                    )
-                state.scratch.pop("tool_protocol_feedback", None)
-                if (on_assistant_stream and policy.phase in {"work", "coordinate", "handoff", "finalize"}
-                        and not policy.required_tool and not policy.bound_handoff):
-                    preview = _AssistantPreview(on_assistant_stream, self.name, task_id, state.step_index + 1)
-                try:
-                    record = self.unit.step(
-                        state, budget, request_history=projection.messages, max_output_tokens=request_output_limit,
-                        allowed_tools=policy.allowed_tools, token_reserve=policy.token_reserve,
-                        allowed_write_paths=policy.allowed_write_paths, required_tool=policy.required_tool,
-                        bound_handoff=policy.bound_handoff,
-                        **({"on_stream": preview.receive} if preview else {}),
-                        request_seconds=budget.available_seconds(policy.seconds_reserve),
-                    )
-                except ProviderError as exc:
-                    if (exc.code != "context_length_exceeded" or overflow_used or not budget.has_steps(1)
-                            or len(state.history) != history_start or cancellation_observed()):
-                        raise
-                    overflow_used = True
-                    retry_envelope = (projection.estimated_input_tokens, request_output_limit)
-                    usage_anchor = None
-                    if exc.attempts:
-                        usage = usage.merged(Usage(source="unknown"))
-                    if self.tracer:
-                        self.tracer.event("provider_error", **identity, call_id=f"error-{uuid.uuid4().hex}",
-                                          step=state.step_index, code=exc.code, http_status=exc.status_code,
-                                          transport=self.provider.transport, request_attempts=exc.attempts,
-                                          usage_source="unknown", recovery="shrink_and_retry")
-                    continue
-                if reset_work_view:
-                    state.scratch["work_checkpoint"] = checkpoint
-                    # All earlier spans and token measurements now precede the
-                    # replay boundary. The raw transcript remains untouched.
-                    excluded_ranges.clear()
-                    reported_assistant_tokens.clear()
-                    usage_anchor = None
-                    compactor = RollingCompactor()
-                retry_envelope = None
-                usage = usage.merged(
-                    Usage(prompt_tokens=record.prompt_tokens,
-                          completion_tokens=record.completion_tokens,
-                          source="unknown" if record.request_attempts > 1 else record.usage_source)
-                )
-                tool_calls += record.tool_calls
-                if (steering is not None and len(state.history) > history_start
-                        and state.history[history_start].get("role") == "assistant"):
-                    steering.acknowledge()
-                self._trace_step(identity, record, request_output_limit)
-                if (record.usage_source == "reported" and record.terminate_reason is None
-                        and len(state.history) > history_start
-                        and state.history[history_start].get("role") == "assistant"):
-                    assistant = copy.deepcopy(state.history[history_start])
-                    reported_assistant_tokens[history_start] = (assistant, record.completion_tokens)
-                    usage_anchor = UsageAnchor(
-                        messages=projection.messages + [assistant], tool_schemas=tool_schemas,
-                        measured_tokens=record.total_tokens,
-                    )
-                if on_step is not None:
-                    on_step(record, state)
-
-                if record.terminate_reason == ErrorClass.T_CANCEL or cancellation_observed():
-                    if record.terminate_reason == ErrorClass.T_CANCEL and self.tracer:
-                        self.tracer.event("cancel_observed", **identity, step=state.step_index)
-                    status, error = "aborted", "用户请求停止"
-                    break
-                budget.seconds_left = remaining_seconds()
-                if record.terminate_reason == ErrorClass.T_BUDGET or not budget.has_tokens(0) or not budget.has_time():
-                    status, error = "limit_exceeded", budget_reason()
-                    break
-                if record.unstructured_tool_call:
-                    protocol = "text" if text_only else "tools"
-                    already_corrected = protocol in corrected_protocols
-                    can_retry = not already_corrected and budget.has_steps(1) and budget.has_tokens(1)
-                    if self.tracer:
-                        self.tracer.event("tool_protocol_correction", **identity, step=record.step,
-                                          retry=can_retry, phase=policy.phase, protocol=protocol)
-                    if not can_retry:
-                        status = "error" if already_corrected else "limit_exceeded"
-                        error = ("纠正后仍在正文中输出工具调用；未执行该调用，无法确认交接。"
-                                 if already_corrected else "模型在正文中输出工具调用，剩余额度不足以纠正。")
-                        break
-                    # Keep the malformed response for auditing and exclude the
-                    # entire unexecuted batch (including any skipped tool replies).
-                    excluded_ranges.append((history_start, len(state.history)))
-                    state.scratch["tool_protocol_feedback"] = (
-                        "[工具协议纠正] 上一轮正文中的调用标记未执行。需要操作且本轮提供了工具时，"
-                        "请通过 API 的结构化 tool_calls 发出实际调用。若本轮仅能用文字交接，"
-                        "请基于已有证据报告结果或以 [BLOCKED] 说明剩余工作。请勿在正文中书写调用标记。"
-                    )
-                    corrected_protocols.add(protocol)
-                    continue
-                if record.recoverable_output_length:
-                    if output_recoveries < self.settings.max_output_recovery_attempts and not budget.exhausted:
-                        output_recoveries += 1
-                        # Preserve the audit history but never forward an incomplete
-                        # assistant/tool envelope, or re-execute an earlier success.
-                        excluded_ranges.append((history_start, len(state.history)))
-                        state.history.append({
-                            "role": "user", "content": (
-                                "[输出截断恢复] 上次响应达到单次输出上限，该轮工具均未执行，"
-                                "该不完整响应未纳入本次请求。更早已成功执行的动作仍有效，不要重复执行。"
-                                "请缩小当前动作：使用 edit_file 局部修改，或 write_file 后分批 append_file；"
-                                "每次只生成一个较小且完整的工具调用。若在思考中耗尽输出预算，"
-                                "请简化本轮计划，先完成一个可验证的小步骤。"
-                            ),
-                        })
-                        if self.tracer:
-                            self.tracer.event(
-                                "output_recovery", **identity, step=record.step,
-                                attempt=output_recoveries, maximum=self.settings.max_output_recovery_attempts,
-                                finish_reason=record.finish_reason,
-                                omitted_response_messages=len(state.history) - history_start - 1,
-                            )
-                        continue
-                    if self.tracer:
-                        self.tracer.event(
-                            "output_recovery_exhausted", **identity, step=record.step,
-                            attempts=output_recoveries, maximum=self.settings.max_output_recovery_attempts,
-                            budget_exhausted=budget.exhausted,
-                        )
-                # ① 终止原因（循环 / 主动放弃）
-                if record.terminate_reason:
-                    error, status = self._terminate(
-                        record.terminate_reason, finish_reason=record.finish_reason,
-                        max_output_tokens=request_output_limit,
-                    )
-                    break
-
-                if policy.phase == "coordinate" and len(state.history) > history_start:
-                    replies = state.scratch.get("human_replies", ())
-                    received = sum(obs.ok and obs.source == "human" for obs in record.observations)
-                    state._coordination_turns.append(CoordinationTurn(
-                        history_start, len(state.history), len(state.scratch.get("live_user_messages", ())),
-                        len(replies) - received,
-                    ))
-                completion = tool_completion(record) if tool_completion and record.observations else None
-                if completion is not None and not isinstance(completion, ToolCompletion):
-                    raise TypeError("tool_completion must return ToolCompletion or None")
-                if text_only and record.decision_kind != "answer" and completion is None:
-                    rejected_text_turns += 1
-                    if rejected_text_turns > 1:
-                        status, error = "error", "收尾阶段连续两次未收到有效的模型文字交接。"
-                        break
-                    continue
-                rejected_text_turns = 0
-
-                # ② 模型给出最终答复 → 必须过验收
-                if record.decision_kind == "answer" or completion is not None:
-                    if receive_steering():
-                        continue
-                    if completion is not None and completion.blocked:
-                        if receive_steering(finishing=True):
-                            continue
-                        answer = error = completion.answer
-                        status = "error"
-                        if self.tracer:
-                            self.tracer.event("tool_handoff_blocked", **identity, step=record.step,
-                                              evidence=completion.evidence, reason=error)
-                        break
-                    if (completion is None and (step_policy is not None or self.unit.autonomous)
-                            and record.answer.lstrip().startswith("[BLOCKED]")):
-                        if policy.reviewed_delivery and not self.sandbox.command_sessions.pending_reason():
-                            retry = (not reviewed_close_retried and budget.has_steps(1)
-                                     and budget.has_tokens(1) and budget.has_time())
-                            if self.tracer:
-                                self.tracer.event("reviewed_delivery_blocked", **identity, step=record.step,
-                                                  action="request_clarification" if retry else "preserve_block",
-                                                  receipts=list(policy.reviewed_delivery))
-                            if retry:
-                                reviewed_close_retried = True
-                                state.scratch["delivery_feedback"] = (
-                                    "[宿主结案核对] 你刚刚报了阻塞。当前文件的独立验收已成功发布，"
-                                    "请根据下列版本回执重新汇总。如果另有真实阻塞，请保留 [BLOCKED] "
-                                    "并具体说明超出这些标准的哪项请求尚未满足。")
-                                continue
-                        if receive_steering(finishing=True):
-                            continue
-                        answer = record.answer
-                        status, error = "error", answer
-                        break
-                    reason = self.sandbox.command_sessions.pending_reason()
-                    if not reason and before_answer is not None:
-                        reason = before_answer()
-                    if isinstance(reason, PendingPeerReview):
-                        status, error = "error", reason.reason
-                        if self.tracer:
-                            self.tracer.event("handoff_pending_peer", **identity, step=record.step, reason=error)
-                        break
-                    if reason:
-                        # An active group worker can correct the reported gate.
-                        # A final text-only checkpoint cannot acquire evidence.
-                        can_repair = step_policy is not None and any(spec.name != "abort_task" for spec in offered)
-                        blocked_handoff_retries = 0 if can_repair else blocked_handoff_retries + 1
-                        if self.tracer:
-                            self.tracer.event("delivery_blocked", **identity, reason=reason)
-                        if blocked_handoff_retries > 1:
-                            status, error = "error", reason
-                            break
-                        state.history.append({"role": "user", "content": reason})
-                        state.scratch["delivery_feedback"] = reason
-                        continue
-                    answer = completion.answer if completion is not None else record.answer
-                    if completion is not None and self.tracer:
-                        self.tracer.event("tool_completion", **identity, step=record.step,
-                                          evidence=completion.evidence, answer=answer)
-                    if durable_task is not None:
-                        durable_task = self.task_service.transition(
-                            task_id, expected_revision=durable_task.revision, status="verifying",
-                        )
-                    evaluation = evaluate(
-                        acceptance, self.sandbox.root, task_id=task_id,
-                        attempt_id=attempt_id, objective=task,
-                    )
-                    verdict = evaluation.report.verdict
-                    if verdict in {"passed", "unverified", "error"} and receive_steering(finishing=True):
-                        if durable_task is not None:
-                            durable_task = self.task_service.transition(
-                                task_id, expected_revision=durable_task.revision, status="running",
-                            )
-                        answer = ""
-                        continue
-                    acceptance_spec = evaluation.spec
-                    acceptance_report = evaluation.report
-                    payload = evaluation.trace_payload()
-                    acceptance_evidence = payload.get("receipts", [])
-                    if durable_task is not None:
-                        durable_task = self.task_service.record_acceptance(
-                            task_id, expected_revision=durable_task.revision,
-                            spec=acceptance_spec, report=acceptance_report,
-                            receipts=acceptance_evidence,
-                        )
-                    why = acceptance_report.reason or "验收通过"
-                    if self.tracer:
-                        self.tracer.event(
-                            "acceptance",
-                            **identity,
-                            step=record.step,
-                            ok=verdict == "passed",
-                            reason=why,
-                            **payload,
-                        )
-                    if verdict == "passed":
-                        if preview:
-                            preview.close(accepted=completion is None)
-                        status = "completed"
-                        break
-                    if verdict in {"unverified", "error"}:
-                        if preview:
-                            preview.close(accepted=completion is None and verdict == "unverified")
-                        status, error = verdict, why
-                        break
-                    acceptance_failures += 1
-                    if acceptance_failures > self.max_acceptance_retries:
-                        status = "failed_acceptance"
-                        error = f"{ErrorClass.T_ACCEPTANCE_FAILED}: {why}"
-                        break
-                    if durable_task is not None:
-                        durable_task = self.task_service.transition(
-                            task_id, expected_revision=durable_task.revision, status="running",
-                        )
-                    # 打回一次：把验收意见作为人类反馈注入，再给模型一次机会
-                    state.scratch["delivery_feedback"] = f"[验收未通过] {why}"
-                    state.history.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"[验收未通过] {why}\n"
-                                "请修正产物后重新给出最终答复；不要重复刚才的做法。"
-                            ),
-                        }
-                    )
-        except TaskTokenLimitError as exc:
-            status, error = "limit_exceeded", str(exc)
-            if self.tracer:
-                self.tracer.event("token_budget_preflight", **identity, step=state.step_index + 1,
-                                  tokens_remaining=budget.tokens_left, reason=error)
-        except ContextLimitError as exc:
-            status, error = "limit_exceeded", f"上下文空间检查未通过：{exc}（T_CONTEXT）"
-            if self.tracer:
-                self.tracer.event("context_limit", **identity, step=state.step_index,
-                                  context_window_tokens=self.settings.context_window_tokens,
-                                  reason=str(exc))
-        except StoreError:
-            # Persistence conflicts are not model errors and must not be hidden
-            # behind a stale success or an unconditional overwrite.
-            raise
-        except ProviderError as exc:
-            if self.tracer:
-                self.tracer.event(
-                    "provider_error", **identity, call_id=f"error-{uuid.uuid4().hex}",
-                    transport=self.provider.transport,
-                    code=exc.code, http_status=exc.status_code,
-                    request_attempts=exc.attempts, usage_source="unknown",
-                    step=state.step_index, retryable=exc.retryable,
-                    latency_ms=round((time.perf_counter() - step_started) * 1000, 2)
-                    if step_started is not None else None,
-                )
-            if exc.attempts:
-                usage = usage.merged(Usage(source="unknown"))
-            if cancellation_observed():
-                status, error = "aborted", "用户请求停止"
-            else:
-                provider_error_code = exc.code
-                status, error = "error", f"模型调用失败：{exc}"
-        except Exception as exc:  # noqa: BLE001 - 循环本身绝不能把进程带走
-            status, error = "error", f"{type(exc).__name__}: {exc}"
-        finally:
-            if steering is not None:
-                steering.close()
-            if preview:
-                preview.close()
-            if owned_commands:
-                self.sandbox.command_sessions.close()
-                self.sandbox.command_sessions = None
-
-        if durable_task is not None:
-            persistent_status = (status if status in {"completed", "unverified"}
-                                 else "cancelled" if status == "aborted" else "failed")
-            durable_task = self.task_service.finish(
-                task_id, expected_revision=durable_task.revision,
-                status=persistent_status, error=error,
-                spec=acceptance_spec, report=acceptance_report, receipts=acceptance_evidence,
-            )
-        duration_ms = round((time.perf_counter() - started) * 1000, 2)
-        result = RunResult(
-            task_id=task_id,
-            attempt_id=attempt_id,
-            run_id=run_id,
-            agent=self.name,
-            status=status,  # type: ignore[arg-type]
-            answer=answer,
-            error=error,
-            provider_error_code=provider_error_code,
-            duration_ms=duration_ms,
-            steps=state.step_index,
-            tool_calls=tool_calls,
-            usage=usage,
-            sandbox=self.sandbox.root.as_posix(),
-            acceptance_spec=acceptance_spec,
-            acceptance_report=acceptance_report,
-            acceptance_evidence=acceptance_evidence,
+        answer = ""
+        step = 0
+        processes = ProcessScope()
+        tmpdir = tempfile.mkdtemp(prefix="miniagent-run-")
+        self.sandbox.command_sessions = CommandSessions()
+        self.sandbox.track_shell_group = processes.track
+        self.sandbox.command_tmpdir = Path(tmpdir)
+        tool_ctx = ToolContext(
+            sandbox=self.sandbox, limits=self.limits, approve=lambda _message: True,
+            deadline=deadline, should_cancel=self.should_cancel,
+            contains_configured_secret=(lambda text: self.settings.api_key in text) if self.settings.api_key else None,
         )
+        specs = self.registry.specs(available_only=True)
+        tool_schemas = [spec.to_api() for spec in specs]
+        self.emit("start", task=task)
 
-        if self.tracer:
-            self.tracer.event(
-                "task_end",
-                **identity,
-                agent=self.name,
-                status=result.status,
-                duration_ms=result.duration_ms,
-                steps=result.steps,
-                tool_calls=result.tool_calls,
-                prompt_tokens=usage.prompt_tokens,
-                completion_tokens=usage.completion_tokens,
-                usage_source=usage.source,
-                error=result.error,
-                acceptance_spec=acceptance_spec.model_dump(mode="json") if acceptance_spec else None,
-                acceptance_report=acceptance_report.model_dump(mode="json") if acceptance_report else None,
-                acceptance_evidence=acceptance_evidence,
-            )
+        def spend(response: LLMResponse) -> None:
+            nonlocal usage
+            usage = usage.merged(response.usage)
+
+        def call_model(*, tools_enabled: bool) -> LLMResponse:
+            options: dict[str, Any] = {}
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None:
+                options["deadline_seconds"] = max(5.0, remaining + 60.0)
+            if self.stream and isinstance(self.provider, DeepSeekProvider):
+                stream_id = uuid.uuid4().hex
+                options["on_stream"] = lambda phase, text: self.emit("delta", stream_id=stream_id, phase=phase, text=text)
+                options["should_cancel"] = self.should_cancel
+            if specs:
+                options["tool_choice"] = "auto" if tools_enabled else "none"
+            length_at_request = len(messages)
+            response = self.provider.chat(messages, tools=specs or None,
+                                          temperature=self.settings.temperature, **options)
+            if response.usage.source == "reported" and response.usage.prompt_tokens:
+                ctx_manager.note_usage(messages, response.usage.prompt_tokens, length_at_request)
+            spend(response)
+            return response
+
+        def summarize(prompt: list[dict[str, Any]]):
+            response = self.provider.chat(prompt, temperature=0.0)
+            spend(response)
+            if response.finish_reason == "length":
+                raise ValueError("summary was truncated")
+            return response.text, response.usage
+
+        def compact(force: bool = False) -> None:
+            limit = ctx_manager.compact_at_tokens
+            if force:
+                ctx_manager.compact_at_tokens = 1
+            try:
+                result = ctx_manager.maybe_compact(messages, tool_schemas, summarize)
+            finally:
+                ctx_manager.compact_at_tokens = limit
+            if result.applied:
+                self.emit("compaction", method=result.method, before_tokens=result.before_tokens,
+                          after_tokens=result.after_tokens, error=result.error)
+
+        def take_inbox() -> bool:
+            if self.inbox is None:
+                return False
+            notes = self.inbox.take(self.name)
+            for note in notes:
+                messages.append({"role": "user", "content": note})
+            if notes:
+                guard.reset()
+                self.emit("steering", count=len(notes))
+            return bool(notes)
+
+        try:
+            while True:
+                if self.should_cancel():
+                    status, error = "cancelled", "cancelled by the user"
+                    break
+                if step >= self.limits.max_steps:
+                    status = "max_steps"
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    status, error = "budget", f"time limit of {self.limits.max_seconds:.0f}s reached"
+                    break
+                if self.limits.max_total_tokens and usage.total >= self.limits.max_total_tokens:
+                    status, error = "budget", f"token budget of {self.limits.max_total_tokens} reached"
+                    break
+                take_inbox()
+                left = self.limits.max_steps - step
+                if not warned and self.limits.max_steps >= 10 and left <= max(3, self.limits.max_steps // 10):
+                    warned = True
+                    messages.append({"role": "user", "content": (
+                        f"[Budget] Only {left} steps remain for this assignment. Prioritise finishing and "
+                        "verifying the most important part, then give your final report.")})
+                compact()
+                step += 1
+                self.emit("step", step=step, max_steps=self.limits.max_steps)
+                try:
+                    response = call_model(tools_enabled=True)
+                except ProviderError as exc:
+                    if exc.code == "context_length_exceeded":
+                        compact(force=True)
+                        response = call_model(tools_enabled=True)
+                    else:
+                        raise
+                messages.append(response.to_assistant_message())
+                calls = response.tool_calls
+                if not calls:
+                    text = response.text.strip()
+                    if response.finish_reason == "length" and recoveries < self.settings.max_output_recovery_attempts:
+                        recoveries += 1
+                        messages.append({"role": "user", "content": (
+                            "[Output limit] Your last response was cut off at the output limit. Continue, "
+                            "but keep each response shorter: write large files in several smaller tool calls.")})
+                        continue
+                    if not text:
+                        empty_answers += 1
+                        if empty_answers <= 2:
+                            messages.append({"role": "user", "content": (
+                                "You returned neither a tool call nor text. Continue the work with a tool call, "
+                                "or write your final report as text.")})
+                            continue
+                    if take_inbox():
+                        continue  # the user said something while the answer was being written
+                    answer, status = text, "completed"
+                    break
+                if response.text.strip():
+                    self.emit("say", text=response.text.strip())
+                executed = 0
+                for call in calls:
+                    executed += 1
+                    if self.should_cancel():
+                        messages.append({"role": "tool", "tool_call_id": call.id,
+                                         "content": "Not executed: the task was cancelled."})
+                        continue
+                    if executed > self.limits.max_tool_calls_per_step:
+                        content = (f"Not executed: at most {self.limits.max_tool_calls_per_step} tool calls run "
+                                   "per response. Repeat this call in your next response if it is still needed.")
+                        messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+                        continue
+                    content, ok = self._execute(call, tool_ctx)
+                    tool_calls += 1
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+                    guard.record(call.name, call.arguments, ok, content)
+                verdict = guard.check()
+                if verdict.nudge:
+                    messages.append({"role": "user", "content": verdict.nudge})
+                    self.emit("loop_nudge", reason=verdict.reason)
+                if verdict.stuck:
+                    status, error = "stuck", f"stopped by the loop guard ({verdict.reason})"
+                    self.emit("loop_stuck", reason=verdict.reason)
+                    break
+            if status in {"max_steps", "stuck", "budget"} and not self.should_cancel():
+                reason = {"max_steps": f"Step budget of {self.limits.max_steps} reached",
+                          "stuck": "Loop detected", "budget": "Budget reached"}[status]
+                answer = self._wrap_up(messages, reason, call_model)
+        except ProviderError as exc:
+            status = "cancelled" if self.should_cancel() else "error"
+            error = f"model request failed ({exc.code}): {exc}"
+        except Exception as exc:  # noqa: BLE001 - one broken run must not take the team down
+            status = "cancelled" if self.should_cancel() else "error"
+            error = f"{type(exc).__name__}: {exc}"
+        finally:
+            sessions = self.sandbox.command_sessions
+            self.sandbox.command_sessions = None
+            self.sandbox.track_shell_group = None
+            if sessions is not None:
+                sessions.close()
+            processes.close()
+            self.sandbox.close_command_venv()
+            self.sandbox.command_tmpdir = None
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        result = AgentResult(agent=self.name, status=status, answer=answer, error=error, steps=step,
+                             tool_calls=tool_calls, usage=usage, duration_s=round(time.monotonic() - started, 2),
+                             compactions=ctx_manager.compactions)
+        self.emit("end", status=status, answer=answer, error=error, steps=step, tool_calls=tool_calls,
+                  prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
+                  duration_s=result.duration_s)
         return result
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def _terminate(reason: str, *, finish_reason: str = "",
-                   max_output_tokens: int | None = None) -> tuple[str, str]:
-        """把 RAO 的终止原因映射为 (error, status)。"""
-        if reason == ErrorClass.T_STORE:
-            return "动作身份持久化失败，本轮未执行工具（T_STORE）", "error"
-        if reason == ErrorClass.T_PROTOCOL:
-            if finish_reason == "length":
-                ceiling = f"（max_output_tokens={max_output_tokens}）" if max_output_tokens else ""
-                return (
-                    f"模型输出达到单次调用上限{ceiling}，响应被截断（finish_reason=length）；"
-                    "本轮工具未执行。请缩小单次产出或调整输出上限后重新运行（T_PROTOCOL）", "error"
-                )
-            return "模型响应协议不完整或异常终止（T_PROTOCOL）", "error"
-        if reason == ErrorClass.T_ABORT:
-            return "任务被主动中止", "aborted"
-        if reason == ErrorClass.T_CANCEL:
-            return "用户请求停止", "aborted"
-        if reason == ErrorClass.T_LOOP:
-            return "检测到重复动作，已终止（T_LOOP）", "limit_exceeded"
-        return f"终止原因：{reason}", "limit_exceeded"
+    def _execute(self, call: ToolCall, ctx: ToolContext) -> tuple[str, bool]:
+        preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
+        self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
+        if call.parse_error:
+            content, ok = (f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
+                           "possibly cut off because the call was too large. Split the work into smaller calls."), False
+        else:
+            result = self.registry.dispatch(call.name, call.arguments, ctx)
+            content, ok = result.content, result.ok
+        if len(content) > MAX_TOOL_RESULT_CHARS:
+            content = content[:MAX_TOOL_RESULT_CHARS] + f"\n…[truncated: {len(content) - MAX_TOOL_RESULT_CHARS} more characters]"
+        if not ok and not content.startswith(("Tool call rejected", "Error")):
+            content = "Error: " + content
+        self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600])
+        return content, ok
 
-    def _trace_step(self, identity: dict, record: StepRecord, request_output_limit: int) -> None:
-        if not self.tracer:
-            return
-        if record.host_handoff:
-            self.tracer.event("bound_handoff_dispatched", **identity, step=record.step, **record.host_handoff)
-        if record.progress_advisory:
-            self.tracer.event("progress_advisory", **identity, step=record.step, message=record.progress_advisory)
-        self.tracer.event(
-            "step",
-            **identity,
-            step=record.step,
-            decision=record.decision_kind,
-            tools=record.tool_names,
-            ok=record.ok,
-            error_class=record.error_class,
-            latency_ms=record.latency_ms,
-            prompt_tokens=record.prompt_tokens,
-            completion_tokens=record.completion_tokens,
-            transport=self.provider.transport,
-            usage_source=record.usage_source,
-            finish_reason=record.finish_reason,
-            model=record.model,
-            request_attempts=record.request_attempts,
-            request_id=record.request_id,
-            max_output_tokens=request_output_limit,
-        )
-        # Calls with bound action IDs were emitted as soon as they returned. Preserve
-        # protocol errors and old synthetic observations that never reached dispatch.
-        for obs in record.observations:
-            if not obs.action_id:
-                self._trace_tool(identity, record.step, obs, obs.source)
-
-    def _trace_tool(self, identity, step, obs, operation):
-        command_metrics = {}
-        if operation == "submit_review" and obs.meta.get("review_refusal"):
-            command_metrics["review_refusal"] = obs.meta["review_refusal"]
-        if operation in {"write_file", "edit_file"} and obs.meta.get("code") == "no_change":
-            command_metrics["changed"] = False
-        if obs.source in {"run_shell", "run_python", "run_browser", "poll_process", "rerun_browser_check"}:
-            metrics = ("exit_code", "pipeline_exit_code", "shell_exit_code", "elapsed_ms", "timed_out", "timeout_s", "cwd",
-                       "stdout_bytes", "stderr_bytes", "truncated", "cancelled", "process_id", "process_state", "replayed_tool_call_id")
-            command_metrics = {key: obs.meta[key] for key in metrics if key in obs.meta}
-        if obs.source == operation and obs.ok:
-            if operation in {"run_shell", "run_python"}:
-                command_metrics["complete_preview"] = not obs.truncated and len(obs.content) <= 200
-            entity = obs.meta.get("entity")
-            if created_name(operation, entity):
-                command_metrics["created_entity"] = {key: entity[key] for key in ("kind", "id", "name")}
-        for key in ("bytes", "returned_chars", "count"):
-            if type(obs.meta.get(key)) is int:
-                command_metrics[key] = obs.meta[key]
-        self.tracer.event(
-            "tool_result",
-            **identity,
-            step=step,
-            agent=self.name,
-            operation=operation,
-            tool=obs.source,
-            action_id=obs.action_id,
-            tool_call_id=obs.tool_call_id,
-            ok=obs.ok,
-            error_class=obs.error_class,
-            artifacts=obs.artifacts,
-            preview=obs.content[:200],
-            **command_metrics,
-        )
+    def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model) -> str:
+        messages.append({"role": "user", "content": WRAP_UP_INSTRUCTION.format(reason=reason)})
+        try:
+            response = call_model(tools_enabled=False)
+        except ProviderError as exc:
+            return f"(No final report: the model request failed — {exc.code}.)"
+        messages.append(response.to_assistant_message())
+        text = response.text.strip()
+        return text or "(The agent stopped without writing a final report.)"

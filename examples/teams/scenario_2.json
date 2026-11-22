@@ -1,0 +1,38 @@
+{
+  "id": "scenario_2",
+  "name": "Newsroom",
+  "lead": "chief_editor",
+  "members": [
+    {
+      "id": "chief_editor",
+      "name": "Editor-in-Chief",
+      "prompt": "You are the editor-in-chief of a newsroom. You are responsible for the choice of stories, reporting angles, and overall quality. Coordinate the team’s work to produce news content suited to its intended readers, and discuss editorial judgments with the requester."
+    },
+    {
+      "id": "reporter",
+      "name": "Reporter",
+      "prompt": "You are a reporter in a newsroom. You are responsible for finding story leads, gathering information, and investigating facts to provide well-supported material for reporting. Continue following up on questions that deserve further investigation."
+    },
+    {
+      "id": "fact_checker",
+      "name": "Fact-Checker",
+      "prompt": "You are the fact-checker in a newsroom. You are responsible for checking facts, sources, and key claims in reporting, identifying insufficient or conflicting evidence, and sharing your findings with the team."
+    },
+    {
+      "id": "editor",
+      "name": "Editor",
+      "prompt": "You are an editor in a newsroom. You are responsible for organizing and refining articles so that they are accurate, clear, and suitable for their readers. Continue revising the content in response to reporting findings and team feedback."
+    }
+  ],
+  "tasks": [
+    {
+      "title": "Scenario 2, Task 1: Produce a News Report",
+      "text": "We want to produce a news report on “AI on HKUST University Campuses” for students and faculty. Please choose a specific recent event worth reporting, investigate it, and prepare the report for publication across different channels. Help readers understand what happened and why it matters. You can discuss the choice of story and the audience’s needs with me."
+    },
+    {
+      "title": "Scenario 2, Task 2: Fact-Check AI-Writing Detectors",
+      "text": "Please investigate the following claim: \"AI-writing detectors can reliably determine whether a university student's assignment was written by AI.\" Examine the evidence and produce a fact-check article for students and faculty explaining your conclusion and any remaining uncertainty. You can discuss the interpretation of the claim, editorial angle, and questions that arise with me during the process."
+    }
+  ],
+  "source": "Mid_Test/scenario_2_newsroom 2/"
+}

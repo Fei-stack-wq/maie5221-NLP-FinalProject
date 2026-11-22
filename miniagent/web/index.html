@@ -3,69 +3,90 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <meta name="theme-color" content="#faf9f6">
-  <title>Agent Studio · 本地工作室</title>
-  <script src="/markdown-it.min.js" defer></script>
-  <script src="/markdown-reader.js" defer></script>
-  <script src="/activity.js" defer></script>
-  <script src="/reply-stream.js" defer></script>
-  <script src="/attachments.js" defer></script>
-  <script src="/superagent.js" defer></script>
-  <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/superagent.css">
-  <link rel="stylesheet" href="/activity.css">
-  <link rel="stylesheet" href="/directory.css">
-  <script src="/directory.js" defer></script>
-  <link rel="stylesheet" href="/room-panel.css">
-  <script src="/room-panel.js" defer></script>
-  <link rel="stylesheet" href="/markdown-reader.css">
-  <script src="/app.js" defer></script>
+  <title>miniagent Studio</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/vendor/markdown-it.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#main">跳到主要内容</a>
-  <div class="shell">
-    <aside class="sidebar" id="sidebar" aria-label="工作室导航">
-      <a href="#assistant" class="brand" aria-label="Agent Studio 首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>Agent <strong>Studio</strong></span></a>
-      <a class="assistant-nav" href="#assistant" data-nav="assistant"><span data-icon="terminal"></span>统一对话<span class="nav-arrow" aria-hidden="true">↗</span></a>
-      <nav aria-label="工作室">
-        <a href="#chats" class="nav-item" data-nav="chats"><span data-icon="messages"></span>最近对话</a>
-        <a href="#roles" class="nav-item" data-nav="roles"><span data-icon="book"></span>角色库</a>
-      </nav>
-      <section class="side-channels" aria-labelledby="channel-label">
-        <div class="channel-section-head"><h2 id="channel-label">固定群聊</h2><button class="icon-button" data-channel-action="create" aria-label="新建固定群聊" title="新建固定群聊"><span data-icon="plus"></span></button></div>
-        <nav id="channel-nav" aria-label="固定群聊"><p class="side-empty">正在读取群聊…</p></nav>
-      </section>
-      <nav aria-label="任务与运行" class="runtime-nav">
-        <div class="nav-label">任务与运行</div>
-        <a href="#home" class="nav-item" data-nav="home"><span data-icon="grid"></span>工作台</a>
-        <a href="#runs" class="nav-item" data-nav="runs"><span data-icon="layers"></span>全部任务<span class="nav-count" id="nav-count">0</span></a>
-        <button class="nav-item new-task-link" data-action="new"><span data-icon="plus"></span>新建任务 <kbd>N</kbd></button>
-      </nav>
-      <div class="sidebar-bottom">
-        <button class="connection-card" data-action="connection" aria-label="查看模型连接信息"><span class="connection-symbol" data-icon="cpu"></span><span><strong id="provider-label">正在连接</strong><small id="provider-caption">读取本地配置</small></span><span class="connection-dot" id="provider-dot"></span></button>
-        <div class="local-user"><span class="avatar">L</span><span>本地工作室<small>仅在这台电脑运行</small></span><span class="version">v0.1</span></div>
-      </div>
-    </aside>
-    <div class="main-shell">
-      <header class="topbar"><div class="breadcrumb"><button class="icon-button mobile-menu" aria-label="展开导航" data-action="menu"><span data-icon="menu"></span></button><span class="crumb-icon" data-icon="workspace"></span><span>工作室</span><span class="separator">/</span><span id="breadcrumb-current">统一对话</span></div><div class="top-actions"><span class="local-status" id="server-status"><span class="dot"></span>本地服务</span><button class="icon-button" data-action="refresh" title="刷新" aria-label="刷新任务"><span data-icon="refresh"></span></button></div></header>
-      <div id="connection-banner" class="connection-banner" role="status" hidden>连接已断开，正在尝试重新连接。已提交的任务不会重复启动。</div>
-      <main id="main" tabindex="-1"><div class="initial-loading"><span class="spinner"></span>正在打开你的工作室…</div></main>
-      <footer class="app-footer"><span><span class="tiny-dot"></span>数据保存在本机</span><span>Agent Studio 本地工作室</span></footer>
+  <aside id="sidebar">
+    <div class="brand">miniagent <span>Studio</span></div>
+    <button id="new-group" class="primary">＋ 新建群聊</button>
+    <ul id="group-list"></ul>
+    <div id="config" class="muted small"></div>
+  </aside>
+
+  <main id="main">
+    <div id="empty" class="empty">
+      <h1>多智能体协作工作室</h1>
+      <p>新建一个群聊，填入成员和各自的职责（或直接选用 Mid_Test 场景模板），然后在群里发布任务。</p>
+      <p class="muted">负责人会拆分并委派工作；成员各自在私有工作区完成并发布文件；需要你决定的事会在群里问你。</p>
     </div>
-  </div>
-  <dialog id="task-dialog" class="task-dialog" aria-labelledby="dialog-title"><div class="dialog-header"><div><span class="eyebrow">NEW TASK</span><h2 id="dialog-title">开始一个新任务</h2></div><button class="icon-button" data-action="close-dialog" aria-label="关闭新建任务"><span data-icon="x"></span></button></div><div id="dialog-form"></div></dialog>
-  <dialog id="info-dialog" class="info-dialog" aria-labelledby="info-title"><div class="dialog-header"><h2 id="info-title">模型连接</h2><button class="icon-button" data-action="close-info" aria-label="关闭连接信息"><span data-icon="x"></span></button></div><div id="connection-info"></div></dialog>
-  <dialog id="role-dialog" class="task-dialog role-dialog" aria-labelledby="role-dialog-title"><div class="dialog-header"><h2 id="role-dialog-title"></h2><button type="button" class="icon-button" data-role-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="role-editor"></div></dialog>
-  <dialog id="channel-dialog" class="task-dialog" aria-labelledby="channel-dialog-title"><div class="dialog-header"><h2 id="channel-dialog-title"></h2><button type="button" class="icon-button" data-channel-action="dismiss" aria-label="关闭"><span data-icon="x"></span></button></div><div id="channel-editor"></div></dialog>
-  <dialog id="membership-dialog" class="task-dialog roster-dialog" aria-labelledby="membership-title"><div class="dialog-header"><h2 id="membership-title">管理群成员</h2><button type="button" class="icon-button" data-dismiss-members aria-label="关闭成员管理"><span data-icon="x"></span></button></div><div id="membership-content"></div></dialog>
-  <dialog id="markdown-reader" class="md-reader" aria-labelledby="md-title">
-    <header><button type="button" class="text-button" data-md-back hidden>返回</button><div><span class="md-origin"></span><h2 id="md-title"></h2><span class="md-path"></span></div>
-    <a class="text-button" download>下载原文</a><button type="button" class="icon-button" data-md-close aria-label="关闭文件预览" autofocus>×</button></header>
-    <article class="prose" aria-live="polite"></article>
+
+    <section id="room" hidden>
+      <header id="room-head">
+        <div class="title">
+          <h2 id="room-name"></h2>
+          <div id="room-members" class="chips"></div>
+        </div>
+        <div class="actions">
+          <span id="task-buttons"></span>
+          <button id="edit-group" title="编辑群聊">设置</button>
+          <button id="toggle-files">文件</button>
+          <button id="stop" class="danger" hidden>停止</button>
+        </div>
+      </header>
+      <div id="timeline"></div>
+      <div id="live" hidden>
+        <div id="live-status"></div>
+        <button id="toggle-activity" class="link">活动记录</button>
+      </div>
+      <div id="activity" hidden></div>
+      <form id="composer">
+        <div id="question-banner" hidden></div>
+        <div class="row">
+          <textarea id="input" rows="3" placeholder="发布任务或回复群里的问题。以 @成员ID 开头可直接点名某位成员。Enter 发送，Shift+Enter 换行。"></textarea>
+          <button type="submit" class="primary">发送</button>
+        </div>
+        <div id="composer-error" class="error" hidden></div>
+      </form>
+    </section>
+  </main>
+
+  <aside id="files" hidden>
+    <header>
+      <strong>团队项目文件</strong>
+      <span>
+        <a id="download-zip" href="#">下载 ZIP</a>
+        <button id="close-files" class="link">关闭</button>
+      </span>
+    </header>
+    <ul id="file-list"></ul>
+    <div id="preview"></div>
+  </aside>
+
+  <dialog id="group-dialog">
+    <form id="group-form" method="dialog">
+      <h3 id="group-dialog-title">新建群聊</h3>
+      <label>模板
+        <select id="template"><option value="">— 自定义 —</option></select>
+      </label>
+      <label>群名称 <input id="group-name" required maxlength="120"></label>
+      <label>协作方式
+        <select id="group-mode">
+          <option value="interactive">互动：成员可在群里向你提问</option>
+          <option value="autonomous">自主：团队自行假设，不提问</option>
+        </select>
+      </label>
+      <div class="members-head"><strong>成员</strong><button type="button" id="add-member" class="link">＋ 添加成员</button></div>
+      <div id="member-rows"></div>
+      <label>负责人 <select id="group-lead"></select></label>
+      <div id="group-error" class="error" hidden></div>
+      <div class="dialog-actions">
+        <button type="button" id="cancel-group">取消</button>
+        <button type="submit" class="primary" id="save-group">创建</button>
+      </div>
+    </form>
   </dialog>
-  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-  <noscript>请启用 JavaScript 使用本地工作室。</noscript>
 </body>
 </html>

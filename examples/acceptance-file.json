@@ -1,7 +1,0 @@
-{
-  "files": [
-    {"path": "result.md", "contains": "全程离线"}
-  ],
-  "min_bytes": 20,
-  "min_lines": 3
-}

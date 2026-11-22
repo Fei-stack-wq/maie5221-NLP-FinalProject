@@ -280,10 +280,15 @@ class DeepSeekProvider(Provider):
              temperature: float = 0.0, *, max_output_tokens: int | None = None,
              deadline_seconds: float | None = None, required_tool: str | None = None,
              on_stream: Callable[[str, str], None] | None = None,
-             should_cancel: Callable[[], bool] | None = None) -> LLMResponse:
+             should_cancel: Callable[[], bool] | None = None,
+             tool_choice: str | None = None) -> LLMResponse:
         if self._insufficient_balance:
             raise self._balance_error(0)
         payload = self._build_payload(messages, tools, temperature)
+        if tool_choice is not None:
+            if tool_choice not in {"auto", "none"} or not tools:
+                raise ProviderError("tool_choice must be auto or none with declared tools", code="invalid_config")
+            payload["tool_choice"] = tool_choice
         if required_tool is not None:
             if self.thinking != "disabled" or required_tool not in {tool.name for tool in tools or []}:
                 raise ProviderError("Named tool choice requires a declared tool and thinking disabled", code="invalid_config")
@@ -432,6 +437,7 @@ class ScriptedProvider(Provider):
         messages: list[dict[str, Any]],
         tools: list[ToolSpec] | None = None,
         temperature: float = 0.0,
+        **_options: Any,
     ) -> LLMResponse:
         if self.cursor >= len(self.script):
             # 剧本耗尽 = 这条任务的行为超出了预期，必须显式报错。

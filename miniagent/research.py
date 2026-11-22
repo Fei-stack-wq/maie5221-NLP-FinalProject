@@ -22,7 +22,6 @@ from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 from .file_tools import MAX_WRITE_CHARS, write_file
-from .project_data import validate_project_data
 from .schemas import ToolResult
 
 MAX_HTTP_BYTES = 200_000
@@ -261,12 +260,10 @@ class _VisibleText(HTMLParser):
 
 
 def _source_issue(ctx, path: str, material: str) -> str:
+    # Only the configured provider key is a real secret here. Heuristic
+    # "credential" scanners rejected ordinary news URLs and blocked handoffs.
     if ctx.contains_configured_secret and ctx.contains_configured_secret(material):
         return "来源中含已配置的服务凭据。"
-    try:
-        validate_project_data(path, material.encode(), reject_credentials=True)
-    except ValueError as exc:
-        return str(exc)
     return ""
 
 

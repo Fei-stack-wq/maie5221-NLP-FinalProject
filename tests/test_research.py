@@ -71,8 +71,10 @@ class ResearchTest(unittest.TestCase):
         self.assertIn("https://campus.example/final/press/launch", result.content)
         self.assertEqual(evidence["observed_bytes_sha256"], hashlib.sha256(page.body).hexdigest())
 
-    def test_one_unpublishable_navigation_link_does_not_block_the_article(self):
-        # The official article's sidebar produced the first URL in the real run.
+    def test_only_links_with_the_configured_secret_are_withheld(self):
+        # The official article's sidebar produced the first URL in a real run.
+        # The old heuristic scanner mistook its "sk-hynix-…" slug for an API
+        # key and withheld it; only the configured secret may be withheld.
         side = "https://news.skhynix.com/en/series/sk-hynix-social-contribution-series"
         secret = "fixture-account-secret"
         self.ctx.contains_configured_secret = lambda value: secret in value
@@ -87,17 +89,18 @@ class ResearchTest(unittest.TestCase):
         path = result.meta["path"]
         raw = (self.root / path).read_bytes()
         record = json.loads(raw)
-        self.assertEqual(record["links"], [{"url":"https://news.skhynix.com/press", "title":"Earnings release"}])
-        self.assertEqual(record["links_withheld"], 3)
+        self.assertEqual(record["links"], [{"url":"https://news.skhynix.com/press", "title":"Earnings release"},
+                                           {"url":side, "title":"SK hynix Social Value in Action"}])
+        self.assertEqual(record["links_withheld"], 2)
         self.assertFalse(record["links_truncated"])
         self.assertEqual(record["text"], "SK hynix Social Value in Action\nExtra\nVerified headline\nEarnings release")
         self.assertEqual(record["url"], page.url)
         self.assertEqual(record["observed_bytes_sha256"], hashlib.sha256(page.body).hexdigest())
         self.assertEqual(path, "sources/" + hashlib.sha256(raw).hexdigest() + ".json")
-        for rejected in (secret, side):
-            self.assertNotIn(rejected, raw.decode())
-            self.assertNotIn(rejected, result.content)
-        self.assertIn("已省略 3 条", result.content)
+        self.assertNotIn(secret, raw.decode())
+        self.assertNotIn(secret, result.content)
+        self.assertIn(side, raw.decode())
+        self.assertIn("已省略 2 条", result.content)
         retrieved = self.registry.dispatch("read_source", {"path":path}, self.ctx)
         self.assertTrue(retrieved.ok)
         self.assertIn(record["text"], retrieved.content)
@@ -108,10 +111,11 @@ class ResearchTest(unittest.TestCase):
                     f'<article>Evidence</article><a href="/nav?ticket={key}">Menu</a>'.encode(), False)
         provider = ScriptedProvider([{"tool_calls":[{"name":"http_get","arguments":{"url":page.url}}]},
                                      {"text":"Source archived."}])
-        agent = Agent("researcher", provider, self.registry, self.ctx.sandbox, Settings(api_key=key))
+        agent = Agent("researcher", provider, self.registry, self.ctx.sandbox, Settings(api_key=key),
+                      system_prompt="Research assistant.")
         with patch("miniagent.research.fetch", return_value=page):
             result = agent.run("Retrieve the public article.")
-        self.assertIn(result.status, {"completed", "unverified"})
+        self.assertEqual(result.status, "completed")
         files = list((self.root / "sources").glob("*.json"))
         self.assertEqual(len(files), 1)
         record = json.loads(files[0].read_text())

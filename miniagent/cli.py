@@ -1,649 +1,227 @@
-"""命令行入口。
+"""Command line: ``python -m miniagent <command>``.
 
-用法（在仓库根目录）：
-    python -m miniagent demo                       # 离线演示，不需要 API key
-    python -m miniagent run "写一份关于 X 的笔记"     # 真实调用 DeepSeek
-    python -m miniagent eval --tasks examples/tasks.jsonl
-    python -m miniagent report runs/<run_id>
-
-设计原则：UI 只是"触发一次 run + 看结果"。课程明确说复杂前端不加分，
-所以这里只做到"能跑、能看、能出报告"。
+studio   local web Studio (groups, chat, files)
+team     run one task for a group from the terminal (answers questions on stdin)
+run      single agent on a folder
+demo     offline team run with a scripted model (no API key needed)
+report   metrics for the tasks of one or all groups
+smoke    three-call live protocol probe of the configured model
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import sys
-import uuid
-from datetime import datetime
+import threading
+import time
+import webbrowser
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import quote
 
-from .agent import Agent
-from .config import Settings, configured_limits
-from .metrics import Tracer, load_events, render_report, summarize
-from .providers import DeepSeekProvider, Provider, ProviderError, ScriptedProvider
-from .acceptance import AcceptanceInput, accept_files
-from .orchestrator import Orchestrator
-from .sandbox import Sandbox
-from .schemas import RunResult
-from .tools import build_default_registry
-from .task_store import TaskStore, StoreError
-from .task_service import TaskService
+from .config import Settings, load_settings
+from .metrics import group_report
+from .providers import ScriptedProvider
+from .studio import Studio, deepseek_factory
 
-# 离线演示剧本：完整走一遍「列目录 -> 写文件 -> 读文件 -> 执行代码 -> 最终答复」。
-# 它同时是一份"模型该长什么样"的说明书，写 prompt 时可以对照。
-DEMO_SCRIPT: list[dict[str, Any]] = [
-    {"tool_calls": [{"name": "list_dir", "arguments": {"path": "."}}]},
-    {
-        "tool_calls": [
-            {
-                "name": "write_file",
-                "arguments": {
-                    "path": "notes.md",
-                    "content": (
-                        "# 演示产物\n\n"
-                        "这个文件是 `ScriptedProvider` 驱动 agent 循环写出来的，全程没有联网、没有 API key。\n\n"
-                        "## 它证明了什么\n"
-                        "- 工具调用闭环（模型给参数 -> 代码执行 -> 结果回传）\n"
-                        "- 沙箱路径限制（写不到工作区之外）\n"
-                        "- 指标采集（每个 step 都有 token 与耗时）\n"
-                    ),
-                },
-            }
-        ]
-    },
-    {"tool_calls": [{"name": "read_file", "arguments": {"path": "notes.md"}}]},
-    {"tool_calls": [{"name": "run_python", "arguments": {"code": "print(2 ** 10)"}}]},
-    {
-        "text": (
-            "## 完成\n\n"
-            "- 生成 `notes.md`\n"
-            "- 回读验证成功\n"
-            "- 沙箱内 Python 可执行（2**10 = 1024）\n\n"
-            "详见同目录下的 `trace.jsonl` 与 `report.md`。"
-        )
-    },
-]
+ROOT = Path(__file__).resolve().parent.parent
 
 
-# ---------------------------------------------------------------------------
+def _settings(args) -> Settings:
+    settings = load_settings(Path(args.env_file) if getattr(args, "env_file", None) else None)
+    if getattr(args, "runs_dir", None):
+        settings = replace(settings, runs_dir=Path(args.runs_dir))
+    if getattr(args, "thinking", None):
+        settings = replace(settings, thinking=args.thinking)
+    if getattr(args, "max_steps", None):
+        settings = settings.with_limits(max_steps=args.max_steps)
+    return settings
+
+
+def _template(name: str) -> dict:
+    path = Path(name)
+    if not path.exists():
+        path = ROOT / "examples" / "teams" / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def cmd_studio(args) -> int:
+    from .server import serve
+    settings = _settings(args)
+    studio = Studio(settings)
+    main, preview = serve(studio, args.port)
+    url = f"http://127.0.0.1:{main.server_address[1]}/"
+    print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")
+    print(f"model {settings.model}, thinking {settings.thinking}, runs in {settings.runs_dir.resolve()}")
+    if not settings.api_key:
+        print("warning: DEEPSEEK_API_KEY is not set (.env or environment); tasks cannot start.")
+    if not args.no_browser:
+        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("\nstopping…")
+    finally:
+        studio.close()
+        main.shutdown()
+        preview.shutdown()
+    return 0
+
+
+def _print_event(event: dict, names: dict) -> None:
+    kind = event["kind"]
+    name = lambda agent: names.get(agent, agent)  # noqa: E731
+    if kind == "user_message":
+        print(f"\n[you] {event['text']}")
+    elif kind == "delegation":
+        print(f"\n[{name(event['agent'])} → {name(event['assignee'])}] {event['task']}")
+    elif kind == "report":
+        files = ", ".join(c["path"] for c in event.get("changes", []))
+        print(f"\n[{name(event['agent'])} report · {event['status']}] {event['text']}" + (f"\n  files: {files}" if files else ""))
+    elif kind == "question":
+        print(f"\n[{name(event['agent'])} asks you] {event['question']}")
+    elif kind == "answer":
+        print(f"\n[your answer] {event['text']}")
+    elif kind == "final":
+        print(f"\n[{name(event['agent'])} · final · {event['status']}]\n{event['text']}")
+    elif kind == "task_finished":
+        print(f"\n— task {event['status']} — {json.dumps(event.get('metrics', {}), ensure_ascii=False)}")
+
+
+def _drive(studio: Studio, group_id: str, text: str, *, read_answers: bool = True) -> dict:
+    store = studio.group(group_id)
+    names = {m.id: m.name for m in store.group.members}
+    after = store.chat()[-1]["seq"] if store.chat() else 0
+    route = studio.post(group_id, text)
+    answered: set[str] = set()
+    while True:
+        state = studio.state(group_id, after)
+        for event in state["events"]:
+            after = event["seq"]
+            _print_event(event, names)
+        live = state["live"]
+        if live is None:
+            break
+        question = live.get("question")
+        if question and question["id"] not in answered and read_answers:
+            answered.add(question["id"])
+            print("\nyour answer (end with an empty line):")
+            lines = []
+            for line in sys.stdin:
+                if not line.strip():
+                    break
+                lines.append(line.rstrip("\n"))
+            studio.post(group_id, "\n".join(lines) or "Please decide yourselves and state your assumptions.")
+        time.sleep(0.5)
+    return studio.store.get(group_id).load_task(route["task_id"])
+
+
+def cmd_team(args) -> int:
+    settings = _settings(args)
+    studio = Studio(settings)
+    if args.group:
+        group_id = args.group
+    else:
+        template = _template(args.template)
+        group = studio.create_group(template["name"], template["members"], template["lead"],
+                                    "autonomous" if args.autonomous else "interactive")
+        group_id = group["id"]
+        print(f"created group {group_id}: {template['name']}")
+    if args.message:
+        text = args.message
+    else:
+        template = _template(args.template)
+        text = template["tasks"][args.task - 1]["text"]
+    record = _drive(studio, group_id, text)
+    print(f"\ngroup {group_id} · task {record['id']} · {record['status']}")
+    print(f"project: {studio.group(group_id).project.root}")
+    return 0 if record["status"] == "completed" else 1
+
+
+def cmd_run(args) -> int:
+    settings = _settings(args)
+    studio = Studio(settings)
+    group = studio.create_group(args.name, [{"id": "agent", "name": "Agent", "prompt": args.role}], "agent",
+                                "autonomous" if args.autonomous else "interactive")
+    record = _drive(studio, group["id"], args.task)
+    print(f"\nproject: {studio.group(group['id']).project.root}")
+    return 0 if record["status"] == "completed" else 1
+
+
+def cmd_demo(args) -> int:
+    settings = replace(_settings(args), api_key="")
+    script = json.loads((ROOT / "examples" / "demo_team.json").read_text(encoding="utf-8"))
+    studio = Studio(settings, provider_factory=lambda _s: ScriptedProvider(script))
+    group = studio.create_group("Offline demo", [
+        {"id": "lead", "name": "Lead", "prompt": "Coordinates the work."},
+        {"id": "writer", "name": "Writer", "prompt": "Writes clear notes."},
+        {"id": "reviewer", "name": "Reviewer", "prompt": "Checks the notes independently."},
+    ], "lead", "autonomous")
+    record = _drive(studio, group["id"], "Write short notes on the ReAct pattern in notes.md and have them reviewed.",
+                    read_answers=False)
+    project = studio.group(group["id"]).project
+    print(f"\nproject files: {[f['path'] for f in project.files()]}")
+    print(f"project: {project.root}")
+    return 0 if record["status"] == "completed" else 1
+
+
+def cmd_report(args) -> int:
+    settings = _settings(args)
+    studio = Studio(settings)
+    groups = [studio.group(args.group)] if args.group else [studio.group(g.id) for g in studio.store.groups()]
+    for store in groups:
+        print(group_report(store))
+        print()
+    return 0
+
+
+def cmd_smoke(args) -> int:
+    from .provider_smoke import run_provider_smoke
+    settings = _settings(args)
+    report = run_provider_smoke(deepseek_factory(settings), live=True)
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report.get("ok") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
-    try:
-        return _main(argv)
-    except (StoreError, sqlite3.Error, OSError) as exc:
-        # Store/operational failure is an explicit command failure. Do not
-        # overwrite active records or turn an unavailable database into success.
-        print(f"存储或文件操作失败（{type(exc).__name__}）；未自动重试或覆盖任务状态。", file=sys.stderr)
-        return 2
-
-
-def _main(argv: list[str] | None = None) -> int:
-    _enable_utf8()
-    try:
-        settings = Settings.from_env()
-    except ValueError as exc:
-        print(f"配置错误：{exc}", file=sys.stderr)
-        return 2
-
-    parser = argparse.ArgumentParser(
-        prog="miniagent",
-        description="多智能体协作系统：RAO 原子 + 编排调度 + 消息总线 + 指标",
-    )
+    parser = argparse.ArgumentParser(prog="python -m miniagent", description="miniagent multi-agent Studio")
+    parser.add_argument("--env-file", help="read settings from this .env (default: ./.env if present)")
+    parser.add_argument("--runs-dir", help="where groups and runs are stored (default: runs)")
+    parser.add_argument("--thinking", choices=["enabled", "disabled"], help="override DEEPSEEK_THINKING")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    demo = sub.add_parser("demo", help="离线演示（ScriptedProvider，无需 API key）")
-    demo.add_argument("--runs-dir", default=str(settings.runs_dir))
-    demo.add_argument("--agent", default="demo-agent")
-    demo.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
+    p = sub.add_parser("studio", help="start the local web Studio")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-browser", action="store_true")
+    p.set_defaults(fn=cmd_studio)
 
-    run = sub.add_parser("run", help="运行一个任务（默认真实调用 DeepSeek）")
-    run.add_argument("task", help="自然语言任务描述")
-    run.add_argument("--agent", default="worker")
-    run.add_argument("--mock", metavar="SCRIPT.json", help="用剧本文件代替真实模型")
-    run.add_argument("--runs-dir", default=str(settings.runs_dir))
-    run.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
-    run.add_argument("--acceptance", metavar="CHECKS.json", help="由用户提供的文件验收规则")
+    p = sub.add_parser("team", help="run one group task in the terminal")
+    p.add_argument("--template", default="scenario_1", help="examples/teams/<name>.json or a path")
+    p.add_argument("--group", help="existing group id (continue its conversation)")
+    p.add_argument("--task", type=int, default=1, help="task number from the template")
+    p.add_argument("--message", help="message text instead of a template task")
+    p.add_argument("--autonomous", action="store_true", help="the team may not ask questions")
+    p.add_argument("--max-steps", type=int, help="member step budget")
+    p.set_defaults(fn=cmd_team)
 
-    evaluate = sub.add_parser("eval", help="批量评测：输出完成率与耗时")
-    evaluate.add_argument("--tasks", default="examples/tasks.jsonl", help="任务集 JSONL")
-    evaluate.add_argument("--mock", metavar="SCRIPT.json", help="用剧本文件代替真实模型")
-    evaluate.add_argument("--runs-dir", default=str(settings.runs_dir))
-    evaluate.add_argument("--agent", default="worker")
-    evaluate.add_argument("--yes", action="store_true")
-    evaluate.add_argument("--acceptance", metavar="CHECKS.json", help="默认文件验收规则；逐题 acceptance 字段优先")
+    p = sub.add_parser("run", help="single agent")
+    p.add_argument("task")
+    p.add_argument("--name", default="Single agent")
+    p.add_argument("--role", default="You are a capable general assistant.")
+    p.add_argument("--autonomous", action="store_true")
+    p.add_argument("--max-steps", type=int)
+    p.set_defaults(fn=cmd_run)
 
-    orchestrate = sub.add_parser(
-        "orchestrate", help="把一句目标拆成子任务图并调度执行（S1 串行 / S2 分层并发 / S3 事件驱动）"
-    )
-    orchestrate.add_argument("goal", help="自然语言目标")
-    orchestrate.add_argument(
-        "--scheduler", choices=["serial", "parallel", "evented"], default="serial",
-        help="serial=一次一个（默认、可复现）；parallel=按层并发；evented=依赖完成即解锁",
-    )
-    orchestrate.add_argument("--max-parallel", type=int, default=3, help="并发上限")
-    orchestrate.add_argument(
-        "--delegate", action="store_true",
-        help="允许 agent 用 delegate_task 把子任务再委派出去（深度默认 2）",
-    )
-    orchestrate.add_argument(
-        "--mock", metavar="SCRIPT.json",
-        help="剧本文件（按 plan→子任务 顺序排列；仅 serial 可用）",
-    )
-    orchestrate.add_argument("--runs-dir", default=str(settings.runs_dir))
-    orchestrate.add_argument("--yes", action="store_true", help="自动批准危险操作（无人值守）")
-    orchestrate.add_argument("--acceptance", metavar="CHECKS.json", help="独立 root 与各子任务的文件验收规则")
+    p = sub.add_parser("demo", help="offline scripted team run")
+    p.set_defaults(fn=cmd_demo)
 
-    smoke = sub.add_parser("provider-smoke", help="有界、无副作用的真实模型多轮工具协议探针")
-    smoke.add_argument("--thinking", choices=["enabled", "disabled"], default=settings.thinking)
-    smoke.add_argument("--output", default="build/provider-smoke.json", help="仅保存脱敏元数据")
+    p = sub.add_parser("report", help="task metrics")
+    p.add_argument("--group")
+    p.set_defaults(fn=cmd_report)
 
-    tasks_view = sub.add_parser("tasks", help="从持久 TaskStore 查询任务状态和执行身份")
-    tasks_view.add_argument("run_dir")
-    tasks_view.add_argument("--task-id", help="查看指定任务及其 attempt/run 历史")
-
-    report = sub.add_parser("report", help="汇总一个 run 目录，生成 report.md")
-    report.add_argument("run_dir")
-
-    studio = sub.add_parser("studio", help="启动本地网页工作室：任务、日志、产物和验收")
-    studio.add_argument("--port", type=int, default=8765)
-    studio.add_argument("--runs-dir", default=str(settings.runs_dir))
-    studio.add_argument("--env-file", type=Path, help="只读取字面量配置；默认尝试当前目录 .env")
-    studio.add_argument("--no-env", action="store_true", help="只使用进程环境变量")
-    studio.add_argument("--open", action="store_true", help="启动后打开默认浏览器")
-
-    for cmd in (run, demo, evaluate, orchestrate):
-        cmd.add_argument("--max-seconds", type=float, help="整个任务的墙钟秒数，0 为不限，默认读取任务配置")
-        cmd.add_argument("--max-steps", type=int, help="模型累计轮数上限，0 为不限，默认读取任务配置")
+    p = sub.add_parser("smoke", help="live provider protocol probe")
+    p.set_defaults(fn=cmd_smoke)
 
     args = parser.parse_args(argv)
-    limits = {name: getattr(args, name) for name in ("max_steps", "max_seconds")
-              if getattr(args, name, None) is not None}
-    if limits:
-        try:
-            settings = replace(settings, limits=configured_limits(settings.limits, limits))
-        except ValueError as exc:
-            parser.error(str(exc))
-
-    if args.command == "studio":
-        return _cmd_studio(args, settings)
-
-    if args.command == "provider-smoke":
-        return _cmd_provider_smoke(args, settings)
-    if args.command == "demo":
-        return _cmd_demo(args, settings)
-    if args.command == "run":
-        return _cmd_run(args, settings)
-    if args.command == "eval":
-        return _cmd_eval(args, settings)
-    if args.command == "orchestrate":
-        return _cmd_orchestrate(args, settings)
-    if args.command == "tasks":
-        return _cmd_tasks(args)
-    if args.command == "report":
-        return _cmd_report(args)
-    parser.print_help()
-    return 1
-
-
-def _cmd_studio(args: argparse.Namespace, settings: Settings) -> int:
-    from .studio_config import load_studio_settings
-    from .studio_service import StudioService
-    from .studio_server import serve
-
-    if not 1 <= args.port <= 65535:
-        print("配置错误：port 必须为 1..65535。", file=sys.stderr)
-        return 2
-    if args.no_env and args.env_file:
-        print("配置错误：--no-env 与 --env-file 不能同时使用。", file=sys.stderr)
-        return 2
-    try:
-        selected = settings if args.no_env else load_studio_settings(settings, args.env_file)
-    except ValueError as exc:
-        print(f"配置错误：{exc}", file=sys.stderr)
-        return 2
-    service = StudioService(Path(args.runs_dir), selected)
-    try:
-        serve(service, port=args.port, open_browser=args.open)
-    finally:
-        service.close()
-    return 0
-
-
-# ---------------------------------------------------------------------------
-def _cmd_demo(args: argparse.Namespace, settings: Settings) -> int:
-    run_dir = _new_run_dir(Path(args.runs_dir))
-    return _execute(
-        tasks=[{"task_id": "demo-1", "task": "演示一次完整的 agent 工具调用闭环。"}],
-        provider_factory=lambda: ScriptedProvider(DEMO_SCRIPT),
-        run_dir=run_dir,
-        settings=settings,
-        agent_name=args.agent,
-        auto_approve=args.yes,
-        # 演示验收：只要 notes.md 存在且非空就算完成。
-        # 把 "completed" 从"模型说完了"改成"产物真的在"，这是指标可信的前提。
-        acceptance=accept_files("notes.md"),
-    )
-
-
-def _cmd_run(args: argparse.Namespace, settings: Settings) -> int:
-    run_dir = _new_run_dir(Path(args.runs_dir))
-    try:
-        acceptance = _load_acceptance(args.acceptance)
-        provider_factory = _make_provider_factory(args.mock, settings)
-    except Exception as exc:  # 没配 key 时给出可操作的提示，而不是堆栈
-        print(f"[配置错误] {exc}", file=sys.stderr)
-        _record_batch_setup_error([{"task_id": "run-1", "task": args.task}], run_dir, exc)
-        return 2
-    return _execute(
-        tasks=[{"task_id": "run-1", "task": args.task}],
-        provider_factory=provider_factory,
-        run_dir=run_dir,
-        settings=settings,
-        agent_name=args.agent,
-        auto_approve=args.yes,
-        acceptance=acceptance,
-    )
-
-
-def _cmd_eval(args: argparse.Namespace, settings: Settings) -> int:
-    try:
-        tasks = _load_tasks(Path(args.tasks))
-    except (ValueError, OSError) as exc:
-        print(f"[任务集错误] {exc}", file=sys.stderr)
-        return 2
-    if not tasks:
-        print(f"[错误] 任务集为空或不存在：{args.tasks}", file=sys.stderr)
-        return 2
-    run_dir = _new_run_dir(Path(args.runs_dir))
-    try:
-        acceptance = _load_acceptance(args.acceptance)
-        provider_factory = _make_provider_factory(args.mock, settings)
-    except Exception as exc:
-        print(f"[配置错误] {exc}", file=sys.stderr)
-        _record_batch_setup_error(tasks, run_dir, exc)
-        return 2
-    return _execute(
-        tasks=tasks,
-        provider_factory=provider_factory,
-        run_dir=run_dir,
-        settings=settings,
-        agent_name=args.agent,
-        auto_approve=args.yes,
-        acceptance=acceptance,
-    )
-
-
-def _cmd_orchestrate(args: argparse.Namespace, settings: Settings) -> int:
-    # 先校验再建目录：被拒绝的命令不该在工作区留下空 run 目录
-    if args.mock and args.scheduler != "serial":
-        print(
-            "[错误] --mock 用的 ScriptedProvider 带游标、不是线程安全的；"
-            "并行/事件驱动模式请用真实模型，或注入自定义 provider。",
-            file=sys.stderr,
-        )
-        return 2
-    run_dir = _new_run_dir(Path(args.runs_dir))
-    goal_id = f"orch-{uuid.uuid4().hex}"
-    try:
-        root_acceptance, acceptances = _load_orchestration_acceptance(args.acceptance)
-        provider = _make_provider_factory(args.mock, settings)()
-    except Exception as exc:
-        print(f"[配置错误] {exc}", file=sys.stderr)
-        _record_batch_setup_error([{"task_id": goal_id, "task": args.goal}], run_dir, exc)
-        return 2
-
-    with Tracer(run_dir) as tracer:
-        orchestrator = Orchestrator(
-            provider=provider,
-            settings=settings,
-            run_dir=run_dir,
-            tracer=tracer,
-            root_acceptance=root_acceptance,
-            acceptances=acceptances,
-            enable_delegation=args.delegate,
-            approve=(lambda _prompt: True) if args.yes else None,
-            human_handler=(
-                (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-                if args.yes
-                else None
-            ),
-        )
-        result = orchestrator.run(
-            args.goal, scheduler=args.scheduler, max_parallel=args.max_parallel, goal_id=goal_id
-        )
-
-    print(f"\n目标：{result.goal}")
-    print(
-        f"调度：{result.scheduler} | 状态：{result.status}"
-        f" | 总耗时 {result.duration_ms / 1000:.2f}s | token {result.tokens}"
-    )
-    print("子任务：")
-    for task in result.subtasks:
-        mark = {"done": "✅", "blocked": "⏭", "skipped": "⏭"}.get(task.status, "❌")
-        suffix = f" | {task.error}" if task.error else ""
-        print(
-            f"  {mark} {task.id} [{task.assignee}] {task.status}"
-            f" | {task.duration_ms / 1000:.2f}s | {task.steps} 步"
-            f" | {task.tokens} token{suffix}"
-        )
-    print(f"子任务完成率：{result.completion_rate:.1%} ({result.completed}/{result.total})")
-
-    if orchestrator.bus and orchestrator.bus.count:
-        print("\n群聊频道（bus.jsonl，最近 10 条）：")
-        print(orchestrator.bus.transcript(limit=10))
-
-    print("\n" + render_report(run_dir))
-    print(f"运行目录：{run_dir.resolve()}")
-    return 0 if result.succeeded else 1
-
-
-def _cmd_tasks(args: argparse.Namespace) -> int:
-    path = Path(args.run_dir) / "tasks.sqlite3"
-    if not path.is_file():
-        print("该运行目录没有 tasks.sqlite3；历史 trace 不会自动迁移为持久任务。", file=sys.stderr)
-        return 2
-    try:
-        store = TaskStore(path)
-        if args.task_id:
-            task = store.get(args.task_id)
-            attempts = store.attempts(task.task_id)
-            data = {"task": task.model_dump(mode="json"),
-                    "attempts": [value.model_dump(mode="json") for value in attempts],
-                    "runs": [run.model_dump(mode="json") for attempt in attempts
-                             for run in store.runs(attempt.attempt_id)]}
-        else:
-            data = [{"task_id": task.task_id, "root_id": task.root_id,
-                     "parent_id": task.parent_id, "status": task.status,
-                     "revision": task.revision, "attempt_id": task.current_attempt_id,
-                     "reason": task.reason} for task in store.tasks()]
-    except (StoreError, ValueError) as exc:
-        print(f"任务查询失败：{exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-    return 0
-
-
-def _cmd_report(args: argparse.Namespace) -> int:
-    run_dir = Path(args.run_dir)
-    if not (run_dir / "trace.jsonl").exists():
-        print(f"[错误] 找不到 trace：{run_dir / 'trace.jsonl'}", file=sys.stderr)
-        return 2
-    print(render_report(run_dir))
-    return 0
-
-
-# ---------------------------------------------------------------------------
-def _execute(
-    tasks: list[dict[str, Any]],
-    provider_factory: Callable[[], Provider],
-    run_dir: Path,
-    settings: Settings,
-    agent_name: str,
-    auto_approve: bool,
-    acceptance: AcceptanceInput = None,
-) -> int:
-    """跑一批任务，然后打印指标。批量跑是"完成率"这个指标的唯一来源。
-
-    ``provider_factory`` 而不是 provider 实例：每个任务都必须是干净的状态。
-    之前用同一个 ScriptedProvider 跑 3 个任务，后两个直接"剧本耗尽"，
-    却被算成 completed —— 指标虚高，是最危险的一类 bug。
-    """
-    results = []
-    task_service = TaskService(TaskStore(run_dir / "tasks.sqlite3"))
-    with Tracer(run_dir) as tracer:
-        for index, item in enumerate(tasks, start=1):
-            case_id = item.get("task_id") or f"task-{index}"
-            task_service.create(
-                task_id=case_id, creation_key=f"root:{case_id}", objective=item["task"],
-                owner=agent_name, assignee=agent_name,
-            )
-            tracer.event(
-                "case_registered", schema_version=2, root_id=case_id,
-                task_id=case_id, level="goal", task=item["task"],
-            )
-        for index, item in enumerate(tasks, start=1):
-            task_id = item.get("task_id") or f"task-{index}"
-            print(f"\n=== [{index}/{len(tasks)}] {task_id} ===")
-            print(f"任务：{item['task'][:120]}")
-            try:
-                selected = _file_acceptance(item["acceptance"]) if "acceptance" in item else acceptance
-                provider = provider_factory()
-                # Directory identity is independent of caller-controlled task IDs.
-                directory = f"{quote(agent_name, safe='')}-{uuid.uuid4().hex}"
-                sandbox = Sandbox(run_dir / "agents" / directory, agent_name=agent_name)
-                agent = Agent(
-                    name=agent_name, provider=provider,
-                    registry=build_default_registry(), sandbox=sandbox,
-                    settings=settings, tracer=tracer, task_service=task_service,
-                    approve=(lambda _prompt: True) if auto_approve else None,
-                    human_handler=(
-                        (lambda _q: "（无人值守模式）请基于已有信息自行判断继续，不要再次询问。")
-                        if auto_approve else None
-                    ),
-                )
-                result = agent.run(item["task"], task_id=task_id, acceptance=selected)
-            except Exception as exc:
-                # Only cancel work that never acquired an execution claim. A
-                # store conflict during execution must remain visible for audit.
-                saved = task_service.store.get(task_id)
-                if saved.status in {"created", "ready"}:
-                    task_service.cancel(task_id, expected_revision=saved.revision,
-                                        reason="setup_failed")
-                result = RunResult(
-                    task_id=task_id, attempt_id=f"setup-{uuid.uuid4().hex}",
-                    agent=agent_name, status="error",
-                    error=f"任务初始化失败：{type(exc).__name__}: {exc}",
-                )
-                tracer.event(
-                    "task_end", schema_version=2, level="goal", root_id=task_id,
-                    **result.model_dump(mode="json"),
-                )
-            results.append(result)
-
-            status_text = "✅ completed" if result.succeeded else f"❌ {result.status}"
-            print(
-                f"结果：{status_text}"
-                f" | 步数 {result.steps}"
-                f" | 工具 {result.tool_calls}"
-                f" | 耗时 {result.duration_ms / 1000:.2f}s"
-                f" | token {result.usage.total}"
-            )
-            if result.error:
-                print(f"原因：{result.error}")
-            if result.answer:
-                preview = result.answer.strip().splitlines()[:6]
-                print("答复：" + "\n      ".join(preview))
-            print(f"沙箱：{result.sandbox}")
-
-    summary = summarize(load_events(run_dir))
-    print("\n" + "=" * 60)
-    print("汇总指标")
-    print("=" * 60)
-    print(f"任务完成率 : {summary['completion_rate']:.1%}  ({summary['completed']}/{summary['total_tasks']})")
-    print(f"平均耗时   : {summary['mean_duration_ms'] / 1000:.2f}s   P95 {summary['p95_duration_ms'] / 1000:.2f}s")
-    print(f"平均步数   : {summary['mean_steps']}")
-    print(f"总 token   : {summary['total_tokens']}")
-    if summary["failure_modes"]:
-        print(f"失败模式   : {summary['failure_modes']}")
-
-    # 落盘：报告里的数字必须与上面打印的完全一致（同一个 summarize 函数）
-    render_report(run_dir)
-
-    print(f"\n运行目录   : {run_dir.resolve()}")
-    print(f"报告       : {(run_dir / 'report.md').resolve()}")
-
-    ok = all(result.succeeded for result in results)
-    return 0 if ok else 1
-
-
-def _make_provider_factory(
-    mock_path: str | None, settings: Settings
-) -> Callable[[], Provider]:
-    """返回一个"每次调用都产出一个干净 provider"的工厂。
-
-    真实 provider 是无状态的，复用同一个实例没问题；
-    ScriptedProvider 有游标，必须每条任务重新读一遍剧本。
-    """
-    if mock_path:
-        path = Path(mock_path)
-        ScriptedProvider.from_json(path)  # 先解析一次：剧本格式错误要在这里暴露
-        return lambda: ScriptedProvider.from_json(path)
-
-    provider = DeepSeekProvider(
-        api_key=settings.api_key,
-        base_url=settings.base_url,
-        model=settings.model,
-        thinking=settings.thinking, reasoning_effort=settings.reasoning_effort,
-        max_output_tokens=settings.max_output_tokens,
-        timeout=settings.request_timeout_seconds,
-        deadline_seconds=settings.request_deadline_seconds,
-        max_retries=settings.max_retries,
-    )
-    return lambda: provider
-
-
-def _cmd_provider_smoke(args: argparse.Namespace, settings: Settings) -> int:
-    from .provider_smoke import run_provider_smoke
-
-    settings = replace(settings, thinking=args.thinking)
-    try:
-        provider = _make_provider_factory(None, settings)()
-    except ProviderError as exc:
-        report = {"status": "not_run", "evidence_level": "L2", "live_verified": False,
-                  "reason_code": exc.code, "model": settings.model,
-                  "thinking": settings.thinking, "calls": []}
-    else:
-        report = run_provider_smoke(provider, live=True, temperature=settings.temperature)
-    path = Path(args.output)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    except OSError:
-        print("无法写入探针报告，请检查输出路径与权限。", file=sys.stderr)
-        return 2
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if report["status"] == "passed" else (2 if report["status"] == "not_run" else 1)
-
-
-def _new_run_dir(base: Path) -> Path:
-    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
-    path = base / run_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _file_acceptance(payload: Any) -> AcceptanceInput:
-    """Parse host-supplied deterministic checks; model plans never call this."""
-    if payload is None:
-        return None
-    if not isinstance(payload, dict) or set(payload) - {"files", "min_bytes", "min_lines"}:
-        raise ValueError("验收须为 files/min_bytes/min_lines 对象")
-    files = payload.get("files")
-    if not isinstance(files, list) or not files:
-        raise ValueError("验收 files 必须是非空数组")
-    names, contains, hashes = [], {}, {}
-    for item in files:
-        if not isinstance(item, dict) or set(item) - {"path", "contains", "sha256"}:
-            raise ValueError("每个 files 项只接受 path/contains/sha256")
-        name = item.get("path")
-        if not isinstance(name, str) or not name.strip() or name in names:
-            raise ValueError("验收文件 path 必须非空且不可重复")
-        names.append(name)
-        for key, values in (("contains", contains), ("sha256", hashes)):
-            if key in item:
-                if not isinstance(item[key], str) or not item[key]:
-                    raise ValueError(f"{key} 必须是非空字符串")
-                values[name] = item[key]
-    options = {key: payload.get(key, default) for key, default in (("min_bytes", 20), ("min_lines", 1))}
-    if any(type(value) is not int or value < 0 for value in options.values()):
-        raise ValueError("min_bytes/min_lines 必须是非负整数")
-    return accept_files(*names, **options, contains=contains, sha256=hashes)
-
-
-def _load_acceptance(filename: str | None) -> AcceptanceInput:
-    if filename is None:
-        return None
-    return _file_acceptance(json.loads(Path(filename).read_text(encoding="utf-8-sig")))
-
-
-def _load_orchestration_acceptance(filename: str | None) -> tuple[AcceptanceInput, dict[str, AcceptanceInput]]:
-    if filename is None:
-        return None, {}
-    payload = json.loads(Path(filename).read_text(encoding="utf-8-sig"))
-    if not isinstance(payload, dict) or set(payload) - {"root", "subtasks"}:
-        raise ValueError("编排验收只接受 root 与 subtasks")
-    children = payload.get("subtasks", {})
-    if not isinstance(children, dict) or any(not isinstance(key, str) or not key.strip() for key in children):
-        raise ValueError("subtasks 必须是以子任务 ID 为键的验收对象")
-    return _file_acceptance(payload.get("root")), {
-        key: _file_acceptance(value) for key, value in children.items()
-    }
-
-
-def _record_batch_setup_error(tasks: list[dict[str, Any]], run_dir: Path, exc: Exception) -> None:
-    task_service = TaskService(TaskStore(run_dir / "tasks.sqlite3"))
-    with Tracer(run_dir) as tracer:
-        for item in tasks:
-            task_id = item["task_id"]
-            task = task_service.create(task_id=task_id, creation_key=f"root:{task_id}",
-                                       objective=item["task"], owner="setup", assignee="setup")
-            task_service.cancel(task_id, expected_revision=task.revision, reason="setup_failed")
-            tracer.event("case_registered", schema_version=2, root_id=task_id, task_id=task_id, level="goal", task=item["task"])
-            tracer.event(
-                "task_end", schema_version=2, level="goal", root_id=task_id,
-                task_id=task_id, attempt_id=f"setup-{uuid.uuid4().hex}",
-                status="error", error=f"配置错误：{type(exc).__name__}: {exc}",
-            )
-    render_report(run_dir)
-
-
-def _load_tasks(path: Path) -> list[dict[str, Any]]:
-    """Read a strict case manifest, including optional per-case acceptance.
-
-    Malformed or duplicate cases are rejected rather than silently disappearing
-    from the evaluation denominator.
-    """
-    if not path.exists():
-        return []
-    tasks: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), start=1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"第 {line_number} 行不是合法 JSON") from exc
-        if isinstance(payload, str):
-            payload = {"task": payload}
-        if not isinstance(payload, dict) or set(payload) - {"task_id", "task", "acceptance"}:
-            raise ValueError(f"第 {line_number} 行须为 task_id/task/acceptance 对象")
-        task_id = payload.get("task_id", f"task-{line_number}")
-        if not isinstance(task_id, str) or not task_id.strip() or task_id in seen:
-            raise ValueError(f"第 {line_number} 行 task_id 为空、类型错误或重复")
-        if not isinstance(payload.get("task"), str) or not payload["task"].strip():
-            raise ValueError(f"第 {line_number} 行缺少有效 task")
-        seen.add(task_id)
-        tasks.append({**payload, "task_id": task_id})
-    return tasks
-
-
-def _enable_utf8() -> None:
-    """Windows 控制台默认不是 UTF-8，中文输出会乱码。"""
-    for stream in (sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            try:
-                reconfigure(encoding="utf-8")
-            except (ValueError, OSError):
-                pass
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    return args.fn(args)

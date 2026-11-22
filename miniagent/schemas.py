@@ -5,7 +5,6 @@ trace 在这里被序列化。改这里的字段要谨慎 —— 它决定了整
 
 对应课程要求：
 - ToolSpec / ToolCall  -> 2.3 行动空间（工具调用协议）
-- RunResult            -> 评估指标（完成率、耗时）
 - Usage                -> 成本与 token 追踪
 """
 
@@ -15,18 +14,6 @@ import json
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
-
-from .contracts.acceptance import AcceptanceReport, AcceptanceSpec, validate_report
-from .acceptance_evidence import validate_evidence
-
-Status = Literal[
-    "completed",          # 有独立验收报告通过
-    "unverified",         # 已返回答复，但没有可用的独立验收证据
-    "failed_acceptance",  # 模型说完成，但验收多次未通过
-    "limit_exceeded",     # 预算耗尽 / 检测到循环
-    "aborted",            # 模型主动放弃（abort_task）
-    "error",              # 模型调用失败或运行时异常
-]
 
 
 class ToolSpec(BaseModel):
@@ -157,40 +144,3 @@ class LLMResponse(BaseModel):
                 for call in self.tool_calls
             ]
         return message
-
-
-class RunResult(BaseModel):
-    """一个任务的最终结果 —— 也就是指标统计的基本单位。"""
-
-    task_id: str
-    attempt_id: str = ""
-    run_id: str = ""
-    agent: str
-    status: Status = "error"
-    answer: str = ""
-    error: str = ""
-    provider_error_code: str | None = None
-    duration_ms: float = 0.0
-    steps: int = 0
-    tool_calls: int = 0
-    usage: Usage = Field(default_factory=Usage)
-    sandbox: str = ""
-    acceptance_spec: AcceptanceSpec | None = None
-    acceptance_report: AcceptanceReport | None = None
-    acceptance_evidence: list[dict[str, Any]] = Field(default_factory=list)
-
-    @property
-    def succeeded(self) -> bool:
-        if self.status != "completed" or self.acceptance_report is None:
-            return False
-        try:
-            report = AcceptanceReport.model_validate(self.acceptance_report)
-            spec = AcceptanceSpec.model_validate(self.acceptance_spec)
-            if (report.verdict != "passed" or report.task_id != self.task_id
-                    or not self.attempt_id or report.attempt_id != self.attempt_id):
-                return False
-            validate_report(spec, report)
-            validate_evidence(spec, report, self.acceptance_evidence)
-        except ValueError:
-            return False
-        return True

@@ -1,20 +1,24 @@
-"""Explicit workload policy, separate from model capacity and actual usage."""
+"""Runtime configuration: provider options, per-agent budgets and team limits.
+
+Every loop in the system is bounded by default. ``0`` is *not* accepted as
+"unlimited" for step counts: an unbounded agent loop with a confused model
+spends money forever (see docs/architecture.md, "Why every loop is bounded").
+"""
 
 from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+import shlex
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-# M0-03 的官方 DeepSeek 模型配置；新增模型需同步协议验证与文档。
 DEFAULT_MODEL = "deepseek-flash"
-# Workload policy, distinct from the provider context window and API maximum.
 DEFAULT_MAX_OUTPUT_TOKENS = 300_000
-DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
-DEFAULT_REQUEST_DEADLINE_SECONDS = 3600.0
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 180.0
+DEFAULT_REQUEST_DEADLINE_SECONDS = 900.0
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 SUPPORTED_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
 
@@ -52,12 +56,7 @@ def validate_provider_options(
     max_retries: int = 2,
     temperature: float = 0.0,
 ) -> None:
-    """Validate settings and direct provider calls without I/O or value echoes.
-
-    max_retries counts additional attempts. A request deadline may be shorter
-    than a per-attempt timeout; the provider must use the remaining deadline.
-    The caller sends reasoning_effort only when thinking is enabled.
-    """
+    """Validate provider settings without I/O and without echoing values."""
     if type(model) is not str or model not in SUPPORTED_MODELS:
         raise ValueError("model must be deepseek-flash or deepseek-v4-pro")
     if type(base_url) is not str or not base_url or any(ord(c) <= 32 or ord(c) == 127 for c in base_url):
@@ -70,7 +69,6 @@ def validate_provider_options(
             and "?" not in base_url and "#" not in base_url
             and not parsed.netloc.endswith(":")
         )
-        # Accessing .port also validates malformed or out-of-range ports.
         port = parsed.port
         valid_url = valid_url and (port is None or 1 <= port <= 65535)
     except ValueError:
@@ -88,55 +86,50 @@ def validate_provider_options(
     _number("request_deadline_seconds", request_deadline_seconds, 0)
 
 
-def _env_integer(name: str, default: str) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError:
-        raise ValueError(f"{name} must be an integer") from None
+@dataclass
+class Limits:
+    """Budgets for one agent run (one member assignment or one lead turn)."""
 
+    max_steps: int = 80
+    """Model turns for one agent run. Always finite (1..1000)."""
 
-def _env_number(name: str, default: str) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError:
-        raise ValueError(f"{name} must be a finite number") from None
+    max_seconds: float = 0
+    """Wall clock for one agent run; 0 means no time limit (steps still bound it)."""
+
+    max_total_tokens: int = 0
+    """Cumulative prompt+completion tokens for one agent run; 0 only records usage."""
+
+    max_tool_calls_per_step: int = 8
+    """Tool calls executed from a single model response; extra calls are refused."""
+
+    tool_timeout_seconds: float = 600.0
+    """Upper bound for one foreground command."""
+
+    def __post_init__(self) -> None:
+        _integer("max_steps", self.max_steps, 1, 1000)
+        _number("max_seconds", self.max_seconds, 0, 86400)
+        _integer("max_total_tokens", self.max_total_tokens, 0, 1_000_000_000)
+        _integer("max_tool_calls_per_step", self.max_tool_calls_per_step, 1, 32)
+        _number("tool_timeout_seconds", self.tool_timeout_seconds, 0)
 
 
 @dataclass
-class Limits:
-    """任务执行预算和单步工具约束。"""
+class TeamLimits:
+    """Bounds for one group task (the lead's coordination of the whole team)."""
 
-    max_steps: int = 0
-    """模型轮数上限。0 表示持续计数，无累计轮数和派生动作数上限。"""
+    lead_max_steps: int = 60
+    """Model turns of the lead for one task (delegations are tool calls inside these turns)."""
 
-    max_seconds: float = 0
-    """整个任务的墙钟时间上限，0 为不限。单次网络请求与工具仍有各自的等待上限。"""
+    max_delegations: int = 24
+    """Member assignments the lead may start for one task."""
 
-    max_total_tokens: int = 0
-    """任务累计输入和输出 token 上限。0 表示仅记录用量。"""
+    max_repeat_assignments: int = 3
+    """Near-identical assignments to the same member before the lead is told to change course."""
 
-    max_tool_calls_per_step: int = 4
-    """单轮模型回复里最多执行几个工具调用，防止一次生成几十个调用。"""
-
-    tool_timeout_seconds: float = 600.0
-    """前台命令的最长运行时间，至多使用剩余任务墙钟。"""
-
-
-def configured_limits(base: Limits, changes: dict) -> Limits:
-    """Validate user-configurable budgets without changing legacy test budgets."""
-    from dataclasses import replace
-    if set(changes) - {"max_steps", "max_seconds", "max_total_tokens"}:
-        raise ValueError("unknown task budget")
-    if "max_steps" in changes:
-        _integer("max_steps", changes["max_steps"], 0, 1000)
-    if "max_total_tokens" in changes:
-        _integer("max_total_tokens", changes["max_total_tokens"], 0, 100_000_000)
-    if "max_seconds" in changes:
-        seconds = changes["max_seconds"]
-        _number("max_seconds", seconds, 0, 86400)
-        if 0 < seconds < 1:
-            raise ValueError("max_seconds must be zero or at least one second")
-    return replace(base, **changes)
+    def __post_init__(self) -> None:
+        _integer("lead_max_steps", self.lead_max_steps, 1, 1000)
+        _integer("max_delegations", self.max_delegations, 0, 200)
+        _integer("max_repeat_assignments", self.max_repeat_assignments, 1, 20)
 
 
 @dataclass
@@ -145,20 +138,21 @@ class Settings:
     base_url: str = DEFAULT_BASE_URL
     api_key: str = field(default="", repr=False)
     temperature: float = 0.0
-    """默认 0：agent 场景要的是可复现，不是创意。进 agent 的每一步都该能重放。"""
-
     limits: Limits = field(default_factory=Limits)
+    team: TeamLimits = field(default_factory=TeamLimits)
     runs_dir: Path = Path("runs")
-    """每个 run 一个目录：<runs_dir>/<run_id>/trace.jsonl + agents/<name>/ 产物。"""
-
-    thinking: Literal["enabled", "disabled"] = "enabled"
+    thinking: Literal["enabled", "disabled"] = "disabled"
     reasoning_effort: Literal["low", "high", "max"] = "high"
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
     request_deadline_seconds: float = DEFAULT_REQUEST_DEADLINE_SECONDS
-    max_retries: int = 2
-    """初次请求之外的额外重试次数；0 表示不重试。"""
+    max_retries: int = 3
     context_window_tokens: int = 1_000_000
+    """Provider context window. Compaction starts long before it (see below)."""
+    compact_at_tokens: int = 110_000
+    """Estimated request size that triggers compaction of older turns."""
+    keep_recent_tokens: int = 32_000
+    """Recent conversation kept verbatim when compacting (Pi's keepRecentTokens)."""
     max_output_recovery_attempts: int = 2
     interaction_mode: Literal["interactive", "autonomous"] = "interactive"
 
@@ -167,7 +161,9 @@ class Settings:
             raise ValueError("interaction_mode must be interactive or autonomous")
         if type(self.api_key) is not str:
             raise ValueError("api_key must be a string")
-        _integer("context_window_tokens", self.context_window_tokens, 1024, 1_000_000)
+        _integer("context_window_tokens", self.context_window_tokens, 4096, 1_000_000)
+        _integer("compact_at_tokens", self.compact_at_tokens, 2048, self.context_window_tokens)
+        _integer("keep_recent_tokens", self.keep_recent_tokens, 512, self.compact_at_tokens)
         _integer("max_output_recovery_attempts", self.max_output_recovery_attempts, 0, 3)
         validate_provider_options(
             model=self.model, base_url=self.base_url,
@@ -179,24 +175,111 @@ class Settings:
         )
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        """只读取当前进程环境变量；不会自动加载 .env（见 .env.example）。"""
+    def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+        """Read settings from ``env`` (default: the process environment)."""
+        env = dict(os.environ if env is None else env)
+
+        def integer(name: str, default: int) -> int:
+            try:
+                return int(env.get(name, default))
+            except ValueError:
+                raise ValueError(f"{name} must be an integer") from None
+
+        def number(name: str, default: float) -> float:
+            try:
+                return float(env.get(name, default))
+            except ValueError:
+                raise ValueError(f"{name} must be a number") from None
+
+        base = cls()
         return cls(
-            model=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
-            base_url=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL),
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-            temperature=_env_number("MA_TEMPERATURE", "0"),
-            thinking=os.environ.get("DEEPSEEK_THINKING", "enabled"),
-            reasoning_effort=os.environ.get("DEEPSEEK_REASONING_EFFORT", "high"),
-            max_output_tokens=_env_integer("DEEPSEEK_MAX_TOKENS", str(DEFAULT_MAX_OUTPUT_TOKENS)),
-            request_timeout_seconds=_env_number("DEEPSEEK_TIMEOUT", str(DEFAULT_REQUEST_TIMEOUT_SECONDS)),
-            request_deadline_seconds=_env_number("DEEPSEEK_DEADLINE", str(DEFAULT_REQUEST_DEADLINE_SECONDS)),
-            max_retries=_env_integer("DEEPSEEK_MAX_RETRIES", "2"),
-            context_window_tokens=_env_integer("MA_CONTEXT_WINDOW_TOKENS", "1000000"),
-            max_output_recovery_attempts=_env_integer("MA_OUTPUT_RECOVERY_ATTEMPTS", "2"),
-            limits=configured_limits(Limits(), {
-                "max_steps": _env_integer("MA_MAX_STEPS", str(Limits.max_steps)),
-                "max_total_tokens": _env_integer("MA_MAX_TOTAL_TOKENS", str(Limits.max_total_tokens)),
-                "max_seconds": _env_number("MA_MAX_SECONDS", str(Limits.max_seconds)),
-            }),
+            model=env.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
+            base_url=env.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL),
+            api_key=env.get("DEEPSEEK_API_KEY", ""),
+            temperature=number("MA_TEMPERATURE", 0),
+            thinking=env.get("DEEPSEEK_THINKING", base.thinking),
+            reasoning_effort=env.get("DEEPSEEK_REASONING_EFFORT", "high"),
+            max_output_tokens=integer("DEEPSEEK_MAX_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS),
+            request_timeout_seconds=number("DEEPSEEK_TIMEOUT", DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            request_deadline_seconds=number("DEEPSEEK_DEADLINE", DEFAULT_REQUEST_DEADLINE_SECONDS),
+            max_retries=integer("DEEPSEEK_MAX_RETRIES", base.max_retries),
+            context_window_tokens=integer("MA_CONTEXT_WINDOW_TOKENS", base.context_window_tokens),
+            compact_at_tokens=integer("MA_COMPACT_AT_TOKENS", base.compact_at_tokens),
+            keep_recent_tokens=integer("MA_KEEP_RECENT_TOKENS", base.keep_recent_tokens),
+            max_output_recovery_attempts=integer("MA_OUTPUT_RECOVERY_ATTEMPTS", 2),
+            interaction_mode=env.get("MA_INTERACTION_MODE", "interactive"),
+            runs_dir=Path(env.get("MA_RUNS_DIR", "runs")),
+            limits=Limits(
+                max_steps=integer("MA_MAX_STEPS", Limits.max_steps),
+                max_seconds=number("MA_MAX_SECONDS", 0),
+                max_total_tokens=integer("MA_MAX_TOTAL_TOKENS", 0),
+            ),
+            team=TeamLimits(
+                lead_max_steps=integer("MA_LEAD_MAX_STEPS", TeamLimits.lead_max_steps),
+                max_delegations=integer("MA_MAX_DELEGATIONS", TeamLimits.max_delegations),
+            ),
         )
+
+    def with_limits(self, **changes) -> "Settings":
+        return replace(self, limits=replace(self.limits, **changes))
+
+
+_ENV_KEYS = frozenset({
+    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_THINKING",
+    "DEEPSEEK_REASONING_EFFORT", "DEEPSEEK_MAX_TOKENS", "DEEPSEEK_TIMEOUT", "DEEPSEEK_DEADLINE",
+    "DEEPSEEK_MAX_RETRIES", "MA_TEMPERATURE", "MA_CONTEXT_WINDOW_TOKENS", "MA_COMPACT_AT_TOKENS",
+    "MA_KEEP_RECENT_TOKENS", "MA_OUTPUT_RECOVERY_ATTEMPTS", "MA_INTERACTION_MODE", "MA_RUNS_DIR",
+    "MA_MAX_STEPS", "MA_MAX_SECONDS", "MA_MAX_TOTAL_TOKENS", "MA_LEAD_MAX_STEPS", "MA_MAX_DELEGATIONS",
+})
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    """Parse KEY=value literals from a .env file. Nothing is executed or expanded.
+
+    Unknown keys are ignored. Legacy step/time keys whose value is ``0`` (the
+    old "unlimited" convention) are dropped so the bounded defaults apply.
+    """
+    with path.open("rb") as handle:
+        content = handle.read(65_537)
+    if len(content) > 65_536:
+        raise ValueError(".env exceeds 64 KiB")
+    try:
+        source = content.decode("utf-8-sig")
+    except UnicodeError:
+        raise ValueError(".env must be UTF-8 text") from None
+    values: dict[str, str] = {}
+    for number, line in enumerate(source.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, raw = line.partition("=")
+        key = key.strip()
+        if not separator:
+            raise ValueError(f".env line {number} needs KEY=value")
+        if key not in _ENV_KEYS:
+            continue
+        try:
+            parts = shlex.split(raw, comments=True, posix=True)
+        except ValueError:
+            raise ValueError(f".env line {number} has an invalid value") from None
+        if len(parts) > 1 or any(char in raw for char in ("$", "`", "\x00")):
+            raise ValueError(f".env line {number} must be a literal value")
+        value = parts[0] if parts else ""
+        if key in {"MA_MAX_STEPS", "MA_LEAD_MAX_STEPS"} and value.strip() == "0":
+            continue
+        values[key] = value
+    return values
+
+
+def load_settings(env_file: Path | None = None) -> Settings:
+    """Process environment wins over an optional .env (default: ./.env)."""
+    path = env_file if env_file is not None else Path(".env")
+    merged: dict[str, str] = {}
+    if path.exists():
+        merged.update(read_env_file(path))
+    elif env_file is not None:
+        raise FileNotFoundError(str(env_file))
+    merged.update({key: value for key, value in os.environ.items() if key in _ENV_KEYS})
+    return Settings.from_env(merged)

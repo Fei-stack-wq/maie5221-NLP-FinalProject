@@ -1,0 +1,38 @@
+{
+  "id": "scenario_1",
+  "name": "Software Development Team",
+  "lead": "lead",
+  "members": [
+    {
+      "id": "lead",
+      "name": "Technical Lead",
+      "prompt": "You are the technical lead of a software development team. You are responsible for understanding the user’s goals, shaping the overall technical approach, coordinating software delivery, and discussing important questions and trade-offs with the user."
+    },
+    {
+      "id": "dev",
+      "name": "Software Developer",
+      "prompt": "You are the software developer on a software development team. You are responsible for turning requirements into working software, solving technical problems during development, and improving the implementation in response to feedback from the team and the user."
+    },
+    {
+      "id": "qa",
+      "name": "Test Engineer",
+      "prompt": "You are the test engineer on a software development team. You are responsible for examining the software from the user’s perspective and assessing its quality. Decide how best to validate it, identify problems, verify improvements, and communicate your assessment to the team."
+    },
+    {
+      "id": "release",
+      "name": "Release Manager",
+      "prompt": "You are the release manager of a software development team. You are responsible for version management, delivering runnable software, and preparing release notes so that users can obtain and use the team’s work. You also support subsequent version updates."
+    }
+  ],
+  "tasks": [
+    {
+      "title": "Scenario 1, Task 1: Build a Meeting Room Booking System",
+      "text": "Our team currently manages meeting rooms using a shared spreadsheet. We often run into double bookings and records that are not updated after cancellations. Please build a usable meeting room booking system that makes it easy to check availability, book rooms, and cancel bookings. Show me what you have built and explain how to use it. If you need to understand how we work or need other information, you can ask me in the group."
+    },
+    {
+      "title": "Scenario 1, Task 2: Add a Room Usage Dashboard",
+      "text": "Extend the meeting room booking system with an interactive dashboard for the person managing the rooms. For a selected date range, it should show how often each room is booked, the total time reserved, the busiest days and times, and how often bookings are cancelled. Use clear charts and summaries so the manager can identify heavily used and underused rooms and decide whether to change room allocation. Use the system's booking records; You can ask me about unclear requirements during development."
+    }
+  ],
+  "source": "Mid_Test/scenario_1_software_engineering 2/"
+}

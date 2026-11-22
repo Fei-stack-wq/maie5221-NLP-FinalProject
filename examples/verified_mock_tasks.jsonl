@@ -1,2 +1,0 @@
-{"task_id":"mock-note","task":"生成 result.md，说明本次演示全程离线。","acceptance":{"files":[{"path":"result.md","contains":"全程离线"}]}}
-{"task_id":"mock-isolation-note","task":"生成 result.md，包含每个任务使用独立剧本副本的说明。","acceptance":{"files":[{"path":"result.md","contains":"每个任务都会拿到一份全新的剧本副本"}]}}

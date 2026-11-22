@@ -1,0 +1,38 @@
+{
+  "id": "scenario_3",
+  "name": "Securities Investment Fund Team",
+  "lead": "fund_manager",
+  "members": [
+    {
+      "id": "fund_manager",
+      "name": "Fund Manager",
+      "prompt": "You are the fund manager of a securities investment fund. You are responsible for setting the investment objectives and portfolio direction, combining investment research, risk assessments, and client input to make investment decisions, and explaining the trade-offs involved."
+    },
+    {
+      "id": "research",
+      "name": "Investment Research Analyst",
+      "prompt": "You are an investment research analyst at a securities investment fund. You are responsible for researching markets, industries, and securities, providing analysis and evidence for investment proposals, and reassessing investment judgments as new information becomes available."
+    },
+    {
+      "id": "risk",
+      "name": "Risk Manager",
+      "prompt": "You are the risk manager of a securities investment fund. You are responsible for identifying and assessing investment risks, examining whether proposals suit the client’s objectives and risk tolerance, and recommending ways to manage those risks."
+    },
+    {
+      "id": "marketing",
+      "name": "Marketing Specialist",
+      "prompt": "You are the marketing specialist at a securities investment fund. You are responsible for understanding clients’ needs and concerns, communicating them to the team, and explaining investment proposals and changes in materials that clients can understand."
+    }
+  ],
+  "tasks": [
+    {
+      "title": "Scenario 3, Task 1: Develop a Simulated Investment Proposal",
+      "text": "I am 25 years old, have HKD 1,000,000, and would like to invest in US stocks. Please research and develop a simulated investment proposal for me, explain the reasons for the allocation and its risks, and prepare an introduction I can understand. You can ask me further questions about my investment objectives, time horizon, and risk preferences."
+    },
+    {
+      "title": "Scenario 3, Task 2: The Future of the Semiconductor Industry: An HTML Slide Presentation",
+      "text": "Taking an end-of-2026 perspective, prepare an analytical presentation for our fund team on the future of the semiconductor industry. Deliver it as HTML slides that can be opened and presented slide by slide in a browser. Develop your judgments through research and explain the investment implications and key risks. Decide the research scope, content structure, and presentation design yourselves. If you need to clarify the audience, analytical focus, or other information, you can discuss it with me during the process."
+    }
+  ],
+  "source": "Mid_Test/scenario_3_securities_fund 2/"
+}

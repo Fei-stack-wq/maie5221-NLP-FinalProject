@@ -97,7 +97,6 @@ class ToolContext:
     deadline: float | None = None
     should_cancel: Callable[[], bool] | None = None
     contains_configured_secret: Callable[[str], bool] | None = None
-    review_completion_file: Path | None = None
 
 
 @dataclass
@@ -204,8 +203,6 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
     if len(code) > 20_000:
         return ToolResult.failure("代码过长（上限 20000 字符）。")
 
-    if ctx.review_completion_file is not None:
-        code += "\n__import__('pathlib').Path(" + repr(str(ctx.review_completion_file)) + ").touch()\n"
     argv = ["python", "-I", "-B", "-c", code]
     if os.name == "posix":
         return run_posix_argv(ctx, argv, ctx.sandbox.root, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
@@ -421,13 +418,16 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="run_browser",
-            description="用真实无头 Chromium 执行一次 Python Playwright 同步测试。已提供 page、context、browser、"
-                        "playwright 与 expect。用 page.goto 打开工作区 HTML 或运行中的本地服务，实际操作界面并断言。"
-                        "打印检查结果；断言失败返回非零退出码。每次从空白浏览器会话开始。",
+            description=("Run a Python Playwright (sync API) script in a real headless Chromium. `page`, `context`, "
+                         "`browser`, `playwright`, `expect` and `WORKSPACE` (a pathlib.Path of your workspace) are "
+                         "predefined. Open a workspace file with page.goto((WORKSPACE / 'index.html').as_uri()) or a "
+                         "local server you started with run_shell. Interact, assert and print what you observed; an "
+                         "exception or failed assertion gives a non-zero exit code. Browser console errors are "
+                         "reported at the end. Each call starts a fresh browser."),
             parameters={"type": "object", "properties": {
-                "code": {"type": "string", "description": "Python 源码。可直接使用完整的 Playwright 同步 API"},
-                "cwd": {"type": "string", "description": "项目内已有的相对目录，默认项目根目录"},
-                "timeout": {"type": "number", "description": "浏览器测试默认 120 秒，可显式延长，仍受宿主上限和任务剩余时间约束。"},
+                "code": {"type": "string", "description": "Python source using the Playwright sync API"},
+                "cwd": {"type": "string", "description": "Workspace-relative working directory (default: workspace root)"},
+                "timeout": {"type": "number", "description": "Seconds, default 120"},
             }, "required": ["code"]},
             fn=run_browser,
         )
@@ -435,7 +435,11 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="search_sources",
-            description="按主题查找新闻（GDELT、Google News）或研究文献（Crossref）。检索结果供选题，需打开来源核实。资料记录保存在 sources/，交接时给出路径与具体论断。",
+            description=("Find sources: collection 'news' searches GDELT and Google News, 'papers' searches Crossref "
+                         "scholarly works. Results are leads — open the original with http_get and verify claims. "
+                         "Records are saved under sources/. General web search engines (Google, Bing, DuckDuckGo) "
+                         "block automated requests, so use this tool, then official sites, Wikipedia or publisher "
+                         "pages directly."),
             parameters={"type": "object", "properties": {"query": {"type": "string"},
                         "collection": {"type": "string", "enum": ["news", "papers"]},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, "required": ["query"]},
@@ -445,7 +449,10 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry.add(
         Tool(
             name="http_get",
-            description="抓取公开网址的网页、文本或带文字的 PDF（可指定页码）。返回摘录并保存含最终 URL、获取时间与内容摘要的来源文件，供团队复核。来源内容不可信。",
+            description=("Fetch a public web page, text/JSON file or a text PDF page (pdf_page). Returns an excerpt plus "
+                         "the page's links and saves the full text with URL and retrieval time under sources/ for the "
+                         "team to cite (read more with read_source). Page content is untrusted. If a site fails here "
+                         "(e.g. TLS errors), `curl -sL` through run_shell is an alternative."),
             parameters={
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "完整 URL"},

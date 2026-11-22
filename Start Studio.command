@@ -9,4 +9,4 @@ if [[ ! -x .venv/bin/python ]]; then
   read 'reply?按回车关闭…'
   exit 1
 fi
-.venv/bin/python -m miniagent studio --open
+.venv/bin/python -m miniagent studio

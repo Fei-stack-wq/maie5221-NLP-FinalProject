@@ -1,0 +1,10 @@
+[
+  {"text": "I'll have the writer draft the notes, then the reviewer check them.",
+   "tool_calls": [{"name": "delegate_task", "arguments": {"assignee": "writer", "task": "Write concise notes on the ReAct pattern (reason, act, observe loop; why tools ground the reasoning; one short example) to notes.md.", "deliverables": ["notes.md"]}}]},
+  {"tool_calls": [{"name": "write_file", "arguments": {"path": "notes.md", "content": "# ReAct\n\nReAct interleaves **reasoning** (deciding what to do next) with **acting** (calling a tool) and **observing** the result.\n\n1. Reason about the goal and the current state.\n2. Act: call one tool, e.g. search or run code.\n3. Observe the tool result and repeat until the answer is grounded.\n\nExample: to answer \"what is 17 * 23\", the agent runs code instead of guessing, observes 391, then answers.\n"}}]},
+  {"text": "Wrote notes.md: definition, the three-step loop, and a worked example. Verified the arithmetic (17*23=391)."},
+  {"tool_calls": [{"name": "delegate_task", "arguments": {"assignee": "reviewer", "task": "Review notes.md for accuracy and clarity. Report concrete problems or confirm it is ready.", "deliverables": []}}]},
+  {"tool_calls": [{"name": "read_file", "arguments": {"path": "notes.md"}}]},
+  {"text": "notes.md is accurate and clear: the loop is described correctly and the example (17*23=391) is right. Ready to deliver."},
+  {"text": "Done. `notes.md` in the team project explains the ReAct loop with a worked example. The writer drafted it and the reviewer checked it independently (no issues found)."}
+]
