@@ -11,6 +11,7 @@ smoke    three-call live protocol probe of the configured model
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import sys
 import threading
@@ -47,21 +48,30 @@ def _template(name: str) -> dict:
 
 def cmd_studio(args) -> int:
     settings = _settings(args)
+    from .instance import advertised_studio
     from .server import serve
     studio = Studio(settings)
     studio.env_file = Path(args.env_file or ".env").resolve()
-    main, preview = serve(studio, args.port)
-    studio.restore_queue()
-    url = f"http://127.0.0.1:{main.server_address[1]}/"
-    print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")
-    print(f"model {settings.model}, thinking {settings.thinking}, runs in {settings.runs_dir.resolve()}")
-    if not settings.api_key:
-        print("warning: DEEPSEEK_API_KEY is not set (.env or environment); tasks cannot start.")
-    if not args.no_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
-        while True:
-            time.sleep(3600)
+        main, preview = serve(studio, args.port, strict_port=args.strict_port)
+    except OSError as exc:
+        studio.close()
+        if args.strict_port and exc.errno == errno.EADDRINUSE:
+            print(f"端口 {args.port} 已被占用。请先关闭占用该端口的服务，再启动工作室。", file=sys.stderr)
+            return 1
+        raise
+    try:
+        with advertised_studio(settings.runs_dir, main.server_port, main.RequestHandlerClass.instance_id):
+            studio.restore_queue()
+            url = f"http://127.0.0.1:{main.server_address[1]}/"
+            print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")
+            print(f"model {settings.model}, thinking {settings.thinking}, runs in {settings.runs_dir.resolve()}")
+            if not settings.api_key:
+                print("warning: DEEPSEEK_API_KEY is not set (.env or environment); tasks cannot start.")
+            if not args.no_browser:
+                threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+            while True:
+                time.sleep(3600)
     except KeyboardInterrupt:
         print("\nstopping…")
     finally:
@@ -246,7 +256,9 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("studio", help="start the local web Studio")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--strict-port", action="store_true", help="require the requested main port, including on reuse")
     p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--reuse", action="store_true", help="open the existing Studio for this data directory if running")
     p.set_defaults(fn=cmd_studio)
 
     p = sub.add_parser("team", help="run one group task in the terminal")
@@ -284,12 +296,27 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_smoke)
 
     args = parser.parse_args(argv)
+    if args.command == "studio" and args.strict_port and not 1 <= args.port <= 65535:
+        parser.error("--strict-port requires a port between 1 and 65535")
     if args.command in {"studio", "demo", "run", "team", "migrate", "eval"}:
-        from .instance import session_lock, StudioInUse
+        from .instance import session_lock, StudioInUse, wait_for_studio
+        directory = _settings(args).runs_dir
         try:
-            with session_lock(_settings(args).runs_dir):
+            with session_lock(directory):
                 return args.fn(args)
         except StudioInUse as exc:
+            if args.command == "studio" and args.reuse:
+                url = wait_for_studio(directory)
+                if url:
+                    if args.strict_port and url != f"http://127.0.0.1:{args.port}/":
+                        print(f"此工作室已在 {url} 运行。请先关闭该实例，再用固定端口 {args.port} 启动。", file=sys.stderr)
+                        return 1
+                    print(f"Studio 已在运行：{url}")
+                    if not args.no_browser:
+                        webbrowser.open(url)
+                    return 0
+                print(f"数据目录正在使用：{directory.resolve()}。请查看已运行的 Studio 窗口或稍后重试。", file=sys.stderr)
+                return 1
             print(str(exc), file=sys.stderr)
             return 1
     return args.fn(args)

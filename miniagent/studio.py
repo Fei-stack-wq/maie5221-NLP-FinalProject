@@ -29,6 +29,7 @@ from . import dispatch_notices
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
 from .provider_http import ProviderError
+from .room_workspace import RoomWorkspace
 from .room_turn import decide, read_excerpt, room_evidence
 from .team import HumanChannel, TeamTask
 
@@ -309,7 +310,9 @@ class Studio:
 
             stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs, client_id=client_id))
             active = {"id":current.task_id, "primary":current.primary} if current else None
+            workspace = RoomWorkspace(store, settings.api_key)
             context = room_evidence(store, actor, active, question, refs, self.roles)
+            context["workspace"] = workspace.describe()
             # Keep the identity of each observed execution and question until the model returns.
             recipients = {current.task_id:ObservedTask(group_id,current,question)} if current else {}
             children = {}
@@ -327,6 +330,11 @@ class Studio:
                     for tid,observed in recipients.items()}
             try:
                 def read(args):
+                    if "workspace_path" in args:
+                        if set(args) - {"workspace_path", "offset"}:
+                            return "Reference a single file source."
+                        result = workspace.inspect(args["workspace_path"], args.get("offset", 0))
+                        return json.dumps(result, ensure_ascii=False)
                     child = children.get(args.get("task_id")) if isinstance(args.get("task_id"), str) else None
                     if child:
                         excerpt = read_dispatch(self, child, args)

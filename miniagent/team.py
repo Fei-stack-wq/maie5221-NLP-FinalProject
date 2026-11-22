@@ -317,6 +317,13 @@ def agent_context(store: GroupStore, agent_id: str, before_seq: int) -> str:
     chat = conversation(store, before_seq)
     if chat:
         sections.append("## Group conversation so far\n" + chat)
+    if store.group.folder:
+        sections.append("## Selected workspace\n"
+                        f"User-selected folder: {store.group.folder}\n"
+                        "Your current working directory (.) is a private checkout of this session's project, "
+                        "including eligible files imported from that folder at task start. Use relative paths "
+                        "with list_dir, find_files and read_file to inspect existing files. Published edits are "
+                        "synced back to the selected folder when the task finishes.")
     sections.append("## Team project files\n" + listing(store.project.files()))
     journal = store.journal(agent_id, limit=5)
     if journal:

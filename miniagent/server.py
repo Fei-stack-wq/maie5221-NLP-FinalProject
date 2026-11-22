@@ -85,6 +85,7 @@ class _Base(BaseHTTPRequestHandler):
 class StudioHandler(_Base):
     studio: Studio
     preview_port: int
+    instance_id: str
 
     def do_HEAD(self):
         self.do_GET()
@@ -118,6 +119,8 @@ class StudioHandler(_Base):
 
     def _api_get(self, parts: list[str], query: dict):
         studio = self.studio
+        if parts == ["instance"]:
+            return self._json(200, {"id": self.instance_id})
         if parts == ["assistant"]:
             return self._json(200, studio.assistant())
         if parts == ["bootstrap"]:
@@ -341,7 +344,8 @@ class PreviewHandler(_Base):
         return self._send(200, path.read_bytes(), content_type)
 
 
-def serve(studio: Studio, port: int = 8765, *, ready: threading.Event | None = None) -> tuple[ThreadingHTTPServer, ThreadingHTTPServer]:
+def serve(studio: Studio, port: int = 8765, *, strict_port: bool = False,
+          ready: threading.Event | None = None) -> tuple[ThreadingHTTPServer, ThreadingHTTPServer]:
     """Start both listeners on background threads and return them."""
     preview_handler = type("Preview", (PreviewHandler,), {"studio": studio})
     if not 0 <= port <= 65535:
@@ -350,11 +354,11 @@ def serve(studio: Studio, port: int = 8765, *, ready: threading.Event | None = N
     assets = {p.relative_to(WEB).as_posix(): p.read_bytes() for p in WEB.rglob("*")
               if p.is_file() and WEB.resolve() in p.resolve().parents}
     handler = type("Handler", (StudioHandler,), {"studio": studio, "studio_token": secrets.token_urlsafe(32),
-                                                 "assets": assets})
+                                                 "assets": assets, "instance_id": secrets.token_hex(16)})
     try:
         main = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:
-        if exc.errno != errno.EADDRINUSE:
+        if strict_port or exc.errno != errno.EADDRINUSE:
             raise
         main = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     try:

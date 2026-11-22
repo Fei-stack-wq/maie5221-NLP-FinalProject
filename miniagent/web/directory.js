@@ -213,8 +213,8 @@ function workspaceSheet() {
     return path.value;
   })));
   const help=g.running ? "当前任务结束后可以切换工作区。" :
-    g.kind==="assistant" ? "新建群聊或私聊会沿用你选的本地文件夹，任务交付后写入该目录。" :
-    "任务开始时读取所选文件夹，交付后把本次修改写回。";
+    g.kind==="assistant" ? "聊天可直接查看所选目录和文本文件。新建群聊或私聊会沿用此目录。" :
+    "聊天可直接查看所选目录和文本文件。执行任务时读取工作副本，交付后写回修改。";
   sheet("会话工作区",el("small",{class:"muted"},g.folder?"当前本地目录":"当前 Studio 默认目录"),
     el("code",{class:"workspace-path"},g.workspace_path),el("p",{class:"muted"},help),
     ...(g.running?[]:[actions,manual,error]));
