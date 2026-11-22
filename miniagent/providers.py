@@ -88,6 +88,7 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
     content, reasoning = [], []
     calls = {}
     pending = ""
+    thinking_announced = False
     finish = usage = None
     try:
         for event in events:
@@ -139,6 +140,9 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
                 if part is not None:
                     _require(isinstance(part, str), "Invalid assistant stream text")
                     parts.append(part)
+                    if field == "reasoning_content" and part and not thinking_announced:
+                        thinking_announced = True
+                        notify("thinking", "")
                     if field == "content" and part:
                         visible = pending + part
                         pending = ""

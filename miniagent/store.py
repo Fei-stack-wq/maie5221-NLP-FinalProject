@@ -3,6 +3,7 @@
 Layout under ``runs_dir``::
 
     groups/<group_id>/group.json            members, lead, mode
+    groups/<group_id>/sessions/s-<id>/    independent room with session.json, chat, project, agents and tasks
     groups/<group_id>/chat.jsonl            public timeline, one event per line, with ``seq``
     groups/<group_id>/project/              the team project (published files)
     groups/<group_id>/project-log.jsonl     who published what, per assignment
@@ -21,7 +22,7 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -104,15 +105,29 @@ class Group:
                    members=[Member(**m) for m in data["members"]])
 
 
+@dataclass
+class Session:
+    """Session-owned fields. The group's roster, lead and mode have one owner."""
+    name: str
+    created_at: float = field(default_factory=now)
+    folder: str = ""
+    archived: bool = False
+
+    def room(self, owner: Group, session_id: str) -> Group:
+        return replace(owner, **asdict(self), id=session_id, pinned=False, created_by=None)
+
+
 class GroupStore:
     """One group's files. Appends to the chat are serialized and numbered."""
 
-    def __init__(self, root: Path, group: Group) -> None:
+    def __init__(self, root: Path, group: Group, *, parent: GroupStore | None = None) -> None:
+        self.parent = parent
         self.root = root
         self.group = group
         self._lock = threading.RLock()
         self.turn_lock = threading.Lock()
         self._notice_ids: set[str] = set()
+        self._client_messages: dict[str, dict] = {}
         self._seq = 0
         self._chat_path = root / "chat.jsonl"
         if self._chat_path.exists():
@@ -120,10 +135,20 @@ class GroupStore:
                 if line.strip():
                     event = json.loads(line)
                     self._seq = max(self._seq, event.get("seq", 0))
+                    if event.get("client_id"):
+                        self._client_messages[event["client_id"]] = event
                     if event.get("notice_id"):
                         self._notice_ids.add(event["notice_id"])
         self.previews = ChatStream(self._seq)
         self.select_project()
+
+    @property
+    def team(self) -> Group:
+        return self.parent.group if self.parent else self.group
+
+    def session_metadata(self) -> Session:
+        g = self.group
+        return Session(g.name, g.created_at, g.folder, g.archived)
 
     def select_project(self):
         # Every binding has its own checkout and sync baseline. Keep the existing
@@ -142,10 +167,19 @@ class GroupStore:
         with self._lock:
             self._seq += 1
             event = {"seq": self._seq, "time": now(), "kind": kind, **fields}
+            draft_id = self.previews.draft_id_for(event)
+            if draft_id:
+                event["draft_id"] = draft_id
             with self._chat_path.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+            if fields.get("client_id"):
+                self._client_messages[fields["client_id"]] = event
             self.previews.committed(event)
             return event
+
+    def client_message(self, client_id):
+        with self._lock:
+            return self._client_messages.get(client_id)
 
     def append_notice(self, kind, notice_id, **fields):
         """A producer retry and a startup replay deliver the same public event once."""
@@ -248,35 +282,84 @@ class Store:
         root = self.root / group.id
         root.mkdir(parents=True)
         from .roles import write_json
-        write_json(root / "group.json", group.to_dict())
-        store = GroupStore(root, group)
         with self._lock:
+            store = GroupStore(root, group)
+            store.append("group_created", name=group.name, members=[asdict(m) for m in group.members], lead=lead, mode=mode)
+            write_json(root / "group.json", group.to_dict())
             self._open[group.id] = store
-        store.append("group_created", name=group.name, members=[asdict(m) for m in group.members], lead=lead, mode=mode)
-        return store
+            return store
+
+    def create_session(self, owner: GroupStore, name: str) -> GroupStore:
+        from .roles import write_json
+        with self._lock:
+            key = "s-" + uuid.uuid4().hex[:12]
+            session = Session(name.strip())
+            group = session.room(owner.group, owner.group.id + "-" + key)
+            group.validate()
+            root = owner.root / "sessions" / key
+            root.mkdir(parents=True)
+            store = GroupStore(root, group, parent=owner)
+            store.append("session_created", name=group.name)
+            # Publish the manifest last: an interrupted creation never exposes a partial room.
+            write_json(root / "session.json", asdict(session))
+            self._open[group.id] = store
+            return store
 
     def get(self, group_id: str) -> GroupStore:
         with self._lock:
             if group_id in self._open:
                 return self._open[group_id]
-            if not re.fullmatch(r"g-[0-9a-f]{12}", group_id or ""):
+            match = re.fullmatch(r"(g-[0-9a-f]{12})(?:-(s-[0-9a-f]{12}))?", group_id or "")
+            if not match:
                 raise KeyError(group_id)
-            path = self.root / group_id / "group.json"
-            if not path.exists():
+            team_id, key = match.groups()
+            parent = self.get(team_id) if key else None
+            if parent:
+                root = parent.root / "sessions" / key
+                path = root / "session.json"
+            else:
+                root = self.root / team_id
+                path = root / "group.json"
+            if not path.is_file():
                 raise KeyError(group_id)
-            store = GroupStore(self.root / group_id, Group.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+            values = json.loads(path.read_bytes())
+            group = Session(**values).room(parent.group, group_id) if parent else Group.from_dict(values)
+            store = GroupStore(root, group, parent=parent)
             self._open[group_id] = store
             return store
 
     def update_group(self, store: GroupStore) -> None:
-        store.group.validate()
         from .roles import write_json
-        write_json(store.root / "group.json", store.group.to_dict())
+        with self._lock:
+            store.group.validate()
+            if store.parent:
+                write_json(store.root / "session.json", asdict(store.session_metadata()))
+            else:
+                write_json(store.root / "group.json", store.group.to_dict())
+                for room in self._open.values():
+                    if room.parent is store:
+                        room.group = room.session_metadata().room(store.group, room.group.id)
+
+    def sessions(self, owner: GroupStore) -> list[GroupStore]:
+        with self._lock:
+            extra = [self.get(owner.group.id + "-" + p.parent.name)
+                     for p in (owner.root / "sessions").glob("s-*/session.json")]
+            return [owner, *sorted(extra, key=lambda s: s.group.created_at)]
 
     def groups(self) -> list[Group]:
-        rows = []
-        for folder in sorted(self.root.iterdir()):
-            path = folder / "group.json"
-            if path.exists():
-                rows.append(Group.from_dict(json.loads(path.read_text(encoding="utf-8"))))
-        return sorted(rows, key=lambda g: g.created_at, reverse=True)
+        with self._lock:
+            rows = [self.get(p.parent.name).group for p in self.root.glob("g-*/group.json")]
+            return sorted(rows, key=lambda g: g.created_at, reverse=True)
+
+    def conversations(self) -> list[Group]:
+        with self._lock:
+            return [room.group for team in self.groups() for room in self.sessions(self.get(team.id))]
+
+    def trash(self, store: GroupStore) -> None:
+        with self._lock:
+            target = self.root.parent / "trash" / store.group.id
+            target.parent.mkdir(exist_ok=True)
+            store.root.rename(target)
+            for key, room in list(self._open.items()):
+                if room is store or room.parent is store:
+                    del self._open[key]

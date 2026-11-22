@@ -133,12 +133,31 @@ class Studio:
         running = self._running.get(store.group.id)
         tasks = store.tasks()
         return {**store.group.to_dict(), "workspace_path":store.group.folder or str(store.project.root.resolve()),
-                "running": bool(running),
+                "team_id":store.team.id, "team_name":store.team.name,
+                "session_name":store.group.name if store.parent else "默认会话",
+                "archived":store.group.archived or store.team.archived, "running": bool(running),
                 "waiting_for_you": bool(running and running.channel.pending()),
                 "last_activity": (store.root/"chat.jsonl").stat().st_mtime, "tasks": len(tasks), "last_status": tasks[-1]["status"] if tasks else None}
 
     def groups(self) -> list[dict]:
         return [self.summary(self.store.get(g.id)) for g in self.store.groups()]
+
+    def sessions(self, group_id):
+        with self._lock:
+            room = self.group(group_id)
+            return [self.summary(item) for item in self.store.sessions(room.parent or room)]
+
+    def create_session(self, group_id, name):
+        with self._lock:
+            room = self.group(group_id)
+            owner = room.parent or room
+            self._require_available(owner)
+            if owner.group.kind != "group" or not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+                raise StudioError("请选择群组，并填写 1 至 120 个字符的会话名称。")
+            return self.summary(self.store.create_session(owner, name))
+
+    def conversations(self):
+        return [self.summary(self.group(g.id)) for g in self.store.conversations()]
 
     def group(self, group_id: str) -> GroupStore:
         try:
@@ -149,6 +168,15 @@ class Studio:
     def update_group(self, group_id: str, changes: dict) -> dict:
         store = self.group(group_id)
         with self._lock:
+            if store.parent and changes.keys() & {"members", "lead", "role_ids", "mode", "pinned"}:
+                shared = {k:v for k,v in changes.items() if k in {"members","lead","role_ids","mode","pinned"}}
+                if len(shared) != len(changes):
+                    raise StudioError("请分别更新群组设置和会话设置。")
+                self.update_group(store.team.id, shared)
+                return self.summary(store)
+            if not store.parent and changes.get("archived") and any(
+                    room.group.id in self._running for room in self.store.sessions(store)):
+                raise StudioError("群组中仍有会话正在执行任务。", 409)
             if group_id in self._running and ("folder" in changes or changes.get("archived")):
                 raise StudioError("Wait for the task before rebinding or archiving its workspace.", 409)
             group = store.group
@@ -178,6 +206,13 @@ class Studio:
                 if "folder" in changes:
                     if changes["folder"]:
                         bind(store, changes["folder"])
+                        path = Path(group.folder)
+                        for other in self.store.sessions(store.parent or store):
+                            if other is store or not other.group.folder:
+                                continue
+                            sibling = Path(other.group.folder)
+                            if path.is_relative_to(sibling) or sibling.is_relative_to(path):
+                                raise ValueError("该目录与同群其他会话的工作区重叠，请选择独立目录。")
                     else:
                         group.folder = ""
                 if "lead" in changes:
@@ -205,6 +240,8 @@ class Studio:
         """Apply a membership delta against the current roster under the same lock as UI edits."""
         with self._lock:
             store = self.group(group_id)
+            store = store.parent or store
+            group_id = store.group.id
             self._require_available(store)
             group = store.group
             if group.kind != "group":
@@ -237,13 +274,16 @@ class Studio:
                                                 "role_ids":bound, "lead":next_lead})
 
     # -- messages ---------------------------------------------------------
-    def post(self, group_id, text, *, attachments=(), options=None, queue=False, dispatched_by=None):
+    def post(self, group_id, text, *, attachments=(), options=None, queue=False, dispatched_by=None, client_id=None):
         store = self.group(group_id)
         if not isinstance(text, str) or len(text) > 60_000:
             raise StudioError("Expected a message of at most 60000 characters")
         if not isinstance(attachments, (list, tuple)) or len(attachments) > 20:
             raise StudioError("Expected up to 20 attachments")
-        refs = [self.uploads.ref(ref) for ref in attachments]
+        if client_id is not None and (not isinstance(client_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", client_id)):
+            raise StudioError("Invalid client message ID")
+        receipt = {"client_id":client_id} if client_id else {}
+        refs = [self.uploads.room_ref(store, ref) for ref in attachments]
         if not text.strip() and not refs:
             raise StudioError("The message is empty.")
         if self.settings.api_key and self.settings.api_key in text:
@@ -251,6 +291,10 @@ class Studio:
         options = {} if options is None else options
         settings, mode = self._task_settings(store, options)
         with store.turn_lock, ExitStack() as turn_scope:
+            if client_id and (previous := store.client_message(client_id)):
+                if previous["text"] != text or previous.get("attachments", []) != refs:
+                    raise StudioError("Message ID already used for different content", 409)
+                return {"route":"received", "seq":previous["seq"], "task_id":previous.get("task_id")}
             with self._lock:
                 self._require_available(store)
                 current = self._running.get(group_id)
@@ -261,9 +305,9 @@ class Studio:
                 actor = target or (question["agent"] if question and question["agent"] in member_ids else store.group.lead)
             if queue:
                 return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode,
-                                    dispatched_by=dispatched_by)
+                                    dispatched_by=dispatched_by, receipt=receipt)
 
-            stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs))
+            stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs, client_id=client_id))
             active = {"id":current.task_id, "primary":current.primary} if current else None
             context = room_evidence(store, actor, active, question, refs, self.roles)
             # Keep the identity of each observed execution and question until the model returns.
@@ -296,7 +340,7 @@ class Studio:
             with self._lock:
                 self._require_available(store)
                 if turn.action == "start_room_task":
-                    return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode)
+                    return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode, receipt=receipt)
                 if turn.action == "change_group_members" and assistant:
                     try:
                         updated = self.change_members(**turn.membership)
@@ -308,25 +352,25 @@ class Studio:
                     answer = turn.text
                 else:
                     tid = turn.task_id or (current.task_id if current else None)
-                    route = self._deliver_turn(recipients.get(tid), turn.action, text, refs)
+                    route = self._deliver_turn(recipients.get(tid), turn.action, text, refs, receipt if tid not in children else {})
                     if route != "stale":
                         if tid in children:
                             verb = "答复" if route == "answer" else "修改要求"
                             self._record_reply(store, actor, text, refs,
-                                               f"已将{verb}转交给「{children[tid]['group_name']}」的任务 {tid}。")
+                                               f"已将{verb}转交给「{children[tid]['group_name']}」的任务 {tid}。", receipt)
                         return {"route":route, "task_id":tid}
                     answer = "刚才的问题或执行已经结束。这条消息没有转交给其他任务。"
                 if settings.api_key:
                     answer = answer.replace(settings.api_key, "[redacted]")
-                return self._record_reply(store, actor, text, refs, answer)
+                return self._record_reply(store, actor, text, refs, answer, receipt)
 
     @staticmethod
-    def _record_reply(store, actor, text, refs, answer):
-        message = store.append("user_message", text=text, addressed=actor, attachments=refs)
+    def _record_reply(store, actor, text, refs, answer, receipt):
+        message = store.append("user_message", text=text, addressed=actor, attachments=refs, **receipt)
         store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"])
         return {"route":"reply", "text":answer}
 
-    def _deliver_turn(self, observed, action, text, refs):
+    def _deliver_turn(self, observed, action, text, refs, receipt):
         if not observed or self._running.get(observed.group_id) is not observed.run:
             return "stale"
         answering = action == "answer_open_question"
@@ -334,13 +378,13 @@ class Studio:
             return "stale"
         # receive also checks cancellation, completion and the exact pending question under its lock.
         return observed.run.channel.receive(text, attachments=refs, steer_only=not answering,
-                                            answer_to=observed.question["id"] if answering else None)
+                                            answer_to=observed.question["id"] if answering else None, **receipt)
 
     def _require_available(self, store):
-        if self._closed or store.group.archived or not store.root.is_dir():
+        if self._closed or store.group.archived or store.team.archived or not store.root.is_dir():
             raise StudioError("Conversation unavailable", 409)
 
-    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None):
+    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None):
         group_id = store.group.id
         with self._lock:
             self._require_available(store)
@@ -350,10 +394,11 @@ class Studio:
                        "member_max_steps":settings.limits.max_steps, "lead_max_steps":settings.team.lead_max_steps,
                        "max_delegations":settings.team.max_delegations}
             tid = "t-" + uuid.uuid4().hex[:12]
+            receipt = receipt or {}
             if running:
-                event = store.append("queued_message", task_id=tid, text=text)
+                event = store.append("queued_message", task_id=tid, text=text, attachments=refs, **receipt)
             else:
-                event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary)
+                event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
             record = {"id":tid, "group_id":group_id, "room_kind":store.group.kind, "status":"queued", "created_at":now(), "primary":primary,
                       "text":body, "trigger_seq":event["seq"], "options":options, "active":[]}
             if dispatched_by:
@@ -430,7 +475,7 @@ class Studio:
             raise StudioError(str(exc), 503) from None
 
     def _advance(self, store):
-        if self._closed or store.group.archived or store.group.id in self._running:
+        if self._closed or store.group.archived or store.team.archived or store.group.id in self._running:
             return
         for record in store.tasks():
             if record.get("status") == "queued":
@@ -442,7 +487,7 @@ class Studio:
 
     def restore_queue(self):
         with self._lock:
-            groups = self.store.groups()
+            groups = self.store.conversations()
             legacy = {}
             assistant_ids = {group.id for group in groups if group.kind == "assistant"}
             for gid in assistant_ids:
@@ -500,7 +545,7 @@ class Studio:
     def find_task(self, tid):
         if not re.fullmatch(r"t-[a-f0-9]{12}", tid):
             raise StudioError("Unknown task",404)
-        for group in self.store.groups():
+        for group in self.store.conversations():
             store = self.group(group.id)
             if (store.root/"tasks"/tid/"task.json").is_file():
                 return store, store.load_task(tid)
@@ -519,12 +564,10 @@ class Studio:
     def trash(self, gid):
         with self._lock:
             store = self.group(gid)
-            if gid in self._running or store.group.kind == "assistant":
-                raise StudioError("Cannot move this conversation to trash",409)
-            target = self.store.root.parent/"trash"/gid
-            target.parent.mkdir(exist_ok=True)
-            store.root.rename(target)
-            self.store._open.pop(gid, None)
+            affected = [store] if store.parent else self.store.sessions(store)
+            if store.group.kind == "assistant" or any(s.group.id in self._running or s.previews.drafts for s in affected):
+                raise StudioError("Cannot move an active conversation or assistant to trash",409)
+            self.store.trash(store)
             return {"trashed":gid}
 
 

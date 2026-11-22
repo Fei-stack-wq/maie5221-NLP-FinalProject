@@ -109,12 +109,12 @@ class StudioHandler(_Base):
             return self._json(400, {"error":str(exc)})
 
     def _static(self, rel: str):
-        path = (WEB / rel).resolve()
-        if WEB.resolve() not in path.parents or not path.is_file():
+        asset = self.assets.get(rel)
+        if asset is None:
             return self._json(404, {"error": "not found"})
         csp = ("default-src 'self'; img-src 'self' data: http://127.0.0.1:*; frame-src http://127.0.0.1:*; "
                "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'")
-        return self._send(200, path.read_bytes(), _content_type(path), {"Content-Security-Policy": csp})
+        return self._send(200, asset, _content_type(Path(rel)), {"Content-Security-Policy": csp})
 
     def _api_get(self, parts: list[str], query: dict):
         studio = self.studio
@@ -123,7 +123,7 @@ class StudioHandler(_Base):
         if parts == ["bootstrap"]:
             return self._json(200, {"token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
                                     "model":studio.settings.model,"thinking":studio.settings.thinking,
-                                    "preview_port":self.preview_port,"workbench_version":1,"member_max_steps":studio.settings.limits.max_steps,
+                                    "preview_port":self.preview_port,"workbench_version":1,"chat_protocol":1,"member_max_steps":studio.settings.limits.max_steps,
                                     "lead_max_steps":studio.settings.team.lead_max_steps,
                                     "max_delegations":studio.settings.team.max_delegations})
         if parts == ["roles"]:
@@ -131,8 +131,13 @@ class StudioHandler(_Base):
         if len(parts) == 3 and parts[0] == "roles" and parts[2] == "knowledge":
             return self._json(200, studio.roles.history(parts[1]))
         if parts == ["tasks"]:
-            groups = [studio.group(query["group"]).group] if query.get("group") else studio.store.groups()
-            rows = [{**r,"group_name":g.name} for g in groups for r in studio.tasks(g.id)]
+            groups = [studio.group(query["group"]).group] if query.get("group") else studio.store.conversations()
+            rows = []
+            for group in groups:
+                room = studio.group(group.id)
+                label = f"{room.team.name} / {group.name}" if room.parent else group.name
+                rows.extend({**task, "group_name": label, "team_id": room.team.id, "session_id": group.id}
+                            for task in room.tasks())
             return self._json(200, sorted(rows, key=lambda t:t.get("created_at",0), reverse=True))
         if len(parts) >= 4 and parts[0] == "tasks" and parts[2] == "files":
             store, task = studio.find_task(parts[1])
@@ -165,7 +170,7 @@ class StudioHandler(_Base):
         if parts == ["templates"]:
             return self._json(200, templates())
         if parts == ["groups"]:
-            rows = studio.groups()
+            rows = studio.conversations() if query.get("view") == "conversations" else studio.groups()
             term = query.get("filter", "").casefold()
             return self._json(200, [r for r in rows if term in r["name"].casefold()])
         if len(parts) >= 2 and parts[0] == "groups":
@@ -174,6 +179,8 @@ class StudioHandler(_Base):
             if not rest:
                 return self._json(200, studio.state(gid, int(query.get("after", 0) or 0),
                                                     int(query.get("activity_after", 0) or 0)))
+            if rest == ["sessions"]:
+                return self._json(200, studio.sessions(gid))
             if rest == ["chat-stream"]:
                 return self._chat_stream(studio.group(gid))
             if rest == ["files"]:
@@ -216,7 +223,7 @@ class StudioHandler(_Base):
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length") or 0)
-        limit = 28_000_000 if urlsplit(self.path).path == "/api/uploads" else 2_000_000
+        limit = 28_000_000 if urlsplit(self.path).path.endswith("/uploads") else 2_000_000
         if length < 0 or length > limit:
             raise StudioError("request too large", 413)
         raw = self.rfile.read(length) if length else b"{}"
@@ -269,9 +276,16 @@ class StudioHandler(_Base):
                                                            kind=body.get("kind","group"),role_ids=body.get("role_ids",[])))
             if len(parts) >= 2 and parts[0] == "groups":
                 gid, rest = parts[1], parts[2:]
+                if method == "POST" and rest == ["uploads"]:
+                    room = studio.group(gid)
+                    data = base64.b64decode(body["data"], validate=True)
+                    return self._json(201, studio.uploads.save_in_room(room, body["name"], data, studio.settings.api_key))
+                if method == "POST" and rest == ["sessions"]:
+                    return self._json(201, studio.create_session(gid, body.get("name")))
                 if method == "POST" and rest == ["messages"]:
                     return self._json(200, studio.post(gid, body.get("text", ""), attachments=body.get("attachments", []),
-                                                      options=body.get("options"), queue=body.get("queue") is True))
+                                                      options=body.get("options"), queue=body.get("queue") is True,
+                                                      client_id=body.get("client_id")))
                 if method == "POST" and rest == ["cancel"]:
                     return self._json(200, studio.cancel(gid))
                 if method == "DELETE" and not rest:
@@ -332,7 +346,11 @@ def serve(studio: Studio, port: int = 8765, *, ready: threading.Event | None = N
     preview_handler = type("Preview", (PreviewHandler,), {"studio": studio})
     if not 0 <= port <= 65535:
         raise ValueError("Invalid Studio port")
-    handler = type("Handler", (StudioHandler,), {"studio": studio, "studio_token": secrets.token_urlsafe(32)})
+    # A running process must keep serving the frontend that matches its Python API.
+    assets = {p.relative_to(WEB).as_posix(): p.read_bytes() for p in WEB.rglob("*")
+              if p.is_file() and WEB.resolve() in p.resolve().parents}
+    handler = type("Handler", (StudioHandler,), {"studio": studio, "studio_token": secrets.token_urlsafe(32),
+                                                 "assets": assets})
     try:
         main = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:

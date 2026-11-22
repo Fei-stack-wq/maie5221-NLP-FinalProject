@@ -10,6 +10,8 @@ class Draft:
     agent: str
     task_id: str = ""
     request: str = ""
+    client_id: str | None = None
+    phase: str = "processing"
     attachments: tuple = ()
     id: str = field(default_factory=lambda: uuid4().hex)
     parts: list[str] = field(default_factory=list)
@@ -27,11 +29,11 @@ class ChatStream:
         self.changed.notify_all()
 
     @contextmanager
-    def room_turn(self, actor, text, refs):
+    def room_turn(self, actor, text, refs, *, client_id=None):
         # turn_lock serializes direct conversation in a room. Workers have separate slots.
         slot = ("", actor)
         with self.changed:
-            self.drafts[slot] = Draft(actor, request=text, attachments=tuple(r["name"] for r in refs))
+            self.drafts[slot] = Draft(actor, request=text, client_id=client_id, attachments=tuple(r["name"] for r in refs))
             self._notify()
         try:
             yield lambda phase, part: self.fragment("", actor, phase, part)
@@ -45,7 +47,7 @@ class ChatStream:
         with self.changed:
             draft = self.drafts.get(slot)
             if phase == "discard":
-                if not draft or not draft.parts:
+                if not draft or (not draft.parts and draft.phase == "processing"):
                     return
                 # A new identity makes reconnecting and retrying replace the previous attempt.
                 if task_id:
@@ -53,20 +55,35 @@ class ChatStream:
                 else:
                     draft.id = uuid4().hex
                     draft.parts.clear()
+                    draft.phase = "processing"
+            elif phase == "thinking":
+                if draft is None:
+                    draft = self.drafts[slot] = Draft(actor, task_id)
+                if draft.phase != "processing":
+                    return
+                draft.phase = "thinking"
             elif phase == "delta" and text:
                 if draft is None:
                     draft = self.drafts[slot] = Draft(actor, task_id)
+                draft.phase = "streaming"
                 draft.parts.append(text)
             else:
                 return
             self._notify()
 
+    def draft_id_for(self, event):
+        if event["kind"] not in ("room_reply", "progress", "report", "final"):
+            return None
+        with self.changed:
+            draft = self.drafts.get((event.get("task_id", ""), event.get("agent")))
+            return draft.id if draft else None
+
     def committed(self, event):
         with self.changed:
             self.chat_seq = event["seq"]
             task_id = event.get("task_id")
-            if task_id and event["kind"] in ("progress", "report", "final"):
-                self.drafts.pop((task_id, event["agent"]), None)
+            if event.get("kind") == "room_reply" or (task_id and event["kind"] in ("progress", "report", "final")):
+                self.drafts.pop((task_id or "", event["agent"]), None)
             if task_id and event["kind"] == "task_finished":
                 for slot in list(self.drafts):
                     if slot[0] == task_id:
@@ -86,13 +103,13 @@ class ChatStream:
                     active = {}
                     patches = []
                     for draft in self.drafts.values():
-                        offset = offsets.get(draft.id, 0)
-                        active[draft.id] = len(draft.parts)
-                        if draft.id not in offsets or offset < len(draft.parts):
-                            patch = {"id":draft.id, "text":"".join(draft.parts[offset:])}
+                        offset, old_phase = offsets.get(draft.id, (0, None))
+                        active[draft.id] = (len(draft.parts), draft.phase)
+                        if old_phase != draft.phase or offset < len(draft.parts):
+                            patch = {"id":draft.id, "phase":draft.phase, "text":"".join(draft.parts[offset:])}
                             if draft.id not in offsets:
                                 patch.update(agent=draft.agent, task_id=draft.task_id,
-                                             request=draft.request, attachments=draft.attachments)
+                                             request=draft.request, attachments=draft.attachments, client_id=draft.client_id)
                             patches.append(patch)
                     frame = {"after":self.chat_seq, "drafts":patches,
                              "removed":list(offsets.keys()-active.keys())}

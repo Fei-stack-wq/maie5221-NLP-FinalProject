@@ -7,6 +7,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from urllib.error import HTTPError
+from unittest.mock import patch
 from miniagent.server import serve
 from miniagent.studio import Studio
 from tests.helpers import FakeProvider, Script, call, reply, settings
@@ -45,6 +46,24 @@ class RebuildHTTPTest(unittest.TestCase):
             for server in (main,preview):
                 server.shutdown()
                 server.server_close()
+
+    def test_running_instance_serves_its_startup_assets(self):
+        with tempfile.TemporaryDirectory() as web:
+            script = Path(web, "app.js")
+            script.write_text("original")
+            with patch("miniagent.server.WEB",Path(web)):
+                main, preview = serve(self.studio,0)
+            try:
+                script.write_text("next build")
+                Path(web, "later.js").write_text("new asset")
+                base = f"http://127.0.0.1:{main.server_port}"
+                self.assertEqual(request(base+"/static/app.js")[2],b"original")
+                self.assertEqual(request(base+"/static/later.js")[0],404)
+                self.assertEqual(json.loads(request(base+"/api/bootstrap")[2])["chat_protocol"],1)
+            finally:
+                for server in (main,preview):
+                    server.shutdown()
+                    server.server_close()
 
     def test_upload_and_assessor_download(self):
         status,_,body=request(self.base+"/api/uploads","POST",

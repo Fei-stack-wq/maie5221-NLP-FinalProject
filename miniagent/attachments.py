@@ -47,6 +47,22 @@ class Uploads:
         meta = json.loads((self.root / identity / "meta.json").read_bytes())
         return {**meta,"name":self._name(data.get("name",meta["name"]))}
 
+    def save_in_room(self, store, name, data, key=""):
+        return {**Uploads(store.root).save(name, data, key), "session_id":store.group.id}
+
+    def room_ref(self, store, data):
+        scope = data.get("session_id")
+        if scope is None and not store.parent:
+            return self.ref(data)  # Existing uploads and pre-session clients.
+        if scope != store.group.id:
+            raise ValueError("Attachment belongs to another conversation")
+        return {**Uploads(store.root).ref(data), "session_id":scope}
+
+    def original(self, store, ref):
+        checked = self.room_ref(store, ref)
+        root = store.root / "uploads" if "session_id" in checked else self.root
+        return root / checked["id"] / "original"
+
     def tools(self, store, agent, through_seq=None):
         def available():
             return {r["id"]: r for event in store.chat() for r in event.get("attachments", [])
@@ -54,9 +70,10 @@ class Uploads:
 
         def read(ctx, args, copy=False):
             identity = args.get("id", "")
-            if identity not in available():
+            ref = available().get(identity)
+            if not ref:
                 return ToolResult.failure("Unknown attachment in this conversation")
-            p = self.root / identity / "original"
+            p = self.original(store, ref)
             if copy:
                 target = ctx.sandbox.resolve(args["path"])
                 target.parent.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,7 @@
 const $ = (selector) => document.querySelector(selector);
 const state = {
   config: null, templates: [], groups: [], current: null, group: null,
-  sending: new Set(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
+  outbox: new Map(), sendQueues: new Map(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
 };
 let md = null;
 
@@ -113,8 +113,8 @@ function collapsible(node, text) {
   node.classList.add("collapsed");
   const toggle = el("button", { class: "link more", type: "button" }, "展开全文");
   toggle.addEventListener("click", () => {
-    node.classList.toggle("collapsed");
-    toggle.textContent = node.classList.contains("collapsed") ? "展开全文" : "收起";
+    const collapsed = toggle.parentElement.classList.toggle("collapsed");
+    toggle.textContent = collapsed ? "展开全文" : "收起";
   });
   node.append(toggle);
   return node;
@@ -144,6 +144,8 @@ function renderEvent(event) {
     case "dispatch_sent":
     case "dispatch_finished":
       return dispatchNotice(event);
+    case "session_created":
+      return el("div",{class:"divider"},el("span",{},"会话已创建 · "+event.name));
     case "group_created":
       return el("div", { class: "divider" }, el("span", {}, `群聊已创建 · ${event.members.length} 位成员 · 负责人 ${memberName(event.lead)}`));
     case "group_updated": {
@@ -224,7 +226,11 @@ function renderEvent(event) {
     case "final":
       return card("final", event.agent,
         [el("b", {}, `${memberName(event.agent)} · 交付说明`), statusChip(event.status)], markdown(event.text),
-        el("div",{class:"actions"},el("button",{type:"button",class:"primary",onclick:()=>deliveryResponse("我接受这次交付。").catch(showError)},icon("check"),"接受交付"),
+        el("div",{class:"actions"},el("button",{type:"button",class:"primary","data-accept-id":"accept-"+state.current+"-"+event.seq,onclick:async e=>{
+          const button=e.currentTarget; button.disabled=true;
+          const sent=await postChatMessage("我接受这次交付。",{clientId:button.dataset.acceptId});
+          if (sent) button.textContent="已接受交付"; else button.disabled=false;
+        }},icon("check"),"接受交付"),
           button("要求修改",()=>{ $("#input").value="请修改上一份交付：";$("#input").focus(); }),
           button("查看文件",()=>toggleFiles(true))));
     case "task_finished": {
@@ -247,12 +253,8 @@ function renderEvent(event) {
 
 async function answerQuestion(form, text) {
   for (const control of form.querySelectorAll("button,textarea")) control.disabled = true;
-  try {
-    await api(`/groups/${state.current}/messages`, { method: "POST", body: { text } });
-    await poll();
-  } catch (error) {
+  if (!await postChatMessage(text)) {
     for (const control of form.querySelectorAll("button,textarea")) control.disabled = false;
-    showError(error);
   }
 }
 
@@ -261,32 +263,40 @@ let directoryRequest = 0;
 async function loadGroups() {
   const request = ++directoryRequest;
   try {
-    const rows = await api("/groups");
+    const rows = await api("/groups?view=conversations");
     if (request !== directoryRequest) return;
     state.groups = rows;
   } catch { return; }
+  if (state.group && state.group.id===state.current) sessionControls(state.group);
   const list = $("#group-list");
   const signature = JSON.stringify([state.current, state.groups.map(g => [g.id, g.name, g.pinned, g.archived, g.running, g.waiting_for_you, Math.floor(g.last_activity || 0)])]);
   if (signature === state.groupSignature && list.childElementCount) return;  // no churn, no flicker
   state.groupSignature = signature;
-  const visible = state.groups.filter(g => !g.archived && g.kind !== "assistant");
+  const activeTeam=state.groups.find(g=>g.id===state.current)?.team_id;
+  const visible = state.groups.filter(g => !g.archived && g.kind !== "assistant" && g.id===g.team_id);
   const pinned = visible.filter(g => g.pinned);
   // Recent unpinned rooms (and anything that needs you) stay one click away.
   const recent = visible.filter(g => !g.pinned).sort((a, b) => b.last_activity - a.last_activity)
-    .filter((g, i) => i < 5 || g.waiting_for_you || g.running || g.id === state.current);
+    .filter((g, i) => i < 5 || g.waiting_for_you || g.running || g.id === activeTeam);
   const row = (g) => el("li", {
     class: g.id === state.current ? "active" : "", onclick: () => openGroup(g.id), title: g.name,
   }, avatar(g.id, g.name, "sm square"), el("span", { class: "name" }, g.name),
     g.waiting_for_you ? el("span", { class: "pill waiting" }, "待你回复")
       : g.running ? el("span", { class: "pill running" }, "进行中") : null);
-  list.replaceChildren(...pinned.map(row));
-  if (recent.length) list.append(el("li", { class: "empty-hint section" }, "最近"), ...recent.map(row));
+  function teamRows(g) {
+    const rooms=state.groups.filter(r=>r.team_id===g.id && !r.archived);
+    if (g.id!==activeTeam || rooms.length<2) return [row(g)];
+    return [row(g),...rooms.map(r=>el("li",{class:"session-row"+(r.id===state.current?" active":""),
+      onclick:()=>openGroup(r.id)},el("span",{class:"name"},r.session_name)))];
+  }
+  list.replaceChildren(...pinned.flatMap(teamRows));
+  if (recent.length) list.append(el("li", { class: "empty-hint section" }, "最近"), ...recent.flatMap(teamRows));
   if (!pinned.length && !recent.length) list.append(el("li", { class: "empty-hint" }, "新建的群聊会出现在这里"));
 }
 
 // ---------------------------------------------------------------- room
 function stopChatStream() {
-  state.feed?.source.close();
+  state.feed?.source?.close();
   state.feed = null;
 }
 
@@ -295,38 +305,47 @@ function openChatStream(id) {
   const timeline = $("#timeline");
   const root = el("div",{class:"chat-drafts"});
   timeline.append(root);
-  const source = new EventSource("/api/groups/"+encodeURIComponent(id)+"/chat-stream");
-  const feed = {source, root, items:new Map(), requested:0};
+  const feed = {id, source:null, root, items:new Map(), committed:new Set(), finishedDrafts:new Set(), requested:0};
   state.feed = feed;
-  let initial = true;
-  source.onopen = () => { initial = true; };
-  source.onmessage = (event) => {
-    if (state.feed !== feed) return;
+  for (const item of state.outbox.values()) showOutgoing(item);
+  feed.onframe = (event) => {
     const frame = JSON.parse(event.data);
     const nearBottom = timeline.scrollHeight-timeline.scrollTop-timeline.clientHeight < 160;
-    if (initial) {
+    if (feed.initial) {
       for (const draft of feed.items.values()) draft.removeAt = frame.after;
-      initial = false;
+      feed.initial = false;
     }
     for (const patch of frame.drafts) {
+      if (feed.finishedDrafts.has(patch.id)) continue;
       let draft = feed.items.get(patch.id);
       if (patch.agent) {
-        if (draft) draft.box.remove();
-        const box = el("div",{class:"chat-draft"});
-        if (patch.request || patch.attachments.length) {
-          box.append(el("div",{class:"msg user"},el("div",{class:"who"},"你"),
-            el("div",{class:"draft-text"},patch.request),
-            patch.attachments.map(name=>el("span",{class:"chip"},name))));
+        if (draft) {
+          // A reconnect starts with the full text of each still-active draft.
+          delete draft.removeAt;
+          draft.body.data="";
+        } else {
+          const box = el("div",{class:"chat-draft"});
+          const local = state.outbox.get(patch.client_id);
+          let requestNode;
+          if (local) {
+            local.status = ""; showOutgoing(local);
+          } else if ((patch.request || patch.attachments.length) && !feed.committed.has(patch.client_id)) {
+            requestNode = el("div",{class:"msg user"},el("div",{class:"who"},"你"),
+              el("div",{class:"draft-text"},patch.request),
+              patch.attachments.map(name=>el("span",{class:"chip"},name)));
+            box.append(requestNode);
+          }
+          const body = document.createTextNode("");
+          const phase = el("span",{class:"reply-phase",role:"status"});
+          const bubble = el("div",{class:"msg with-avatar"},avatar(patch.agent,memberName(patch.agent)),el("div",{class:"who"},el("b",{"data-actor":patch.agent},memberName(patch.agent)),phase),
+            el("div",{class:"draft-text"},body));
+          box.append(bubble); root.append(box);
+          draft = {box,bubble,body,phase,requestNode,clientId:patch.client_id}; feed.items.set(patch.id,draft);
         }
-        const body = document.createTextNode("");
-        const bubble = el("div",{class:"msg",hidden:true},el("div",{class:"who","data-actor":patch.agent},memberName(patch.agent)),
-          el("div",{class:"draft-text"},body));
-        box.append(bubble); root.append(box);
-        draft = {box,bubble,body}; feed.items.set(patch.id,draft);
       }
-      if (draft && patch.text) {
-        draft.body.appendData(patch.text);
-        draft.bubble.hidden = false;
+      if (draft) {
+        if (patch.text) draft.body.appendData(patch.text);
+        draft.phase.textContent = patch.phase==="thinking" ? "正在思考…" : patch.phase==="processing" ? "正在处理…" : "";
       }
     }
     for (const key of frame.removed) {
@@ -334,13 +353,37 @@ function openChatStream(id) {
       if (draft) draft.removeAt=frame.after;
     }
     retireDrafts();
+    renderWelcome();
     if (nearBottom) timeline.scrollTop=timeline.scrollHeight;
     if (frame.after > state.after && frame.after > feed.requested) {
       feed.requested=frame.after;
       poll();
     }
   };
+  connectChatStream();
 }
+
+function connectChatStream() {
+  const feed = state.feed;
+  if (!feed || feed.source || document.hidden || !state.config?.chat_protocol) return;
+  const source = feed.source = new EventSource("/api/groups/"+encodeURIComponent(feed.id)+"/chat-stream");
+  source.onopen = () => { feed.initial=true; };
+  source.onmessage = event => {
+    if (state.feed===feed && feed.source===source) feed.onframe(event);
+  };
+}
+
+function pauseChatStream() {
+  if (state.feed) { state.feed.source?.close(); state.feed.source=null; }
+  clearTimeout(state.timer);
+}
+
+document.addEventListener("visibilitychange",()=>{
+  if (document.hidden) pauseChatStream();
+  else { connectChatStream(); poll(); }
+});
+window.addEventListener("pagehide",pauseChatStream);
+window.addEventListener("pageshow",connectChatStream);
 
 function retireDrafts() {
   const feed=state.feed;
@@ -354,13 +397,14 @@ function retireDrafts() {
 
 async function openGroup(id) {
   $("#directory").hidden = true;
-  $("#sending-status").hidden = !state.sending.has(id);
-  if (state.current !== id) { state.runOptions = {}; $("#thinking").value = ""; $("#queue").checked = false; }
-  $("#uploads").value = "";
+  switchComposerRoom(id);
+  state.group=null;
+  $("#room-name").textContent=""; $("#room-members").replaceChildren(); $("#session-controls").hidden=true;
+  $("#room-avatars").replaceChildren(); $("#member-panel").hidden=true; $("#workspace-choice").textContent="工作区";
   state.current = id; state.after = 0; state.activityAfter = 0; state.rendered = new Set();
   state.publications=new Map();state.toolWidgets=new Map();state.view="room";
   state.questionForms=new Map();state.worklog=null;setNav(null);
-  $("#attachment-chips").replaceChildren();
+  $("#file-list").replaceChildren(); $("#preview").replaceChildren();
   state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null;
   $("#question-banner").hidden = $("#live").hidden = true;
   history.replaceState(null, "", "#" + id);
@@ -377,7 +421,8 @@ function renderHead() {
   const workspace = $("#workspace-choice");
   workspace.title = g.workspace_path;
   workspace.textContent = "工作区 · "+(g.folder ? g.folder.split(/[\\/]/).filter(Boolean).pop() : "Studio 默认目录")+" ▾";
-  $("#room-name").textContent = g.name;
+  $("#room-name").textContent = g.team_name || g.name;
+  sessionControls(g);
   $("#room-mode").hidden = g.mode !== "autonomous";
   $("#room-avatars").replaceChildren(...g.members.slice(0, 6).map(m => avatar(m.id, m.name, "sm")));
   $("#member-panel").hidden = g.kind !== "group";
@@ -432,17 +477,12 @@ function renderLive(live) {
     banner.hidden = false;
     banner.replaceChildren(el("b", {}, `${memberName(live.question.agent)} 在等你回答`),
       el("span", { class: "q" }, live.question.question.replace(/\s+/g, " ").slice(0, 200)),
-      button("让团队自己决定", async()=>{await api(`/groups/${state.current}/messages`,{method:"POST",body:{text:"Please decide as a team and state your assumptions."}});poll();}));
+      button("让团队自己决定", ()=>postChatMessage("Please decide as a team and state your assumptions.")));
     $("#input").placeholder = "在这里或问题卡片里回答，也可以继续追问……";
   } else {
     banner.hidden = true;
     $("#input").placeholder = "询问进展、补充要求，或勾选「排队为新任务」交办下一项工作……";
   }
-}
-
-async function deliveryResponse(text) {
-  await api("/groups/"+state.current+"/messages",{method:"POST",body:{text}});
-  await poll();
 }
 
 function renderActivity(items) {
@@ -492,13 +532,24 @@ async function refreshRoom(feed, first) {
       state.after = Math.max(state.after, event.seq);
       if (state.rendered.has(event.seq)) continue;
       state.rendered.add(event.seq);
+      const outgoing = event.client_id && reconcileOutgoing(feed,event.client_id);
+      const draft = feed.items.get(event.draft_id);
+      if (event.draft_id) feed.finishedDrafts.add(event.draft_id);
       if (event.task_id && event.changes?.length) {
         const files=new Map(state.publications.get(event.task_id));
         for (const c of event.changes) files.set(c.path,c);
         state.publications.set(event.task_id,files);
       }
       const node = renderEvent(event);
-      if (node) timeline.insertBefore(node,feed.root);
+      const bubble = outgoing || draft?.bubble;
+      if (node && bubble) {
+        bubble.className = node.className + " settled";
+        bubble.replaceChildren(...node.childNodes);
+        timeline.insertBefore(bubble,feed.root);
+        if (state.worklog?.node === node) state.worklog.node = bubble;
+      } else if (node) timeline.insertBefore(node,feed.root);
+      else if (outgoing) outgoing.remove();
+      if (draft) { draft.box.remove(); feed.items.delete(event.draft_id); }
     }
     retireDrafts();
     if (data.events.length && (first || nearBottom)) timeline.scrollTop = timeline.scrollHeight;
@@ -522,37 +573,109 @@ async function refreshRoom(feed, first) {
   } catch (error) {
     console.warn(error);
   }
-  if (state.feed === feed) state.timer = setTimeout(poll, state.live ? 900 : 2500);
+  if (state.feed === feed && !document.hidden) state.timer = setTimeout(poll, state.live ? 900 : 2500);
 }
 
-async function send(event) {
-  event.preventDefault();
-  const input = $("#input");
-  const text = input.value.trim();
-  if ((!text && !$("#uploads").files.length) || !state.current || state.sending.has(state.current)) return;
-  const gid = state.current;
-  state.sending.add(gid);
-  $("#sending-status").hidden = false;
-  const errorBox = $("#composer-error");
-  errorBox.hidden = true;
-  try {
-    const queue = $("#queue").checked;
-    const options = {...state.runOptions};
-    if ($("#thinking").value) options.thinking = $("#thinking").value;
-    const uploads = await Promise.all(Array.from($("#uploads").files, uploadFile));
-    await api(`/groups/${gid}/messages`, {method:"POST", body:{text, attachments:uploads, options, queue}});
-    if (state.current !== gid) return;
-    state.runOptions = {};
-    $("#queue").checked = false; $("#uploads").value = ""; renderUploads();
-    if (input.value.trim() === text) { input.value = ""; autoGrow(); }
-    poll();
-    loadGroups();
-  } catch (error) {
-    if (state.current === gid) { errorBox.textContent = error.message; errorBox.hidden = false; }
-  } finally {
-    state.sending.delete(gid);
-    if (state.current === gid) $("#sending-status").hidden = true;
+function showOutgoing(item) {
+  const feed=state.feed;
+  if (!feed || feed.id!==item.gid || !state.outbox.has(item.id)) return;
+  if (!item.node?.isConnected) {
+    item.feedback=el("div",{class:"outgoing-feedback",role:"status"});
+    item.node=el("div",{class:item.legacy && !item.failed ? "outgoing" : "msg user outgoing"},el("div",{class:"who"},el("b",{},"你")),
+      el("div",{class:"draft-text"},item.text),item.files.map(file=>el("span",{class:"chip"},file.name)),
+      item.feedback);
+    if (item.legacy && !item.failed) item.node.replaceChildren(item.feedback);
+    feed.root.append(item.node);
   }
+  item.feedback.replaceChildren(item.status);
+  if (item.failed) {
+    item.feedback.append(el("button",{class:"link",type:"button",onclick:()=>scheduleSend(item)},"重试"));
+  }
+  item.feedback.hidden=!item.status;
+}
+
+function reconcileOutgoing(feed,id) {
+  feed.committed.add(id);
+  const accept = $("#timeline").querySelector('[data-accept-id="'+CSS.escape(id)+'"]');
+  if (accept) { accept.disabled=true; accept.textContent="已接受交付"; }
+  const item=state.outbox.get(id);
+  let node;
+  if (item?.gid===feed.id) {
+    node=item.node; state.outbox.delete(id);
+  }
+  for (const draft of feed.items.values()) {
+    if (draft.clientId===id && draft.requestNode) {
+      if (node) draft.requestNode.remove(); else node=draft.requestNode;
+    }
+  }
+  return node;
+}
+
+function scheduleSend(item) {
+  const previous=state.sendQueues.get(item.gid);
+  if (item.legacy && item.failed) item.node?.remove();
+  item.failed=false;
+  item.status=previous ? "等待发送…" : item.files.length ? "正在上传附件…" : "正在发送…";
+  showOutgoing(item);
+  const delivery=(async()=>{
+    if (previous) await previous;
+    try {
+      if (item.files.length) {
+        item.status="正在上传附件…"; showOutgoing(item);
+        for (let i=item.uploads.length;i<item.files.length;i++) item.uploads.push(await uploadFile(item.files[i],item.gid));
+      }
+      item.status=item.legacy ? "正在等待完整回复…" : "等待助手接收…"; showOutgoing(item);
+      await api("/groups/"+item.gid+"/messages",{method:"POST",body:{client_id:item.id,text:item.text,
+        attachments:item.uploads,options:item.options,queue:item.queue}});
+      if (item.legacy && state.outbox.has(item.id)) { item.node?.remove(); state.outbox.delete(item.id); }
+      item.status=""; showOutgoing(item);
+      if (state.current===item.gid) await poll();
+      else state.outbox.delete(item.id);  // The committed event will load with the room.
+      loadGroups();
+      return true;
+    } catch (error) {
+      if (item.legacy) item.node?.remove();
+      item.failed=true; item.status=error.message || "发送失败";
+      showOutgoing(item);
+      return false;
+    }
+  })();
+  state.sendQueues.set(item.gid,delivery);
+  item.delivery=delivery;
+  delivery.finally(()=>{
+    if (state.sendQueues.get(item.gid)===delivery) state.sendQueues.delete(item.gid);
+  });
+  return delivery;
+}
+
+function postChatMessage(text,{files=[],options={},queue=false,clientId=crypto.randomUUID()}={}) {
+  const gid=state.current;
+  if (!gid || state.feed?.id!==gid) return Promise.resolve(false);
+  const existing=state.outbox.get(clientId);
+  if (existing && existing.gid===gid) return existing.failed ? scheduleSend(existing) : existing.delivery;
+  const item={id:clientId,gid,text,files,uploads:[],options,queue,legacy:!state.config.chat_protocol};
+  state.outbox.set(item.id,item);
+  const delivery=scheduleSend(item);
+  renderWelcome();
+  const timeline=$("#timeline");
+  timeline.scrollTop=timeline.scrollHeight;
+  return delivery;
+}
+
+function send(event) {
+  event.preventDefault();
+  const input=$("#input"), files=Array.from($("#uploads").files);
+  const text=input.value.trim(), gid=state.current;
+  if ((!text && !files.length) || !gid || state.feed?.id!==gid) return;
+  const options={...state.runOptions};
+  if ($("#thinking").value) options.thinking=$("#thinking").value;
+  const queue=$("#queue").checked;
+  input.value=""; autoGrow();
+  $("#uploads").value=""; renderUploads();
+  $("#queue").checked=false; state.runOptions={};
+  $("#composer-error").hidden=true;
+  postChatMessage(text,{files,options,queue});
+  input.focus();
 }
 
 // ---------------------------------------------------------------- files
@@ -637,7 +760,7 @@ function openDialog(group = null) {
   $("#group-dialog-title").textContent = group ? "编辑群聊" : "新建群聊";
   $("#save-group").textContent = group ? "保存" : "创建";
   $("#template").parentElement.hidden = Boolean(group);
-  $("#group-name").value = group ? group.name : "";
+  $("#group-name").value = group ? group.team_name || group.name : "";
   $("#group-mode").value = group ? group.mode : "interactive";
   $("#member-rows").replaceChildren(...(group ? group.members : [{ id: "lead", name: "Team Lead", prompt: "" }]).map(memberRow));
   refreshLead(group ? group.lead : "lead");
@@ -661,11 +784,11 @@ async function saveGroup(event) {
     body.role_ids = body.members.filter(m=>state.boundRoles.has(m.id)).map(m=>m.id);
 
     const result = state.editing
-      ? await api(`/groups/${state.editing.id}`, { method: "PATCH", body })
+      ? await api(`/groups/${state.editing.team_id || state.editing.id}`, { method: "PATCH", body })
       : await api("/groups", { method: "POST", body });
     $("#group-dialog").close();
     await loadGroups();
-    openGroup(result.id);
+    openGroup(state.editing?.id || result.id);
   } catch (error) {
     $("#group-error").textContent = error.message; $("#group-error").hidden = false;
   }
@@ -694,7 +817,7 @@ function renderWelcome() {
   const timeline = $("#timeline"), g = state.group;
   const existing = timeline.querySelector(".welcome");
   const substantive = [...timeline.children].some(n => !n.classList.contains("divider") && !n.classList.contains("chat-drafts") && !n.classList.contains("welcome"));
-  if (substantive || !g || state.live) { existing?.remove(); return; }
+  if (substantive || state.feed?.root.childElementCount || !g || state.live) { existing?.remove(); return; }
   if (existing) return;
   const assistant = g.kind === "assistant";
   const lead = g.members.find(m => m.id === g.lead);
@@ -755,8 +878,12 @@ async function boot() {
   if (window.markdownit) md = window.markdownit({ html: false, linkify: true, breaks: true });
   state.config = await api("/bootstrap");
   state.templates = state.config.templates;
+  if (!state.config.chat_protocol) {
+    $("#composer").prepend(el("div",{class:"muted small",role:"status"},
+      "当前 Studio 服务只支持整段回复。重启这个实例并刷新页面可开启流式回复。"));
+  }
   setupDirectory();setupReader();fillIcons();updateConnection();
-  setupComposer();
+  setupComposer(); setupSessions();
   $("#config").textContent = `负责人 ≤${state.config.lead_max_steps} 步 · 成员 ≤${state.config.member_max_steps} 步`;
   $("#template").append(...state.templates.map((t) => el("option", { value: t.id }, t.name)));
   $("#template").addEventListener("change", applyTemplate);
@@ -767,7 +894,8 @@ async function boot() {
   $("#group-form").addEventListener("submit", saveGroup);
   $("#composer").addEventListener("submit", send);
   $("#input").addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) send(event);
+    if (mentionKey(event)) return;
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode!==229) send(event);
   });
   $("#toggle-files").addEventListener("click", () => toggleFiles());
   $("#close-files").addEventListener("click", () => toggleFiles(false));
@@ -781,7 +909,7 @@ async function boot() {
     }
   });
   await loadGroups();
-  setInterval(loadGroups, 5000);
+  setInterval(()=>{ if (!document.hidden) loadGroups(); }, 5000);
   const hash = location.hash.slice(1);
   if (taskAddress(hash)) await openTaskAddress(hash);
   else if (Object.hasOwn(directoryRoutes,hash)) await directoryRoutes[hash]();

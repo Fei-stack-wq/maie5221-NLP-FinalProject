@@ -6,9 +6,16 @@ from .room_turn import read_excerpt, task_evidence
 
 
 def directory(groups):
-    return [{"id":g.id, "name":g.name, "kind":g.kind, "lead":g.lead,
-             "members":[m.id for m in g.members], "archived":g.archived}
-            for g in groups if g.kind != "assistant"]
+    teams = {g.id: g for g in groups}
+    rooms = []
+    for g in groups:
+        if g.kind == "assistant":
+            continue
+        owner = teams[g.id.partition("-s-")[0]]
+        rooms.append({"id": g.id, "name": g.name, "kind": g.kind, "lead": g.lead,
+                      "team_id": owner.id, "team_name": owner.name,
+                      "members": [m.id for m in g.members], "archived": g.archived or owner.archived})
+    return rooms
 
 
 @lru_cache(maxsize=128)
@@ -45,7 +52,7 @@ def legacy_dispatch_origins(source):
 
 
 def workspace_evidence(studio, source):
-    groups = studio.store.groups()
+    groups = studio.store.conversations()
     legacy = legacy_dispatch_origins(source)
     receipts = []
     for group in groups:

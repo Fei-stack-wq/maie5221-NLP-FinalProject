@@ -26,7 +26,7 @@ function artifactCards(scope, changes) {
 }
 
 function taskAddress(hash) {
-  return /^(g-[a-f0-9]{12})\/task\/(t-[a-f0-9]{12})$/.exec(hash);
+  return /^(g-[a-f0-9]{12}(?:-s-[a-f0-9]{12})?)\/task\/(t-[a-f0-9]{12})$/.exec(hash);
 }
 async function openTaskAddress(hash) {
   const [,gid,tid]=taskAddress(hash);
@@ -159,7 +159,7 @@ async function workbenchView() {
   const root=enterView("workbench");
   history.replaceState(null,"","#workbench");
   const view=el("section",{class:"workbench"}); root.append(view);
-  const [tasks,rooms]=await Promise.all([api("/tasks"),api("/groups")]);
+  const [tasks,rooms]=await Promise.all([api("/tasks"),api("/groups?view=conversations")]);
   if (!view.isConnected) return;
   const stats=el("div",{class:"bench-stats"}), list=el("section",{class:"bench-list"});
   const categories=[
@@ -183,7 +183,7 @@ async function workbenchView() {
   categories.forEach(([name,test],i)=>stats.append(el("button",{type:"button",onclick:()=>select(i)},
     el("span",{},name),el("strong",{},String(tasks.filter(test).length)))));
   const target=el("select",{"aria-label":"发送到会话",required:true},el("option",{value:""},"选择会话"),
-    ...rooms.filter(g=>!g.archived).map(g=>el("option",{value:g.id},g.name)));
+    ...rooms.filter(g=>!g.archived).map(g=>el("option",{value:g.id},g.id===g.team_id ? g.name : g.team_name+" / "+g.name)));
   const input=el("textarea",{rows:2,placeholder:"给哪个团队交办什么工作？","aria-label":"消息",required:true});
   const form=el("form",{class:"bench-compose"},el("h3",{},"发消息"),input,
     el("div",{class:"actions"},target,el("button",{type:"submit",class:"primary"},"发送到会话")));

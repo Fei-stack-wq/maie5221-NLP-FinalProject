@@ -56,17 +56,17 @@ async function fillLibrary() {
     event.target.value = "";
   };
 }
-async function uploadFile(file) {
+async function uploadFile(file, roomId) {
   if (file.size > 20 * 1024 * 1024) throw Error("附件超过 20 MiB");
   const data = await new Promise((resolve,reject)=>{
     const reader = new FileReader();
     reader.onload=()=>resolve(String(reader.result).split(",")[1]);
     reader.onerror=reject; reader.readAsDataURL(file);
   });
-  return api("/uploads",{method:"POST",body:{name:file.name,data}});
+  return api("/groups/"+roomId+"/uploads",{method:"POST",body:{name:file.name,data}});
 }
 async function roomsView() {
-  const root = enterView("rooms"), rooms = await api("/groups");
+  const root = enterView("rooms"), rooms = await api("/groups?view=conversations");
   if (state.view!=="rooms" || state.current) return;
   const search = editInput("",{placeholder:"搜索群聊或私聊","aria-label":"搜索会话",type:"search"});
   const kinds = ["全部","群聊","私聊","已归档"];
@@ -77,9 +77,9 @@ async function roomsView() {
     for (const b of segmented.children) b.setAttribute("aria-pressed", b.textContent===kind);
     const visible = rooms.filter(g=>g.kind!=="assistant" && g.archived===(kind==="已归档")
       && (!["私聊","群聊"].includes(kind) || g.kind===(kind==="私聊"?"dm":"group"))
-      && g.name.toLowerCase().includes(search.value.toLowerCase())).sort((a,b)=>b.last_activity-a.last_activity);
+      && (g.team_name+" "+g.name).toLowerCase().includes(search.value.toLowerCase())).sort((a,b)=>b.last_activity-a.last_activity);
     list.replaceChildren(...visible.map(g=>el("button",{type:"button",class:"card",onclick:()=>openGroup(g.id).catch(showError)},
-      el("div",{class:"card-top"},avatar(g.id,g.name,"square"),el("strong",{},g.name),
+      el("div",{class:"card-top"},avatar(g.id,g.name,"square"),el("strong",{},g.team_id!==g.id?g.team_name+" / "+g.name:g.name),
         g.waiting_for_you?el("span",{class:"status interrupted"},"待你回复"):g.running?statusChip("running"):null),
       el("div",{class:"card-meta"},el("span",{class:"kind"+(g.kind==="dm"?" dm":"")},g.kind==="dm"?"私聊":"群聊"),
         el("span",{class:"avatar-stack"},...(g.members||[]).slice(0,5).map(m=>avatar(m.id,m.name,"sm"))),
@@ -224,10 +224,10 @@ function roomOptions() {
   const g=state.group;
   const patch=async body=>{await api("/groups/"+g.id,{method:"PATCH",body});$("#sheet").close();await openGroup(g.id);};
   sheet("会话管理",el("p",{},g.members.map(m=>m.name+" (@"+m.id+")").join(" · ")),
-    button(g.pinned?"取消固定":"固定到侧栏",()=>patch({pinned:!g.pinned})),
-    button(g.archived?"恢复会话":"归档会话",()=>patch({archived:!g.archived})),
+    ...(g.team_id===g.id?[button(g.pinned?"取消固定":"固定到侧栏",()=>patch({pinned:!g.pinned}))]:[]),
+    button(g.kind==="group" && g.id===g.team_id ? (g.archived?"恢复群组":"归档群组") : (g.archived?"恢复会话":"归档会话"),()=>patch({archived:!g.archived})),
     button("会话工作区",workspaceSheet),
-    button("移到废纸篓",async()=>{if(confirm("将此会话移到本地废纸篓？")){await api("/groups/"+g.id,{method:"DELETE"});$("#sheet").close();await roomsView();}}));
+    button("移到废纸篓",async()=>{if(confirm(g.kind==="group" && g.id===g.team_id ? "将整个群组及其全部会话移到本地废纸篓？" : "将此会话移到本地废纸篓？")){await api("/groups/"+g.id,{method:"DELETE"});$("#sheet").close();await roomsView();}}));
 }
 function runOptions() {
   const opts=state.runOptions||{};

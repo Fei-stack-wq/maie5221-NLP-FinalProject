@@ -182,7 +182,7 @@ def cmd_demo(args) -> int:
 def cmd_report(args) -> int:
     settings = _settings(args)
     studio = Studio(settings)
-    groups = [studio.group(args.group)] if args.group else [studio.group(g.id) for g in studio.store.groups()]
+    groups = [studio.group(args.group)] if args.group else [studio.group(g.id) for g in studio.store.conversations()]
     for store in groups:
         print(group_report(store))
         print()

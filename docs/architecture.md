@@ -3,10 +3,10 @@
 miniagent is a small multi-agent collaboration system. A **group** has members
 with role prompts; one member is the **lead**. A requester (the human) posts a
 task in the group chat; the lead plans, delegates pieces to members, may ask other members to review, asks the requester when a decision is theirs,
-and finishes with a final answer. Files are the team's shared output.
+and finishes with a final answer. Each session has its own chat and project. Its members can share files across tasks in that session.
 
 ```
-browser ── server.py (API + UI, preview origin) ── studio.py (one task thread per group)
+browser ── server.py (API + UI, preview origin) ── studio.py (one task thread per session)
                                                        │
                                                   team.py  TeamTask
                                                    │   lead Agent ── delegate_task ──► member Agent
@@ -201,6 +201,10 @@ Each group holds its own transient drafts, one per task and actor plus one for t
 
 This follows the separation between incremental model events and committed items in the [OpenAI Agents SDK streaming implementation](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/src/agents/result.py#L1005-L1080) and its [terminal output regressions](https://github.com/openai/openai-agents-python/blob/91fb508a8931016efa793b033147d08cd20308cf/tests/test_streamed_terminal_output_backfill.py#L62-L118). Studio reuses its existing room log for recovery. `tests/test_chat_stream.py` holds the model stream open until Chromium has rendered the first segment, including across a refresh.
 
+The composer immediately echoes a submission in its room, captures attachments and clears the input. A client message ID reconciles that bubble with the room draft and the durable input. Sends from one tab are ordered per room, so the user can type and send a follow-up while a preceding request is pending. A failed submission retains its text and attachments for an explicit retry. Studio checks committed IDs under the turn lock. A repeated ID returns the original receipt without executing another model turn.
+
+The assistant bubble shows a processing state when the router accepts the message, a thinking state on the first provider reasoning fragment, and public text as it arrives. Background tabs release the event stream and reconnect using the room snapshot when visible again. Browser regressions hold the message POST, thinking phase and successive HTTP body chunks independently, and exercise consecutive sends, failures and retries. The immediate user append and distinct pending and streaming states follow [Vercel AI SDK Chat](https://github.com/vercel/ai/blob/ai%406.0.0/packages/ai/src/ui/chat.ts) and its [chat tests](https://github.com/vercel/ai/blob/ai%406.0.0/packages/ai/src/ui/chat.test.ts).
+
 ## Verification
 
 * `python -m unittest discover -s tests -t .` — offline suite (scripted model):
@@ -209,3 +213,31 @@ This follows the separation between incremental model events and committed items
   questions, budgets, @mentions, cross-task context, HTTP API and preview origin.
 * `python -m miniagent demo` — offline end-to-end team run.
 * Live runs of the Mid_Test scenarios: see [mid-test-status.md](mid-test-status.md).
+
+
+Each Studio process snapshots its bundled UI assets at startup and advertises
+`chat_protocol: 1` in bootstrap. Running an old API with JavaScript loaded
+from a newer checkout previously left both the local echo and the saved user
+message visible, while the missing stream endpoint returned 404. A page that
+encounters a pre-stream backend now shows its capability and renders the
+durable exchange once. Restarting the instance on the same port and data
+directory enables streaming for its existing rooms.
+
+On a streaming backend each committed public assistant event carries its
+transient `draft_id` when available. The client promotes the same DOM bubble
+to committed Markdown, including when polling beats the final stream frame.
+A late snapshot cannot resurrect it. Outgoing user bubbles use their client
+IDs the same way. The acceptance button uses an ID scoped to that room and
+delivery so another click or a reload does not repeat the receipt. Ordinary
+submissions with identical text still have separate IDs. The identity-based
+update follows [Vercel AI SDK Chat.makeRequest](https://github.com/vercel/ai/blob/ai%406.0.0/packages/ai/src/ui/chat.ts#L574-L599).
+
+## Groups and sessions
+
+A collaboration group owns one roster and lead. The original group ID continues to address its default session. Its chat log, workspace binding, published project, task IDs and links stay at their original locations. Additional sessions use an address of the form `g-…-s-…` and live in `groups/<team>/sessions/<session>/`. Their manifest stores the display name, creation time, optional workspace binding and archive flag. Group settings are resolved from the owner on load and after a roster edit.
+
+The browser requests `GET /api/groups/<team>/sessions` or the directory projection `GET /api/groups?view=conversations`. `POST /api/groups/<team>/sessions` accepts a name and returns the new room. Existing message, task, stream, preview, export and file endpoints take the returned room ID. The session owns its timeline, local notes, attachments, active worker, queue, working copies and published versions. Each new upload goes to `POST /api/groups/<room>/uploads` and carries the room ID. Explicit folder bindings for siblings must be disjoint. Approved general role knowledge can still follow the role between rooms.
+
+An unaddressed work request goes to the current group's lead, who can do the work or use synchronous delegation to chosen members. A leading mention selects a primary member for that task. Ordinary follow-ups use the current session's read-only evidence. A subsequent independent task in the same session can reuse earlier deliveries. Super Agent can create sessions and dispatch to their addresses; direct work in an existing group needs no additional Super Agent turn.
+
+The channel/topic split and composer interaction were informed by Zulip's [topic-scoped message lookup](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/zerver/lib/topic.py#L81-L91) and [mention insertion](https://github.com/zulip/zulip/blob/a57ea58f7b32ef1fe34ea1ee0e6c5d40e08879d2/web/src/composebox_typeahead.ts#L1459-L1491). Studio's task and filesystem boundaries are implemented locally. `tests/test_group_sessions.py` exercises this contract with disk reloads, concurrent workers and a browser submitting work to two sessions of the same team.

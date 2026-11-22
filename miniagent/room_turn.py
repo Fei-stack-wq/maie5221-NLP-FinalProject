@@ -57,7 +57,7 @@ def read_excerpt(store, uploads, context, args):
     try:
         if "attachment_id" in args and not args.keys() - {"attachment_id", "offset"}:
             ref = next(r for r in context["attachments"] if r["id"] == args["attachment_id"])
-            with (uploads.root / uploads.ref(ref)["id"] / "original").open("rb") as stream:
+            with uploads.original(store, ref).open("rb") as stream:
                 return excerpt(stream)
         if set(args) - {"task_id", "path", "offset"}:
             return "Unknown evidence reference."

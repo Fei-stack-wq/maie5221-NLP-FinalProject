@@ -109,7 +109,7 @@ class HumanChannel:
         with self._cond:
             return dict(self._pending) if self._pending and self._answer is None else None
 
-    def receive(self, text: str, *, attachments=(), answer_to=None, steer_only=False) -> str:
+    def receive(self, text: str, *, attachments=(), answer_to=None, steer_only=False, client_id=None) -> str:
         """Apply an answer to its exact question, or steer without consuming a question."""
         with self._cond:
             if self._finished or self.should_cancel():
@@ -117,14 +117,15 @@ class HumanChannel:
             pending = self._pending if self._answer is None else None
             if answer_to is not None and (not pending or pending["id"] != answer_to):
                 return "stale"
+            receipt = {"client_id":client_id} if client_id else {}
             if pending and not steer_only:
                 self._answer = text
                 self.store.append("answer", task_id=self.task_id, qid=pending["id"], text=text,
-                                  agent=pending["agent"], attachments=list(attachments))
+                                  agent=pending["agent"], attachments=list(attachments), **receipt)
                 self._cond.notify_all()
                 return "answer"
             message = self.store.append("user_message", task_id=self.task_id, text=text, during_task=True,
-                              attachments=list(attachments))
+                              attachments=list(attachments), **receipt)
             self._messages.append((message["seq"], text))
             return "steering"
 

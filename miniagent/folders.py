@@ -32,7 +32,7 @@ def bind(store, raw):
     if not root.is_absolute() or not root.is_dir():
         raise ValueError("Choose an existing absolute directory")
     root = root.resolve()
-    runs = store.root.parents[1].resolve()
+    runs = (store.parent or store).root.parents[1].resolve()
     if root == Path.home() or root == runs or root in runs.parents or runs in root.parents:
         raise ValueError("Choose a project outside Studio's data directory")
     store.group.folder = str(root)
