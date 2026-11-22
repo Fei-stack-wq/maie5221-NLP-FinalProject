@@ -116,6 +116,37 @@ class StudioFusionTest(unittest.TestCase):
         self.assertEqual(self.service.group(gid).load_task(queued["task_id"])["status"],"completed")
         self.assertFalse((self.service.group(gid).project.root/"draft.md.miniagent-conflict").exists())
 
+    def test_selected_workspace_isolated_across_folder_changes_and_restart(self):
+        gid=self.dm()
+        store=self.service.group(gid)
+        builtin=store.project.root
+        (builtin/"internal.txt").write_text("Earlier room delivery")
+        folders=[self.root/"Project A",self.root/"Project B"]
+        for folder in folders:
+            folder.mkdir()
+            (folder/"brief.txt").write_text(folder.name)
+            self.service.update_group(gid,{"folder":str(folder)})
+            self.script.queues["dev"]=[reply("",call("read_file",path="brief.txt")),
+                reply("",call("write_file",path=folder.name+".md",content=folder.name)),reply("Published.")]
+            self.service.post(gid,"Deliver",queue=True)
+            self.service.wait(gid)
+            self.assertEqual((store.project.root/"brief.txt").read_text(),folder.name)
+            self.assertFalse((store.project.root/"internal.txt").exists())
+            self.assertEqual((folder/(folder.name+".md")).read_text(),folder.name)
+        self.assertFalse((folders[1]/"Project A.md").exists())
+        self.assertFalse((folders[0]/"Project B.md").exists())
+        self.service.update_group(gid,{"folder":""})
+        self.assertEqual(store.project.root,builtin)
+        self.assertEqual((builtin/"internal.txt").read_text(),"Earlier room delivery")
+        self.service.update_group(gid,{"folder":str(folders[0])})
+        self.assertTrue((store.project.root/"Project A.md").is_file())
+        self.assertFalse((store.project.root/"Project B.md").exists())
+        self.service.close()
+        reopened=Studio(self.service.settings,lambda _:self.provider)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.summary(reopened.group(gid))["workspace_path"],str(folders[0].resolve()))
+        self.assertEqual((reopened.group(gid).project.root/"brief.txt").read_text(),"Project A")
+
     def test_partial_reply_is_cleared_on_provider_retry(self):
         from miniagent.studio import Running
         running = Running("t-test", "dev", None, None)

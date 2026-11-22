@@ -8,11 +8,23 @@ from .workspace import scan, _copy
 
 
 def pick():
-    if sys.platform != "darwin":
-        raise ValueError("Enter the local folder path on this platform.")
-    result = subprocess.run(["osascript", "-e", 'POSIX path of (choose folder with prompt "选择团队工作区")'],
-                            capture_output=True, text=True)
-    return result.stdout.strip() if result.returncode == 0 else ""
+    if sys.platform == "darwin":
+        command = ["/usr/bin/osascript", "-e", 'POSIX path of (choose folder with prompt "选择项目工作区")']
+    else:
+        command = [sys.executable, "-c",
+                   "from tkinter import Tk, filedialog\n"
+                   "root = Tk()\nroot.withdraw()\n"
+                   "print(filedialog.askdirectory(parent=root, title='选择项目工作区', mustexist=True))\n"
+                   "root.destroy()"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError:
+        raise ValueError("无法打开系统选择器，请输入本机文件夹的绝对路径。") from None
+    if result.returncode == 0:
+        return result.stdout.rstrip("\r\n")
+    if sys.platform == "darwin" and "(-128)" in result.stderr:
+        return ""
+    raise ValueError("无法打开系统选择器，请输入本机文件夹的绝对路径。")
 
 
 def bind(store, raw):
@@ -33,7 +45,7 @@ def checked(root, rel):
     return target
 
 
-def sync(store, *, importing, key=""):
+def sync(store, *, importing, key="", published=None):
     folder = store.group.folder
     if not folder:
         return []
@@ -41,9 +53,10 @@ def sync(store, *, importing, key=""):
     if not external.is_dir() or external.is_symlink() or external.resolve() != external:
         raise ValueError("Bound folder moved or is unavailable")
     project = store.project.root.resolve()
-    state = store.root / "folder-sync.json"
+    state = store.folder_state
     baseline = json.loads(state.read_bytes()) if state.exists() else {}
-    if baseline.get("folder") != folder:
+    first_import = baseline.get("folder") != folder
+    if first_import:
         baseline = {}
     previous = baseline.get("files", {})
     outside, skipped = scan(external)
@@ -52,12 +65,13 @@ def sync(store, *, importing, key=""):
     updated = dict(previous)
     conflicts = dict(baseline.get("conflicts", {}))
     generated = set(baseline.get("conflict_files", []))
-    for name in sorted(outside.keys() | inside.keys() | previous.keys()):
+    names = outside.keys() | inside.keys() | previous.keys() if published is None else published
+    for name in sorted(names):
         if name in generated:
             continue
         ext, obj, old = outside.get(name), inside.get(name), previous.get(name)
         if importing:
-            if ext == old or (obj != old and obj != ext):
+            if ext == old or (not first_import and obj != old and obj != ext):
                 continue
             src, dst, sha = external, project, ext
         else:

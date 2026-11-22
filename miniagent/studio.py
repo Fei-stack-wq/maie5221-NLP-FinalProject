@@ -91,6 +91,7 @@ class Studio:
         self._running: dict[str, Running] = {}
         self._lock = threading.RLock()
         self._dispatch_changed = threading.Condition(self._lock)
+        self._folder_sync_lock = threading.Lock()
 
     # -- groups -----------------------------------------------------------
     def create_group(self, name: str, members: list[dict], lead: str, mode: str = "interactive", *, role_ids=(), kind="group", created_by=None) -> dict:
@@ -102,7 +103,11 @@ class Studio:
                 notes = {m["id"]:m.get("note","") for m in members}
                 roster = [m for m in members if m["id"] not in role_ids]
                 roster.extend({**row,"note":notes.get(row["id"],"")} for row in selected)
-                store = self.store.create(name, roster, lead, mode, role_ids=list(role_ids), kind=kind, created_by=created_by)
+                source = self.group(created_by["group_id"]).group if created_by else None
+                from_assistant = source is not None and source.kind == "assistant"
+                store = self.store.create(name, roster, lead, mode, role_ids=list(role_ids), kind=kind,
+                                          created_by=created_by, pinned=from_assistant and kind=="group",
+                                          folder=source.folder if from_assistant else "")
                 self._bind_matching_roles(store.group)
                 self.store.update_group(store)
                 dispatch_notices.group_created(self, store)
@@ -127,7 +132,8 @@ class Studio:
     def summary(self, store: GroupStore) -> dict:
         running = self._running.get(store.group.id)
         tasks = store.tasks()
-        return {**store.group.to_dict(), "running": bool(running),
+        return {**store.group.to_dict(), "workspace_path":store.group.folder or str(store.project.root.resolve()),
+                "running": bool(running),
                 "waiting_for_you": bool(running and running.channel.pending()),
                 "last_activity": (store.root/"chat.jsonl").stat().st_mtime, "tasks": len(tasks), "last_status": tasks[-1]["status"] if tasks else None}
 
@@ -147,6 +153,7 @@ class Studio:
                 raise StudioError("Wait for the task before rebinding or archiving its workspace.", 409)
             group = store.group
             original = group.to_dict()
+            old_project, old_state = store.project, store.folder_state
             try:
                 if "name" in changes:
                     group.name = str(changes["name"]).strip()
@@ -178,10 +185,13 @@ class Studio:
                 group.validate()
                 if "members" in changes or "role_ids" in changes:
                     self._bind_matching_roles(group)
+                if group.folder != original["folder"]:
+                    store.select_project()
                 self.store.update_group(store)
             except (ValueError, KeyError, TypeError, AttributeError, OSError) as exc:
                 restored = type(group).from_dict(original)
                 store.group.__dict__.update(restored.__dict__)
+                store.project, store.folder_state = old_project, old_state
                 raise StudioError(f"Invalid change: {exc}") from None
             old_names = {m["id"]:m["name"] for m in original["members"]}
             new_names = {m.id:m.name for m in group.members}
@@ -376,7 +386,9 @@ class Studio:
         try:
             settings, mode = self._task_settings(store, record["options"])
             provider = self.provider_factory(settings)
-            for warning in sync(store, importing=True, key=settings.api_key):
+            with self._folder_sync_lock:
+                warnings = sync(store, importing=True, key=settings.api_key)
+            for warning in warnings:
                 store.append("system",task_id=tid,text=warning)
             members = []
             for member in store.group.members:
@@ -432,11 +444,17 @@ class Studio:
         with self._lock:
             groups = self.store.groups()
             legacy = {}
-            for group in groups:
-                if group.kind == "assistant":
-                    legacy.update(legacy_dispatch_origins(self.group(group.id)))
+            assistant_ids = {group.id for group in groups if group.kind == "assistant"}
+            for gid in assistant_ids:
+                legacy.update(legacy_dispatch_origins(self.group(gid)))
             for g in groups:
                 store = self.group(g.id)
+                # Older releases wrote pinned=False for every room. An update in those
+                # releases did not record which preferences were changed, so respect it.
+                if (g.kind == "group" and (g.created_by or {}).get("group_id") in assistant_ids
+                        and not g.pinned and not g.archived and not any(e["kind"] == "group_updated" for e in store.chat())):
+                    store.group.pinned = True
+                    self.store.update_group(store)
                 dispatch_notices.group_created(self, store)
                 active = self._running.get(g.id)
                 for task in store.tasks():
@@ -517,7 +535,13 @@ class Studio:
             try:
                 snapshot(store, task.task_id)
                 result["evaluation"] = evaluate(store, task.options.get("checks", []), task.settings)
-                result["folder_warnings"] = sync(store, importing=False, key=task.settings.api_key)
+                if store.group.folder:
+                    published = {c["path"] for c in task_changes(store, task.task_id)}
+                    with self._folder_sync_lock:
+                        result["folder_warnings"] = sync(store, importing=False, key=task.settings.api_key,
+                                                         published=published)
+                else:
+                    result["folder_warnings"] = []
             except (ValueError, OSError) as exc:
                 result["delivery_warning"] = str(exc)
             store.save_task(result)

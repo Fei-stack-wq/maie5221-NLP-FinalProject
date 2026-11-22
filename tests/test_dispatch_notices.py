@@ -113,8 +113,30 @@ class DispatchNoticesTest(unittest.TestCase):
         self.assertIn("could not be found",self.source.load_task(result["task_id"])["final_answer"])
         self.assertEqual(len([e for e in self.notices() if e["kind"]=="dispatch_sent"]),2)
 
+    def test_auto_pin_migrates_untouched_groups_and_respects_later_preferences(self):
+        origin={"group_id":self.aid,"task_id":"t-000000000000"}
+        new=self.studio.create_group("New",[],"writer",role_ids=["writer"],created_by=origin)
+        private=self.studio.create_group("DM",[],"writer",role_ids=["writer"],kind="dm",created_by=origin)
+        self.assertTrue(new["pinned"])
+        self.assertFalse(private["pinned"])
+        self.assertFalse(self.studio.summary(self.studio.group(self.gid))["pinned"])
+        legacy=self.studio.group(new["id"])
+        legacy.group.pinned=False
+        self.studio.store.update_group(legacy)
+        self.reopen()
+        self.assertTrue(self.studio.group(new["id"]).group.pinned)
+        self.studio.update_group(new["id"],{"pinned":False})
+        self.reopen()
+        self.assertFalse(self.studio.group(new["id"]).group.pinned)
+        self.assertFalse(self.studio.group(private["id"]).group.pinned)
+
     def test_original_chat_links_live_result_and_versioned_artifact(self):
         gate = threading.Event()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        workspace = Path(tmp.name).resolve()/"前台工作区"
+        workspace.mkdir()
+        (workspace/"brief.txt").write_text("Front desk")
         def write_when_released(messages):
             self.assertTrue(gate.wait(20))
             return reply("",call("write_file",path="memo.md",content="# Original memo"))
@@ -135,6 +157,18 @@ class DispatchNoticesTest(unittest.TestCase):
                     errors=[]
                     page.on("pageerror",lambda error:errors.append(str(error)))
                     page.goto(base+"#"+self.aid)
+                    choice = page.locator("#workspace-choice")
+                    expect(choice).to_contain_text("Studio 默认目录")
+                    choice.click()
+                    expect(page.locator(".workspace-path")).to_have_text(str(self.source.project.root.resolve()))
+                    choose = page.get_by_role("button",name="选择本地文件夹…")
+                    with patch("miniagent.server.pick",return_value=""):
+                        choose.click()
+                        expect(choose).to_be_enabled()
+                        expect(page.locator("#sheet")).to_be_visible()
+                    with patch("miniagent.server.pick",return_value=str(workspace)):
+                        choose.click()
+                        expect(choice).to_contain_text(workspace.name)
                     page.locator("#input").fill(text)
                     page.locator("#composer button[type=submit]").click()
                     sent=page.locator('[data-notice="dispatch_sent"]')
@@ -144,6 +178,11 @@ class DispatchNoticesTest(unittest.TestCase):
                     expect(sent.get_by_role("link",name="查看任务")).to_be_visible()
                     sent_event=self.notices()[1]
                     gid,tid=sent_event["target_group_id"],sent_event["target_task_id"]
+                    pinned = page.locator("#group-list li").filter(has_text="Writing Room")
+                    expect(pinned).to_be_visible()
+                    target = self.studio.group(gid)
+                    self.assertEqual(target.group.folder,str(workspace))
+                    self.assertEqual((target.project.root/"brief.txt").read_text(),"Front desk")
                     task_link=sent.get_by_role("link",name="查看任务")
                     expect(task_link).to_have_attribute("href","#"+gid+"/task/"+tid)
                     expect(returned).to_have_count(0)
@@ -161,6 +200,7 @@ class DispatchNoticesTest(unittest.TestCase):
                     gate.set()
                     expect(returned).to_contain_text("Delivered memo.md.",timeout=10000)
                     self.studio.wait(gid)
+                    self.assertEqual((workspace/"memo.md").read_text(),"# Original memo")
                     self.studio.post(gid,"Update memo.md",queue=True)
                     self.studio.wait(gid)
                     page.reload()
@@ -173,6 +213,20 @@ class DispatchNoticesTest(unittest.TestCase):
                     expect(deep.locator("#sheet")).to_contain_text(tid)
                     sent.get_by_role("link",name="Writing Room").click()
                     expect(page.locator("#room-name")).to_contain_text("Writing Room")
+                    expect(choice).to_have_attribute("title",str(workspace))
+                    page.set_viewport_size({"width":390,"height":844})
+                    pinned.scroll_into_view_if_needed()
+                    expect(pinned).to_be_visible()
+                    page.set_viewport_size({"width":1280,"height":860})
+                    choice.click()
+                    page.get_by_text("手动输入路径",exact=True).click()
+                    page.get_by_label("文件夹路径").fill(str(workspace/"missing"))
+                    page.get_by_role("button",name="使用此路径").click()
+                    expect(page.locator("#sheet [role=alert]")).to_be_visible()
+                    expect(choice).to_have_attribute("title",str(workspace))
+                    page.get_by_role("button",name="使用 Studio 默认目录").click()
+                    expect(choice).to_contain_text("Studio 默认目录")
+                    self.assertEqual((workspace/"memo.md").read_text(),"# New memo")
                     self.assertEqual(errors,[])
                     self.assertEqual([e["kind"] for e in self.notices()],
                                      ["assistant_group_created","dispatch_sent","dispatch_finished"])

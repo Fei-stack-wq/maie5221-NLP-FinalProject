@@ -109,6 +109,10 @@ generated version is written alongside an external edit as `.miniagent-conflict`
 Symlinks, VCS directories, caches and files over 25 MB are excluded. These
 local workspaces separate files; shell and Python execute as the local OS user.
 
+The header's workspace selector shows the resolved location for the current room. Without a binding it is `groups/<room>/project` under the runs directory. Selecting a folder persists a room preference. Each bound location has a private checkout and sync baseline, and switching back restores the corresponding checkout. Existing bindings keep their previous storage layout. On completion only paths published by this task are exported. Sync operations are serialized so groups sharing a folder can detect a previous publisher's changes. The picker uses macOS's folder dialog and [Tk's directory chooser](https://github.com/python/cpython/blob/v3.14.0/Lib/tkinter/filedialog.py) on other desktop platforms. A path can also be entered directly.
+
+A conversation created by the Super Agent inherits its explicitly bound folder at creation. When the assistant uses Studio storage, each new conversation gets its own internal project. New assistant-created groups start pinned. Later dispatch to an existing room uses that room's own settings. Older assistant-created groups with untouched preferences receive the new pin default on startup. Existing user changes are preserved. This follows the earlier Studio [channel creation and workspace selection](https://github.com/Fei-stack-wq/maie5221-NLP-FinalProject/blob/57e6a858e9bb12838d4c19e247ba8bdafa2827b5/miniagent/studio_channels.py#L195-L255) and [pin preference regression](https://github.com/Fei-stack-wq/maie5221-NLP-FinalProject/blob/57e6a858e9bb12838d4c19e247ba8bdafa2827b5/tests/test_studio_channels.py#L42-L62).
+
 **`studio.py`, `server.py`, `web/`** expose one service to the UI, CLI and
 assistant tools. A private chat is a one-member group with independent files and
 history. In a group or DM, `room_turn.py` gives the addressed role the room's

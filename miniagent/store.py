@@ -15,6 +15,7 @@ Layout under ``runs_dir``::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -122,7 +123,19 @@ class GroupStore:
                     if event.get("notice_id"):
                         self._notice_ids.add(event["notice_id"])
         self.previews = ChatStream(self._seq)
-        self.project = Project(root / "project", root / "project-log.jsonl")
+        self.select_project()
+
+    def select_project(self):
+        # Every binding has its own checkout and sync baseline. Keep the existing
+        # shared checkout for a folder synchronized by an older Studio.
+        home = self.root
+        folder = self.group.folder
+        if folder:
+            legacy = self.root / "folder-sync.json"
+            if not legacy.is_file() or json.loads(legacy.read_bytes()).get("folder") != folder:
+                home = self.root / "workspaces" / hashlib.sha256(folder.encode("utf-8")).hexdigest()
+        self.project = Project(home / "project", self.root / "project-log.jsonl")
+        self.folder_state = home / "folder-sync.json"
 
     # -- chat -------------------------------------------------------------
     def append(self, kind: str, **fields: Any) -> dict:
