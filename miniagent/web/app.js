@@ -48,7 +48,8 @@ function fillIcons(root = document) {
     if (!slot.querySelector("svg")) slot.prepend(icon(slot.dataset.icon));
   }
 }
-const AVATAR_COLORS = ["#3b8ff0", "#8673f2", "#1ea887", "#ef8a3c", "#e2659b", "#16a2b8", "#cf9a12", "#5f6fe0"];
+// Seal inks: one family — cobalt, indigo, slate, celadon, gold — so a crowded room stays harmonious.
+const AVATAR_COLORS = ["#22409c", "#3d4a8f", "#2f5d86", "#4e8a80", "#5a4b8a", "#a7802a", "#2d6f7c", "#43507a"];
 function avatarColor(id) {
   let h = 0;
   for (const ch of String(id || "?")) h = (h * 31 + ch.codePointAt(0)) >>> 0;
@@ -65,9 +66,17 @@ function initials(name) {
   return (words.length > 1 ? words[0][0] + words[1][0] : text.slice(0, 2)).toUpperCase();
 }
 function avatar(id, name, size = "") {
-  const node = el("span", { class: "avatar" + (size ? " " + size : ""), title: name || id, "aria-hidden": "true" }, initials(name || id));
+  // A small seal carries one character, as a real name-chop would.
+  let mark = initials(name || id);
+  if (size === "sm" && /^[\u4e00-\u9fff]{2}$/.test(mark)) mark = mark[0];
+  const node = el("span", { class: "avatar" + (size ? " " + size : ""), title: name || id, "aria-hidden": "true" }, mark);
   node.style.setProperty("--c", avatarColor(id));
   return node;
+}
+function brandSeal() {
+  const mark = el("span", { class: "brand-mark" });
+  mark.innerHTML = $("#brand-seal").innerHTML;
+  return mark;
 }
 function youAvatar(size = "") { return el("span", { class: "avatar you" + (size ? " " + size : ""), "aria-hidden": "true" }, "你"); }
 
@@ -822,7 +831,7 @@ function renderWelcome() {
   const assistant = g.kind === "assistant";
   const lead = g.members.find(m => m.id === g.lead);
   const card = el("div", { class: "welcome" },
-    assistant ? el("span", { class: "brand-mark", style: "width:44px;height:44px;margin:auto" }, icon("spark"))
+    assistant ? brandSeal()
       : el("div", { class: "avatar-stack" }, ...g.members.slice(0, 6).map(m => avatar(m.id, m.name))),
     el("h3", {}, assistant ? "你好，我是工作室助手" : `欢迎来到「${g.name}」`),
     el("p", {}, assistant
