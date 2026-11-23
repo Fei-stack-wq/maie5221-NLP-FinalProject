@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .studio import Studio, StudioError
-from .settings_api import save_key
+from .settings_api import model_settings, save_key, save_models
 from .folders import pick
 from .evaluation import assessor_export
 from .workbench import published_bytes, tool_page
@@ -133,7 +133,7 @@ class StudioHandler(_Base):
                 return self._json(200, studio.assistant())
         if parts == ["bootstrap"]:
             return self._json(200, {"token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
-                                    "model":studio.settings.model,"thinking":studio.settings.thinking,
+                                    **model_settings(studio.settings),
                                     "preview_port":self.preview_port,"workbench_version":1,"chat_protocol":1,"task_pause":True,"member_max_steps":studio.settings.limits.max_steps,
                                     "lead_max_steps":studio.settings.team.lead_max_steps,
                                     "max_delegations":studio.settings.team.max_delegations})
@@ -175,7 +175,7 @@ class StudioHandler(_Base):
                 return self._send(200,archive.read_bytes(),"application/zip")
         if parts == ["config"]:
             s = studio.settings
-            return self._json(200, {"model": s.model, "thinking": s.thinking, "has_key": bool(s.api_key),
+            return self._json(200, {**model_settings(s), "has_key": bool(s.api_key),
                                     "preview_port": self.preview_port, "member_max_steps": s.limits.max_steps,
                                     "lead_max_steps": s.team.lead_max_steps, "max_delegations": s.team.max_delegations})
         if parts == ["templates"]:
@@ -267,6 +267,8 @@ class StudioHandler(_Base):
             parts = parts[1:]
             if method == "POST" and parts == ["settings","api-key"]:
                 return self._json(200, save_key(studio,body.get("api_key")))
+            if method == "POST" and parts == ["settings","models"]:
+                return self._json(200, save_models(studio, body))
             if studio.settings.api_key and studio.settings.api_key in json.dumps(body,ensure_ascii=False):
                 raise StudioError("The payload contains the configured API key.")
             if method == "POST" and parts == ["uploads"]:

@@ -173,8 +173,37 @@ async function connectionSheet() {
   const status=el("div",{class:"key-state"+(ready?" ready":"")},el("span",{class:"conn-dot"+(ready?" ready":"")}),
     el("span",{},ready?"DeepSeek 已配置 · "+state.config.model:"尚未配置 DeepSeek API key"));
   sheet("模型连接",status,field(ready?"更换 API key":"DeepSeek API key",el("div",{class:"key-row"},key,toggle)),save,message,
-    el("p",{class:"sheet-note"},"密钥只保存在这台电脑的 .env 文件里，网页不会再显示完整内容。可在 platform.deepseek.com 创建。"));
-  key.focus();
+    el("p",{class:"sheet-note"},"密钥只保存在这台电脑的 .env 文件里，网页不会再显示完整内容。可在 platform.deepseek.com 创建。"),
+    modelSettings());
+  if (!ready) key.focus();
+}
+const MODEL_LABEL = {"deepseek-flash":"deepseek-flash · 快、省","deepseek-v4-pro":"deepseek-v4-pro · 更强、更贵"};
+// Studio-wide model choice for new tasks. Review work (review hand-offs and review loops) can use
+// another model or thinking mode so the reviewer does not share the author's blind spots.
+function modelSettings() {
+  const c=state.config, models=c.models||["deepseek-flash","deepseek-v4-pro"];
+  const pick=(value,options)=>{const s=el("select",{},...options.map(([v,t])=>el("option",{value:v},t)));s.value=value;return s;};
+  const model=pick(c.model,models.map(m=>[m,MODEL_LABEL[m]||m]));
+  const reviewerModel=pick(c.reviewer_model||"",[["","与作者相同"],...models.map(m=>[m,MODEL_LABEL[m]||m])]);
+  const reviewerThinking=pick(c.reviewer_thinking||"",[["","与作者相同"],["enabled","开启"],["disabled","关闭"]]);
+  const note=el("p",{class:"sheet-note",role:"status"});
+  const save=el("button",{type:"button",onclick:async()=>{
+    save.disabled=true; note.textContent="正在保存…";
+    try {
+      const result=await api("/settings/models",{method:"POST",body:{model:model.value,reviewer_model:reviewerModel.value,reviewer_thinking:reviewerThinking.value}});
+      Object.assign(state.config,{model:result.model,reviewer_model:result.reviewer_model,reviewer_thinking:result.reviewer_thinking});
+      updateConnection();
+      note.textContent=result.environment_override.length
+        ? "已保存到 .env，但系统环境变量 "+result.environment_override.join("、")+" 会在下次启动时覆盖它。"
+        : "✓ 已保存，之后的新任务生效；正在运行的任务不受影响。";
+    } catch(error) { note.textContent=error.message; }
+    finally { save.disabled=false; }
+  }},"保存模型设置");
+  return el("section",{class:"model-settings"},el("h4",{},"模型"),
+    field("成员与负责人",model),
+    el("div",{class:"model-pair"},field("评审用的模型",reviewerModel),field("评审的思考模式",reviewerThinking)),
+    el("p",{class:"sheet-note"},"评审类派工和评审循环使用评审设置；换一个模型来评审，能减少作者和评审共同的盲点。单个任务可在「运行选项」里另选。"),
+    save,note);
 }
 function workspaceSheet() {
   const g=state.group;
@@ -236,15 +265,16 @@ function runOptions() {
   const keys=["member_max_steps","lead_max_steps","max_delegations"];
   const inputs=keys.map(k=>editInput(opts[k]??state.config[k],{type:"number",min:k==="max_delegations"?0:1,max:k==="max_delegations"?200:1000}));
   const checks=el("textarea",{rows:3,placeholder:"[]"},JSON.stringify(opts.checks||[]));
-  const reviewerModel=el("select",{"aria-label":"评审模型"},el("option",{value:""},"与作者相同"),
+  const studioDefault=v=>v?`工作室设置（${v}）`:"工作室设置（与作者相同）";
+  const reviewerModel=el("select",{"aria-label":"评审模型"},el("option",{value:""},studioDefault(state.config.reviewer_model)),
     ...["deepseek-flash","deepseek-v4-pro"].map(m=>el("option",{value:m},m)));
   reviewerModel.value=opts.reviewer_model||"";
-  const reviewerThinking=el("select",{"aria-label":"评审思考模式"},el("option",{value:""},"与作者相同"),
+  const reviewerThinking=el("select",{"aria-label":"评审思考模式"},el("option",{value:""},studioDefault({enabled:"开启",disabled:"关闭"}[state.config.reviewer_thinking]||"")),
     el("option",{value:"enabled"},"开启"),el("option",{value:"disabled"},"关闭"));
   reviewerThinking.value=opts.reviewer_thinking||"";
   sheet("下一项任务",field("工作方式",mode),...inputs.map((v,i)=>field(["成员步数","负责人步数","委派数"][i],v)),
     field("评审用的模型",reviewerModel),field("评审的思考模式",reviewerThinking),
-    el("p",{class:"muted small"},"评审、测试类的派工和评审循环会用这里的设置；默认与作者相同。换一个模型来评审，能减少共同的盲点。"),
+    el("p",{class:"muted small"},"只对下一项任务生效。工作室的默认模型在侧栏「模型连接」里设置。"),
     field("验收检查（JSON 数组）",checks),button("应用",()=>{
       state.runOptions={interaction_mode:mode.value,checks:JSON.parse(checks.value||"[]")};
       if (reviewerModel.value) state.runOptions.reviewer_model=reviewerModel.value;

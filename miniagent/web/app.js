@@ -924,9 +924,13 @@ function updateConnection() {
   const ready = Boolean(state.config?.has_key);
   $("#conn-dot").classList.toggle("ready", ready);
   $("#conn-title").textContent = ready ? "DeepSeek 已连接" : "填写 API key";
+  const c = state.config || {};
+  const reviewer = c.reviewer_model || c.reviewer_thinking
+    ? ` · 评审 ${(c.reviewer_model || c.model || "").replace("deepseek-", "")}${c.reviewer_thinking ? (c.reviewer_thinking === "enabled" ? " 思考开" : " 思考关") : ""}` : "";
   $("#conn-detail").textContent = ready
-    ? `${state.config.model} · 思考${state.config.thinking === "enabled" ? "开" : "关"}`
+    ? `${c.model} · 思考${c.thinking === "enabled" ? "开" : "关"}${reviewer}`
     : "配置后团队才能开始工作";
+  $("#connection").title = ready ? "模型连接：API key 与模型选择" : "填写 DeepSeek API key";
   const banner = $("#key-banner");
   if (banner) banner.hidden = ready || !state.current;
 }

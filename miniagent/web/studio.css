@@ -195,3 +195,10 @@ body:has(#files:not([hidden])) #member-panel { display: none; }
 #mention-list button { width:100%; display:flex; justify-content:space-between; border:0; background:transparent; }
 #mention-list button[aria-selected="true"] { background:var(--primary-soft); }
 #mention-list small { color:var(--muted); }
+
+/* Model choice inside the connection sheet. */
+.model-settings { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); display: grid; gap: 10px; }
+.model-settings h4 { margin: 0; font-size: 15px; }
+.model-settings .model-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.model-settings > button { justify-self: start; }
+@media (max-width: 760px) { .model-settings .model-pair { grid-template-columns: 1fr; } }
