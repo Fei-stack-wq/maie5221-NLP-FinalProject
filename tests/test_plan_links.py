@@ -75,6 +75,75 @@ class PlanLinksTest(unittest.TestCase):
         self.assertEqual(view["steps"][0]["decision"], {"stage":"completed", "source":"review", "agent":"qa"})
         self.assertEqual(sum(e["kind"] == "plan" for e in detail["events"]), 1)
 
+    def test_lead_work_and_two_steps_share_one_retest(self):
+        self.script.queues.update(lead=[
+            plan(step("Design", id="design", outputs=["design.md"]), step("Choose format", id="format"),
+                 step("Fix", id="fix", owner="dev"), step("Retest", id="retest", owner="qa"),
+                 step("Deliver notes", id="ship", on_delivery=True)),
+            reply("", call("write_file", path="design.md", content="Format spec")),
+            reply("", call("record_plan_result", step_ids=["format"], result="Selected CSV.")),
+            reply("", call("review_loop", author="dev", reviewer="qa", work="Verify the format change.",
+                           step="fix", retest_steps=["retest", "retest"])),
+            reply("Shipped with release notes.")],
+            qa=[reply("VERDICT: CHANGES REQUESTED\nCorrect the format."), reply("VERDICT: APPROVED")],
+            dev=[reply("", call("write_file", path="fix.md", content="Corrected")), reply("Fixed.")])
+        tid = self.studio.post(self.gid, "Ship the change", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid)
+        rows = {s["id"]: s for s in detail["plan_view"]["steps"]}
+        self.assertEqual(detail["plan_view"]["counts"]["completed"], 5)
+        self.assertEqual({k for k, s in rows.items() if s["confirmed"]}, {"fix", "retest"})
+        self.assertEqual(rows["retest"]["history"], rows["fix"]["history"][-2:])
+        self.assertEqual(rows["design"]["evidence"]["lead_work"]["files"][0]["path"], "design.md")
+        self.assertEqual(rows["format"]["evidence"]["lead_work"]["summary"], "Selected CSV.")
+        self.assertEqual(rows["ship"]["evidence"]["lead_work"]["kind"], "final")
+        self.assertEqual(sum(e["kind"] == "plan" for e in detail["events"]), 1)
+
+    def test_lead_decides_one_step_without_replacing_the_plan(self):
+        initial = [step("Build", id="build", owner="dev"), step("Ship", id="ship")]
+        self.script.queues.update(lead=[plan(*initial),
+            reply("", call("delegate_task", assignee="dev", step_ids=["build"], task="Prepare the build.")),
+            reply("", call("record_plan_result", step_ids=["build"], decision="rework", result="Fix format.")),
+            reply("", call("delegate_task", assignee="dev", step_ids=["build"], task="Correct the format.")),
+            reply("", call("record_plan_result", step_ids=["build"], decision="accept", result="Verified fix.")),
+            reply("Ready.")], dev=[reply("Built."), reply("Fixed.")])
+        tid = self.studio.post(self.gid, "Prepare build", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid)
+        self.assertEqual(sum(e["kind"] == "plan" for e in detail["events"]), 1)
+        self.assertEqual(detail["plan_view"]["counts"]["completed"], 1)
+        built, ship = detail["plan_view"]["steps"]
+        self.assertTrue(built["confirmed"])
+        self.assertFalse(ship["completed"])
+        self.assertEqual([e["status"] for e in built["history"] if e["kind"] == "plan_decision"],
+                         ["rework", "completed"])
+        self.assertEqual(built["decision"]["source"], "lead")
+
+    def test_historical_links_are_atomic_scoped_and_idempotent(self):
+        from miniagent.studio import StudioError
+        self.script.queues.update(lead=[plan(step("Design", id="design"), step("Repair", id="fix"),
+                                             step("Verify", id="retest"), step("Release", id="ship")),
+            reply("", call("write_file", path="design.md", content="Spec")),
+            reply("", call("delegate_task", assignee="qa", step="fix", review=True, task="Verify repaired build.")),
+            reply("Delivered.")], qa=[reply("VERDICT: APPROVED")])
+        tid = self.studio.post(self.gid, "Ship it", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid)
+        seq = {e["kind"]: e["seq"] for e in detail["events"]}
+        links = [{"source_seq": seq[kind], "step_ids": [key]} for kind, key in
+                 (("publish", "design"), ("report", "retest"), ("final", "ship"))]
+        with self.assertRaises(StudioError):
+            self.studio.link_plan_evidence(tid, links + [{"source_seq": seq["plan"], "step_ids": ["ship"]}])
+        self.assertEqual(self.studio.task_detail(tid)["events"], detail["events"])
+        self.assertEqual(self.studio.link_plan_evidence(tid, [{"source_seq": seq["report"], "step_ids": ["fix"]}]),
+                         {"links_added": 0})
+        self.assertEqual(self.studio.link_plan_evidence(tid, links)["links_added"], 3)
+        self.assertEqual(self.studio.link_plan_evidence(tid, links)["links_added"], 0)
+        after = self.studio.task_detail(tid)
+        self.assertEqual(after["events"][:-1], detail["events"])
+        self.assertEqual(after["task"], detail["task"])
+        self.assertEqual((after["plan_view"]["counts"]["completed"], after["plan_view"]["counts"]["accepted"]), (4, 2))
+
     def test_signed_step_does_not_confirm_other_work_or_survive_reassignment(self):
         steps = [step("Fix build", id="fix"), step("Release", "in_progress", id="ship")]
         record = {"id":"t", "primary":"lead", "status":"completed", "plan":{"linked":True,"steps":steps}}
@@ -109,6 +178,10 @@ class PlanLinksTest(unittest.TestCase):
         self.assertEqual(view()["counts"]["accepted"], 0)
         report(assign(), "approved", checks={"passed":0,"total":1})
         self.assertEqual(view()["counts"]["accepted"], 0)
+        for problem in ({"missing_deliverables": ["required.md"]}, {"unpublished_files": ["blocked.md"]}):
+            report(assign(), "approved", **problem)
+            self.assertFalse(view()["steps"][0]["completed"])
+            self.assertFalse(view()["steps"][0]["confirmed"])
         old = assign()
         newer = append("delegation", assignee="dev", task="Change build", step="fix")
         append("report", agent="dev", status="completed", assignment_seq=newer, step="fix")
@@ -118,6 +191,45 @@ class PlanLinksTest(unittest.TestCase):
         record["plan"]["steps"] = [step("Fix build","rework", id="fix"), steps[1]]
         append("plan", agent="lead", steps=record["plan"]["steps"])
         self.assertEqual(view()["steps"][0]["decision"], {"stage":"rework", "source":"lead", "agent":"lead"})
+
+    def test_production_counts_while_awaiting_review_and_reopen_invalidates_it(self):
+        steps = [step("Build", id="build")]
+        record = {"id": "t", "primary": "lead", "status": "running", "plan": {"linked": True, "steps": steps}}
+        events = []
+        def append(kind, **data):
+            seq = len(events) + 1
+            events.append(dict(kind=kind, task_id="t", time=seq, seq=seq, **data))
+            return seq
+        def check(done, signed):
+            row = plan_view(record, events)["steps"][0]
+            self.assertEqual((row["completed"], row["confirmed"]), (done, signed))
+        append("plan", agent="lead", steps=steps)
+        assigned = append("delegation", assignee="dev", task="Build", step="build")
+        append("report", agent="dev", status="completed", step="build", assignment_seq=assigned)
+        qa = append("delegation", assignee="qa", task="Verify", step="build", review=True)
+        check(True, False)
+        append("report", agent="qa", status="completed", assignment_seq=qa, verdict="approved", review=True)
+        check(True, True)
+        record["plan"]["steps"] = [step("Build", "in_progress", id="build")]
+        append("plan", agent="lead", steps=record["plan"]["steps"])
+        check(False, False)
+
+    def test_publication_must_cover_all_outputs_and_deletion_reopens(self):
+        steps = [step("Design", id="spec", owner="lead", outputs=["api.md", "data.md"]),
+                 step("Other", id="other", owner="lead")]
+        record = {"id":"t", "primary":"lead", "status":"completed", "plan":{"linked":True, "steps":steps}}
+        events = []
+        def publish(path, change):
+            seq = len(events) + 1
+            events.append(dict(kind="publish", task_id="t", time=seq, seq=seq, agent="lead",
+                               changes=[dict(path=path, change=change)]))
+            return [r["completed"] for r in plan_view(record, events)["steps"]]
+        self.assertEqual(publish("api.md", "added"), [False, False])
+        self.assertEqual(publish("data.md", "added"), [True, False])
+        self.assertEqual(publish("api.md", "deleted"), [False, False])
+        self.assertEqual(publish("api.md", "added"), [True, False])
+        events.append(dict(kind="final", task_id="t", seq=5, time=5, agent="lead", status="completed", text="Done"))
+        self.assertEqual(plan_view(record, events)["counts"]["completed"], 1)
 
     def test_qualified_review_returns_to_lead_without_accepting_or_ordering_a_fix(self):
         self.script.queues.update(lead=[
@@ -142,7 +254,7 @@ class PlanLinksTest(unittest.TestCase):
         self.studio.post(self.gid, "Prepare a note", queue=True)
         record = finished(self.studio, self.gid)
         context = self.provider.for_agent("qa")[0]["messages"][1]["content"]
-        self.assertIn("[submitted] Write draft (ID: s1)", context)
+        self.assertIn("[x] Write draft (ID: s1)", context)
         self.assertIn("submitted by dev: note.md", context)
         detail = self.studio.task_detail(record["id"])
         self.assertEqual(sum(e["kind"] == "plan" for e in detail["events"]), 1)
@@ -166,9 +278,9 @@ class PlanLinksTest(unittest.TestCase):
         finished(self.studio, self.gid)
         view = self.studio.task_detail(tid)["plan_view"]
         row = view["steps"][0]
-        self.assertEqual((row["id"], row["stage"]), ("draft", "unconfirmed"))
+        self.assertEqual((row["id"], row["stage"]), ("draft", "completed"))
         self.assertEqual([e["kind"] for e in row["history"]], ["delegation", "report"])
-        self.assertEqual(view["counts"], {"total": 1, "accepted": 0, "in_progress": 0, "submitted": 1})
+        self.assertEqual(view["counts"], {"total": 1, "accepted": 0, "in_progress": 0, "submitted": 1, "completed": 1, "confirmed": 0})
 
     def test_live_fast_plan_and_final_history_in_browser(self):
         enter, release, submitted, finish = (threading.Event() for _ in range(4))
@@ -195,20 +307,22 @@ class PlanLinksTest(unittest.TestCase):
                     page = browser.new_page()
                     page.goto(f"http://127.0.0.1:{main.server_port}/#{self.gid}")
                     card = page.locator("#timeline .linked-plan")
-                    expect(card.locator(".plan-count")).to_have_text("进行中 1 · 已提交 0 · 已确认 0 / 1")
+                    expect(card.locator(".plan-count")).to_have_text("已完成 0 / 1 · 已确认 0 / 1 · 进行中 1")
                     release.set()
                     self.assertTrue(submitted.wait(5))
-                    expect(card.locator(".plan-count")).to_have_text("进行中 0 · 已提交 1 · 已确认 0 / 1")
+                    expect(card.locator(".plan-count")).to_have_text("已完成 1 / 1 · 已确认 0 / 1 · 进行中 0")
                     digest = hashlib.sha256(b"Ready").hexdigest()
                     expect(card.get_by_role("link", name="note.md")).to_have_attribute("href", f"/api/tasks/{tid}/files/note.md?sha256={digest}")
                     expect(card).to_contain_text("检查 1/1")
                     finish.set()
-                    expect(card.locator(".plan-stage")).to_have_text("已提交，尚未确认")
+                    expect(card.locator(".plan-stage")).to_have_text("已完成")
+                    expect(card.locator(".plan-confirmation")).to_have_text("未确认")
                     page.reload()
-                    expect(card.locator(".plan-stage")).to_have_text("已提交，尚未确认")
+                    expect(card.locator(".plan-stage")).to_have_text("已完成")
+                    expect(card.locator(".plan-confirmation")).to_have_text("未确认")
                     expect(page.locator("#timeline .divider").filter(has_text="计划已更新")).to_have_text("计划已更新")
                     page.get_by_role("button", name="查看任务树").click()
-                    expect(page.locator("#sheet .linked-plan .plan-count")).to_have_text("进行中 0 · 已提交 1 · 已确认 0 / 1")
+                    expect(page.locator("#sheet .linked-plan .plan-count")).to_have_text("已完成 1 / 1 · 已确认 0 / 1 · 进行中 0")
             events = self.studio.task_detail(tid)["events"]
             self.assertEqual(sum(e["kind"] == "plan" for e in events), 1)
         finally:

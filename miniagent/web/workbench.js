@@ -68,17 +68,20 @@ function dispatchNotice(event) {
 }
 
 function planCard(plan, scope) {
-  const {in_progress, submitted, accepted, total} = plan.counts;
-  const stages = {pending:"待处理", in_progress:"进行中", completed:"已确认", rework:"要求修改",
-    submitted:"已提交", unconfirmed:"已提交，尚未确认", unrecorded:"未记录步骤结果"};
+  const {in_progress, completed, confirmed, total} = plan.counts;
+  const stages = {pending:"待处理", in_progress:"进行中", completed:"已完成", rework:"要求修改",
+    incomplete:"未完成", unrecorded:"未记录步骤结果"};
   function historyItem(entry) {
-    const verb = entry.kind === "delegation" ? "接手" : "提交报告";
+    const verb = {delegation:"接手", report:"提交报告", publish:"发布产物", plan_work:"完成工作", plan_decision:entry.status === "rework" ? "要求修改" : "确认此步", final:"提交最终交付"}[entry.kind];
     const verdict = {approved:"通过", "changes requested":"要求修改", unclear:"未给明确结论"};
     const detail = el("div",{class:"plan-history-item"},
-      `@${entry.agent} ${verb}`, entry.time ? " · " + fmtTime(entry.time) : "",
+      `#${entry.seq} @${entry.agent} ${verb}`, entry.time ? " · " + fmtTime(entry.time) : "",
       entry.status ? " · " + (STATUS_LABEL[entry.status] || entry.status) : "",
       entry.verdict ? " · 评审" + (verdict[entry.verdict] || entry.verdict) : "",
       entry.checks ? ` · 检查 ${entry.checks.passed}/${entry.checks.total}` : "");
+    if (entry.summary) detail.append(el("details",{},el("summary",{},"工作结果"),el("p",{},entry.summary)));
+    if (entry.missing_deliverables?.length) detail.append(el("span",{},"缺少产物：" + entry.missing_deliverables.join("、")));
+    if (entry.unpublished_files?.length) detail.append(el("span",{},"未发布：" + entry.unpublished_files.join("、")));
     for (const file of entry.files || []) {
       if (file.change === "deleted" || !file.sha256) {
         detail.append(el("span",{},file.path));
@@ -98,6 +101,7 @@ function planCard(plan, scope) {
     const signedBy = decision?.agent && (decision.source === "review" ? "评审 @" : "负责人 @") + decision.agent;
     const content = el("div",{class:"plan-step-content"},
       el("div",{},el("span",{class:"plan-text"},step.step), el("small",{class:"plan-stage"},stages[step.stage]),
+        el("small",{class:"plan-confirmation"},step.confirmed ? "已确认" : "未确认"),
         signedBy ? el("small",{class:"plan-owner"},signedBy) : null,
         step.owner ? el("span",{class:"plan-owner"},"@"+step.owner) : null,
         step.after?.length ? el("span",{class:"plan-wait"},"依赖第 "+step.after.join("、")+" 步") : null));
@@ -108,7 +112,7 @@ function planCard(plan, scope) {
   }
   return el("section",{class:"linked-plan","aria-label":"任务计划"},
     el("div",{class:"plan-heading"},el("strong",{},"任务计划"), el("span",{class:"plan-count"},
-      `进行中 ${in_progress} · 已提交 ${submitted} · 已确认 ${accepted} / ${total}`)), list,
+      `已完成 ${completed} / ${total} · 已确认 ${confirmed} / ${total} · 进行中 ${in_progress}`)), list,
     plan.explanation ? el("p",{class:"plan-note"},plan.explanation) : null,
     plan.unlinked.length ? el("details",{class:"unlinked"},el("summary",{},`其他派工（${plan.unlinked.length}）`),
       ...plan.unlinked.map(e=>el("p",{},`@${e.assignee} · ${e.task}`))) : null);

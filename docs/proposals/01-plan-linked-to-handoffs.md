@@ -110,6 +110,13 @@ Switch: `MA_PLAN_LINKS` (default on). Off = current behaviour.
    show no counts.
 8. Fast mode: plan written once, evidence still updates.
 
+## Delivered behavior for plan progress
+
+The plan header counts completed and confirmed steps separately. Lead publications, the final delivery
+and short reports of non-file work can complete lead-owned steps. Member reports and post-fix reviews
+can cover several steps with one event ID. The workbench shows the original evidence and who confirmed it.
+See [the runtime contract](../architecture.md#team-communication-and-rollout) and `tests/test_plan_links.py`.
+
 ## Measurement and acceptance
 
 - `bench` on the three Task 1s: ≥ 80 % of hand-offs linked to a step; `update_plan` calls per task

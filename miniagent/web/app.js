@@ -800,7 +800,7 @@ function hydrateRoomPlans(data) {
   for (const event of data.events) {
     const host = state.planHosts.get(event.task_id);
     if (!host || event.task_id === live?.task_id) continue;
-    if (event.linked || event.inherited_plan || (host.planSnapshot && ["task_finished","task_paused"].includes(event.kind))) {
+    if (event.linked || event.inherited_plan || event.kind === "plan_evidence" || (host.planSnapshot && ["task_finished","task_paused"].includes(event.kind))) {
       changed.add(event.task_id);
     }
   }

@@ -500,7 +500,7 @@ dialog label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5p
 .linked-plan { border-left: 2px solid var(--cobalt); padding: 5px 12px; margin: 10px 0; }
 .plan-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; }
 .plan-step-content { min-width: 0; overflow-wrap: anywhere; }
-.plan-stage, .linked-plan .plan-owner { margin-left: 8px; }
+.plan-stage, .plan-confirmation, .linked-plan .plan-owner { margin-left: 8px; }
 .linked-plan .submitted .plan-stage { color: var(--cobalt); }
 .linked-plan .completed .plan-stage { color: var(--celadon); }
 .linked-plan .rework .plan-stage { color: var(--gold-deep); }

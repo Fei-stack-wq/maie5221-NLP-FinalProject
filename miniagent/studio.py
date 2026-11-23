@@ -698,6 +698,43 @@ class Studio:
                 "diagnostics":[e for e in activity if e.get("type") in ("loop_nudge","loop_stuck","error")
                                or (e.get("type")=="end" and e.get("status") not in ("completed","dispatched"))]}
 
+    def link_plan_evidence(self, tid, links):
+        """Attach existing work to stable plan IDs without editing the work or issuing a sign-off."""
+        with self._lock:
+            store, task = self.find_task(tid)
+            plan = task.get("plan") or {}
+            if not plan.get("linked") or not isinstance(links, list) or not 1 <= len(links) <= 40:
+                raise StudioError("Expected 1–40 evidence links for a plan with stable step IDs.")
+            steps = {s["id"]:s for s in plan["steps"]}
+            events = {e["seq"]:e for e in store.chat() if e.get("task_id") == tid}
+            view = plan_view(task, list(events.values()))
+            existing = {(item["seq"], step["id"]) for step in view["steps"] for item in step["history"]}
+            additions = []
+            for link in links:
+                if not isinstance(link, dict) or type(link.get("source_seq")) is not int:
+                    raise StudioError("Each link needs a source event sequence.")
+                event = events.get(link["source_seq"], {})
+                keys = link.get("step_ids")
+                if (not isinstance(keys, list) or not 1 <= len(keys) <= 20
+                        or any(not isinstance(key, str) or key not in steps for key in keys)):
+                    raise StudioError("Choose existing step IDs in this task.")
+                if event.get("kind") == "report":
+                    assignment = events.get(event.get("assignment_seq"), {})
+                    if assignment.get("kind") != "delegation" or assignment.get("assignee") != event.get("agent"):
+                        raise StudioError("The report needs its original assignment.")
+                elif event.get("kind") in ("publish", "final") and event.get("agent") == task["primary"]:
+                    if any(steps[key].get("owner") not in (None, task["primary"]) for key in keys):
+                        raise StudioError("Attach lead work to a lead-owned or unassigned step.")
+                else:
+                    raise StudioError("Choose a report, lead publication or final delivery from this task.")
+                new = [key for key in dict.fromkeys(keys) if (event["seq"], key) not in existing]
+                if new:
+                    additions.append({"source_seq":event["seq"], "step_ids":new})
+                    existing.update((event["seq"], key) for key in new)
+            if additions:
+                store.append("plan_evidence", task_id=tid, links=additions)
+            return {"links_added":sum(len(link["step_ids"]) for link in additions)}
+
     def trash(self, gid):
         with self._lock:
             store = self.group(gid)

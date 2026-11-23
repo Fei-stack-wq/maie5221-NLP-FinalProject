@@ -296,6 +296,8 @@ class StudioHandler(_Base):
                 return self._json(200, studio.roles.revise(parts[1],parts[3],body["status"],text=body.get("text"),
                                                           revision=body.get("revision")))
             if method == "POST" and len(parts)==3 and parts[0]=="tasks":
+                if parts[2]=="plan-evidence":
+                    return self._json(200,studio.link_plan_evidence(parts[1], body.get("links")))
                 if parts[2]=="pause":
                     return self._json(200,studio.pause_task(parts[1]))
                 if parts[2]=="resume":

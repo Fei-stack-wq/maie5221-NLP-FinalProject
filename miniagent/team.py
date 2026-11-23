@@ -105,6 +105,9 @@ class ParallelBatch:
                 self._cond.wait(0.5)
             return not self.broken
 
+PLAN_STEP_IDS = {"type":"array", "items":{"type":"string"}, "maxItems":20,
+                 "description":"All stable plan step IDs this single handoff covers"}
+
 CHECKS_SCHEMA = {
     "type": "array", "maxItems": 20,
     "description": ("Mechanical checks Studio runs on the published project after the work, for your information: "
@@ -220,9 +223,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
                 "the reviewer's findings go straight to the author's continued session, and you receive the final "
                 "verdict, the last review and the files changed.")
         if settings.team.plans and settings.team.plan_links:
-            parts.append("- Write the plan with update_plan once the work is clear. Pass its step ID on hand-offs. "
-                         "Studio records assignments, submissions and reviews. Update the plan only when changing "
-                         "the plan or accepting or returning a step. Use after for dependencies.")
+            parts.append("- Write the plan once. For your own steps, bind outputs or on_delivery. Pass the covered "
+                         "step IDs on handoffs and retest_steps for post-fix reviews. Use record_plan_result for a decision "
+                         "on individual steps. Use after for dependencies.")
         elif settings.team.plans:
             parts.append(
                 "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
@@ -357,6 +360,7 @@ def _clip(text: str, limit: int) -> str:
 
 def render_plan(plan: dict) -> str:
     marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]", "rework": "[!]",
+             "incomplete": "[incomplete]",
              "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]", "unrecorded": "[no recorded outcome]"}
     steps = plan.get("steps", [])
     numbered = any(s.get("after") for s in steps)
@@ -375,6 +379,8 @@ def render_plan(plan: dict) -> str:
             rows[i] += f" — submitted by {submitted['agent']}: {paths}"
         if reviewed := evidence.get("reviewed"):
             rows[i] += f" — review: {reviewed['verdict']}"
+        if step.get("completed"):
+            rows[i] += " — completed" + (" and confirmed" if step.get("confirmed") else ", awaiting confirmation")
     return "\n".join(rows) + (f"\nNote: {plan['explanation']}" if plan.get("explanation") else "")
 
 
@@ -635,6 +641,8 @@ class TeamTask:
                 registry.add(self._review_tool(agent_id))
             if self.settings.team.plans:
                 registry.add(self._plan_tool(agent_id))
+                if self.settings.team.plan_links:
+                    registry.add(self._plan_result_tool(agent_id))
             if self.settings.team.background_handoffs:
                 registry.add(self._wait_tool(agent_id))
         if self.interactive:
@@ -745,7 +753,8 @@ class TeamTask:
                        "description": "Project-relative files or folders this assignment reads or builds on"},
         }
         if team.plans and team.plan_links:
-            properties["step"] = {"type": "string", "description": "Stable plan step ID this hand-off advances"}
+            properties["step"] = {"type": "string", "description": "Primary plan step this hand-off advances"}
+            properties["step_ids"] = PLAN_STEP_IDS
         if team.handoff_kinds:
             properties["kind"] = {
                 "type": "string", "enum": list(HANDOFF_KINDS),
@@ -797,7 +806,9 @@ class TeamTask:
                 "author": {"type": "string", "enum": ids, "description": "Teammate who produced and will fix the work"},
                 "reviewer": {"type": "string", "enum": ids, "description": "Teammate who reviews or tests it"},
                 "work": {"type": "string", "description": "What was produced and where, and what the reviewer must check"},
-                **({"step": {"type": "string", "description": "Stable plan step ID for every round"}}
+                **({"step": {"type": "string", "description": "Primary plan step for every round"},
+                    "step_ids": PLAN_STEP_IDS,
+                    "retest_steps": {**PLAN_STEP_IDS, "description":"Additional steps covered only by a review after a fix"}}
                    if self.settings.team.plans and self.settings.team.plan_links else {}),
                 "criteria": {"type": "string", "description": "What 'acceptable' means for the reviewer's verdict"},
                 "deliverables": {"type": "array", "items": {"type": "string"},
@@ -1016,6 +1027,33 @@ class TeamTask:
                                      f"files you read or produce: {', '.join(hit[:20])}. They are in the team "
                                      "project, not in your workspace copy; say in your report if they change your work.")
 
+    def _plan_result_tool(self, lead_id: str) -> Tool:
+        def record_result(_ctx, args):
+            keys = list(dict.fromkeys(args["step_ids"]))
+            rows = {s["id"]: s for s in (self.plan or {}).get("steps", [])}
+            summary = args["result"].strip()
+            if not summary or not keys or any(k not in rows for k in keys):
+                return ToolResult.failure("Provide a result and existing step IDs.")
+            decision = args.get("decision")
+            if decision:
+                if decision not in ("accept", "rework"):
+                    return ToolResult.failure("Choose accept or rework for a decision.")
+                kind, status = "plan_decision", "completed" if decision == "accept" else "rework"
+            else:
+                if any(rows[k].get("owner") not in (None, lead_id) for k in keys):
+                    return ToolResult.failure("Record your own work on lead-owned or unassigned steps.")
+                kind, status = "plan_work", "completed"
+            self.store.append(kind, task_id=self.task_id, agent=lead_id, step_ids=keys, text=summary, status=status)
+            return ToolResult(ok=True, content="Plan result recorded for " + ", ".join(keys) + ".")
+
+        return Tool(name="record_plan_result",
+                    description="Report your own non-file work, or explicitly accept or return selected steps. Omit decision to record work without signing it.",
+                    parameters={"type": "object", "properties": {
+                        "step_ids": {**PLAN_STEP_IDS, "minItems": 1},
+                        "result": {"type": "string", "minLength": 1, "maxLength": 1200},
+                        "decision": {"type": "string", "enum": ["accept", "rework"]}},
+                        "required": ["step_ids", "result"]}, fn=record_result)
+
     def _plan_tool(self, lead_id: str) -> Tool:
         linked = self.settings.team.plan_links
         return Tool(
@@ -1028,7 +1066,11 @@ class TeamTask:
                 "explanation": {"type": "string", "description": "Optional short note on what changed"},
                 "steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
                     "type": "object", "properties": {
-                        **({"id": {"type": "string", "description": "Stable step ID. Assigned when omitted."}} if linked else {}),
+                        **({"id": {"type": "string", "description": "Stable step ID. Assigned when omitted."},
+                            "outputs": {"type":"array","items":{"type":"string"},"maxItems":40,
+                                        "description":"For your own work: exact project paths whose publication completes this step"},
+                            "on_delivery": {"type":"boolean","description":"Your final answer itself delivers this step"}}
+                           if linked else {}),
                         "step": {"type": "string"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"] + (["rework"] if linked else [])},
                         "owner": {"type": "string", "description": "Teammate id responsible, if any"},
@@ -1111,14 +1153,20 @@ class TeamTask:
             batch.arrive(assignee)  # refused before it ran; the others still check each other's results
         return outcome
 
-    def _step_link(self, requested):
-        if not requested or not (self.settings.team.plan_links and self.settings.team.plans):
+    def _step_link(self, requested, extra=()):
+        if not (self.settings.team.plan_links and self.settings.team.plans):
             return {}, ""
         ids = [s["id"] for s in (self.plan or {}).get("steps", []) if s.get("id")]
-        if requested in ids:
-            return {"step": requested}, ""
-        return {"requested_step": requested}, (f"Unlinked hand-off: unknown plan step {requested!r}. "
-                                               f"Valid step IDs: {', '.join(ids) or '(no plan yet)'}.")
+        requested_ids = list(dict.fromkeys(([requested] if requested else []) + list(extra)))
+        valid = [key for key in requested_ids if key in ids]
+        invalid = [key for key in requested_ids if key not in ids]
+        link = {"step": valid[0]} if valid else {}
+        if len(valid) > 1:
+            link["step_ids"] = valid
+        if invalid:
+            link["requested_step"] = invalid[0]
+            return link, f"Unknown plan steps: {', '.join(invalid)}. Valid step IDs: {', '.join(ids) or '(no plan yet)'}."
+        return link, ""
 
     def _delegate_one(self, lead_id: str, args: dict, batch: ParallelBatch | None) -> ToolResult:
         assignee = str(args.get("assignee", "")).strip()
@@ -1150,7 +1198,7 @@ class TeamTask:
             if missing:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
-        link, warning = self._step_link(args.get("step"))
+        link, warning = self._step_link(args.get("step"), args.get("step_ids", []))
         conflict = self._background_conflict(assignee, deliverables, inputs)
         if conflict:
             return ToolResult.failure(conflict)
@@ -1281,7 +1329,8 @@ class TeamTask:
                      "to change, reply 'No change needed' and say why in one sentence.")
         text = "\n".join(lines)
         event = self.store.append("delegation", task_id=self.task_id, agent=self.primary, assignee=member.id,
-                                  task=text, deliverables=deliverables, reconcile=True)
+                                  task=text, deliverables=deliverables, reconcile=True, continues_assignment=entry["seq"],
+                                  **{k:entry[k] for k in ("step", "step_ids") if k in entry})
         # Kept in the in-flight entry, so a pause during the check can finish it on resume.
         entry["first"] = {"status": result.status, "answer": result.answer, "error": result.error,
                           "changes": [c.as_dict() for c in changes], "skipped": list(skipped)}
@@ -1352,7 +1401,11 @@ class TeamTask:
             report_extra.update(assignment_seq=entry["seq"], talk=dict(entry.get("talk", {})))
         if self.settings.team.plan_links and entry:
             report_extra.update(assignment_seq=entry["seq"])
-            report_extra.update({k: entry[k] for k in ("step", "requested_step") if k in entry})
+            report_extra.update({k: entry[k] for k in ("step", "step_ids", "requested_step") if k in entry})
+            if missing:
+                report_extra["missing_deliverables"] = missing
+            if skipped:
+                report_extra["unpublished_files"] = list(skipped)
             if review:
                 report_extra["verdict"] = review_verdict(report)
         if entry:
@@ -1419,7 +1472,10 @@ class TeamTask:
         except ValueError as exc:
             return ToolResult.failure(f"Invalid checks: {exc}")
         names = {m.id: m.name for m in self.group.members}
-        link, warning = self._step_link(args.get("step"))
+        step_ids = args.get("step_ids", [])
+        link, warning = self._step_link(args.get("step"), step_ids)
+        retest_link, retest_warning = self._step_link(args.get("step"), step_ids + args.get("retest_steps", []))
+        warning = retest_warning or warning
         key = f"{author}>{reviewer}"
         state = self.loop_state if self.loop_state and self.loop_state.get("key") == key else None
         if state is None:  # a resumed task continues the saved round and phase instead
@@ -1439,7 +1495,8 @@ class TeamTask:
                                      "criteria, or `VERDICT: CHANGES REQUESTED` followed by numbered, concrete findings the "
                                      "author can act on.")
                     reviewed = self._assign(lead_id, reviewer, review_task, deliverables=[], review=True,
-                                            loop={"id": state["id"], "round": number, "role": "review"}, link=link,
+                                            loop={"id": state["id"], "round": number, "role": "review"},
+                                            link=retest_link if number > 1 else link,
                                             spec={"kind": "check"} if self.settings.team.handoff_kinds else None)
                     if isinstance(reviewed, ToolResult):
                         state["stop"] = reviewed.content
@@ -1521,6 +1578,15 @@ class TeamTask:
                 row["id"] = item["id"]
             if item.get("owner"):
                 row["owner"] = str(item["owner"]).strip()[:60]
+            if self.settings.team.plan_links and (item.get("outputs") or item.get("on_delivery")):
+                if row.setdefault("owner", lead_id) != lead_id:
+                    return ToolResult.failure("Direct publication and final delivery evidence belong to the task lead.")
+                if outputs := item.get("outputs"):
+                    if any(not p.strip() or p.startswith("/") or any(part in ("", ".", "..") for part in p.split("/")) for p in outputs):
+                        return ToolResult.failure("Use exact project-relative output paths.")
+                    row["outputs"] = list(dict.fromkeys(outputs))
+                if item.get("on_delivery"):
+                    row["on_delivery"] = True
             after = item.get("after") or []
             if after:
                 if any(type(n) is not int or not 1 <= n <= len(steps) for n in after):

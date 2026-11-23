@@ -119,13 +119,23 @@ evidence passing are on by default and each has a switch (`MA_HANDOFF_KINDS`,
 deliverable quality has not been measured yet. Task metrics record
 `handoff_kinds` and `background_handoffs` for that comparison.
 
-`MA_PLAN_LINKS=1` links handoffs and review rounds to the lead's named plan steps.
-A completed delegated review can confirm or return its linked step. The plan card names the
-reviewer or lead who decided. It projects historical events on read, keeping a signature
-attached to its handoff when later work reopens the step. Task completion alone supplies
-no step verdict. A qualified approval remains in the review report for the lead to decide.
-`MA_PLAN_LINKS=0` retains snapshot plans. In fast mode, a linked plan can be
-written once. The task tree and plan keep unlinked work visible.
+With `MA_PLAN_LINKS=1`, the chat and task tree project two independent counts from the same task events.
+A finished assignment counts as completed work when its declared checks passed and its deliverables published.
+Confirmation records an explicit step acceptance by the lead or an unqualified approval from its assigned reviewer.
+A request for changes reopens the step. A new work assignment or changed lead output invalidates a previous signature.
+A running review can leave already completed work awaiting confirmation.
+
+A handoff may name several stable IDs in `step_ids`. In a review loop, `retest_steps` adds coverage only on
+reviews after a fix. The same report sequence and files appear under each covered step. Lead-owned steps can
+bind exact project-relative `outputs` or declare that the final answer delivers the step with `on_delivery`.
+For a decision or other non-file result, `record_plan_result` records a short result for specific step IDs. Its optional `decision`
+field lets the lead accept or return those steps with a reason.
+These events update progress without another whole-plan call. An unrelated final answer leaves other steps open.
+
+Historical evidence can be attached with `POST /api/tasks/<id>/plan-evidence` and a `links` array of
+`{source_seq, step_ids}` objects. References are task-local, batched atomically and idempotent.
+The projection uses the original evidence timestamp and reviewer, even if the reference was added later.
+`MA_PLAN_LINKS=0` retains snapshot plans.
 
 Studio enables addressed mail, urgent steering, lead consultations and teammate
 tools by default, including for work dispatched by the Super Agent. Members decide
