@@ -40,7 +40,7 @@ from typing import Any, Callable
 
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .checkpoint import Continuation, PauseRequested
-from .config import Settings
+from .config import FAST_SOFT_MINUTES, Settings
 from .context import ContextManager
 from .evaluation import evaluate, validate
 from .meter import TaskMeter
@@ -308,9 +308,13 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         if settings.team.parallel_delegations:
             parts.append(
                 "- Assignments that need nothing from each other can run at the same time: call `delegate_task` "
-                "several times in one response, each with `independent: true` and its own `deliverables`. When they "
-                "finish, each teammate sees the others' results and fixes anything that turned out to depend on "
-                "them. If one assignment needs another's output, delegate them one after another.")
+                "several times in one response, each with `independent: true`, its own `deliverables` and the "
+                "`inputs` it reads. When they finish, each teammate sees the others' results and fixes anything that "
+                "turned out to depend on them. Good candidates: release notes, a user guide or a test plan drafted "
+                "while the build or the tests run; separate research topics for separate researchers. Not "
+                "candidates: anything that reviews, summarises, prices, presents or builds on work that does not "
+                "exist yet — a risk review before the research, an outline before the reporting, client material "
+                "before the analysis. Those go one after another.")
         parts.append(
             "- Add `checks` to an assignment when 'done' can be checked mechanically (a file exists, contains a "
             "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
@@ -324,7 +328,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         if settings.team.plans:
             parts.append(
                 "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
-                "report (mark steps done, add or change steps). The requester sees it and may steer you.")
+                "report (mark steps done, add or change steps). Give a step `after` when it needs earlier steps; "
+                "steps whose `after` steps are done can be started together. The requester sees the plan and may "
+                "steer you.")
         if settings.team.resume_members:
             parts.append(
                 "- A teammate you assign again during this task continues their earlier session: they still "
@@ -344,6 +350,15 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
              "user's choice when given. Studio delivers dispatch links and the eventual result and files to this "
              "chat automatically. Use await_result only when your own next step needs that result." if studio_assistant else
              "- Do the work yourself with your tools and verify it before you finish."),
+        ]
+    if settings.team.fast:
+        parts += [
+            "- FAST MODE: the requester wants a usable result within about 10–15 minutes and accepts a simpler "
+            "one. The task stops at 15 minutes; Studio warns you at 5, 8 and 10. Choose the simplest approach that "
+            "meets the request and decide details yourself. Do small pieces yourself instead of delegating; "
+            "delegate only a few substantial pieces, in parallel when they are independent. Check the essential "
+            "behaviour once, skip optional documents, polish and repeated reviews, and say in your final answer "
+            "what was simplified or left out.",
         ]
     if interactive:
         parts += [
@@ -404,6 +419,9 @@ def member_prompt(me: Member, lead: Member, members: list[Member], settings: Set
                      "reasonable assumption and state it in your report.")
     else:
         parts.append("- The requester is not available. Make reasonable assumptions and state them in your report.")
+    if settings.team.fast:
+        parts.append("- FAST MODE: deliver the essential result in as few steps as possible, check it once, add no "
+                     "extra documents unless asked, and keep your report short.")
     parts += [
         "- Save durable lessons and conventions with `propose_knowledge`, subject to user approval.",
         "",
@@ -430,8 +448,12 @@ def _clip(text: str, limit: int) -> str:
 
 def render_plan(plan: dict) -> str:
     marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
-    rows = [f"{marks.get(s['status'], '[ ]')} {s['step']}" + (f" — {s['owner']}" if s.get("owner") else "")
-            for s in plan.get("steps", [])]
+    steps = plan.get("steps", [])
+    numbered = any(s.get("after") for s in steps)
+    rows = [f"{marks.get(s['status'], '[ ]')} " + (f"{i}. " if numbered else "") + s["step"]
+            + (f" — {s['owner']}" if s.get("owner") else "")
+            + (f" (after {', '.join(map(str, s['after']))})" if s.get("after") else "")
+            for i, s in enumerate(steps, 1)]
     return "\n".join(rows) + (f"\nNote: {plan['explanation']}" if plan.get("explanation") else "")
 
 
@@ -557,6 +579,9 @@ class TeamTask:
         """Guards counters, sessions and the record while assignments run in parallel."""
         self.plan: dict | None = None
         self.reviewer_provider: Provider | None = None
+        self.member_provider: Provider | None = None
+        """Fast mode: members' own work runs on a provider without thinking."""
+        self.deadline: float | None = None
         self.parallel_batches = 0
         self.batch: ParallelBatch | None = None
         """The parallel batch whose assignments are about to start (see _can_run_together)."""
@@ -717,6 +742,8 @@ class TeamTask:
             "checks": CHECKS_SCHEMA,
             "review": {"type": "boolean",
                        "description": "True when this assignment reviews or tests someone else's work"},
+            "inputs": {"type": "array", "items": {"type": "string"}, "maxItems": 40,
+                       "description": "Project-relative files or folders this assignment reads or builds on"},
         }
         if team.parallel_delegations:
             properties["independent"] = {
@@ -776,7 +803,9 @@ class TeamTask:
                     "type": "object", "properties": {
                         "step": {"type": "string"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                        "owner": {"type": "string", "description": "Teammate id responsible, if any"}},
+                        "owner": {"type": "string", "description": "Teammate id responsible, if any"},
+                        "after": {"type": "array", "items": {"type": "integer", "minimum": 1},
+                                  "description": "Numbers of earlier steps (1-based) this step needs first"}},
                     "required": ["step", "status"]}},
             }, "required": ["steps"]},
             fn=lambda _ctx, args: self._update_plan(lead_id, args))
@@ -807,6 +836,12 @@ class TeamTask:
         for i, mine in enumerate(claimed):
             for theirs in claimed[i + 1:]:
                 if any(_overlaps(a, b) for a in mine for b in theirs):
+                    return False
+        # Declared inputs make a dependency explicit: nothing may read what another call in the batch produces.
+        for i, args in enumerate(batch):
+            reads = [_norm(p) for p in args.get("inputs") or [] if _norm(p)]
+            for j, theirs in enumerate(claimed):
+                if i != j and any(_overlaps(a, b) for a in reads for b in theirs):
                     return False
         # A brief that names another assignment's files or teammate probably needs its output.
         for i, args in enumerate(batch):
@@ -859,11 +894,23 @@ class TeamTask:
             checks = validate(list(args.get("checks") or []))
         except ValueError as exc:
             return ToolResult.failure(f"Invalid checks: {exc}")
+        inputs = [str(p).strip() for p in args.get("inputs") or [] if str(p).strip()][:40]
+        missing = []
+        if inputs:
+            manifest = self.store.project.manifest()
+            missing = [p for p in inputs if not _present(p, manifest)]
+            task += "\n\nRead these project files first: " + ", ".join(inputs)
+            if missing:
+                task += ("\nNot in the project yet: " + ", ".join(missing)
+                         + ". Say in your report if the work needed them.")
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
                                fresh=fresh, checks=checks, review=review, batch=batch)
         if isinstance(outcome, ToolResult):
             return outcome
         lines = self._report_lines(outcome)
+        if missing:
+            lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing)
+                         + ". If the work depended on them, run it again after the step that produces them.")
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
         ok = outcome["result"].status in {"completed", "max_steps", "stuck", "budget"}
         return ToolResult(ok=ok, content="\n".join(lines))
@@ -1048,6 +1095,8 @@ class TeamTask:
             return ToolResult.failure("The reviewer must be someone other than the author.")
         if len(work) < 10:
             return ToolResult.failure("Describe the work to review and where it is.")
+        if self.settings.team.fast and type(rounds_max) is int:
+            rounds_max = min(rounds_max, 2)
         if type(rounds_max) is not int or not 1 <= rounds_max <= 5:
             return ToolResult.failure("max_rounds must be between 1 and 5")
         try:
@@ -1127,6 +1176,13 @@ class TeamTask:
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
         return ToolResult(ok=bool(rounds), content="\n".join(lines))
 
+    def _time_boxed(self, limits, reserve: float = 0):
+        """Within a task time limit, an agent run gets the time that is left (minus room for the lead to wrap up)."""
+        if self.deadline is None:
+            return limits
+        left = max(5.0, self.deadline - time.monotonic() - reserve)  # past the limit an agent only writes its report
+        return replace(limits, max_seconds=min(limits.max_seconds or left, left))
+
     def _update_plan(self, lead_id: str, args: dict) -> ToolResult:
         steps = []
         for item in args.get("steps") or []:
@@ -1136,6 +1192,12 @@ class TeamTask:
             row = {"step": text, "status": item.get("status", "pending")}
             if item.get("owner"):
                 row["owner"] = str(item["owner"]).strip()[:60]
+            after = item.get("after") or []
+            if after:
+                if any(type(n) is not int or not 1 <= n <= len(steps) for n in after):
+                    return ToolResult.failure(f"Step {len(steps) + 1}: `after` may only name earlier steps "
+                                              f"(1–{len(steps)}).")
+                row["after"] = sorted(set(after))
             steps.append(row)
         if not 1 <= len(steps) <= 20:
             return ToolResult.failure("A plan has 1–20 steps.")
@@ -1145,7 +1207,10 @@ class TeamTask:
             self._update(plan=self.plan)
         self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation)
         done = sum(s["status"] == "completed" for s in steps)
-        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done. The requester can see it.")
+        ready = [str(i) for i, s in enumerate(steps, 1) if s["status"] == "pending"
+                 and all(steps[n - 1]["status"] == "completed" for n in s.get("after", []))]
+        hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
+        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint} The requester can see it.")
 
     def _run_member(self, member: Member, task: str, deliverables: list[str], entry: dict, max_steps=None,
                     *, fresh: bool = False, review: bool = False, reconcile: bool = False):
@@ -1172,10 +1237,15 @@ class TeamTask:
             assignment += ("\n\nThis assignment is a review or test: you own the verification of this work. Check "
                            "the real behaviour end to end and report concrete evidence.")
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
-        settings = self.settings.reviewer() if review else self.settings
-        provider = self.reviewer_provider if review and self.reviewer_provider is not None else self.provider
+        # Reviews keep the lead's thinking (or the reviewer settings); in fast mode members' own work does not think.
+        settings = self.settings.reviewer() if review else self.settings.member()
+        if review:
+            provider = self.reviewer_provider if self.reviewer_provider is not None else self.provider
+        else:
+            provider = self.member_provider if self.member_provider is not None else self.provider
+        limits = settings.limits if max_steps is None else replace(settings.limits, max_steps=max_steps)
         agent = Agent(member.id, provider, self._registry(member.id, lead=False), Sandbox(workspace, member.id),
-                      settings, limits=settings.limits if max_steps is None else replace(settings.limits, max_steps=max_steps),
+                      settings, limits=self._time_boxed(limits, reserve=45),
                       system_prompt=member_prompt(member, lead, self.group.members, settings, self.interactive),
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel,
                       stream=True, continuation=self.control)
@@ -1236,7 +1306,10 @@ class TeamTask:
     def run(self) -> dict:
         self.started_at = time.monotonic() - self.control.saved.get("elapsed",0)
         self.meter.started = time.time() - self.control.saved.get("elapsed", 0)
-        self.meter.budget_minutes = float(self.options.get("budget_minutes") or 0)
+        self.meter.budget_minutes = float(self.options.get("budget_minutes")
+                                          or (FAST_SOFT_MINUTES if self.settings.team.fast else 0))
+        if self.settings.team.task_seconds:
+            self.deadline = time.monotonic() + self.settings.team.task_seconds - self.control.saved.get("elapsed", 0)
         self.meter.budget_tokens = int(self.options.get("budget_tokens") or 0)
         me = self.group.member(self.primary)
         can_delegate = self.primary == self.group.lead and len(self.group.members) > 1
@@ -1276,12 +1349,14 @@ class TeamTask:
                 self.record["dispatched_by"] = self.dispatched_by
             self.store.save_task(self.record)
             self.store.append("task_started", task_id=self.task_id, agent=self.primary,
-                              **({"continued_from":self.continued_from} if self.continued_from else {}))
+                              **({"continued_from":self.continued_from} if self.continued_from else {}),
+                              **({"fast": True} if self.settings.team.fast else {}))
             self.lead_baseline = self.store.project.checkout(workspace)
         settings = self.settings
         # The coordinating lead gets the lead budget; a member addressed directly works
         # like any assignment, with the member budget.
         limits = replace(settings.limits, max_steps=settings.team.lead_max_steps) if can_delegate else settings.limits
+        limits = self._time_boxed(limits)
         prompt = lead_prompt(me, self.group.members, settings, self.interactive, can_delegate,
                              studio_assistant=self.group.kind == "assistant")
         if not can_delegate and self.primary != self.group.lead:

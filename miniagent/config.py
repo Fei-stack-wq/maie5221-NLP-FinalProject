@@ -141,11 +141,18 @@ class TeamLimits:
     retrospective: bool = True
     """After a task, draft lessons for the user to approve into role knowledge."""
 
+    fast: bool = False
+    """Fast mode: a time-boxed task where only the lead and reviewers think (see fast_profile)."""
+
+    task_seconds: int = 0
+    """Hard wall-clock limit for the whole task; 0 means none. Agents wrap up with a report when it is reached."""
+
     def __post_init__(self) -> None:
         _integer("lead_max_steps", self.lead_max_steps, 1, 1000)
         _integer("max_delegations", self.max_delegations, 0, 200)
         _integer("max_repeat_assignments", self.max_repeat_assignments, 1, 20)
-        for name in ("resume_members", "parallel_delegations", "review_loops", "plans", "retrospective"):
+        _integer("task_seconds", self.task_seconds, 0, 24 * 3600)
+        for name in ("resume_members", "parallel_delegations", "review_loops", "plans", "retrospective", "fast"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be true or false")
 
@@ -184,6 +191,10 @@ class Settings:
         """Settings for review assignments (identical to these unless a reviewer model or thinking is set)."""
         return replace(self, model=self.reviewer_model or self.model,
                        thinking=self.reviewer_thinking or self.thinking)
+
+    def member(self) -> "Settings":
+        """Settings for members' own work: in fast mode they run without thinking."""
+        return replace(self, thinking="disabled") if self.team.fast else self
 
     @property
     def distinct_reviewer(self) -> bool:
@@ -340,3 +351,27 @@ def load_settings(env_file: Path | None = None) -> Settings:
         raise FileNotFoundError(str(env_file))
     merged.update({key: value for key, value in os.environ.items() if key in _ENV_KEYS})
     return Settings.from_env(merged)
+
+
+FAST_TASK_SECONDS = 15 * 60
+FAST_SOFT_MINUTES = 10
+
+
+def fast_profile(settings: Settings) -> Settings:
+    """Fast mode: aim for a usable result in 10–15 minutes and accept a simpler one.
+
+    As in aider's architect mode, the model that decides (the lead, and reviewers) keeps
+    thinking, at low effort, while workers run without it; ``deepseek-flash`` throughout.
+    The task has a hard 15-minute limit (agents then write their report), a soft
+    10-minute budget that warns the lead, smaller step and hand-off budgets, at most two
+    review rounds, short tool timeouts, and no plan updates or post-task lessons.
+    """
+    return replace(
+        settings, model="deepseek-flash", reasoning_effort="low",
+        reviewer_model="" if settings.reviewer_model == "deepseek-v4-pro" else settings.reviewer_model,
+        limits=replace(settings.limits, max_steps=min(settings.limits.max_steps, 30),
+                       tool_timeout_seconds=min(settings.limits.tool_timeout_seconds, 120)),
+        team=replace(settings.team, fast=True, task_seconds=FAST_TASK_SECONDS,
+                     lead_max_steps=min(settings.team.lead_max_steps, 25),
+                     max_delegations=min(settings.team.max_delegations, 4),
+                     plans=False, retrospective=False))

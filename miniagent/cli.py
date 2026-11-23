@@ -367,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("bench", help="compare team set-ups and a single agent on the Mid_Test scenarios")
     p.add_argument("--out", required=True, help="directory for results, copied projects and chats")
     p.add_argument("--arms", default="team,team-classic,solo",
-                   help="comma-separated: team, team-fresh, team-classic, solo")
+                   help="comma-separated: team, team-fresh, team-classic, solo, fast")
     p.add_argument("--scenarios", default="1,2,3", help="scenario numbers, e.g. 1,2,3")
     p.add_argument("--solo-max-steps", type=int, default=400)
     p.add_argument("--tasks", default="", help="task numbers to run per scenario, e.g. 1 (default: all)")

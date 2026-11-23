@@ -321,7 +321,9 @@ function renderEvent(event) {
     case "task_started": {
       const tools=toolWidget(tid);state.toolWidgets.set(tid,tools);
       return el("section",{class:"chat-run"},el("div",{class:"chat-run-head"},
-        el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), (event.continued_from?"续作开始 · ":"任务开始 · ")+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
+        el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), (event.continued_from?"续作开始 · ":"任务开始 · ")+memberName(event.agent)+" 负责",
+          event.fast ? el("span",{class:"fast-badge",title:"约 10–15 分钟交付简化版本，15 分钟时收尾"},"⚡ 快速模式") : null),
+        button("查看任务树",()=>taskDetail(tid))),tools);
     }
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
@@ -366,7 +368,10 @@ function renderEvent(event) {
       const node = card("plan", event.agent,
         [el("b", {}, `${memberName(event.agent)} · 计划`), el("span", { class: "plan-count" }, `${done}/${event.steps.length} 完成`)],
         el("ol", { class: "plan-steps" }, ...event.steps.map((s) => el("li", { class: s.status },
-          el("span", { class: "plan-text" }, s.step), s.owner ? el("span", { class: "plan-owner" }, memberName(s.owner)) : null))),
+          el("span", { class: "plan-text" }, s.step),
+          s.after && s.after.length && s.status !== "completed" && s.after.some((n) => event.steps[n - 1]?.status !== "completed")
+            ? el("span", { class: "plan-wait" }, "等第 " + s.after.join("、") + " 步") : null,
+          s.owner ? el("span", { class: "plan-owner" }, memberName(s.owner)) : null))),
         event.explanation ? el("p", { class: "plan-note" }, event.explanation) : null);
       state.planCards.set(tid, node);
       return node;
@@ -914,6 +919,7 @@ function send(event) {
   if ((!text && !files.length) || !gid || state.feed?.id!==gid) return;
   const options={...state.runOptions};
   if ($("#thinking").value) options.thinking=$("#thinking").value;
+  if (state.fast) options.mode="fast";
   const queue=$("#queue").checked;
   input.value=""; autoGrow();
   $("#uploads").value=""; renderUploads();
@@ -1101,8 +1107,19 @@ function renderUploads() {
     } }, "×"))));
 }
 
+function setFast(on) {
+  state.fast = on;
+  const toggle = $("#fast-mode");
+  toggle.setAttribute("aria-pressed", String(on));
+  try { localStorage.setItem("studio.fast", on ? "1" : "0"); } catch (_) { /* private mode */ }
+}
+
 function setupComposer() {
   const input = $("#input"), timeline = $("#timeline"), bottom = $("#bottom");
+  let remembered = false;
+  try { remembered = localStorage.getItem("studio.fast") === "1"; } catch (_) { /* private mode */ }
+  setFast(remembered);
+  $("#fast-mode").addEventListener("click", () => setFast(!state.fast));
   input.addEventListener("input", autoGrow);
   $("#uploads").addEventListener("change", renderUploads);
   $("#key-banner-open").addEventListener("click", () => connectionSheet().catch(showError));

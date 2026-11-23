@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import Settings
+from .config import Settings, fast_profile
 from .providers import DeepSeekProvider, Provider
 from .store import Group, GroupStore, Store, Member, now
 from .roles import Roles
@@ -445,9 +445,11 @@ class Studio:
     def _task_settings(self, store, options):
         if not isinstance(options, dict) or options.keys() - {
                 "thinking","interaction_mode","member_max_steps","lead_max_steps","max_delegations","checks",
-                "budget_minutes","budget_tokens",
+                "budget_minutes","budget_tokens","mode",
                 "reviewer_model","reviewer_thinking"}:
             raise StudioError("Invalid task options")
+        if options.get("mode", "standard") not in ("standard", "fast"):
+            raise StudioError("mode must be standard or fast")
         mode = options.get("interaction_mode", store.group.mode)
         if mode not in ("interactive","autonomous"):
             raise StudioError("Unknown interaction mode")
@@ -462,6 +464,8 @@ class Studio:
                            reviewer_thinking=options.get("reviewer_thinking", base.reviewer_thinking),
                            limits=replace(base.limits, max_steps=options.get("member_max_steps", base.limits.max_steps)),
                            team=replace(base.team, **{k:options[k] for k in ("max_delegations","lead_max_steps") if k in options}))
+        if options.get("mode") == "fast":
+            settings = fast_profile(settings)
         return settings, mode
 
     def _start(self, store, record, saved=None):
@@ -470,6 +474,7 @@ class Studio:
             settings, mode = self._task_settings(store, record["options"])
             provider = self.provider_factory(settings)
             reviewer_provider = self.provider_factory(settings.reviewer()) if settings.distinct_reviewer else None
+            member_provider = self.provider_factory(settings.member()) if settings.team.fast else None
             if saved:
                 group = Group.from_dict(saved["team"])
             else:
@@ -514,6 +519,7 @@ class Studio:
             running.meter = task.meter
             task.redispatched_from = record.get("redispatched_from")
             task.reviewer_provider = reviewer_provider
+            task.member_provider = member_provider
             task.options = record["options"]
             task.created_at = record["created_at"]
             running.thread = threading.Thread(target=self._run, args=(store.group.id, task, running),

@@ -7,6 +7,7 @@ The arms run the same two tasks per scenario in one group each, in autonomous mo
 * ``team-fresh``   — the same, except every assignment starts a new conversation.
 * ``team-classic`` — the same roles with all of those features off (the behaviour before them).
 * ``solo``         — one agent holding all four role descriptions, with a larger step budget.
+* ``fast``         — the four roles in fast mode (lead and reviewers think, workers do not, 15-minute limit).
 
 Post-task lessons are switched off in every arm: nobody approves them during a benchmark.
 
@@ -26,10 +27,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .config import Settings
+from .config import Settings, fast_profile
 from .studio import Studio
 
-ARMS = ("team", "team-fresh", "team-classic", "solo")
+ARMS = ("team", "team-fresh", "team-classic", "solo", "fast")
 EXCLUSIVE = {"scenario_1"}
 _COPY_IGNORE = shutil.ignore_patterns(".git", "__pycache__", "node_modules", ".venv", "*.pyc")
 
@@ -49,6 +50,8 @@ def arm_settings(settings: Settings, arm: str, solo_max_steps: int) -> Settings:
         return replace(settings, team=replace(settings.team, **{**on, "resume_members": False}))
     if arm == "team-classic":
         return replace(settings, team=replace(settings.team, **{key: False for key in on}))
+    if arm == "fast":
+        return fast_profile(replace(settings, team=replace(settings.team, **on)))
     if arm == "solo":
         return replace(settings.with_limits(max_steps=solo_max_steps),
                        team=replace(settings.team, retrospective=False))
