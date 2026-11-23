@@ -26,6 +26,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .studio import Studio, StudioError
 from .settings_api import model_settings, save_key, save_models
 from .folders import pick
+from .instance import runtime_version
 from .evaluation import assessor_export
 from .workbench import published_bytes, tool_page
 
@@ -86,6 +87,7 @@ class StudioHandler(_Base):
     studio: Studio
     preview_port: int
     instance_id: str
+    build_id: str
 
     def end_headers(self):
         self.send_header("X-Studio-Instance", self.instance_id)
@@ -132,7 +134,11 @@ class StudioHandler(_Base):
             with studio.writing_request():  # first visit can create the assistant room
                 return self._json(200, studio.assistant())
         if parts == ["bootstrap"]:
-            return self._json(200, {"token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
+            try:
+                local_build = runtime_version()
+            except OSError:  # The checkout can be changing while the running UI remains available.
+                local_build = None
+            return self._json(200, {"version":{"running":self.build_id, "local":local_build}, "token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
                                     **model_settings(studio.settings),
                                     "preview_port":self.preview_port,"workbench_version":1,"chat_protocol":1,"task_pause":True,"member_max_steps":studio.settings.limits.max_steps,
                                     "lead_max_steps":studio.settings.team.lead_max_steps,
@@ -383,10 +389,11 @@ def serve(studio: Studio, port: int = 8765, *, strict_port: bool = False,
     if not 0 <= port <= 65535:
         raise ValueError("Invalid Studio port")
     # A running process must keep serving the frontend that matches its Python API.
+    build_id = runtime_version()
     assets = {p.relative_to(WEB).as_posix(): p.read_bytes() for p in WEB.rglob("*")
               if p.is_file() and WEB.resolve() in p.resolve().parents}
     handler = type("Handler", (StudioHandler,), {"studio": studio, "studio_token": secrets.token_urlsafe(32),
-                                                 "assets": assets, "instance_id": secrets.token_hex(16)})
+                                                 "assets": assets, "build_id": build_id, "instance_id": secrets.token_hex(16)})
     try:
         main = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:

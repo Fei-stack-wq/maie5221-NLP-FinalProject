@@ -10,7 +10,8 @@
 #sidebar .brand .label { display: grid; line-height: 1.2; }
 #sidebar .brand .label > span:first-child { font: 700 17px var(--serif); letter-spacing: .03em; }
 #sidebar .brand .label > span:first-child span { color: var(--cobalt); }
-#sidebar .brand .motto { font: 11px var(--serif); letter-spacing: .32em; color: var(--gold-deep); margin-top: 4px; }
+#studio-version { margin-top: 4px; font: 11px/1.4 var(--sans); color: var(--ink-2); white-space: nowrap; }
+#studio-version code { font-size: 1em; }
 .brand-mark { width: 34px; height: 34px; flex: none; display: grid; place-items: center; }
 .brand-mark svg { width: 34px; height: 34px; }
 #new-group { width: 100%; justify-content: center; padding: 10px 12px; margin: 0 0 16px; border-radius: 10px; }
@@ -154,7 +155,8 @@ body:has(#files:not([hidden])) #member-panel { display: none; }
 @media (max-width: 760px) {
   body { flex-direction: column; }
   #sidebar { width: 100%; flex: 0 0 auto; flex-direction: row; align-items: center; gap: 6px; padding: 8px 10px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-  #sidebar .brand { padding: 0 6px 0 0; } #sidebar .brand .label { display: none; }
+  #sidebar .brand { padding: 0 6px 0 0; } #sidebar .brand .label > span:first-child { font-size: 13px; }
+  #sidebar .brand { flex: none; }
   #sections { display: flex; margin: 0; } #sidebar button { white-space: nowrap; width: auto; }
   #new-group { margin: 0; } #sidebar > label, #config { display: none; }
   #group-list { display: flex; flex: 0 0 auto; overflow: visible; gap: 4px; }

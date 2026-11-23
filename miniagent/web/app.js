@@ -80,6 +80,17 @@ function brandSeal() {
 }
 function youAvatar(size = "") { return el("span", { class: "avatar you" + (size ? " " + size : ""), "aria-hidden": "true" }, "你"); }
 
+function showStudioVersion(version) {
+  const label = $("#studio-version");
+  if (!version?.running) return;
+  let status = "未核对";
+  if (version.local) status = version.local === version.running ? "本地最新" : "有本地更新";
+  label.replaceChildren("版本 ", el("code", {}, version.running.slice(0, 12)),
+    el("span", {class:"version-status"}, " · " + status));
+  label.title = "运行版本 " + version.running + (version.local ? "\n打开页面时的本地版本 " + version.local : "");
+  label.hidden = false;
+}
+
 async function api(path, options = {}) {
   const init = { ...options, headers: { ...(options.headers || {}) } };
   if (options.body !== undefined) {
@@ -94,6 +105,8 @@ async function api(path, options = {}) {
     const changed = state.instance !== instance;
     const banner = $("#studio-update");
     if (changed || response.headers.get("X-Studio-Update") === "pending") {
+      const status = $("#studio-version .version-status");
+      if (status) status.textContent = changed ? " · 请刷新" : " · 等待更新";
       banner.hidden = false;
       banner.firstElementChild.textContent = changed
         ? "工作室已更新。准备好后刷新页面即可使用新版。"
@@ -1060,6 +1073,7 @@ async function boot() {
   if (window.markdownit) md = window.markdownit({ html: false, linkify: true, breaks: true });
   $("#studio-update button").addEventListener("click", () => location.reload());
   state.config = await api("/bootstrap");
+  showStudioVersion(state.config.version);
   state.templates = state.config.templates;
   if (!state.config.chat_protocol) {
     $("#composer").prepend(el("div",{class:"muted small",role:"status"},

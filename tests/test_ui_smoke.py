@@ -29,6 +29,13 @@ class StudioBrowserTest(unittest.TestCase):
                     page=browser.new_page()
                     base=f"http://127.0.0.1:{main.server_port}/"
                     page.goto(base+"#"+assistant)
+                    version = page.locator("#studio-version")
+                    short_id = main.RequestHandlerClass.build_id[:12]
+                    expect(version).to_have_text(f"版本 {short_id} · 本地最新")
+                    page.set_viewport_size({"width":390, "height":844})
+                    expect(version.locator("code")).to_be_in_viewport()
+                    expect(version.locator(".version-status")).to_be_in_viewport()
+                    page.set_viewport_size({"width":1280, "height":720})
                     def send(message):
                         page.locator("#input").fill(message)
                         page.locator("#composer button[type=submit]").click()

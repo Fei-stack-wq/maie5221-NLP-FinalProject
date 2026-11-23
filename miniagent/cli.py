@@ -89,8 +89,7 @@ def reopen_studio(directory, args):
 def cmd_studio(args) -> int:
     import signal
     settings = _settings(args)
-    from .instance import RestartStudio, advertised_studio, runtime_version
-    version = runtime_version()
+    from .instance import RestartStudio, advertised_studio
     from .server import serve
     studio = Studio(settings)
     studio.env_file = Path(args.env_file or ".env").resolve()
@@ -103,7 +102,8 @@ def cmd_studio(args) -> int:
             return 1
         raise
     try:
-        with advertised_studio(settings.runs_dir, main.server_port, main.RequestHandlerClass.instance_id, version) as update:
+        with advertised_studio(settings.runs_dir, main.server_port, main.RequestHandlerClass.instance_id,
+                               main.RequestHandlerClass.build_id) as update:
             studio.restore_queue()
             url = f"http://127.0.0.1:{main.server_address[1]}/"
             print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")

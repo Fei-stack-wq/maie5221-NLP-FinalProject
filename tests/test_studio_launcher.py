@@ -96,8 +96,15 @@ class StudioLauncherTest(unittest.TestCase):
                 self.assertIsNotNone(first)
                 url = first.url.rstrip("/")
                 asset = package / "web" / "launcher-test.txt"
+                def bootstrap():
+                    return json.loads(request(url + "/api/bootstrap")[2])
+
+                self.assertEqual(bootstrap()["version"], {"running":first.version, "local":first.version})
                 asset.write_text("busy update")
-                token = json.loads(request(url + "/api/bootstrap")[2])["token"]
+                stale = bootstrap()
+                self.assertEqual(stale["version"]["running"], first.version)
+                self.assertNotEqual(stale["version"]["local"], first.version)
+                token = stale["token"]
                 body = json.dumps({"name":"Saved through update","members":[{"id":"lead","name":"Lead","prompt":"Lead"}],"lead":"lead"}).encode()
                 # Hold a real authenticated POST after admission and before its JSON has arrived.
                 with contextlib.closing(http.client.HTTPConnection("127.0.0.1", first.port, timeout=8)) as client:
@@ -116,6 +123,8 @@ class StudioLauncherTest(unittest.TestCase):
                     gid = json.loads(response.read())["id"]
                 second = wait_for_instance(runs, previous=first.id, timeout=8)
                 self.assertEqual(second.url, first.url)
+                self.assertEqual(second.version, stale["version"]["local"])
+                self.assertEqual(bootstrap()["version"], {"running":second.version, "local":second.version})
                 self.assertEqual(request(url + "/static/launcher-test.txt")[2], b"busy update")
                 self.assertIn(gid, [r["id"] for r in json.loads(request(url + "/api/groups")[2])])
 
