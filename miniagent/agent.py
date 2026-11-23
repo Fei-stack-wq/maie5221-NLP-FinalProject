@@ -17,6 +17,11 @@ lacked:
 4. **Steering is cooperative.** Messages the user sends while the agent works
    are appended at the next step boundary; the agent is never interrupted in
    the middle of a tool batch.
+5. **A session can be continued.** Passing an :class:`AgentSession` keeps the
+   conversation after the run ends. A later ``run`` with the same session
+   appends the next assignment to that history instead of starting over, as
+   Codex CLI's ``send_input`` does for a spawned agent. The new assignment is
+   anchored so compaction never summarizes it away.
 
 Loop structure follows OpenAI Agents SDK ``Runner`` (max_turns → final
 handling) and Pi ``agent-loop.ts`` (tool batch → steering check → next
@@ -31,6 +36,7 @@ import signal
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
@@ -58,6 +64,14 @@ WRAP_UP_INSTRUCTION = (
 )
 
 
+class BatchPaused(Exception):
+    """A pause reached part of a concurrent batch; ``done`` holds the calls that finished."""
+
+    def __init__(self, done: dict[int, ToolResult]) -> None:
+        super().__init__("batch paused")
+        self.done = done
+
+
 class Inbox(Protocol):
     def take(self, agent: str) -> list[str]: ...
 
@@ -73,10 +87,33 @@ class AgentResult:
     usage: Usage = field(default_factory=Usage)
     duration_s: float = 0.0
     compactions: int = 0
+    resumed: bool = False
+    """True when this run continued an earlier conversation of the same session."""
 
     @property
     def ok(self) -> bool:
         return self.status in ("completed", "dispatched")
+
+
+@dataclass
+class AgentSession:
+    """One agent's conversation, kept between runs so a follow-up assignment continues it.
+
+    A session can be continued only when its last run ended cleanly with a
+    final assistant message (no unanswered tool calls). After an error or a
+    cancellation the next run starts a fresh conversation.
+    """
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    context: ContextManager | None = None
+    runs: int = 0
+
+    @property
+    def resumable(self) -> bool:
+        if not self.messages or self.context is None:
+            return False
+        last = self.messages[-1]
+        return last.get("role") == "assistant" and not last.get("tool_calls")
 
 
 class ProcessScope:
@@ -149,15 +186,15 @@ class Agent:
         except Exception:  # noqa: BLE001 - UI/trace sinks are best effort
             pass
 
-    def run(self, task: str, *, context: str = "") -> AgentResult:
+    def run(self, task: str, *, context: str = "", session: AgentSession | None = None) -> AgentResult:
+        """Run one task.
+
+        A saved pause frame for this agent continues exactly where it paused. Otherwise a
+        resumable ``session`` continues that conversation with ``task`` as the next assignment,
+        and without either the run starts a new conversation.
+        """
         started = time.monotonic()
         deadline = started + self.limits.max_seconds if self.limits.max_seconds else None
-        first = (context.strip() + "\n\n---\n\n# Your task\n" + task) if context.strip() else task
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": first},
-        ]
-        ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
         guard = LoopGuard()
         usage = Usage()
         tool_calls = 0
@@ -189,6 +226,29 @@ class Agent:
             next_call = saved["next_call"]
             in_tool = saved["in_tool"]
             batch_ok, handed_off = saved["batch_ok"], saved["handed_off"]
+            resumed = bool(saved.get("resumed"))
+            compactions_before = saved.get("compactions_before", ctx_manager.compactions)
+        else:
+            resumed = session is not None and session.resumable
+            if resumed:
+                messages = session.messages
+                ctx_manager = session.context
+                note = (context.strip() + "\n\n---\n\n# Your next assignment\n" + task) if context.strip() else task
+                current = {"role": "user", "content": note}
+                messages.append(current)
+                ctx_manager.anchor(current)
+            else:
+                first = (context.strip() + "\n\n---\n\n# Your task\n" + task) if context.strip() else task
+                messages = [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": first},
+                ]
+                ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
+            compactions_before = ctx_manager.compactions
+        if session is not None:
+            session.messages, session.context = messages, ctx_manager
+            if not saved:
+                session.runs += 1
         processes = ProcessScope()
         tmpdir = tempfile.mkdtemp(prefix="miniagent-run-")
         self.sandbox.command_sessions = CommandSessions()
@@ -203,7 +263,7 @@ class Agent:
         )
         specs = self.registry.specs(available_only=True)
         tool_schemas = [spec.to_api() for spec in specs]
-        self.emit("resume" if saved else "start", task=task)
+        self.emit("resume" if saved else "start", task=task, resumed=resumed)
 
         def spend(response: LLMResponse) -> None:
             nonlocal usage
@@ -327,6 +387,35 @@ class Agent:
                     pending = calls
                     next_call = 0
                     batch_ok, handed_off = True, False
+                if next_call == 0 and len(pending) > 1:
+                    if control:
+                        control.boundary()
+                    rejoin_batch, in_tool = in_tool, True
+                    try:
+                        together = self._run_together(pending, tool_ctx, rejoining=rejoin_batch)
+                    except BatchPaused as paused:
+                        # Keep what finished; only the paused calls run again on resume.
+                        for index in sorted(paused.done):
+                            call, result = pending[index], paused.done[index]
+                            batch_ok = batch_ok and result.ok
+                            handed_off = handed_off or result.handed_off
+                            tool_calls += 1
+                            messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
+                            guard.record(call.name, call.arguments, result.ok, result.content)
+                        pending = [call for index, call in enumerate(pending) if index not in paused.done]
+                        next_call = 0
+                        raise PauseRequested() from None
+                    if together is None:
+                        in_tool = rejoin_batch
+                    else:
+                        in_tool = False
+                        for call, result in zip(pending, together):
+                            batch_ok = batch_ok and result.ok
+                            handed_off = handed_off or result.handed_off
+                            tool_calls += 1
+                            messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
+                            guard.record(call.name, call.arguments, result.ok, result.content)
+                        next_call = len(pending)
                 for index in range(next_call, len(pending)):
                     next_call = index
                     call = pending[index]
@@ -377,6 +466,7 @@ class Agent:
                 "warned":warned, "recoveries":recoveries, "empty_answers":empty_answers,
                 "pending":[c.model_dump() for c in pending], "next_call":next_call, "in_tool":in_tool,
                 "batch_ok":batch_ok, "handed_off":handed_off, "processes":self.sandbox.command_sessions.checkpoint(),
+                "resumed":resumed, "compactions_before":compactions_before,
             }
             raise
         except ProviderError as exc:
@@ -397,13 +487,47 @@ class Agent:
             shutil.rmtree(tmpdir, ignore_errors=True)
         result = AgentResult(agent=self.name, status=status, answer=answer, error=error, steps=step,
                              tool_calls=tool_calls, usage=usage, duration_s=round(elapsed + time.monotonic() - started, 2),
-                             compactions=ctx_manager.compactions)
+                             compactions=ctx_manager.compactions - compactions_before, resumed=resumed)
         self.emit("end", status=status, answer=answer, error=error, steps=step, tool_calls=tool_calls,
                   prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
                   duration_s=result.duration_s)
         return result
 
     # ------------------------------------------------------------------
+    def _run_together(self, calls: list[ToolCall], ctx: ToolContext, *, rejoining: bool = False) -> list[ToolResult] | None:
+        """Run a batch of calls to one tool concurrently when that tool allows it; results keep call order.
+
+        Codex dispatches tools that declare parallel support under a shared lock and
+        everything else exclusively; here the tool decides per batch from the arguments.
+        When a pause reaches some of the calls, the finished ones are returned in
+        :class:`BatchPaused` so that only the others run again on resume.
+        """
+        if len(calls) < 2 or len(calls) > self.limits.max_tool_calls_per_step or self.should_cancel():
+            return None
+        if len({call.name for call in calls}) != 1 or any(call.parse_error for call in calls):
+            return None
+        tool = self.registry.get(calls[0].name)
+        if tool is None or tool.concurrent is None:
+            return None
+        try:
+            if not tool.concurrent([call.arguments for call in calls]):
+                return None
+        except Exception:  # noqa: BLE001 - a failing predicate just means "one after another"
+            return None
+        self.emit("parallel", tool=tool.name, count=len(calls))
+        with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix=f"{self.name}-tools") as pool:
+            futures = [pool.submit(self._execute, call, ctx, rejoining=rejoining) for call in calls]
+        done: dict[int, ToolResult] = {}
+        paused = False
+        for index, future in enumerate(futures):
+            try:
+                done[index] = future.result()
+            except PauseRequested:
+                paused = True
+        if paused:
+            raise BatchPaused(done)
+        return [done[index] for index in range(len(calls))]
+
     def _execute(self, call: ToolCall, ctx: ToolContext, *, rejoining=False) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
         if not rejoining:

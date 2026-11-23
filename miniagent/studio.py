@@ -463,7 +463,8 @@ class Studio:
 
     def _task_settings(self, store, options):
         if not isinstance(options, dict) or options.keys() - {
-                "thinking","interaction_mode","member_max_steps","lead_max_steps","max_delegations","checks"}:
+                "thinking","interaction_mode","member_max_steps","lead_max_steps","max_delegations","checks",
+                "reviewer_model","reviewer_thinking"}:
             raise StudioError("Invalid task options")
         mode = options.get("interaction_mode", store.group.mode)
         if mode not in ("interactive","autonomous"):
@@ -471,6 +472,8 @@ class Studio:
         validate(options.get("checks", []))
         base = self.settings
         settings = replace(base, thinking=options.get("thinking", base.thinking),
+                           reviewer_model=options.get("reviewer_model", base.reviewer_model),
+                           reviewer_thinking=options.get("reviewer_thinking", base.reviewer_thinking),
                            limits=replace(base.limits, max_steps=options.get("member_max_steps", base.limits.max_steps)),
                            team=replace(base.team, **{k:options[k] for k in ("max_delegations","lead_max_steps") if k in options}))
         return settings, mode
@@ -480,6 +483,7 @@ class Studio:
         try:
             settings, mode = self._task_settings(store, record["options"])
             provider = self.provider_factory(settings)
+            reviewer_provider = self.provider_factory(settings.reviewer()) if settings.distinct_reviewer else None
             if saved:
                 group = Group.from_dict(saved["team"])
             else:
@@ -517,6 +521,7 @@ class Studio:
             task.interactive = mode == "interactive"
             task.studio = self
             task.redispatched_from = record.get("redispatched_from")
+            task.reviewer_provider = reviewer_provider
             task.options = record["options"]
             task.created_at = record["created_at"]
             running.thread = threading.Thread(target=self._run, args=(store.group.id, task, running),
@@ -683,6 +688,7 @@ class Studio:
             store.save_task(result)
             for warning in result.get("folder_warnings", []):
                 store.append("system", task_id=task.task_id, text=warning)
+            self._retrospective(store, task, result)
         except Exception as exc:  # noqa: BLE001 - recorded in the chat, never crashes the server
             store.append("task_finished", task_id=task.task_id, status="failed", error=f"{type(exc).__name__}: {exc}")
             try:
@@ -700,6 +706,20 @@ class Studio:
                         del self._running[group_id]
                         self._dispatch_changed.notify_all()
                         self._advance(store)
+
+    def _retrospective(self, store, task: TeamTask, record: dict) -> None:
+        """Draft lessons for one-click approval; never affects the task's outcome."""
+        if (not task.settings.team.retrospective or store.group.kind == "assistant"
+                or record.get("status") not in ("completed", "incomplete", "failed")):
+            return
+        try:
+            from .retrospective import draft_and_propose
+            entries = draft_and_propose(self, store, record, task.provider)
+            if entries:
+                record["lessons"] = [e["id"] for e in entries]
+                store.save_task(record)
+        except Exception as exc:  # noqa: BLE001 - a retrospective is optional
+            store.trace(task.task_id, {"type": "retrospective_failed", "error": f"{type(exc).__name__}: {exc}"})
 
     def _activity(self, running: Running, event: dict) -> None:
         with running.lock:

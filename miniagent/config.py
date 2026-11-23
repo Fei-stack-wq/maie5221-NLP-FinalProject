@@ -126,10 +126,28 @@ class TeamLimits:
     max_repeat_assignments: int = 3
     """Near-identical assignments to the same member before the lead is told to change course."""
 
+    resume_members: bool = True
+    """A member assigned again in the same task continues its earlier conversation instead of starting over."""
+
+    parallel_delegations: bool = True
+    """Several delegate_task calls in one lead response run at once when their declared files do not overlap."""
+
+    review_loops: bool = True
+    """The lead may run an author–reviewer fix loop (review_loop) without relaying each round itself."""
+
+    plans: bool = True
+    """The lead keeps a visible plan with update_plan."""
+
+    retrospective: bool = True
+    """After a task, draft lessons for the user to approve into role knowledge."""
+
     def __post_init__(self) -> None:
         _integer("lead_max_steps", self.lead_max_steps, 1, 1000)
         _integer("max_delegations", self.max_delegations, 0, 200)
         _integer("max_repeat_assignments", self.max_repeat_assignments, 1, 20)
+        for name in ("resume_members", "parallel_delegations", "review_loops", "plans", "retrospective"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be true or false")
 
 
 @dataclass
@@ -155,6 +173,19 @@ class Settings:
     """Recent conversation kept verbatim when compacting (Pi's keepRecentTokens)."""
     max_output_recovery_attempts: int = 2
     interaction_mode: Literal["interactive", "autonomous"] = "interactive"
+    reviewer_model: str = ""
+    """Model for review assignments; empty means the same model as the authors."""
+    reviewer_thinking: str = ""
+    """Thinking mode for review assignments ("enabled"/"disabled"); empty means the same as the authors."""
+
+    def reviewer(self) -> "Settings":
+        """Settings for review assignments (identical to these unless a reviewer model or thinking is set)."""
+        return replace(self, model=self.reviewer_model or self.model,
+                       thinking=self.reviewer_thinking or self.thinking)
+
+    @property
+    def distinct_reviewer(self) -> bool:
+        return (self.reviewer_model or self.model) != self.model or (self.reviewer_thinking or self.thinking) != self.thinking
 
     def __post_init__(self) -> None:
         if self.interaction_mode not in ("interactive", "autonomous"):
@@ -165,6 +196,10 @@ class Settings:
         _integer("compact_at_tokens", self.compact_at_tokens, 2048, self.context_window_tokens)
         _integer("keep_recent_tokens", self.keep_recent_tokens, 512, self.compact_at_tokens)
         _integer("max_output_recovery_attempts", self.max_output_recovery_attempts, 0, 3)
+        if self.reviewer_thinking not in ("", "enabled", "disabled"):
+            raise ValueError("reviewer_thinking must be empty, enabled or disabled")
+        if self.reviewer_model and self.reviewer_model not in SUPPORTED_MODELS:
+            raise ValueError("reviewer_model must be empty, deepseek-flash or deepseek-v4-pro")
         validate_provider_options(
             model=self.model, base_url=self.base_url,
             thinking=self.thinking, reasoning_effort=self.reasoning_effort,
@@ -184,6 +219,16 @@ class Settings:
                 return int(env.get(name, default))
             except ValueError:
                 raise ValueError(f"{name} must be an integer") from None
+
+        def flag(name: str, default: bool) -> bool:
+            value = env.get(name)
+            if value is None or value == "":
+                return default
+            if value.strip().lower() in ("1", "true", "yes", "on"):
+                return True
+            if value.strip().lower() in ("0", "false", "no", "off"):
+                return False
+            raise ValueError(f"{name} must be 0 or 1")
 
         def number(name: str, default: float) -> float:
             try:
@@ -208,6 +253,8 @@ class Settings:
             keep_recent_tokens=integer("MA_KEEP_RECENT_TOKENS", base.keep_recent_tokens),
             max_output_recovery_attempts=integer("MA_OUTPUT_RECOVERY_ATTEMPTS", 2),
             interaction_mode=env.get("MA_INTERACTION_MODE", "interactive"),
+            reviewer_model=env.get("MA_REVIEWER_MODEL", ""),
+            reviewer_thinking=env.get("MA_REVIEWER_THINKING", ""),
             runs_dir=Path(env.get("MA_RUNS_DIR", "runs")),
             limits=Limits(
                 max_steps=integer("MA_MAX_STEPS", Limits.max_steps),
@@ -217,6 +264,11 @@ class Settings:
             team=TeamLimits(
                 lead_max_steps=integer("MA_LEAD_MAX_STEPS", TeamLimits.lead_max_steps),
                 max_delegations=integer("MA_MAX_DELEGATIONS", TeamLimits.max_delegations),
+                resume_members=flag("MA_RESUME_MEMBERS", TeamLimits.resume_members),
+                parallel_delegations=flag("MA_PARALLEL_DELEGATIONS", TeamLimits.parallel_delegations),
+                review_loops=flag("MA_REVIEW_LOOPS", TeamLimits.review_loops),
+                plans=flag("MA_PLANS", TeamLimits.plans),
+                retrospective=flag("MA_RETROSPECTIVE", TeamLimits.retrospective),
             ),
         )
 
@@ -230,6 +282,8 @@ _ENV_KEYS = frozenset({
     "DEEPSEEK_MAX_RETRIES", "MA_TEMPERATURE", "MA_CONTEXT_WINDOW_TOKENS", "MA_COMPACT_AT_TOKENS",
     "MA_KEEP_RECENT_TOKENS", "MA_OUTPUT_RECOVERY_ATTEMPTS", "MA_INTERACTION_MODE", "MA_RUNS_DIR",
     "MA_MAX_STEPS", "MA_MAX_SECONDS", "MA_MAX_TOTAL_TOKENS", "MA_LEAD_MAX_STEPS", "MA_MAX_DELEGATIONS",
+    "MA_RESUME_MEMBERS", "MA_PARALLEL_DELEGATIONS", "MA_REVIEW_LOOPS", "MA_PLANS", "MA_RETROSPECTIVE",
+    "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING",
 })
 
 

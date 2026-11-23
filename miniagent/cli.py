@@ -255,6 +255,27 @@ def cmd_eval(args) -> int:
     return 0
 
 
+def cmd_bench(args) -> int:
+    from .bench import ARMS, Bench
+    settings = _settings(args)
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    unknown = [a for a in arms if a not in ARMS]
+    if unknown:
+        raise SystemExit(f"unknown arm(s): {', '.join(unknown)}; choose from {', '.join(ARMS)}")
+    if not settings.api_key:
+        raise SystemExit("DEEPSEEK_API_KEY is not set; the comparison needs the real model")
+    scenarios = [f"scenario_{n.strip()}" for n in args.scenarios.split(",") if n.strip()]
+    templates = {name: _template(name) for name in scenarios}
+    tasks = [int(n) for n in args.tasks.split(",") if n.strip()] if args.tasks else None
+    if tasks and tasks != [1] and 1 not in tasks:
+        raise SystemExit("Task 2 builds on Task 1 in the same group; include task 1")
+    meta = Bench(settings, templates, arms, Path(args.out), solo_max_steps=args.solo_max_steps,
+                 min_balance=args.min_balance, tasks=tasks).run(scenarios)
+    print((Path(args.out) / "summary.md").read_text(encoding="utf-8"))
+    print(json.dumps({k: meta.get(k) for k in ("balance_before", "balance_after")}, ensure_ascii=False))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m miniagent", description="miniagent multi-agent Studio")
     parser.add_argument("--env-file", help="read settings from this .env (default: ./.env if present)")
@@ -300,6 +321,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tasks", required=True)
     p.set_defaults(fn=cmd_eval)
 
+    p = sub.add_parser("bench", help="compare team set-ups and a single agent on the Mid_Test scenarios")
+    p.add_argument("--out", required=True, help="directory for results, copied projects and chats")
+    p.add_argument("--arms", default="team,team-classic,solo",
+                   help="comma-separated: team, team-fresh, team-classic, solo")
+    p.add_argument("--scenarios", default="1,2,3", help="scenario numbers, e.g. 1,2,3")
+    p.add_argument("--solo-max-steps", type=int, default=400)
+    p.add_argument("--tasks", default="", help="task numbers to run per scenario, e.g. 1 (default: all)")
+    p.add_argument("--min-balance", type=float, default=5.0,
+                   help="do not start another task when the DeepSeek balance is below this amount")
+    p.set_defaults(fn=cmd_bench)
     p = sub.add_parser("smoke", help="live provider protocol probe")
     p.set_defaults(fn=cmd_smoke)
 

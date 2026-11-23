@@ -213,6 +213,55 @@ input[type=checkbox] { accent-color: var(--cobalt); width: 15px; height: 15px; }
 .msg.report.incomplete { border-left-color: var(--gold); } .msg.report.failed { border-left-color: var(--vermilion); }
 .msg.publication { border-style: dashed; }
 
+/* A review round: the same slip, with the reviewer's indigo rule. */
+.msg.delegation.review { border-left-color: #5a4b8a; }
+.checks-count { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 0 7px; }
+
+/* Checks Studio ran on the published files: a quiet ledger, open only when something failed. */
+.check-results { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; font-size: 12.5px; }
+.check-results > summary { font: 12px var(--mono); color: var(--gold-deep); }
+.check-results.all > summary { color: var(--celadon); }
+.check-results ul { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; }
+.check-results li { display: grid; grid-template-columns: 16px 1fr; column-gap: 6px; align-items: start; }
+.check-results li::before { content: "✓"; color: var(--celadon); font-weight: 700; }
+.check-results li.fail::before { content: "✗"; color: var(--vermilion); }
+.check-results code { font: 12px var(--mono); overflow-wrap: anywhere; }
+.check-results pre { grid-column: 2; margin: 4px 0 0; max-height: 9rem; overflow: auto; padding: 6px 8px; border-radius: 6px;
+  background: var(--paper-2); border: 1px solid var(--line); font: 11.5px/1.5 var(--mono); white-space: pre-wrap; }
+
+/* The lead's plan: a scroll of steps; an older plan folds away when a newer one arrives. */
+.msg.plan { background: var(--paper); border: 1px solid var(--line-cool); border-radius: var(--radius); padding: 13px 18px 12px 14px; }
+.msg.plan .plan-count { font: 11.5px var(--mono); color: var(--muted); }
+.plan-steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 5px; counter-reset: step; }
+.plan-steps li { display: flex; align-items: baseline; gap: 9px; font-size: 13.5px; color: var(--ink-2); }
+.plan-steps li::before { content: ""; flex: none; width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--faint); transform: translateY(1px); }
+.plan-steps li.in_progress { color: var(--ink); font-weight: 600; }
+.plan-steps li.in_progress::before { border-color: var(--cobalt); background: linear-gradient(90deg, var(--cobalt) 50%, transparent 50%); }
+.plan-steps li.completed { color: var(--muted); }
+.plan-steps li.completed .plan-text { text-decoration: line-through; text-decoration-color: var(--line-strong); }
+.plan-steps li.completed::before { border-color: var(--celadon); background: var(--celadon); }
+.plan-owner { font: 11px var(--mono); color: var(--faint); margin-left: auto; white-space: nowrap; }
+.plan-note { margin: 8px 0 0; font-size: 12.5px; color: var(--muted); font-style: italic; }
+.msg.plan.superseded { padding-block: 6px; opacity: .62; }
+.msg.plan.superseded .plan-steps, .msg.plan.superseded .plan-note { display: none; }
+.msg.plan.superseded .who b::after { content: "（已更新）"; font-weight: 400; color: var(--faint); }
+
+/* Lessons wait for the requester, so they carry the gold of human decisions. */
+.msg.lessons { background: linear-gradient(180deg, var(--gold-mist), var(--paper) 70%); border: 1px solid #ead9a8;
+  border-radius: var(--radius); padding: 14px 18px; }
+.msg.lessons .who b { color: var(--gold-deep); font-family: var(--serif); }
+.lesson-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 10px; }
+.lesson-list li { display: grid; grid-template-columns: 22px 1fr auto; gap: 10px; align-items: start;
+  padding-top: 10px; border-top: 1px solid #efe4c4; }
+.lesson-list li:first-child { border-top: 0; padding-top: 0; }
+.lesson-list p { margin: 3px 0 0; font-size: 13.5px; line-height: 1.7; color: var(--ink); }
+.lesson-scope { margin-left: 8px; font: 11px var(--mono); color: var(--gold-deep); }
+.lesson-actions { display: flex; gap: 6px; align-items: center; }
+.lesson-actions button { padding: 4px 11px; font-size: 12.5px; border-radius: 99px; }
+.lesson-state { font-size: 12.5px; color: var(--muted); white-space: nowrap; }
+.lesson-state.approved { color: var(--celadon); font-weight: 600; }
+@media (max-width: 760px) { .lesson-list li { grid-template-columns: 22px 1fr; } .lesson-actions { grid-column: 2; } }
+
 /* Gold leaf: the team needs the requester. */
 .msg.question {
   background: linear-gradient(180deg, var(--gold-mist), var(--paper) 80%);

@@ -5,7 +5,7 @@
 const $ = (selector) => document.querySelector(selector);
 const state = {
   config: null, templates: [], groups: [], current: null, group: null,
-  outbox: new Map(), sendQueues: new Map(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
+  outbox: new Map(), sendQueues: new Map(), planCards: new Map(), questionForms: new Map(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
 };
 let md = null;
 
@@ -113,6 +113,54 @@ const STATUS_LABEL = {
   paused: "已暂停", pausing: "正在保存断点", stuck: "循环中止", budget: "预算用尽", error: "出错", queued: "排队中", interrupted: "已中断", running: "进行中",
 };
 
+function verdictChip(event) {
+  if (!event.loop || event.loop.role !== "review") return null;
+  const match = /VERDICT:\s*(APPROVED|CHANGES\s+REQUESTED)/i.exec((event.text || "").slice(0, 2000));
+  if (!match) return null;
+  const approved = /^APPROVED$/i.test(match[1]);
+  return el("span", { class: "status " + (approved ? "completed" : "incomplete") }, approved ? "评审通过" : "要求修改");
+}
+
+function checkResults(checks) {
+  if (!checks || !checks.total) return null;
+  const all = checks.passed === checks.total;
+  const rows = checks.checks.map((c) => el("li", { class: c.passed ? "pass" : "fail" },
+    c.kind === "command" ? el("code", {}, c.command) : el("span", {}, c.path + (c.kind === "contains" ? ` 含 “${c.text}”` : " 存在")),
+    !c.passed && (c.output || c.error) ? el("pre", {}, (c.error || c.output).slice(-900)) : null));
+  return el("details", { class: "check-results" + (all ? " all" : ""), open: !all },
+    el("summary", {}, `检查 ${checks.passed}/${checks.total} 通过 · 仅供参考，不拦截交付`), el("ul", {}, ...rows));
+}
+
+function lessonsCard(event) {
+  const decide = async (entry, row, status) => {
+    for (const b of row.querySelectorAll("button")) b.disabled = true;
+    try {
+      await api(`/roles/${encodeURIComponent(entry.role)}/knowledge/${encodeURIComponent(entry.id)}/status`, { method: "POST", body: { status } });
+      row.querySelector(".lesson-actions").replaceChildren(el("span", { class: "lesson-state " + status }, status === "approved" ? "✓ 已记住" : "已忽略"));
+    } catch (error) {
+      for (const b of row.querySelectorAll("button")) b.disabled = false;
+      showError(error);
+    }
+  };
+  const rows = event.entries.map((entry) => {
+    const actions = el("span", { class: "lesson-actions" });
+    const row = el("li", {}, avatar(entry.role, memberName(entry.role), "sm"),
+      el("div", {}, el("b", {}, memberName(entry.role)), el("span", { class: "lesson-scope" }, entry.scope === "general" ? "所有群" : "本群"),
+        el("p", {}, entry.text)), actions);
+    actions.append(el("button", { type: "button", class: "primary", onclick: () => decide(entry, row, "approved") }, icon("check"), "记住"),
+      el("button", { type: "button", onclick: () => decide(entry, row, "rejected") }, "不用"));
+    api(`/roles/${encodeURIComponent(entry.role)}/knowledge`).then((history) => {
+      const latest = history.filter((h) => h.id === entry.id).pop();
+      if (latest && latest.status !== "proposed")
+        actions.replaceChildren(el("span", { class: "lesson-state " + latest.status }, latest.status === "approved" ? "✓ 已记住" : "已忽略"));
+    }).catch(() => {});
+    return row;
+  });
+  return el("div", { class: "msg lessons" },
+    el("div", { class: "who" }, el("b", {}, "复盘 · 值得记住的经验"), el("span", {}, "批准后，相关成员在之后的任务里会用到")),
+    el("ul", { class: "lesson-list" }, ...rows));
+}
+
 function statusChip(status) {
   return el("span", { class: `status ${status}` }, STATUS_LABEL[status] || status);
 }
@@ -201,8 +249,11 @@ function renderEvent(event) {
         el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), "任务开始 · "+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
     }
     case "delegation": {
-      const node = card("delegation", event.agent,
-        [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, "派工")],
+      const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
+        : (event.review ? "评审" : "派工");
+      const node = card("delegation" + (event.loop || event.review ? " review" : ""), event.agent,
+        [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, label),
+          event.checks && event.checks.length ? el("span", { class: "checks-count" }, `${event.checks.length} 项检查`) : null],
         markdown(event.task),
         event.deliverables && event.deliverables.length
           ? el("div", { class: "chips", style: "margin-top:8px" }, event.deliverables.map((p) => el("span", { class: "chip" }, p))) : null);
@@ -211,9 +262,9 @@ function renderEvent(event) {
     case "report": {
       const level = event.status === "completed" ? "" : (event.status === "error" || event.status === "cancelled" ? "failed" : "incomplete");
       const node = card(`report ${level}`, event.agent,
-        [el("b", {}, memberName(event.agent)), statusChip(event.status),
+        [el("b", {}, memberName(event.agent)), statusChip(event.status), verdictChip(event),
           el("span", {}, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)],
-        markdown(event.text), artifactCards(scope,event.changes));
+        markdown(event.text), checkResults(event.checks), artifactCards(scope,event.changes));
       return collapsible(node, event.text);
     }
     case "question": {
@@ -233,6 +284,20 @@ function renderEvent(event) {
       if (form) form.replaceWith(el("div", { class: "answered-note" }, "✓ 已回答"));
       return el("div", { class: "msg user" }, who(el("b", {}, `你的回答 → ${memberName(event.agent)}`)), markdown(event.text));
     }
+    case "plan": {
+      const previous = state.planCards.get(tid);
+      if (previous) previous.classList.add("superseded");
+      const done = event.steps.filter((s) => s.status === "completed").length;
+      const node = card("plan", event.agent,
+        [el("b", {}, `${memberName(event.agent)} · 计划`), el("span", { class: "plan-count" }, `${done}/${event.steps.length} 完成`)],
+        el("ol", { class: "plan-steps" }, ...event.steps.map((s) => el("li", { class: s.status },
+          el("span", { class: "plan-text" }, s.step), s.owner ? el("span", { class: "plan-owner" }, memberName(s.owner)) : null))),
+        event.explanation ? el("p", { class: "plan-note" }, event.explanation) : null);
+      state.planCards.set(tid, node);
+      return node;
+    }
+    case "lessons":
+      return lessonsCard(event);
     case "publish":
       return card("publication", event.agent, [el("b",{},memberName(event.agent)), el("span",{},"发布了文件")], artifactCards(scope,event.changes));
     case "final":
@@ -415,7 +480,7 @@ async function openGroup(id) {
   $("#room-avatars").replaceChildren(); $("#member-panel").hidden=true; $("#workspace-choice").textContent="工作区";
   state.current = id; state.after = 0; state.activityAfter = 0; state.rendered = new Set();
   state.publications=new Map();state.toolWidgets=new Map();state.view="room";
-  state.questionForms=new Map();state.worklog=null;setNav(null);
+  state.questionForms=new Map();state.planCards=new Map();state.worklog=null;setNav(null);
   $("#file-list").replaceChildren(); $("#preview").replaceChildren();
   state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null;
   $("#question-banner").hidden = $("#live").hidden = true;
