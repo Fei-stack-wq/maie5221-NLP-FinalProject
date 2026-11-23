@@ -6,7 +6,7 @@ import json
 import zipfile
 from dataclasses import dataclass
 
-from . import studio_admin, studio_cleanup
+from . import recovery, studio_admin, studio_cleanup
 from .config import SUPPORTED_MODELS
 from .schemas import ToolSpec
 from .studio_tools import (CANCEL_DESCRIPTION, INSPECT_DESCRIPTION, MEMBERSHIP_DESCRIPTION, MEMBERSHIP_FIELDS,
@@ -168,6 +168,7 @@ def room_evidence(store, actor, active, pending, refs, roles):
             "group_note":member.note, "approved_knowledge":"\n".join(visible)[:4000],
             "active_task":active, "pending_question":pending,
             "paused_task":next((r["id"] for r in tasks if r["status"]=="paused"),None),
+            "interrupted_task":tasks[-1]["id"] if tasks and recovery.eligible(store, tasks[-1]) and not active else None,
             "tasks":[task_evidence(r, publications) for r in latest],
             "conversation":conversation(store, events[-1]["seq"] + 1 if events else 1, budget_chars=14000),
             "attachments":list(catalog.values()), "attachments_now":refs}
@@ -205,6 +206,15 @@ def _read_batch(response, tools, reads, text):
         return []
     writes = [c for c in response.tool_calls if c.name not in reads]
     if writes:
+        if all(c.name == READ.name for c in inspections) and len(writes) == 1:
+            decision, _ = _authorized(response.model_copy(update={"tool_calls":writes}), tools, text)
+            pending = writes[0]
+            if (pending.name == START.name and not pending.parse_error
+                    and not validate_arguments(START.parameters, pending.arguments)
+                    and pending.arguments["quote"].strip() and pending.arguments["quote"] in text):
+                return inspections  # Legacy START without a recovery target is deferred, never executed here.
+            if decision and decision.action in (START.name, "resume_room_task", STEER.name, ANSWER.name):
+                return inspections
         if any(c.name != studio_admin.INSPECT.name or c.arguments.get("view") != "overview" for c in inspections):
             return []
         decision, _ = _authorized(response.model_copy(update={"tool_calls":writes}), tools, text)
@@ -215,9 +225,16 @@ def _read_batch(response, tools, reads, text):
 
 def decide(provider, context, text, read, *, on_stream=None):
     """Route one message in a group or DM. The Studio assistant has its own agent loop (assistant.py)."""
-    tools = [START]
+    interrupted = context.get("interrupted_task")
+    # A generic "start" from an older model/tool transcript must not silently
+    # create unrelated work when there is an unfinished assignment in this room.
+    start = action_tool(START.name, "Choose new for a separate brief or the interrupted task ID to continue its work.",
+                        ["new", interrupted]) if interrupted else START
+    tools = [start]
     if context.get("paused_task"):
         tools.append(action_tool("resume_room_task", "Continue the paused execution from its saved checkpoint.", [context["paused_task"]]))
+    elif context.get("interrupted_task"):
+        tools.append(action_tool("resume_room_task", "Continue the interrupted assignment from saved files, its plan and unfinished handoffs. Use when asked to carry on that work.", [context["interrupted_task"]]))
     if context.get("active_task"):
         tools.append(action_tool("pause_room_task", "Pause this task to continue later with its progress intact.", [context["active_task"]["id"]]))
     targets = context.get("action_targets")
@@ -249,6 +266,7 @@ def decide(provider, context, text, read, *, on_stream=None):
     original_tools = list(tools)
     repaired = False
     structural_only = True
+    verify_action = False
     while True:
         try:
             response = provider.chat(messages, tools=tools or None, temperature=0, **stream)
@@ -266,12 +284,26 @@ def decide(provider, context, text, read, *, on_stream=None):
             if response.finish_reason == "stop" and not response.tool_calls and response.text.strip():
                 return Turn("reply", response.text.strip())
             result, issue = _authorized(response, tools, text, worker_names=worker_names, read_names=read_names)
-            if result:
+            if result and not verify_action:
+                if result.action == START.name and interrupted and result.task_id == interrupted:
+                    return Turn("resume_room_task", task_id=interrupted)
                 return result
+            if result and verify_action:
+                # Evidence may suggest an action, but file contents cannot authorize it.
+                messages = list(original)
+                tools = [tool for tool in original_tools if tool.name not in read_names]
+                verify_action = False
+                repaired = True
+                continue
             # Retry an incomplete control decision on the original conversation. Text read from a
             # file can never enter this independent authorization step or change its permissions.
-            if not repaired and (issue in ("length", "empty_reply") or (seen and not structural_only and issue == "unavailable_tool")):
+            legacy_start = interrupted and any(c.name == START.name and "task_id" not in c.arguments
+                                               for c in response.tool_calls)
+            needs_authorization = ((legacy_start and issue == "invalid_arguments")
+                                   or (seen and not structural_only and issue == "unavailable_tool"))
+            if not repaired and (needs_authorization or issue in ("length", "empty_reply")):
                 repaired = True
+                verify_action = False
                 messages = [{"role":"system","content":system + " The previous attempt did not return a usable routing decision. "
                              "Respond directly or select authorized actions from the original conversation."}, *original[1:]]
                 tools = [tool for tool in original_tools if tool.name not in read_names]
@@ -287,6 +319,9 @@ def decide(provider, context, text, read, *, on_stream=None):
             if issue == "ambiguous_actions" and names:
                 detail += "（" + "、".join(dict.fromkeys(names)) + "）"
             return Turn("reply", "这次会话操作未执行：" + detail + "。", issue=issue, requested_tools=names)
+        mixed_room_read = (all(c.name == READ.name for c in inspections)
+                           and len(inspections) < len(response.tool_calls))
+        verify_action = verify_action or mixed_room_read
         messages.append(response.to_assistant_message())
         next_reads = []
         seen_before = len(seen)
@@ -295,8 +330,7 @@ def decide(provider, context, text, read, *, on_stream=None):
         for call in response.tool_calls:
             if call.name not in reads:
                 messages.append({"role":"tool","tool_call_id":call.id,"content":
-                                 "Deferred until the inventory has been read. No changes applied. "
-                                 "Return the complete intended cleanup scope after reviewing the directory."})
+                                 "Deferred. Review the evidence before choosing an action. No changes applied."})
                 continue
             ref = call.name + json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
             if ref in seen:
@@ -326,6 +360,8 @@ def decide(provider, context, text, read, *, on_stream=None):
             messages.append({"role":"tool", "tool_call_id":call.id, "content":content})
         if structural_only:
             tools = [t for t in original_tools if (remaining > 0 and len(seen) > seen_before) or t.name not in read_names]
+        elif verify_action:
+            tools = [t for t in original_tools if t.name not in read_names] + (next_reads if remaining > 0 else [])
         else:
             tools = next_reads if remaining > 0 else []
 

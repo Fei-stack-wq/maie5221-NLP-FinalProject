@@ -308,7 +308,7 @@ function renderEvent(event) {
     case "task_started": {
       const tools=toolWidget(tid);state.toolWidgets.set(tid,tools);
       return el("section",{class:"chat-run"},el("div",{class:"chat-run-head"},
-        el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), "任务开始 · "+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
+        el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), (event.continued_from?"续作开始 · ":"任务开始 · ")+memberName(event.agent)+" 负责"),button("查看任务树",()=>taskDetail(tid))),tools);
     }
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
@@ -585,8 +585,9 @@ function renderHead() {
 async function changePlayback(button,taskId,operation,done=poll) {
   button.disabled=true;
   try {
-    await api("/tasks/"+taskId+"/"+operation,{method:"POST",body:{}});
-    await done();
+    const result=await api("/tasks/"+taskId+"/"+operation,{method:"POST",body:{}});
+    if (done===poll) await poll();
+    else await done(result.task_id || taskId);
   } catch(error) {
     showError(error);
   } finally {
@@ -597,16 +598,17 @@ async function changePlayback(button,taskId,operation,done=poll) {
 function renderLive(live) {
   const box = $("#live");
   const paused=state.group?.paused_task_id;
-  const play=$("#playback"), resume=!live && Boolean(paused);
-  play.hidden=!state.config?.task_pause || (!live && !paused);
-  play.textContent=resume ? "▶ 继续执行" : live?.pausing ? "正在保存断点…" : "⏸ 暂停";
+  const interrupted=state.group?.interrupted_task_id;
+  const play=$("#playback"), resume=!live && Boolean(paused || interrupted);
+  play.hidden=!state.config?.task_pause || (!live && !resume);
+  play.textContent=resume ? (paused ? "▶ 继续执行" : "▶ 从已保存进度继续") : live?.pausing ? "正在保存断点…" : "⏸ 暂停";
   play.disabled=Boolean(live?.pausing);
-  play.onclick=()=>changePlayback(play,live?.task_id || paused,resume?"resume":"pause");
+  play.onclick=()=>changePlayback(play,live?.task_id || paused || interrupted,live?"pause":paused?"resume":"recover");
   $("#toggle-activity").hidden=!live;
   if (!live) {
-    box.hidden=!paused;
+    box.hidden=!resume;
     $("#question-banner").hidden=true;
-    if (paused) $("#live-status").textContent="已暂停 · 断点已保存";
+    if (resume) $("#live-status").textContent=paused ? "已暂停 · 断点已保存" : "已中断 · 可从已有文件和执行记录创建续作";
     return;
   }
   box.hidden = false;

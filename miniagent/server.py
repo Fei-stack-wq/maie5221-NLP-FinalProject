@@ -292,6 +292,8 @@ class StudioHandler(_Base):
                     return self._json(200,studio.pause_task(parts[1]))
                 if parts[2]=="resume":
                     return self._json(200,studio.resume_task(parts[1]))
+                if parts[2]=="recover":
+                    return self._json(200,studio.recover_task(parts[1]))
                 if parts[2]=="cancel":
                     from .studio_dispatch import cancel_task
                     return self._json(200,cancel_task(studio,parts[1]))

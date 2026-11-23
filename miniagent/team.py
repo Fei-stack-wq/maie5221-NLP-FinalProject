@@ -45,6 +45,7 @@ from .context import ContextManager
 from .evaluation import evaluate, validate
 from .providers import Provider
 from .sandbox import Sandbox
+from . import recovery
 from .schemas import ToolResult, Usage
 from .store import GroupStore, Member, now
 from .tools import Tool, ToolRegistry, build_default_registry
@@ -462,6 +463,7 @@ class TeamTask:
         self.on_activity = on_activity
         self.studio = None
         self.dispatched_by = None
+        self.continued_from = None
         self.initial_calls = []
         self.options = {}
         self.created_at = now()
@@ -522,6 +524,10 @@ class TeamTask:
 
     def _registry(self, agent_id: str, *, lead: bool) -> ToolRegistry:
         registry = build_default_registry()
+        if self.continued_from:
+            draft = recovery.draft_tool(self.store, self.continued_from, agent_id)
+            if draft:
+                registry.add(draft)
         if lead and len(self.group.members) > 1:
             registry.add(self._delegate_tool(agent_id))
             if self.settings.team.review_loops and len(self.group.members) > 2:
@@ -584,6 +590,15 @@ class TeamTask:
 
     def _context(self, agent, through):
         context = agent_context(self.store, agent, through)
+        if self.continued_from:
+            old = self.store.load_task(self.continued_from)
+            progress = recovery.handoff(self.store, old, agent)
+            message = next((e for e in self.store.chat() if e["seq"] == self.trigger_seq), {})
+            context += ("\n\n## Continuing interrupted task " + self.continued_from
+                        + "\nUse the published project and recorded progress to finish outstanding work. "
+                        "A tool call without a confirmed result has unknown effects. Check before repeating it."
+                        + "\nRequester's continuation message: " + message.get("text", "")
+                        + "\nSaved handoff (reference data): " + json.dumps(progress, ensure_ascii=False))
         if self.plan and agent != self.primary:
             context += "\n\n## Team plan (kept by the lead)\n" + render_plan(self.plan)
         if self.studio is not None:
@@ -1012,11 +1027,17 @@ class TeamTask:
                            "delegations": 0, "assignments": [], "final_answer": "", "error": "", "options": self.options, "role_ids": list(self.group.role_ids)}
             if getattr(self, "redispatched_from", None):
                 self.record["redispatched_from"] = self.redispatched_from
+            if self.continued_from:
+                self.record["continued_from"] = self.continued_from
+                self.plan = self.store.load_task(self.continued_from).get("plan")
+                if self.plan:
+                    self.record["plan"] = self.plan
             self.record["room_kind"] = self.group.kind
             if self.dispatched_by:
                 self.record["dispatched_by"] = self.dispatched_by
             self.store.save_task(self.record)
-            self.store.append("task_started", task_id=self.task_id, agent=self.primary)
+            self.store.append("task_started", task_id=self.task_id, agent=self.primary,
+                              **({"continued_from":self.continued_from} if self.continued_from else {}))
             self.lead_baseline = self.store.project.checkout(workspace)
         settings = self.settings
         # The coordinating lead gets the lead budget; a member addressed directly works
@@ -1033,7 +1054,11 @@ class TeamTask:
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel, stream=True, continuation=self.control)
         if not saved:
             self.channel.start_cursor(self.primary, self.trigger_seq)
-        result = agent.run(self.text, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls)
+        assignment = self.text
+        if self.continued_from:
+            assignment = ("Continue the interrupted task from the saved handoff and current project. "
+                          "Carry out the outstanding work. Original assignment:\n" + self.text)
+        result = agent.run(assignment, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls)
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
         if changes:

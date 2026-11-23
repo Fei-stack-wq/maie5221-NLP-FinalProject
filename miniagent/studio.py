@@ -26,7 +26,7 @@ from .store import Group, GroupStore, Store, Member, now
 from .roles import Roles
 from .attachments import Uploads
 from .assistant_room import workspace_evidence, progress, read_dispatch, legacy_dispatch_origins
-from . import checkpoint, dispatch_notices, studio_dispatch, studio_admin, studio_cleanup
+from . import checkpoint, dispatch_notices, recovery, studio_dispatch, studio_admin, studio_cleanup
 from .studio_tools import assistant_tools, update_settings
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
@@ -143,6 +143,7 @@ class Studio:
                 "session_name":store.group.name if store.parent else "默认会话",
                 "archived":store.group.archived or store.team.archived, "running": bool(running),
                 "paused_task_id":next((r["id"] for r in tasks if r["status"]=="paused"), None),
+                "interrupted_task_id":tasks[-1]["id"] if tasks and not running and recovery.eligible(store, tasks[-1]) else None,
                 "waiting_for_you": bool(running and running.channel.pending()),
                 "last_activity": (store.root/"chat.jsonl").stat().st_mtime, "tasks": len(tasks), "last_status": tasks[-1]["status"] if tasks else None}
 
@@ -357,6 +358,8 @@ class Studio:
                     return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode,
                                         receipt=receipt, initial_calls=(turn.arguments or {}).get("initial_calls"))
                 if turn.action in ("pause_room_task", "resume_room_task"):
+                    if turn.action == "resume_room_task" and turn.task_id == context.get("interrupted_task"):
+                        return self._recover(store, turn.task_id, text, refs, receipt, options)
                     operation = self.pause_task if turn.action == "pause_room_task" else self.resume_task
                     try:
                         info = operation(turn.task_id)
@@ -404,7 +407,7 @@ class Studio:
         if self._closed or store.group.archived or store.team.archived or not store.root.is_dir():
             raise StudioError("Conversation unavailable", 409)
 
-    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None, redispatched_from=None, initial_calls=None):
+    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None, redispatched_from=None, initial_calls=None, continued_from=None):
         group_id = store.group.id
         with self._lock:
             self._require_available(store)
@@ -421,6 +424,8 @@ class Studio:
                 event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
             record = {"id":tid, "group_id":group_id, "room_kind":store.group.kind, "status":"queued", "created_at":now(), "primary":primary,
                       "text":body, "trigger_seq":event["seq"], "options":options, "active":[]}
+            if continued_from:
+                record["continued_from"] = continued_from
             if initial_calls:
                 record["initial_calls"] = initial_calls
             if redispatched_from:
@@ -462,6 +467,9 @@ class Studio:
             if saved:
                 group = Group.from_dict(saved["team"])
             else:
+                previous = next((r for r in reversed(store.tasks()) if r["id"] != tid and r["status"] != "queued"), None)
+                if previous and recovery.eligible(store, previous):
+                    recovery.preserve_drafts(store, previous, recovery.handoff(store, previous))
                 with self._folder_sync_lock:
                     warnings = sync(store, importing=True, key=settings.api_key)
                 for warning in warnings:
@@ -487,6 +495,7 @@ class Studio:
             task = TeamTask(store, provider, settings, task_id=tid, text=record["text"], primary=primary,
                             trigger_seq=record["trigger_seq"], channel=running.channel, should_cancel=cancel.is_set,
                             on_activity=lambda e: self._activity(running, e))
+            task.continued_from = record.get("continued_from")
             task.initial_calls = record.get("initial_calls", [])
             task.group = group
             task.control = running.control = checkpoint.Continuation(saved)
@@ -632,7 +641,7 @@ class Studio:
         events = [e for e in store.chat() if e.get("task_id") == tid]
         run = self._running.get(store.group.id)
         pausing = bool(run and run.task_id == tid and run.control.requested.is_set())
-        return {"task":record,"pausing":pausing,"events":events,"activity":activity,"changes":task_changes(store,tid),
+        return {"task":record,"pausing":pausing,"recoverable":recovery.eligible(store, record),"events":events,"activity":activity,"changes":task_changes(store,tid),
                 "has_snapshot":(store.root/"tasks"/tid/"artifacts.zip").is_file(),
                 "diagnostics":[e for e in activity if e.get("type") in ("loop_nudge","loop_stuck","error")
                                or (e.get("type")=="end" and e.get("status") not in ("completed","dispatched"))]}
@@ -751,6 +760,31 @@ class Studio:
                 raise StudioError(f"读取断点失败：{exc}",409) from None
             self._start(room,record,saved)
             return {"task_id":task_id,"status":"running"}
+
+    def recover_task(self, task_id):
+        with self._lock:
+            room, _ = self.find_task(task_id)
+            return self._recover(room, task_id, "从已保存进度继续任务 " + task_id, [], {}, {})
+
+    def _recover(self, room, task_id, message, refs, receipt, overrides):
+        # Called under the same lock as task submission. A stale tab or a second click
+        # resolves to the existing successor even after a process restart.
+        self._require_available(room)
+        record = room.load_task(task_id)
+        if not recovery.eligible(room, record):
+            raise StudioError("该任务没有可用于续作的中断记录。", 409)
+        tasks = room.tasks()
+        for task in tasks:
+            if task.get("continued_from") == task_id:
+                return {"route":"received","task_id":task["id"],"continued_from":task_id}
+        options = {**record.get("options", {}), **overrides}
+        settings, mode = self._task_settings(room, options)
+        primary = record.get("primary", room.group.lead)
+        if primary not in {m.id for m in room.group.members}:
+            primary = room.group.lead
+        result = self._submit(room, message, record["text"], primary, refs, options, settings, mode,
+                              receipt=receipt, continued_from=task_id, dispatched_by=record.get("dispatched_by"))
+        return {**result, "continued_from":task_id}
 
     def cancel(self, group_id: str) -> dict:
         with self._lock:

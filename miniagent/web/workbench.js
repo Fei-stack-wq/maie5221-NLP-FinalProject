@@ -215,6 +215,7 @@ async function taskDetail(id) {
     body.replaceChildren();
     for (const b of tabs.children) b.setAttribute("aria-pressed",b.textContent===name);
     if (name==="概览") {
+      if (t.continued_from) body.append(button("查看中断的原任务",()=>taskDetail(t.continued_from)));
       body.append(taskTree(t,d.events,scope));
       if (t.final_answer) body.append(el("h4",{},"最终答复"),documentBody(t.final_answer,scope));
       if (t.evaluation) body.append(el("p",{},t.evaluation.total?"验收 "+t.evaluation.passed+"/"+t.evaluation.total:"未指定验收条件"));
@@ -240,10 +241,10 @@ async function taskDetail(id) {
   const playback=el("button",{type:"button",class:"ghost"});
   function playbackState() {
     const resume=t.status==="paused";
-    playback.hidden=!state.config.task_pause || (!resume && t.status!=="running");
+    playback.hidden=!state.config.task_pause || (!resume && !d.recoverable && t.status!=="running");
     playback.disabled=d.pausing;
-    playback.textContent=d.pausing?"正在保存断点…":resume?"▶ 继续执行":"⏸ 暂停";
-    playback.onclick=()=>changePlayback(playback,id,resume?"resume":"pause",()=>taskDetail(id));
+    playback.textContent=d.pausing?"正在保存断点…":resume?"▶ 继续执行":d.recoverable?"▶ 从已保存进度继续":"⏸ 暂停";
+    playback.onclick=()=>changePlayback(playback,id,resume?"resume":d.recoverable?"recover":"pause",taskDetail);
   }
   playbackState();
   sheet("任务详情",el("div",{class:"task-meta"},status,el("code",{},id),
