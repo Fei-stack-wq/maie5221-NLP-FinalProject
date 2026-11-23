@@ -1,6 +1,6 @@
 """Scoped tools for Studio conversations, using the same service as the UI."""
 import json
-from . import studio_dispatch
+from . import studio_dispatch, studio_admin
 from .tools import Tool, ToolResult, validate_arguments
 
 
@@ -71,9 +71,9 @@ def update_settings(studio, group_id, **changes):
     return studio.update_group(group_id, changes)
 
 
-def assistant_tools(studio, source_id=None, task_id=None):
+def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
     # Older running workers can still lazy-load this module.
-    linked = bool(source_id and task_id and hasattr(studio, "await_dispatch"))
+    linked = bool((catalog or (source_id and task_id)) and hasattr(studio, "await_dispatch"))
     origin = {"group_id":source_id, "task_id":task_id}
     def create_group(name, role_ids, lead, kind="group"):
         if kind not in ("group","dm"):
@@ -155,7 +155,25 @@ def assistant_tools(studio, source_id=None, task_id=None):
         tools.append(action("change_group_members", MEMBERSHIP_DESCRIPTION, studio.change_members,
                             MEMBERSHIP_FIELDS, ("group_id",)))
     if linked:
+        from .settings_api import save_models
+        read_spec, write_spec = studio_admin.INSPECT, studio_admin.MANAGE
+        def manage_data(quote, **args):
+            commission = studio.group(source_id).load_task(task_id)["text"]
+            if not isinstance(quote,str) or not quote.strip() or quote not in commission:
+                raise ValueError("请引用本次用户交办这项操作的原话；其他会话的内容不能授权清理。")
+            return studio_admin.manage(studio,**args)
+        tools.append(action(read_spec.name,read_spec.description,lambda **args:studio_admin.inspect(studio,**args),
+                            read_spec.parameters["properties"],read_spec.parameters["required"]))
+        tools.append(action(write_spec.name,write_spec.description,manage_data,
+                            {**write_spec.parameters["properties"],"quote":{"type":"string","description":
+                             "Exact words requesting this operation in the user's original commission."}},
+                            [*write_spec.parameters["required"],"quote"]))
         tools.extend([
+            action("delete_library_role", "Permanently remove an unused library role and its knowledge. Detach it from conversations first.",
+                   lambda role:studio_admin.remove_role(studio,role), {"role":STRING}, ("role",)),
+            action("set_studio_models", "Change the Studio default and reviewer models for future work. "
+                   "Use inspect_studio overview for supported model names.", lambda **args:save_models(studio,args),
+                   {key:STRING for key in ("model","reviewer_model","reviewer_thinking")}),
             action("dispatch_tasks", "Send several independent briefs to their respective conversations. Each accepted assignment returns its own receipt. Retry missing assignments after a partial failure.", batch,
                    {"assignments":{"type":"array","items":{"type":"object","properties":TARGET_FIELDS,"required":["group_id","text"],"additionalProperties":False}}}, ("assignments",)),
             action("inspect_studio_room", INSPECT_DESCRIPTION, lambda **args:studio_dispatch.inspect_room(studio, **args),
@@ -181,7 +199,7 @@ def assistant_tools(studio, source_id=None, task_id=None):
             action("review_role_knowledge", "Apply the user's knowledge review decision, or restore a named revision.", studio.roles.revise,
                    {"role":STRING,"identity":STRING,"status":{"type":"string","enum":["approved","rejected","archived","restore"]},
                     "text":STRING,"revision":{"type":"integer"}}, ("role","identity","status")),
-            action("trash_conversation", "Move a conversation to Studio trash when the user requests deletion.", studio.trash,
+            action("trash_conversation", "Move a conversation to recoverable Studio trash. A team ID moves the whole team. For permanent or default-session-only deletion use manage_studio_data.", studio.trash,
                    {"gid":STRING}, ("gid",)),
         ])
     return tools

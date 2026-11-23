@@ -66,10 +66,14 @@ def redispatch(studio, origin, task_id, group_id, text=None, assignee=None):
             raise ValueError("Select an assignment in a team conversation or DM.")
         events = [e for e in source.chat() if e.get("task_id") == task_id and
                   e["kind"] in ("user_message","queued_message") and not e.get("during_task")]
-        if not events:
+        if events:
+            event = next((e for e in events if e["seq"] == record.get("trigger_seq")), events[0])
+            refs = event.get("attachments", [])
+        elif "input_attachments" in record:
+            refs = record["input_attachments"]
+        else:
             raise ValueError("The original task input is unavailable.")
-        event = next((e for e in events if e["seq"] == record.get("trigger_seq")), events[0])
-        inputs = [(source, ref) for ref in event.get("attachments", [])]
+        inputs = [(source, ref) for ref in refs]
         recipient = assignee or (record["primary"] if group_id == source.group.id else None)
         sent = submit(studio, origin, group_id, record["text"] if text is None else text,
                       assignee=recipient, options=record.get("options"), inputs=inputs, previous=task_id)

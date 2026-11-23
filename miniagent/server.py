@@ -305,9 +305,12 @@ class StudioHandler(_Base):
             if len(parts) >= 2 and parts[0] == "groups":
                 gid, rest = parts[1], parts[2:]
                 if method == "POST" and rest == ["uploads"]:
-                    room = studio.group(gid)
                     data = base64.b64decode(body["data"], validate=True)
-                    return self._json(201, studio.uploads.save_in_room(room, body["name"], data, studio.settings.api_key))
+                    with studio._lock:
+                        room = studio.group(gid)
+                        studio._require_available(room)
+                        upload = studio.uploads.save_in_room(room, body["name"], data, studio.settings.api_key)
+                    return self._json(201,upload)
                 if method == "POST" and rest == ["sessions"]:
                     return self._json(201, studio.create_session(gid, body.get("name")))
                 if method == "POST" and rest == ["messages"]:

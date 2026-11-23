@@ -102,7 +102,7 @@ async function api(path, options = {}) {
     }
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || response.statusText);
+  if (!response.ok) throw Object.assign(new Error(data.error || response.statusText), {status:response.status});
   return data;
 }
 
@@ -642,6 +642,9 @@ async function refreshRoom(feed, first) {
   try {
     const data = await api(`/groups/${id}?after=${state.after}&activity_after=${state.activityAfter}`);
     if (state.feed !== feed) return;
+    if (state.after && data.events.some(e => e.kind === "chat_cleared" || e.kind === "history_updated")) {
+      return openGroup(id);
+    }
     state.group = data.group;
     for (const label of feed.root.querySelectorAll("[data-actor]")) label.textContent=memberName(label.dataset.actor);
     renderHead();
@@ -690,6 +693,11 @@ async function refreshRoom(feed, first) {
       ? "问工作室助手任何事，或请它组建团队、派发任务……"
       : "交办工作、追问进展，或回答团队的问题。用 @成员ID 点名某位成员。";
   } catch (error) {
+    if (error.status === 404 && state.feed === feed) {
+      await roomsView();
+      showError("此会话已删除或移至废纸篓。");
+      return;
+    }
     console.warn(error);
   }
   if (state.feed === feed && !document.hidden) state.timer = setTimeout(poll, state.live ? 900 : 2500);

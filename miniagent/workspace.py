@@ -157,6 +157,7 @@ class Project:
                     changes.append(Change(rel, kind, after, (workspace / rel).stat().st_size, conflict))
             if changes:
                 entry = {"time": time.time(), "author": author, "task_id": task_id, "note": note[:500],
+                         "project_scope":os.path.relpath(self.root, self.log_path.parent),
                          "changes": [c.as_dict() for c in changes]}
                 self.log_path.parent.mkdir(parents=True, exist_ok=True)
                 with self.log_path.open("a", encoding="utf-8") as stream:

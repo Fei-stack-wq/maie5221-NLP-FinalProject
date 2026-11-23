@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -130,12 +131,16 @@ class GroupStore:
         self._notice_ids: set[str] = set()
         self._client_messages: dict[str, dict] = {}
         self._seq = 0
+        self.cleared_seq = 0
         self._chat_path = root / "chat.jsonl"
         if self._chat_path.exists():
             for line in self._chat_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     event = json.loads(line)
                     self._seq = max(self._seq, event.get("seq", 0))
+                    if event["kind"] == "chat_cleared":
+                        self.cleared_seq = event["seq"]
+                        self._notice_ids.update(event.get("past_notices", []))
                     if event.get("client_id"):
                         self._client_messages[event["client_id"]] = event
                     if event.get("notice_id"):
@@ -178,6 +183,56 @@ class GroupStore:
             self.previews.committed(event)
             return event
 
+    def clear_chat(self, *, keep_task_inputs=True):
+        with self._lock:
+            events = self.chat()
+            if keep_task_inputs:
+                # Older assignments kept original attachment references only on the trigger
+                # event. Preserve that task input before removing the transcript.
+                inputs = {e["task_id"]: e.get("attachments",[]) for e in reversed(events)
+                          if e.get("task_id") and e["kind"] in ("queued_message","user_message") and not e.get("during_task")}
+                for task in self.tasks():
+                    if task["id"] in inputs and "input_attachments" not in task:
+                        self.save_task({**task,"input_attachments":inputs[task["id"]]})
+            previous = len(events)
+            marker = {"seq":self._seq + 1, "time":now(), "kind":"chat_cleared",
+                      "past_notices":sorted(self._notice_ids)}
+            # A one-line JSON object is also a valid JSONL log. Keep the cursor monotonic
+            # and prior receipt identities so restart does not republish cleared notices.
+            tmp = self._chat_path.with_suffix(".clearing")
+            try:
+                tmp.write_text(json.dumps(marker,ensure_ascii=False)+"\n", encoding="utf-8")
+                tmp.replace(self._chat_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            self._seq = self.cleared_seq = marker["seq"]
+            self._client_messages.clear()
+            self.previews.committed(marker)
+            return previous
+
+    def revise_chat(self, transform):
+        """Atomically update structured references, keeping transcript cursors and receipt deduplication."""
+        from .studio_artifacts import replacement
+        with self._lock:
+            if not self._chat_path.exists():
+                return
+            changed = False
+            rows = []
+            for line in self._chat_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    before = json.loads(line)
+                    after = transform(dict(before))
+                    if after != before:
+                        changed = True
+                    if after is not None:
+                        rows.append(after)
+            if changed:
+                marker = {"seq":self._seq+1,"time":now(),"kind":"history_updated"}
+                with replacement(self._chat_path) as tmp:
+                    tmp.write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in [*rows,marker]),encoding="utf-8")
+                self._seq = marker["seq"]
+                self.previews.committed(marker)
+
     def client_message(self, client_id):
         with self._lock:
             return self._client_messages.get(client_id)
@@ -199,6 +254,7 @@ class GroupStore:
                     event = json.loads(line)
                     if event.get("kind") in ("room_reply", "progress", "report", "final") and event.get("text"):
                         event["text"] = historic_text(event["text"])
+                    event.pop("past_notices", None)
                     if event["seq"] > after:
                         events.append(event)
             return events
@@ -271,7 +327,7 @@ class Store:
     """All groups under ``runs_dir/groups``."""
 
     def __init__(self, runs_dir: Path) -> None:
-        self.root = Path(runs_dir) / "groups"
+        self.root = Path(runs_dir).resolve() / "groups"
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._open: dict[str, GroupStore] = {}
@@ -360,9 +416,40 @@ class Store:
 
     def trash(self, store: GroupStore) -> None:
         with self._lock:
-            target = self.root.parent / "trash" / store.group.id
+            target = self.trash_path(store.group.id)
+            if store.root.resolve() != store.root.absolute() or target.exists():
+                raise ValueError("Unexpected or occupied trash location")
             target.parent.mkdir(exist_ok=True)
             store.root.rename(target)
             for key, room in list(self._open.items()):
                 if room is store or room.parent is store:
                     del self._open[key]
+
+    def trash_path(self, identity):
+        if not isinstance(identity,str) or not re.fullmatch(r"g-[a-f0-9]{12}(?:-s-[a-f0-9]{12})?", identity):
+            raise ValueError("Invalid Studio conversation ID")
+        root = self.root.parent.resolve() / "trash"
+        target = root / identity
+        if target.resolve() != target:
+            raise ValueError("Unexpected trash location")
+        return target
+
+    def restore(self, identity):
+        with self._lock:
+            source = self.trash_path(identity)
+            if not source.is_dir():
+                raise ValueError("未在废纸篓找到该会话。")
+            owner, sep, key = identity.partition("-s-")
+            target = self.get(owner).root / "sessions" / ("s-" + key) if sep else self.root / identity
+            if target.resolve() != target.absolute() or target.exists():
+                raise ValueError("原位置不可用。")
+            target.parent.mkdir(exist_ok=True)
+            source.rename(target)
+            return self.get(identity)
+
+    def purge_trash(self, identity):
+        with self._lock:
+            path = self.trash_path(identity)
+            if not path.is_dir():
+                raise ValueError("未在废纸篓找到该会话。")
+            shutil.rmtree(path)

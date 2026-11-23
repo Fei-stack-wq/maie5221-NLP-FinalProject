@@ -22,7 +22,7 @@ def write_json(path, data):
 
 class Roles:
     def __init__(self, root):
-        self.root = Path(root) / "roles"
+        self.root = Path(root).resolve() / "roles"
         self.lock = threading.RLock()
 
     def path(self, role):

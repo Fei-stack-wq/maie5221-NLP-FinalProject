@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import re
 import threading
 import uuid
@@ -25,8 +26,8 @@ from .store import Group, GroupStore, Store, Member, now
 from .roles import Roles
 from .attachments import Uploads
 from .assistant_room import workspace_evidence, progress, read_dispatch, legacy_dispatch_origins
-from . import checkpoint, dispatch_notices, studio_dispatch
-from .studio_tools import update_settings
+from . import checkpoint, dispatch_notices, studio_dispatch, studio_admin
+from .studio_tools import assistant_tools, update_settings
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
 from .provider_http import ProviderError
@@ -326,6 +327,7 @@ class Studio:
             owner_names = {}
             if assistant:
                 context.update(workspace_evidence(self, store))
+                context["studio_capabilities"] = {t.name:t.description for t in assistant_tools(self,catalog=True)}
                 with self._lock:
                     for item in context["dispatches"] + context["earlier_dispatches"]:
                         tid, gid = item["id"], item["group_id"]
@@ -342,6 +344,12 @@ class Studio:
                     for tid,observed in recipients.items()}
             try:
                 def read(args):
+                    if assistant and "studio_inspection" in args:
+                        try:
+                            result = json.dumps(studio_admin.inspect(self,**args["studio_inspection"]),ensure_ascii=False)
+                            return result.replace(settings.api_key,"[redacted]") if settings.api_key else result
+                        except (ValueError, KeyError, OSError, StudioError) as exc:
+                            return str(exc)
                     if assistant and "studio_room" in args:
                         try:
                             info = studio_dispatch.inspect_room(self, **args["studio_room"])
@@ -381,6 +389,12 @@ class Studio:
                         answer = f"「{updated['name']}」当前成员为 {names}，负责人是 @{updated['lead']}。"
                     except (StudioError, ValueError) as exc:
                         answer = f"群成员调整未完成：{exc}"
+                elif assistant and turn.action == studio_admin.MANAGE.name:
+                    try:
+                        result = studio_admin.manage(self,posting=group_id,**turn.arguments)
+                        answer = studio_admin.receipt(result)
+                    except (ValueError, KeyError, OSError, StudioError) as exc:
+                        answer = f"管理操作未完成：{exc}"
                 elif assistant and turn.action in ("cancel_task", "update_group_settings"):
                     try:
                         if turn.action == "cancel_task":
@@ -430,6 +444,8 @@ class Studio:
                                             answer_to=observed.question["id"] if answering else None, **receipt)
 
     def _require_available(self, store):
+        if (store.root/".pending-artifact-delete.json").exists() or (store.root/".resetting-default").exists():
+            raise StudioError("该会话有待完成的清理操作，请通过工作室助手重试。",409)
         if self._closed or store.group.archived or store.team.archived or not store.root.is_dir():
             raise StudioError("Conversation unavailable", 409)
 
@@ -566,11 +582,20 @@ class Studio:
     def restore_queue(self):
         with self._lock:
             groups = self.store.conversations()
+            unavailable = set()
+            for group in groups:
+                try:
+                    studio_admin.recover(self,self.group(group.id))
+                except (OSError, ValueError) as exc:
+                    unavailable.add(group.id)
+                    logging.getLogger(__name__).warning("Pending cleanup for %s: %s",group.id,exc)
             legacy = {}
             assistant_ids = {group.id for group in groups if group.kind == "assistant"}
             for gid in assistant_ids:
                 legacy.update(legacy_dispatch_origins(self.group(gid)))
             for g in groups:
+                if g.id in unavailable:
+                    continue
                 store = self.group(g.id)
                 # Older releases wrote pinned=False for every room. An update in those
                 # releases did not record which preferences were changed, so respect it.
@@ -602,7 +627,7 @@ class Studio:
                 if g.kind == "assistant":
                     return self.summary(self.group(g.id))
             return self.create_group("工作室助手", [{"id":"assistant","name":"工作室助手",
-                "prompt":"Help the user in conversation. You can create roles, organize groups and dispatch work through Studio tools."}],
+                "prompt":"Manage the user's Studio through its tools. Inspect current records, coordinate roles and assignments, and manage conversations, deliverables and trash at the requested scope."}],
                 "assistant", kind="assistant")
 
     def dispatch_status(self, task_id):

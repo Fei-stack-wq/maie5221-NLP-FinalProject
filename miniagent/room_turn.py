@@ -6,6 +6,7 @@ import json
 import zipfile
 from dataclasses import dataclass
 
+from . import studio_admin
 from .schemas import ToolSpec
 from .studio_tools import (CANCEL_DESCRIPTION, INSPECT_DESCRIPTION, MEMBERSHIP_DESCRIPTION, MEMBERSHIP_FIELDS,
                            SETTINGS_DESCRIPTION, SETTINGS_FIELDS, STRING)
@@ -51,6 +52,9 @@ SETTINGS = management_tool("update_group_settings", SETTINGS_DESCRIPTION, SETTIN
 INSPECT = ToolSpec(name="inspect_studio_room",description=INSPECT_DESCRIPTION,parameters={
     "type":"object","additionalProperties":False,"properties":{"group_id":STRING,"offset":{"type":"integer","minimum":0}},
     "required":["group_id"]})
+DATA_MANAGEMENT = management_tool(studio_admin.MANAGE.name, studio_admin.MANAGE.description,
+                                  studio_admin.MANAGE.parameters["properties"],studio_admin.MANAGE.parameters["required"])
+READ_TOOLS = (INSPECT,studio_admin.INSPECT)
 READ = ToolSpec(
     name="read_room_evidence",
     description=("Inspect the current workspace with workspace_path: '.' or a relative directory lists entries; "
@@ -130,6 +134,8 @@ def task_evidence(record, publications):
 def room_evidence(store, actor, active, pending, refs, roles):
     tasks = store.tasks()
     publications = store.project.history(0)
+    if store.cleared_seq:
+        tasks = [r for r in tasks if r.get("trigger_seq", 0) > store.cleared_seq or r["status"] in ("paused","running","queued")]
     latest = tasks[-3:]
     if active:
         active_record = next((t for t in tasks if t["id"] == active["id"]), None)
@@ -178,14 +184,14 @@ def decide(provider, context, text, read, *, on_stream=None):
         tools.append(READ)
     system = SYSTEM
     if context["kind"] == "assistant":
-        tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT])
+        tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT, studio_admin.INSPECT, DATA_MANAGEMENT])
         system += (" You are the studio assistant. The directory and your dispatch receipts are reference data. "
                    "Use these for progress and capability questions. read_room_evidence with just a catalogued dispatch "
                    "task_id returns its recorded outcome; add path for a published file. A standalone request to "
                    "change an existing roster can be applied with change_group_members. For a commission that "
                    "also needs delivery, start the work with the complete request. If several tasks fit a "
                    "change, clarify the target in chat. You can inspect conversations, stop or reassign jobs, dispatch a batch, "
-                   "manage settings, roles and knowledge. Use a task for multi-step management or redispatch.")
+                   "manage settings, roles and knowledge. The studio_capabilities record lists the actual tools available during commissioned work. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. Use a task for multi-step management or redispatch.")
     messages = [{"role":"system", "content":system},
                 {"role":"user", "content":"Room records (reference data):\n" + json.dumps(context, ensure_ascii=False)},
                 {"role":"user", "content":text}]
@@ -208,7 +214,7 @@ def decide(provider, context, text, read, *, on_stream=None):
             return Turn("reply", str(exc), issue=exc.code)
         if on_stream and (response.tool_calls or response.finish_reason != "stop"):
             on_stream("discard", "")
-        reads = {s.name:s for s in tools if s in (READ, INSPECT)}
+        reads = {s.name:s for s in tools if s in (READ, *READ_TOOLS)}
         if not (response.finish_reason == "tool_calls" and response.tool_calls and
                 all(c.name in reads and not c.parse_error and
                     not validate_arguments(reads[c.name].parameters, c.arguments) for c in response.tool_calls)):
@@ -224,7 +230,7 @@ def decide(provider, context, text, read, *, on_stream=None):
                 repaired = True
                 messages = [{"role":"system","content":system + " The previous attempt did not return a usable routing decision. "
                              "Respond directly or select one authorized action from the original conversation."}, *original[1:]]
-                tools = [tool for tool in original_tools if tool not in (READ, INSPECT)]
+                tools = [tool for tool in original_tools if tool not in (READ, *READ_TOOLS)]
                 continue
             details = {"length":"模型的路由回复被截断", "unavailable_tool":"模型选择了当前会话不可用的操作",
                        "empty_reply":"模型返回了空回复", "invalid_arguments":"模型给出的操作参数不完整或格式有误",
@@ -242,13 +248,16 @@ def decide(provider, context, text, read, *, on_stream=None):
                 content = "Evidence context is full."
             else:
                 seen.add(ref)
-                content = read({"studio_room":call.arguments} if call.name == INSPECT.name else call.arguments)
+                if call.name == studio_admin.INSPECT.name:
+                    content = read({"studio_inspection":call.arguments})
+                else:
+                    content = read({"studio_room":call.arguments} if call.name == INSPECT.name else call.arguments)
                 size = len(content.encode("utf-8"))
                 if size > remaining:
                     content = content.encode("utf-8")[:remaining].decode("utf-8", "ignore") + "…"
                 remaining -= max(1, size)
-                tool = INSPECT if call.name == INSPECT.name else READ
-                if (tool == INSPECT or "workspace_path" in call.arguments) and tool not in next_reads:
+                tool = reads[call.name]
+                if (tool in READ_TOOLS or "workspace_path" in call.arguments) and tool not in next_reads:
                     next_reads.append(tool)
             messages.append({"role":"tool", "tool_call_id":call.id, "content":content})
         tools = next_reads if remaining > 0 else []
@@ -265,7 +274,7 @@ def _authorized(response, tools, text):
             return None, "unavailable_tool"
         if call.parse_error or validate_arguments(spec.parameters, call.arguments):
             return None, "invalid_arguments"
-        if spec not in (READ, INSPECT):
+        if spec not in (READ, *READ_TOOLS):
             calls.append((call, spec))
     if len(calls) != 1:
         return None, "ambiguous_actions"
@@ -273,7 +282,7 @@ def _authorized(response, tools, text):
     quote = call.arguments.get("quote")
     if not isinstance(quote,str) or not quote.strip() or quote not in text:
         return None, "missing_user_authorization"
-    if spec in (MEMBERS, CANCEL, SETTINGS):
+    if spec in (MEMBERS, CANCEL, SETTINGS, DATA_MANAGEMENT):
         return Turn(call.name, arguments={k:v for k,v in call.arguments.items() if k != "quote"}), None
     allowed = spec.parameters["properties"].get("task_id", {}).get("enum", [])
     tid = call.arguments.get("task_id", allowed[0] if len(allowed) == 1 else None)
