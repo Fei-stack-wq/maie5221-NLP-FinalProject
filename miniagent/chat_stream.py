@@ -84,7 +84,7 @@ class ChatStream:
             task_id = event.get("task_id")
             if event.get("kind") == "room_reply" or (task_id and event["kind"] in ("progress", "report", "final")):
                 self.drafts.pop((task_id or "", event["agent"]), None)
-            if task_id and event["kind"] == "task_finished":
+            if task_id and event["kind"] in ("task_finished","task_paused"):
                 for slot in list(self.drafts):
                     if slot[0] == task_id:
                         del self.drafts[slot]

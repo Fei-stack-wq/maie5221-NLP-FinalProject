@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -327,6 +327,25 @@ class CommandSessions:
             state = "timed_out"
         result.meta.update(process_id=handle, process_state=state, command=command)
         return result
+
+    def checkpoint(self):
+        """Stop outstanding processes and keep their actual final results for a later poll."""
+        self.stopping.set()
+        self.executor.shutdown(wait=True)
+        saved = {}
+        for handle, (future, command) in self.jobs.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = ToolResult.failure(f"Command ended during pause: {exc}")
+            saved[handle] = {"command":command, "result":result.model_dump()}
+        return saved
+
+    def restore(self, saved):
+        for handle, row in saved.items():
+            done = Future()
+            done.set_result(ToolResult.model_validate(row["result"]))
+            self.jobs[handle] = (done,row["command"])
 
     def close(self):
         self.stopping.set()

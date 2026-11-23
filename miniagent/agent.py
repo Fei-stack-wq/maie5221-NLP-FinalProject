@@ -31,12 +31,13 @@ import signal
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
 
 import psutil
 
+from .checkpoint import Continuation, PauseRequested
 from .config import Limits, Settings
 from .context import ContextManager
 from .loop_guard import LoopGuard
@@ -124,7 +125,7 @@ class Agent:
                  settings: Settings, *, system_prompt: str, limits: Limits | None = None,
                  on_event: Callable[[dict], None] | None = None,
                  should_cancel: Callable[[], bool] | None = None,
-                 inbox: Inbox | None = None, stream: bool = False) -> None:
+                 inbox: Inbox | None = None, stream: bool = False, continuation: Continuation | None = None) -> None:
         self.name = name
         self.provider = provider
         self.registry = registry
@@ -136,6 +137,7 @@ class Agent:
         self.should_cancel = should_cancel or (lambda: False)
         self.inbox = inbox
         self.stream = stream
+        self.continuation = continuation
 
     # ------------------------------------------------------------------
     def emit(self, event_type: str, **fields: Any) -> None:
@@ -166,9 +168,32 @@ class Agent:
         error = ""
         answer = ""
         step = 0
+        pending = []
+        next_call = 0
+        in_tool = False
+        batch_ok, handed_off = True, False
+        elapsed = 0.0
+        control = self.continuation
+        saved = control.frames.pop(self.name, None) if control else None
+        if saved:
+            messages = saved["messages"]
+            step, tool_calls = saved["step"], saved["tool_calls"]
+            elapsed = saved["elapsed"]
+            if deadline is not None:
+                deadline -= elapsed
+            usage = Usage.model_validate(saved["usage"])
+            ctx_manager = ContextManager(**saved["context"])
+            guard.restore(saved["guard"])
+            warned, recoveries, empty_answers = saved["warned"], saved["recoveries"], saved["empty_answers"]
+            pending = [ToolCall.model_validate(row) for row in saved["pending"]]
+            next_call = saved["next_call"]
+            in_tool = saved["in_tool"]
+            batch_ok, handed_off = saved["batch_ok"], saved["handed_off"]
         processes = ProcessScope()
         tmpdir = tempfile.mkdtemp(prefix="miniagent-run-")
         self.sandbox.command_sessions = CommandSessions()
+        if saved:
+            self.sandbox.command_sessions.restore(saved["processes"])
         self.sandbox.track_shell_group = processes.track
         self.sandbox.command_tmpdir = Path(tmpdir)
         tool_ctx = ToolContext(
@@ -178,13 +203,14 @@ class Agent:
         )
         specs = self.registry.specs(available_only=True)
         tool_schemas = [spec.to_api() for spec in specs]
-        self.emit("start", task=task)
+        self.emit("resume" if saved else "start", task=task)
 
         def spend(response: LLMResponse) -> None:
             nonlocal usage
             usage = usage.merged(response.usage)
 
         def call_model(*, tools_enabled: bool) -> LLMResponse:
+            nonlocal step
             options: dict[str, Any] = {}
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None:
@@ -193,12 +219,18 @@ class Agent:
                 stream_id = uuid.uuid4().hex
                 self.emit("delta", stream_id=stream_id, phase="discard", text="")
                 options["on_stream"] = lambda phase, text: self.emit("delta", stream_id=stream_id, phase=phase, text=text)
-                options["should_cancel"] = self.should_cancel
+                options["should_cancel"] = lambda: self.should_cancel() or bool(tools_enabled and control and control.requested.is_set())
             if specs:
                 options["tool_choice"] = "auto" if tools_enabled else "none"
             length_at_request = len(messages)
-            response = self.provider.chat(messages, tools=specs or None,
-                                          temperature=self.settings.temperature, **options)
+            try:
+                response = self.provider.chat(messages, tools=specs or None,
+                                              temperature=self.settings.temperature, **options)
+            except ProviderError:
+                if tools_enabled and control and control.requested.is_set() and not self.should_cancel():
+                    step -= 1
+                    raise PauseRequested()
+                raise
             if response.usage.source == "reported" and response.usage.prompt_tokens:
                 ctx_manager.note_usage(messages, response.usage.prompt_tokens, length_at_request)
             spend(response)
@@ -239,61 +271,68 @@ class Agent:
                 if self.should_cancel():
                     status, error = "cancelled", "cancelled by the user"
                     break
-                if step >= self.limits.max_steps:
-                    status = "max_steps"
-                    break
-                if deadline is not None and time.monotonic() >= deadline:
-                    status, error = "budget", f"time limit of {self.limits.max_seconds:.0f}s reached"
-                    break
-                if self.limits.max_total_tokens and usage.total >= self.limits.max_total_tokens:
-                    status, error = "budget", f"token budget of {self.limits.max_total_tokens} reached"
-                    break
-                take_inbox()
-                left = self.limits.max_steps - step
-                if not warned and self.limits.max_steps >= 10 and left <= max(3, self.limits.max_steps // 10):
-                    warned = True
-                    messages.append({"role": "user", "content": (
-                        f"[Budget] Only {left} steps remain for this assignment. Prioritise finishing and "
-                        "verifying the most important part, then give your final report.")})
-                compact()
-                step += 1
-                self.emit("step", step=step, max_steps=self.limits.max_steps)
-                try:
-                    response = call_model(tools_enabled=True)
-                except ProviderError as exc:
-                    if exc.code == "context_length_exceeded":
-                        compact(force=True)
-                        response = call_model(tools_enabled=True)
-                    else:
-                        raise
-                messages.append(response.to_assistant_message())
-                calls = response.tool_calls
-                if not calls:
-                    text = response.text.strip()
-                    if response.finish_reason == "length" and recoveries < self.settings.max_output_recovery_attempts:
-                        recoveries += 1
+                if control:
+                    control.boundary()
+                if not pending:
+                    if step >= self.limits.max_steps:
+                        status = "max_steps"
+                        break
+                    if deadline is not None and time.monotonic() >= deadline:
+                        status, error = "budget", f"time limit of {self.limits.max_seconds:.0f}s reached"
+                        break
+                    if self.limits.max_total_tokens and usage.total >= self.limits.max_total_tokens:
+                        status, error = "budget", f"token budget of {self.limits.max_total_tokens} reached"
+                        break
+                    take_inbox()
+                    left = self.limits.max_steps - step
+                    if not warned and self.limits.max_steps >= 10 and left <= max(3, self.limits.max_steps // 10):
+                        warned = True
                         messages.append({"role": "user", "content": (
-                            "[Output limit] Your last response was cut off at the output limit. Continue, "
-                            "but keep each response shorter: write large files in several smaller tool calls.")})
-                        continue
-                    if not text:
-                        empty_answers += 1
-                        if empty_answers <= 2:
+                            f"[Budget] Only {left} steps remain for this assignment. Prioritise finishing and "
+                            "verifying the most important part, then give your final report.")})
+                    compact()
+                    step += 1
+                    self.emit("step", step=step, max_steps=self.limits.max_steps)
+                    try:
+                        response = call_model(tools_enabled=True)
+                    except ProviderError as exc:
+                        if exc.code == "context_length_exceeded":
+                            compact(force=True)
+                            response = call_model(tools_enabled=True)
+                        else:
+                            raise
+                    messages.append(response.to_assistant_message())
+                    calls = response.tool_calls
+                    if not calls:
+                        text = response.text.strip()
+                        if response.finish_reason == "length" and recoveries < self.settings.max_output_recovery_attempts:
+                            recoveries += 1
                             messages.append({"role": "user", "content": (
-                                "You returned neither a tool call nor text. Continue the work with a tool call, "
-                                "or write your final report as text.")})
+                                "[Output limit] Your last response was cut off at the output limit. Continue, "
+                                "but keep each response shorter: write large files in several smaller tool calls.")})
                             continue
-                    if take_inbox():
-                        continue  # the user said something while the answer was being written
-                    answer, status = text, "completed"
-                    break
-                if response.text.strip():
-                    self.emit("say", text=response.text.strip())
-                executed = 0
-                batch_ok = True
-                handed_off = False
-                for call in calls:
-                    executed += 1
+                        if not text:
+                            empty_answers += 1
+                            if empty_answers <= 2:
+                                messages.append({"role": "user", "content": (
+                                    "You returned neither a tool call nor text. Continue the work with a tool call, "
+                                    "or write your final report as text.")})
+                                continue
+                        if take_inbox():
+                            continue  # the user said something while the answer was being written
+                        answer, status = text, "completed"
+                        break
+                    if response.text.strip():
+                        self.emit("say", text=response.text.strip())
+                    pending = calls
+                    next_call = 0
+                    batch_ok, handed_off = True, False
+                for index in range(next_call, len(pending)):
+                    next_call = index
+                    call = pending[index]
+                    if control:
+                        control.boundary()
+                    executed = index + 1
                     if self.should_cancel():
                         batch_ok = False
                         messages.append({"role": "tool", "tool_call_id": call.id,
@@ -305,13 +344,17 @@ class Agent:
                                    "per response. Repeat this call in your next response if it is still needed.")
                         messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                         continue
-                    tool_result = self._execute(call, tool_ctx)
+                    rejoining = in_tool
+                    in_tool = True
+                    tool_result = self._execute(call, tool_ctx, rejoining=rejoining)
+                    in_tool = False
                     content, ok = tool_result.content, tool_result.ok
                     batch_ok = batch_ok and ok
                     handed_off = handed_off or tool_result.handed_off
                     tool_calls += 1
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                     guard.record(call.name, call.arguments, ok, content)
+                pending = []
                 if handed_off and batch_ok and not self.should_cancel() and not take_inbox():
                     status = "dispatched"
                     break
@@ -327,6 +370,15 @@ class Agent:
                 reason = {"max_steps": f"Step budget of {self.limits.max_steps} reached",
                           "stuck": "Loop detected", "budget": "Budget reached"}[status]
                 answer = self._wrap_up(messages, reason, call_model)
+        except PauseRequested:
+            control.frames[self.name] = {
+                "messages":messages, "step":step, "tool_calls":tool_calls, "elapsed":elapsed + time.monotonic()-started,
+                "usage":usage.model_dump(), "context":asdict(ctx_manager), "guard":guard.snapshot(),
+                "warned":warned, "recoveries":recoveries, "empty_answers":empty_answers,
+                "pending":[c.model_dump() for c in pending], "next_call":next_call, "in_tool":in_tool,
+                "batch_ok":batch_ok, "handed_off":handed_off, "processes":self.sandbox.command_sessions.checkpoint(),
+            }
+            raise
         except ProviderError as exc:
             status = "cancelled" if self.should_cancel() else "error"
             error = f"model request failed ({exc.code}): {exc}"
@@ -344,7 +396,7 @@ class Agent:
             self.sandbox.command_tmpdir = None
             shutil.rmtree(tmpdir, ignore_errors=True)
         result = AgentResult(agent=self.name, status=status, answer=answer, error=error, steps=step,
-                             tool_calls=tool_calls, usage=usage, duration_s=round(time.monotonic() - started, 2),
+                             tool_calls=tool_calls, usage=usage, duration_s=round(elapsed + time.monotonic() - started, 2),
                              compactions=ctx_manager.compactions)
         self.emit("end", status=status, answer=answer, error=error, steps=step, tool_calls=tool_calls,
                   prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
@@ -352,9 +404,10 @@ class Agent:
         return result
 
     # ------------------------------------------------------------------
-    def _execute(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
+    def _execute(self, call: ToolCall, ctx: ToolContext, *, rejoining=False) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
-        self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
+        if not rejoining:
+            self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
         if call.parse_error:
             result = ToolResult.failure(f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
                                         "possibly cut off because the call was too large. Split the work into smaller calls.")

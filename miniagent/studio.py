@@ -21,11 +21,11 @@ from typing import Callable
 
 from .config import Settings
 from .providers import DeepSeekProvider, Provider
-from .store import GroupStore, Store, Member, now
+from .store import Group, GroupStore, Store, Member, now
 from .roles import Roles
 from .attachments import Uploads
 from .assistant_room import workspace_evidence, progress, read_dispatch, legacy_dispatch_origins
-from . import dispatch_notices, studio_dispatch
+from . import checkpoint, dispatch_notices, studio_dispatch
 from .studio_tools import update_settings
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
@@ -56,6 +56,7 @@ class Running:
     primary: str
     channel: HumanChannel
     cancel: threading.Event
+    control: checkpoint.Continuation = field(default_factory=checkpoint.Continuation)
     thread: threading.Thread | None = None
     activity: deque = field(default_factory=lambda: deque(maxlen=3000))
     activity_seq: int = 0
@@ -138,6 +139,7 @@ class Studio:
                 "team_id":store.team.id, "team_name":store.team.name,
                 "session_name":store.group.name if store.parent else "默认会话",
                 "archived":store.group.archived or store.team.archived, "running": bool(running),
+                "paused_task_id":next((r["id"] for r in tasks if r["status"]=="paused"), None),
                 "waiting_for_you": bool(running and running.channel.pending()),
                 "last_activity": (store.root/"chat.jsonl").stat().st_mtime, "tasks": len(tasks), "last_status": tasks[-1]["status"] if tasks else None}
 
@@ -179,6 +181,8 @@ class Studio:
             if not store.parent and changes.get("archived") and any(
                     room.group.id in self._running for room in self.store.sessions(store)):
                 raise StudioError("群组中仍有会话正在执行任务。", 409)
+            if "folder" in changes and any(t["status"]=="paused" for t in store.tasks()):
+                raise StudioError("请先完成或结束暂停的任务，再更换这个会话的工作区。",409)
             if group_id in self._running and ("folder" in changes or changes.get("archived")):
                 raise StudioError("Wait for the task before rebinding or archiving its workspace.", 409)
             group = store.group
@@ -361,7 +365,14 @@ class Studio:
                 self._require_available(store)
                 if turn.action == "start_room_task":
                     return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode, receipt=receipt)
-                if turn.action == "change_group_members" and assistant:
+                if turn.action in ("pause_room_task", "resume_room_task"):
+                    operation = self.pause_task if turn.action == "pause_room_task" else self.resume_task
+                    try:
+                        info = operation(turn.task_id)
+                        answer = "已请求暂停，将在保存断点后停下。" if turn.action == "pause_room_task" else f"已继续任务 {info['task_id']}。"
+                    except StudioError as exc:
+                        answer = str(exc)
+                elif turn.action == "change_group_members" and assistant:
                     try:
                         updated = self.change_members(**turn.arguments)
                         names = "、".join(m["name"] for m in updated["members"])
@@ -404,7 +415,7 @@ class Studio:
         return {"route":"reply", "text":answer}
 
     def _deliver_turn(self, source, observed, action, text, refs, receipt):
-        if not observed or self._running.get(observed.group_id) is not observed.run:
+        if not observed or self._running.get(observed.group_id) is not observed.run or observed.run.control.requested.is_set():
             return "stale"
         answering = action == "answer_open_question"
         if answering and not observed.question:
@@ -425,13 +436,13 @@ class Studio:
         with self._lock:
             self._require_available(store)
             store.group.member(primary)
-            running = self._running.get(group_id)
+            queued = group_id in self._running or any(t["status"]=="paused" for t in store.tasks())
             options = {**options, "thinking":settings.thinking, "interaction_mode":mode,
                        "member_max_steps":settings.limits.max_steps, "lead_max_steps":settings.team.lead_max_steps,
                        "max_delegations":settings.team.max_delegations}
             tid = "t-" + uuid.uuid4().hex[:12]
             receipt = receipt or {}
-            if running:
+            if queued:
                 event = store.append("queued_message", task_id=tid, text=text, attachments=refs, **receipt)
             else:
                 event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
@@ -441,11 +452,11 @@ class Studio:
                 record["redispatched_from"] = redispatched_from
             if dispatched_by:
                 record["dispatched_by"] = dispatched_by
-            if running:
+            if queued:
                 record["queued_message"] = {"text":text,"attachments":refs,"addressed":primary}
             store.save_task(record)
             dispatch_notices.task_receipt(self, store, record)
-            if running:
+            if queued:
                 return {"route":"queued","task_id":tid}
             self._start(store, record)
             return {"route":"task", "task_id":tid}
@@ -464,23 +475,27 @@ class Studio:
                            team=replace(base.team, **{k:options[k] for k in ("max_delegations","lead_max_steps") if k in options}))
         return settings, mode
 
-    def _start(self, store, record):
+    def _start(self, store, record, saved=None):
         tid, primary = record["id"], record["primary"]
         try:
             settings, mode = self._task_settings(store, record["options"])
             provider = self.provider_factory(settings)
-            with self._folder_sync_lock:
-                warnings = sync(store, importing=True, key=settings.api_key)
-            for warning in warnings:
-                store.append("system",task_id=tid,text=warning)
-            members = []
-            for member in store.group.members:
-                if member.id in store.group.role_ids:
-                    role = self.roles.get(member.id)
-                    member = Member(role["id"],role["name"],role["prompt"],member.note)
-                if member.note:
-                    member = replace(member,prompt=member.prompt+"\nGroup note: "+member.note)
-                members.append(member)
+            if saved:
+                group = Group.from_dict(saved["team"])
+            else:
+                with self._folder_sync_lock:
+                    warnings = sync(store, importing=True, key=settings.api_key)
+                for warning in warnings:
+                    store.append("system",task_id=tid,text=warning)
+                members = []
+                for member in store.group.members:
+                    if member.id in store.group.role_ids:
+                        role = self.roles.get(member.id)
+                        member = Member(role["id"],role["name"],role["prompt"],member.note)
+                    if member.note:
+                        member = replace(member,prompt=member.prompt+"\nGroup note: "+member.note)
+                    members.append(member)
+                group = replace(store.group, members=members, role_ids=list(store.group.role_ids), mode=mode)
             if "queued_message" in record:
                 event = next((e for e in store.chat() if e["kind"] == "user_message" and e.get("task_id") == tid), None)
                 if event is None:
@@ -493,7 +508,11 @@ class Studio:
             task = TeamTask(store, provider, settings, task_id=tid, text=record["text"], primary=primary,
                             trigger_seq=record["trigger_seq"], channel=running.channel, should_cancel=cancel.is_set,
                             on_activity=lambda e: self._activity(running, e))
-            task.group = replace(store.group, members=members, role_ids=list(store.group.role_ids), mode=mode)
+            task.group = group
+            task.control = running.control = checkpoint.Continuation(saved)
+            running.channel.control = task.control
+            if saved:
+                running.channel.restore(saved["channel"])
             task.dispatched_by = record.get("dispatched_by")
             task.interactive = mode == "interactive"
             task.studio = self
@@ -502,10 +521,20 @@ class Studio:
             task.created_at = record["created_at"]
             running.thread = threading.Thread(target=self._run, args=(store.group.id, task, running),
                                               name=f"task-{tid}", daemon=True)
+            if saved:
+                record["status"] = "running"
+                store.save_task(record)
+                checkpoint.path_for(store,tid).unlink()
+                store.append("task_resumed",task_id=tid,agent=primary)
             self._running[store.group.id] = running
             running.thread.start()
         except Exception as exc:
             self._running.pop(store.group.id, None)
+            if saved:
+                checkpoint.save(checkpoint.path_for(store,tid),saved)
+                record.update(status="paused",error=str(exc))
+                store.save_task(record)
+                raise StudioError(str(exc),503) from None
             record.update(status="failed", finished_at=now(), error=str(exc))
             store.save_task(record)
             store.append("task_finished", task_id=tid, status="failed", error=str(exc))
@@ -516,7 +545,10 @@ class Studio:
     def _advance(self, store):
         if self._closed or store.group.archived or store.team.archived or store.group.id in self._running:
             return
-        for record in store.tasks():
+        records = store.tasks()
+        if any(r["status"]=="paused" for r in records):
+            return
+        for record in records:
             if record.get("status") == "queued":
                 try:
                     self._start(store, record)
@@ -544,7 +576,11 @@ class Studio:
                 for task in store.tasks():
                     if active and active.task_id == task["id"]:
                         continue
-                    if task["status"] == "running":
+                    if task["status"] == "running" and checkpoint.path_for(store,task["id"]).is_file():
+                        task.update(status="paused", active=[])
+                        store.save_task(task)
+                        store.append("task_paused",task_id=task["id"])
+                    elif task["status"] == "running":
                         task.update(status="interrupted", finished_at=now(), active=[])
                         store.save_task(task)
                         store.append("task_finished",task_id=task["id"],status="interrupted")
@@ -573,11 +609,13 @@ class Studio:
         with self._dispatch_changed:
             while True:
                 parent = self._running.get(source_id)
+                if parent and parent.task_id == parent_id and not parent.cancel.is_set():
+                    parent.control.boundary()
                 if self._closed or not parent or parent.task_id != parent_id or parent.cancel.is_set():
                     raise StudioError("The dispatching task was stopped.")
                 task = target.load_task(tid)
                 child = self._running.get(gid)
-                if task["status"] not in ("queued","running") and (not child or child.task_id != tid):
+                if task["status"] not in ("queued","running","paused") and (not child or child.task_id != tid):
                     return self.dispatch_status(tid)
                 self._dispatch_changed.wait()
 
@@ -595,7 +633,9 @@ class Studio:
         trace = store.task_dir(tid)/"trace.jsonl"
         activity = [json.loads(line) for line in trace.read_text().splitlines()] if include_activity and trace.exists() else []
         events = [e for e in store.chat() if e.get("task_id") == tid]
-        return {"task":record,"events":events,"activity":activity,"changes":task_changes(store,tid),
+        run = self._running.get(store.group.id)
+        pausing = bool(run and run.task_id == tid and run.control.requested.is_set())
+        return {"task":record,"pausing":pausing,"events":events,"activity":activity,"changes":task_changes(store,tid),
                 "has_snapshot":(store.root/"tasks"/tid/"artifacts.zip").is_file(),
                 "diagnostics":[e for e in activity if e.get("type") in ("loop_nudge","loop_stuck","error")
                                or (e.get("type")=="end" and e.get("status") not in ("completed","dispatched"))]}
@@ -613,7 +653,21 @@ class Studio:
     def _run(self, group_id: str, task: TeamTask, running: Running) -> None:
         store = task.store
         try:
-            result = task.run()
+            try:
+                result = task.run()
+            except checkpoint.PauseRequested:
+                with self._lock:
+                    if running.cancel.is_set():
+                        task._update(status="cancelled", active=[], finished_at=now())
+                        store.append("task_finished",task_id=task.task_id,status="cancelled")
+                    else:
+                        checkpoint.save(checkpoint.path_for(store,task.task_id),task.continuation_state())
+                        task._update(status="paused", active=[])
+                        store.append("task_paused",task_id=task.task_id,agent=task.primary)
+                        # Make the visible playback control usable as soon as the pause is committed.
+                        del self._running[group_id]
+                        self._dispatch_changed.notify_all()
+                return
             try:
                 snapshot(store, task.task_id)
                 result["evaluation"] = evaluate(store, task.options.get("checks", []), task.settings)
@@ -658,6 +712,34 @@ class Studio:
             running.activity_seq += 1
             running.activity.append({**event, "seq": running.activity_seq})
 
+    def pause_task(self, task_id):
+        with self._lock:
+            room, record = self.find_task(task_id)
+            if record["status"] == "paused":
+                return {"task_id":task_id,"status":"paused"}
+            run = self._running.get(room.group.id)
+            if not run or run.task_id != task_id or run.cancel.is_set() or record["status"] not in ("queued","running"):
+                raise StudioError("该任务当前无法暂停。",409)
+            run.control.requested.set()
+            self._dispatch_changed.notify_all()
+            return {"task_id":task_id,"status":"pausing"}
+
+    def resume_task(self, task_id):
+        with self._lock:
+            room, record = self.find_task(task_id)
+            self._require_available(room)
+            run = self._running.get(room.group.id)
+            if run and run.task_id == task_id and not run.control.requested.is_set():
+                return {"task_id":task_id,"status":"running"}
+            if run or record["status"] != "paused":
+                raise StudioError("该任务尚未停在可继续的断点。",409)
+            try:
+                saved = checkpoint.load(checkpoint.path_for(room,task_id),task_id)
+            except (OSError,ValueError) as exc:
+                raise StudioError(f"读取断点失败：{exc}",409) from None
+            self._start(room,record,saved)
+            return {"task_id":task_id,"status":"running"}
+
     def cancel(self, group_id: str) -> dict:
         with self._lock:
             running = self._running.get(group_id)
@@ -686,7 +768,7 @@ class Studio:
                 record = store.load_task(running.task_id)
             except (OSError, ValueError):
                 record = {}
-            live = {"task_id": running.task_id, "primary": running.primary, "active": record.get("active", []),
+            live = {"pausing":running.control.requested.is_set(), "task_id": running.task_id, "primary": running.primary, "active": record.get("active", []),
                     "question": running.channel.pending(), "activity": activity[-400:], "activity_seq": cursor}
         return {"group": self.summary(store), "events": store.chat(after), "live": live}
 
@@ -718,10 +800,10 @@ class Studio:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            self._dispatch_changed.notify_all()
             runs = list(self._running.values())
-        for running in runs:
-            running.cancel.set()
+            for running in runs:
+                running.control.requested.set()
+            self._dispatch_changed.notify_all()
         for running in runs:
             if running.thread:
-                running.thread.join(10)
+                running.thread.join()

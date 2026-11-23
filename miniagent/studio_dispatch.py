@@ -2,7 +2,7 @@
 import hashlib
 import json
 
-from . import dispatch_notices
+from . import checkpoint, dispatch_notices
 from .store import now
 
 
@@ -16,12 +16,14 @@ def cancel_task(studio, task_id):
             if not run.cancel.is_set():
                 studio.cancel(room.group.id)
             return {"task_id":task_id, "status":"stopping"}
-        if state == "queued":
+        if state in ("queued", "paused"):
             record.update(status="cancelled", finished_at=now(), active=[])
             room.save_task(record)
             room.append("task_finished", task_id=task_id, status="cancelled")
             dispatch_notices.task_outcome(studio, room, record)
             studio._dispatch_changed.notify_all()
+            checkpoint.path_for(room,task_id).unlink(missing_ok=True)
+            studio._advance(room)
             state = "cancelled"
         return {"task_id":task_id, "status":state}
 

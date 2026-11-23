@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .checkpoint import PauseRequested
 from .browser_tool import run_browser
 from .config import Limits
 from .project_navigation import find_files, read_lines, search_files
@@ -142,6 +143,8 @@ class ToolRegistry:
 
         try:
             return tool.fn(ctx, arguments)
+        except PauseRequested:
+            raise
         except SandboxError as exc:
             return ToolResult.failure(f"Workspace access denied: {exc}")
         except subprocess.TimeoutExpired:

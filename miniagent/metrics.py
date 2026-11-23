@@ -11,7 +11,7 @@ from .store import GroupStore
 
 
 def summarize(tasks: list[dict]) -> dict:
-    finished = [t for t in tasks if t.get("status") not in {None, "running", "queued"}]
+    finished = [t for t in tasks if t.get("status") not in {None, "running", "queued", "paused"}]
     completed = [t for t in finished if t["status"] == "completed"]
     dispatched = sum(t["status"] == "dispatched" for t in finished)
     delivery_attempts = len(finished) - dispatched

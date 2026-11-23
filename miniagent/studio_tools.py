@@ -160,6 +160,8 @@ def assistant_tools(studio, source_id=None, task_id=None):
                    {"assignments":{"type":"array","items":{"type":"object","properties":TARGET_FIELDS,"required":["group_id","text"],"additionalProperties":False}}}, ("assignments",)),
             action("inspect_studio_room", INSPECT_DESCRIPTION, lambda **args:studio_dispatch.inspect_room(studio, **args),
                    {"group_id":STRING, "offset":{"type":"integer","minimum":0}}, ("group_id",)),
+            action("pause_task", "Pause a running task at a resumable checkpoint.", studio.pause_task, {"task_id":STRING}, ("task_id",)),
+            action("resume_task", "Resume a paused task using its original ID.", studio.resume_task, {"task_id":STRING}, ("task_id",)),
             action("cancel_task", CANCEL_DESCRIPTION, lambda task_id:studio_dispatch.cancel_task(studio, task_id),
                    {"task_id":STRING}, ("task_id",)),
             action("redispatch_task", "Reassign or rerun a recorded task in a target conversation. Carries its original brief, inputs and checks. Optionally replace text or name an assignee. Once accepted, stop the old execution if still active.",

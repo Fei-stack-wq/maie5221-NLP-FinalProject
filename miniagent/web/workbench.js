@@ -68,7 +68,7 @@ function dispatchNotice(event) {
 function taskTree(task, events, scope) {
   const root=el("div",{class:"tree-root"},el("strong",{},"@"+(task.primary||"—")),statusChip(task.status),el("p",{},task.text));
   const list=el("ol",{class:"branches"}), pending=new Map();
-  const active=["running","queued"].includes(task.status);
+  const active=["running","queued","paused"].includes(task.status);
   for (const e of events) {
     if (e.kind==="delegation") {
       const badge=el("small",{class:"tree-status"},active?"等待回报":"无回报记录");
@@ -225,7 +225,7 @@ async function taskDetail(id) {
       body.append(artifactCards(scope,[...scope.files.values()])||el("p",{class:"muted"},"本任务没有发布文件。"));
     } else if (name==="轨迹") {
       const widget=toolWidget(id); body.append(widget);widget.open=true;
-      if (!["running","queued"].includes(t.status)) widget.update(null,t.status);
+      if (!["running","queued","paused"].includes(t.status)) widget.update(null,t.status);
     } else if (name==="对话") {
       for (const e of d.events) body.append(el("p",{},[e.agent||e.kind,e.text||e.task||e.question||e.status].filter(Boolean).join(" · ")));
     } else {
@@ -237,9 +237,18 @@ async function taskDetail(id) {
   }
   for (const name of ["概览","对话","轨迹","产物","诊断"]) tabs.append(button(name,()=>render(name)));
   let status=statusChip(t.status);
+  const playback=el("button",{type:"button",class:"ghost"});
+  function playbackState() {
+    const resume=t.status==="paused";
+    playback.hidden=!state.config.task_pause || (!resume && t.status!=="running");
+    playback.disabled=d.pausing;
+    playback.textContent=d.pausing?"正在保存断点…":resume?"▶ 继续执行":"⏸ 暂停";
+    playback.onclick=()=>changePlayback(playback,id,resume?"resume":"pause",()=>taskDetail(id));
+  }
+  playbackState();
   sheet("任务详情",el("div",{class:"task-meta"},status,el("code",{},id),
     button("打开会话",()=>{$("#sheet").close();return openGroup(t.group_id);}),
-    button("刷新记录",()=>taskDetail(id))),tabs,body);
+    playback,button("刷新记录",()=>taskDetail(id))),tabs,body);
   await render("概览");
   const visible=()=>body.isConnected && $("#sheet").open && request===taskViewRequest;
   async function update() {
@@ -247,10 +256,11 @@ async function taskDetail(id) {
     try {
       const next=await api("/tasks/"+id+"?view=summary");
       if (!visible()) return;
-      const changed=next.task.status!==t.status || next.events.length!==d.events.length ||
+      const changed=next.pausing!==d.pausing || next.task.status!==t.status || next.events.length!==d.events.length ||
         next.has_snapshot!==d.has_snapshot || next.changes.length!==d.changes.length;
       d=next;t=d.task;scope.files=fileIndex(d.changes);
       if (changed) {
+        playbackState();
         const chip=statusChip(t.status);status.replaceWith(chip);status=chip;
         if (selected!=="轨迹") {
           const expanded=[...body.querySelectorAll(".branch[open]")].map(n=>n.dataset.assignment);
@@ -258,11 +268,11 @@ async function taskDetail(id) {
           for (const node of body.querySelectorAll(".branch")) node.open=expanded.includes(node.dataset.assignment);
         }
       }
-      const ended=!["queued","running"].includes(t.status);
+      const ended=!["queued","running","paused"].includes(t.status);
       body.querySelector(".tool-widget")?.update(null,ended?t.status:null);
       if (ended) return;
     } catch(error) { if (visible()) showError(error); }
     if (visible()) setTimeout(update,2000);
   }
-  if (["queued","running"].includes(t.status)) setTimeout(update,2000);
+  if (["queued","running","paused"].includes(t.status)) setTimeout(update,2000);
 }

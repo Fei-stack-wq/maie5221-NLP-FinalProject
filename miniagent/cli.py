@@ -47,6 +47,7 @@ def _template(name: str) -> dict:
 
 
 def cmd_studio(args) -> int:
+    import signal
     settings = _settings(args)
     from .instance import advertised_studio
     from .server import serve
@@ -70,8 +71,15 @@ def cmd_studio(args) -> int:
                 print("warning: DEEPSEEK_API_KEY is not set (.env or environment); tasks cannot start.")
             if not args.no_browser:
                 threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-            while True:
-                time.sleep(3600)
+            main_thread = threading.current_thread() is threading.main_thread()
+            if main_thread:
+                previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
+            try:
+                while True:
+                    time.sleep(3600)
+            finally:
+                if main_thread:
+                    signal.signal(signal.SIGTERM, previous)
     except KeyboardInterrupt:
         print("\nstopping…")
     finally:

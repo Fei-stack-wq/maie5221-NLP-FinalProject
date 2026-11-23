@@ -110,7 +110,7 @@ function fmtDuration(seconds) {
 
 const STATUS_LABEL = {
   dispatched: "已派工", completed: "完成", incomplete: "未完成", failed: "失败", cancelled: "已停止", max_steps: "步数用尽",
-  stuck: "循环中止", budget: "预算用尽", error: "出错", queued: "排队中", interrupted: "已中断", running: "进行中",
+  paused: "已暂停", pausing: "正在保存断点", stuck: "循环中止", budget: "预算用尽", error: "出错", queued: "排队中", interrupted: "已中断", running: "进行中",
 };
 
 function statusChip(status) {
@@ -192,6 +192,9 @@ function renderEvent(event) {
       return el("div",{class:"msg user"},el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))));
     case "queued_message":
       return el("div",{class:"divider"},el("span",{},"已排队，当前任务结束后开始 · "+event.text));
+    case "task_paused":
+    case "task_resumed":
+      return el("div",{class:"divider"},el("span",{},event.kind==="task_paused"?"任务已暂停 · 断点已保存":"任务从断点继续"));
     case "task_started": {
       const tools=toolWidget(tid);state.toolWidgets.set(tid,tools);
       return el("section",{class:"chat-run"},el("div",{class:"chat-run-head"},
@@ -444,7 +447,7 @@ function renderHead() {
   $("#task-buttons").replaceChildren(...(template && idle ? template.tasks.map((t, i) =>
     el("button", { type: "button", title: t.text, onclick: () => { $("#input").value = t.text; autoGrow(); $("#input").focus(); } },
       `任务 ${i + 1} · ${t.title.replace(/^.*?:\s*/, "").slice(0, 28)}`)) : []));
-  $("#stop").hidden = !g.running;
+  $("#stop").hidden = !g.running && !g.paused_task_id;
   $("#queue-toggle").hidden = !g.running;
   if (!g.running) $("#queue").checked = false;
   $("#edit-group").disabled = g.kind === "assistant";
@@ -452,10 +455,39 @@ function renderHead() {
   setNav(g.kind === "assistant" ? "assistant-nav" : null);
 }
 
+async function changePlayback(button,taskId,operation,done=poll) {
+  button.disabled=true;
+  try {
+    await api("/tasks/"+taskId+"/"+operation,{method:"POST",body:{}});
+    await done();
+  } catch(error) {
+    showError(error);
+  } finally {
+    if (button.isConnected && !state.live?.pausing) button.disabled=false;
+  }
+}
+
 function renderLive(live) {
   const box = $("#live");
-  if (!live) { box.hidden = true; $("#question-banner").hidden = true; return; }
+  const paused=state.group?.paused_task_id;
+  const play=$("#playback"), resume=!live && Boolean(paused);
+  play.hidden=!state.config?.task_pause || (!live && !paused);
+  play.textContent=resume ? "▶ 继续执行" : live?.pausing ? "正在保存断点…" : "⏸ 暂停";
+  play.disabled=Boolean(live?.pausing);
+  play.onclick=()=>changePlayback(play,live?.task_id || paused,resume?"resume":"pause");
+  $("#toggle-activity").hidden=!live;
+  if (!live) {
+    box.hidden=!paused;
+    $("#question-banner").hidden=true;
+    if (paused) $("#live-status").textContent="已暂停 · 断点已保存";
+    return;
+  }
   box.hidden = false;
+  if (live.pausing) {
+    $("#live-status").textContent="暂停中 · 等待当前操作结束并保存断点";
+    $("#question-banner").hidden=true;
+    return;
+  }
   if (state.stepsTask !== live.task_id) { state.steps = {}; state.stepsTask = live.task_id; }
   const steps = state.steps;
   let last = null;
@@ -912,8 +944,10 @@ async function boot() {
     const box = $("#activity"); box.hidden = !box.hidden; box.scrollTop = box.scrollHeight;
   });
   $("#stop").addEventListener("click", async () => {
-    if (state.current && confirm("停止当前任务？已发布的文件会保留。")) {
-      await api(`/groups/${state.current}/cancel`, { method: "POST", body: {} });
+    if (state.current && confirm("结束本次执行并放弃继续？已发布的文件会保留。")) {
+      const tid=state.live?.task_id || state.group?.paused_task_id;
+      const path=state.config.task_pause && tid ? "/tasks/"+tid+"/cancel" : "/groups/"+state.current+"/cancel";
+      await api(path, { method: "POST", body: {} });
       poll();
     }
   });

@@ -126,7 +126,7 @@ class StudioHandler(_Base):
         if parts == ["bootstrap"]:
             return self._json(200, {"token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
                                     "model":studio.settings.model,"thinking":studio.settings.thinking,
-                                    "preview_port":self.preview_port,"workbench_version":1,"chat_protocol":1,"member_max_steps":studio.settings.limits.max_steps,
+                                    "preview_port":self.preview_port,"workbench_version":1,"chat_protocol":1,"task_pause":True,"member_max_steps":studio.settings.limits.max_steps,
                                     "lead_max_steps":studio.settings.team.lead_max_steps,
                                     "max_delegations":studio.settings.team.max_delegations})
         if parts == ["roles"]:
@@ -270,6 +270,14 @@ class StudioHandler(_Base):
             if len(parts) == 5 and parts[0] == "roles" and parts[2] == "knowledge" and parts[4] == "status" and method == "POST":
                 return self._json(200, studio.roles.revise(parts[1],parts[3],body["status"],text=body.get("text"),
                                                           revision=body.get("revision")))
+            if method == "POST" and len(parts)==3 and parts[0]=="tasks":
+                if parts[2]=="pause":
+                    return self._json(200,studio.pause_task(parts[1]))
+                if parts[2]=="resume":
+                    return self._json(200,studio.resume_task(parts[1]))
+                if parts[2]=="cancel":
+                    from .studio_dispatch import cancel_task
+                    return self._json(200,cancel_task(studio,parts[1]))
             if method == "POST" and parts == ["groups"]:
                 if body.get("kind") == "assistant":
                     raise ValueError("Use /api/assistant")

@@ -63,6 +63,17 @@ class LoopGuard:
     nudge_step: int | None = None
     steps_since_nudge: int = 0
 
+    def snapshot(self) -> dict:
+        return {"history":list(self.history), "seen":list(self.seen_observations), "nudged":list(self.nudged),
+                "nudge_step":self.nudge_step, "steps_since_nudge":self.steps_since_nudge}
+
+    def restore(self, saved: dict) -> None:
+        self.history.extend(tuple(row) for row in saved["history"])
+        self.seen_observations.update(saved["seen"])
+        self.nudged.update(saved["nudged"])
+        self.nudge_step = saved["nudge_step"]
+        self.steps_since_nudge = saved["steps_since_nudge"]
+
     def record(self, tool: str, arguments: dict, ok: bool, observation: str) -> None:
         obs = _digest(observation)
         # Waiting on a running process legitimately repeats the same answer.

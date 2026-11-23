@@ -150,6 +150,7 @@ def room_evidence(store, actor, active, pending, refs, roles):
             "recipient":actor, "role":role,
             "group_note":member.note, "approved_knowledge":"\n".join(visible)[:4000],
             "active_task":active, "pending_question":pending,
+            "paused_task":next((r["id"] for r in tasks if r["status"]=="paused"),None),
             "tasks":[task_evidence(r, publications) for r in latest],
             "conversation":conversation(store, events[-1]["seq"] + 1 if events else 1, budget_chars=14000),
             "attachments":list(catalog.values()), "attachments_now":refs}
@@ -157,6 +158,10 @@ def room_evidence(store, actor, active, pending, refs, roles):
 
 def decide(provider, context, text, read, *, on_stream=None):
     tools = [START]
+    if context.get("paused_task"):
+        tools.append(action_tool("resume_room_task", "Continue the paused execution from its saved checkpoint.", [context["paused_task"]]))
+    if context.get("active_task"):
+        tools.append(action_tool("pause_room_task", "Pause this task to continue later with its progress intact.", [context["active_task"]["id"]]))
     targets = context.get("action_targets")
     if targets:
         tools.append(action_tool(STEER.name, STEER.description, targets))

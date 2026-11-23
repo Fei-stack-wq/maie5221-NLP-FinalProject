@@ -68,8 +68,8 @@ def workspace_evidence(studio, source):
             if origin.get("group_id") == source.group.id or (not origin and task["id"] in legacy):
                 receipts.append((target, task))
     receipts.sort(key=lambda pair:pair[1].get("created_at", 0))
-    live = [pair for pair in receipts if pair[1]["status"] in ("queued", "running")]
-    finished = [pair for pair in receipts if pair[1]["status"] not in ("queued", "running")]
+    live = [pair for pair in receipts if pair[1]["status"] in ("queued", "running", "paused")]
+    finished = [pair for pair in receipts if pair[1]["status"] not in ("queued", "running", "paused")]
     dispatches = []
     histories = {}
     for target, task in finished[-4:] + live:

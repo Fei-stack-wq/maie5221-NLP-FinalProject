@@ -39,6 +39,7 @@ from dataclasses import replace
 from typing import Any, Callable
 
 from .agent import Agent, AgentResult
+from .checkpoint import Continuation
 from .config import Settings
 from .providers import Provider
 from .sandbox import Sandbox
@@ -71,19 +72,33 @@ class HumanChannel:
         self._finished = False
         self._cursors: dict[str, int] = {}
         self.questions = 0
+        self.control = None
+
+    def snapshot(self):
+        with self._cond:
+            return {"pending":self._pending, "answer":self._answer, "messages":list(self._messages),
+                    "cursors":dict(self._cursors), "questions":self.questions}
+
+    def restore(self, saved):
+        self._pending, self._answer = saved["pending"], saved["answer"]
+        self._messages, self._cursors, self.questions = saved["messages"], saved["cursors"], saved["questions"]
+
 
     # called by agent threads
     def ask(self, agent: str, question: str) -> str:
         with self._cond:
-            qid = "q-" + uuid.uuid4().hex[:10]
-            self._pending = {"id": qid, "agent": agent, "question": question}
-            self._answer = None
-            self.questions += 1
-            self.store.append("question", task_id=self.task_id, agent=agent, question=question, qid=qid)
+            if self._pending is None:
+                qid = "q-" + uuid.uuid4().hex[:10]
+                self._pending = {"id": qid, "agent": agent, "question": question}
+                self._answer = None
+                self.questions += 1
+                self.store.append("question", task_id=self.task_id, agent=agent, question=question, qid=qid)
             while self._answer is None:
                 if self.should_cancel():
                     self._pending = None
                     raise Cancelled()
+                if self.control:
+                    self.control.boundary()
                 self._cond.wait(timeout=0.5)
             answer, self._answer, self._pending = self._answer, None, None
             return answer
@@ -363,6 +378,16 @@ class TeamTask:
         self.lead_baseline: dict[str, str] = {}
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
+        self.control = Continuation()
+        self.delegation = None
+        self.started_at = None
+
+    def continuation_state(self):
+        return {"task_id":self.task_id, "elapsed":time.monotonic()-self.started_at, "frames":self.control.frames, "team":self.group.to_dict(),
+                "lead_baseline":self.lead_baseline, "delegation":self.delegation,
+                "delegations":self.delegations, "history":self.history, "assignments":self.assignments,
+                "channel":self.channel.snapshot()}
+
 
     # -- plumbing ---------------------------------------------------------
     def _event(self, event: dict) -> None:
@@ -407,7 +432,8 @@ class TeamTask:
         question = question.strip()
         if not question:
             return ToolResult.failure("The question is empty.")
-        self._event({"type": "question", "agent": agent, "question": question})
+        if self.channel.pending() is None:
+            self._event({"type": "question", "agent": agent, "question": question})
         try:
             answer = self.channel.ask(agent, question)
         except Cancelled:
@@ -458,33 +484,38 @@ class TeamTask:
             return ToolResult.failure(f"Unknown assignee {assignee!r}. Choose one of: {', '.join(valid)}.")
         if len(task) < 10:
             return ToolResult.failure("The assignment is empty or too short. Describe the work completely.")
-        if self.delegations >= self.settings.team.max_delegations:
-            return ToolResult.failure(
-                f"The delegation budget for this task ({self.settings.team.max_delegations}) is used up. "
-                "Finish now with what the team has produced and state what remains open.")
-        max_steps = args.get("max_steps")
-        if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150,self.settings.limits.max_steps)):
-            return ToolResult.failure(f"max_steps must be between 1 and {min(150,self.settings.limits.max_steps)}")
-        previous = self.history.setdefault(assignee, [])
-        similar = sum(1 for old in previous
-                      if difflib.SequenceMatcher(None, old[:3000], task[:3000]).ratio() >= 0.9)
-        if similar >= self.settings.team.max_repeat_assignments:
-            return ToolResult.failure(
-                f"Refused: you have already given {assignee} this assignment {similar} times with nearly the same "
-                "wording. Repeating it will not change the outcome. Use the previous reports, change the approach "
-                "(different instructions, a different teammate, or doing it yourself), or finish and report what "
-                "is still open.")
-        self.delegations += 1
-        previous.append(task)
         member = self.group.member(assignee)
         lead_workspace = self.store.workspace(lead_id)
-        own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
-                                            task_id=self.task_id, note="lead edits before delegation")
-        if own:
-            self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
-        event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
-                                  task=task, deliverables=deliverables)
-        result, changes, skipped = self._run_member(member, task, deliverables, event["seq"], max_steps)
+        max_steps = args.get("max_steps")
+        if self.delegation is None:
+            if self.delegations >= self.settings.team.max_delegations:
+                return ToolResult.failure(
+                    f"The delegation budget for this task ({self.settings.team.max_delegations}) is used up. "
+                    "Finish now with what the team has produced and state what remains open.")
+            if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150,self.settings.limits.max_steps)):
+                return ToolResult.failure(f"max_steps must be between 1 and {min(150,self.settings.limits.max_steps)}")
+            previous = self.history.setdefault(assignee, [])
+            similar = sum(1 for old in previous
+                          if difflib.SequenceMatcher(None, old[:3000], task[:3000]).ratio() >= 0.9)
+            if similar >= self.settings.team.max_repeat_assignments:
+                return ToolResult.failure(
+                    f"Refused: you have already given {assignee} this assignment {similar} times with nearly the same "
+                    "wording. Repeating it will not change the outcome. Use the previous reports, change the approach "
+                    "(different instructions, a different teammate, or doing it yourself), or finish and report what "
+                    "is still open.")
+            self.delegations += 1
+            previous.append(task)
+            own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
+                                                task_id=self.task_id, note="lead edits before delegation")
+            if own:
+                self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
+            event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
+                                      task=task, deliverables=deliverables)
+            self.delegation = {"assignee":assignee, "seq":event["seq"]}
+        elif self.delegation["assignee"] != assignee:
+            raise ValueError("The saved delegation does not match its pending tool call")
+        result, changes, skipped = self._run_member(member, task, deliverables, self.delegation["seq"], max_steps)
+        self.delegation = None
         self.lead_baseline = self.store.project.checkout(lead_workspace)
         report = result.answer or "(no report)"
         if result.error:
@@ -514,7 +545,9 @@ class TeamTask:
 
     def _run_member(self, member: Member, task: str, deliverables: list[str], trigger_seq: int, max_steps=None):
         workspace = self.store.workspace(member.id)
-        baseline = self.store.project.checkout(workspace)
+        if "baseline" not in self.delegation:
+            self.delegation["baseline"] = self.store.project.checkout(workspace)
+        baseline = self.delegation["baseline"]
         lead = self.group.member(self.primary)
         assignment = task
         if deliverables:
@@ -525,8 +558,9 @@ class TeamTask:
                       system_prompt=member_prompt(member, lead, self.group.members, self.settings,
                                                                  self.interactive),
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel,
-                      stream=True)
-        self.channel.start_cursor(member.id, trigger_seq)
+                      stream=True, continuation=self.control)
+        if member.id not in self.control.frames:
+            self.channel.start_cursor(member.id, trigger_seq)
         self.active.append(member.id)
         self._update(active=list(self.active))
         try:
@@ -549,21 +583,29 @@ class TeamTask:
         self.store.save_task(self.record)
 
     def run(self) -> dict:
-        started = time.monotonic()
+        self.started_at = time.monotonic() - self.control.saved.get("elapsed",0)
         me = self.group.member(self.primary)
         can_delegate = self.primary == self.group.lead and len(self.group.members) > 1
-        self.record = {"id": self.task_id, "group_id": self.group.id, "text": self.text, "primary": self.primary,
-                       "status": "running", "created_at": self.created_at, "trigger_seq": self.trigger_seq, "finished_at": None, "active": [self.primary],
-                       "delegations": 0, "assignments": [], "final_answer": "", "error": "", "options": self.options, "role_ids": list(self.group.role_ids)}
-        if getattr(self, "redispatched_from", None):
-            self.record["redispatched_from"] = self.redispatched_from
-        self.record["room_kind"] = self.group.kind
-        if self.dispatched_by:
-            self.record["dispatched_by"] = self.dispatched_by
-        self.store.save_task(self.record)
-        self.store.append("task_started", task_id=self.task_id, agent=self.primary)
         workspace = self.store.workspace(self.primary)
-        self.lead_baseline = self.store.project.checkout(workspace)
+        saved = self.control.saved
+        if saved:
+            self.record = self.store.load_task(self.task_id)
+            self.lead_baseline = saved["lead_baseline"]
+            self.delegation, self.delegations = saved["delegation"], saved["delegations"]
+            self.history, self.assignments = saved["history"], saved["assignments"]
+            self._update(status="running", active=[self.primary])
+        else:
+            self.record = {"id": self.task_id, "group_id": self.group.id, "text": self.text, "primary": self.primary,
+                           "status": "running", "created_at": self.created_at, "trigger_seq": self.trigger_seq, "finished_at": None, "active": [self.primary],
+                           "delegations": 0, "assignments": [], "final_answer": "", "error": "", "options": self.options, "role_ids": list(self.group.role_ids)}
+            if getattr(self, "redispatched_from", None):
+                self.record["redispatched_from"] = self.redispatched_from
+            self.record["room_kind"] = self.group.kind
+            if self.dispatched_by:
+                self.record["dispatched_by"] = self.dispatched_by
+            self.store.save_task(self.record)
+            self.store.append("task_started", task_id=self.task_id, agent=self.primary)
+            self.lead_baseline = self.store.project.checkout(workspace)
         settings = self.settings
         # The coordinating lead gets the lead budget; a member addressed directly works
         # like any assignment, with the member budget.
@@ -576,8 +618,9 @@ class TeamTask:
                        f"The team lead is {lead.name} ({lead.id}).")
         agent = Agent(self.primary, self.provider, self._registry(self.primary, lead=can_delegate),
                       Sandbox(workspace, self.primary), settings, system_prompt=prompt, limits=limits,
-                      on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel, stream=True)
-        self.channel.start_cursor(self.primary, self.trigger_seq)
+                      on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel, stream=True, continuation=self.control)
+        if not saved:
+            self.channel.start_cursor(self.primary, self.trigger_seq)
         result = agent.run(self.text, context=self._context(self.primary, self.trigger_seq))
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
@@ -593,7 +636,7 @@ class TeamTask:
         usage = Usage(prompt_tokens=totals["prompt_tokens"], completion_tokens=totals["completion_tokens"])
         for item in self.assignments:
             usage = usage.merged(Usage(prompt_tokens=item["prompt_tokens"], completion_tokens=item["completion_tokens"]))
-        metrics = {"duration_s": round(time.monotonic() - started, 1), "lead": totals,
+        metrics = {"duration_s": round(time.monotonic() - self.started_at, 1), "lead": totals,
                    "delegations": self.delegations, "questions": self.channel.questions,
                    "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),

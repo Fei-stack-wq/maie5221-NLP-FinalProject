@@ -32,7 +32,7 @@ def task_receipt(studio, target, record, *, legacy_origin=None):
 
 def task_outcome(studio, target, record, *, legacy_origin=None):
     origin = record.get("dispatched_by") or legacy_origin
-    if not origin or record["status"] in ("queued", "running"):
+    if not origin or record["status"] in ("queued", "running", "paused"):
         return
     tid = record["id"]
     published = {c["path"]:c for c in task_changes(target, tid)}
