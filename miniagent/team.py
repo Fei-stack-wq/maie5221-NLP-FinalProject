@@ -43,6 +43,7 @@ from .checkpoint import Continuation, PauseRequested
 from .config import Settings
 from .context import ContextManager
 from .evaluation import evaluate, validate
+from .meter import TaskMeter
 from .providers import Provider
 from .sandbox import Sandbox
 from . import recovery
@@ -123,17 +124,20 @@ class HumanChannel:
         self._messages: list[tuple[int, str]] = []
         self._finished = False
         self._cursors: dict[str, int] = {}
+        self._notes: dict[str, list[str]] = {}
         self.questions = 0
         self.control = None
 
     def snapshot(self):
         with self._cond:
             return {"pending":self._pending, "answer":self._answer, "messages":list(self._messages),
-                    "cursors":dict(self._cursors), "questions":self.questions}
+                    "cursors":dict(self._cursors), "questions":self.questions,
+                    "notes":{agent: list(items) for agent, items in self._notes.items()}}
 
     def restore(self, saved):
         self._pending, self._answer = saved["pending"], saved["answer"]
         self._messages, self._cursors, self.questions = saved["messages"], saved["cursors"], saved["questions"]
+        self._notes = {agent: list(items) for agent, items in (saved.get("notes") or {}).items()}
 
 
     # called by agent threads
@@ -155,12 +159,18 @@ class HumanChannel:
             answer, self._answer, self._pending = self._answer, None, None
             return answer
 
+    def note(self, agent: str, text: str) -> None:
+        """A Studio notice for one agent (e.g. a soft budget mark), delivered at its next step."""
+        with self._cond:
+            self._notes.setdefault(agent, []).append(text)
+
     def take(self, agent: str) -> list[str]:
         with self._cond:
             cursor = self._cursors.get(agent, 0)
             new = self._messages[cursor:]
             self._cursors[agent] = len(self._messages)
-        return [f"[Message from the requester, sent while the team was working]\n{text}" for _, text in new]
+            notes = self._notes.pop(agent, [])
+        return notes + [f"[Message from the requester, sent while the team was working]\n{text}" for _, text in new]
 
     def start_cursor(self, agent: str, before_seq: int) -> None:
         """An agent that starts now has already seen all earlier messages in its context."""
@@ -237,8 +247,12 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "than its author (tests, fact-checks, risk review…). When a check finds real problems, send the "
             "concrete findings back to the author to fix, then have the fix re-checked. Stop iterating once the "
             "result is good — do not polish forever or repeat the same assignment.",
-            "- You may read files and run commands yourself to verify reports before you rely on them, and you "
-            "may write files yourself when that is part of your own role.",
+            "- Verification has an owner. Rely on the evidence of whoever reviewed or tested the work and on Studio's "
+            "check results instead of re-running their tests; spot-check yourself only when a report is vague, a "
+            "check failed or something important was not covered. You may write files yourself when that is part "
+            "of your role.",
+            "- Size each assignment: pass a smaller `max_steps` for short pieces of work (notes, a summary, one "
+            "fix) so a teammate does not wander.",
         ]
         if settings.team.parallel_delegations:
             parts.append(
@@ -292,6 +306,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "instead of asking, and list them in your final answer.",
         ]
     parts += [
+        "- Work efficiently: put independent tool calls in one response — read several files, run several "
+        "searches or fetches at once. Reads, searches and fetches in the same response run in parallel, and "
+        "every extra response costs model time.",
         "- Save durable lessons, conventions and requester preferences with `propose_knowledge`, subject to user approval.",
         "",
         "## Finishing",
@@ -320,6 +337,13 @@ def member_prompt(me: Member, lead: Member, members: list[Member], settings: Set
         "team project. Everything you create, change or delete there is published to the team when you finish.",
         "- Work like a professional in your role: inspect the existing files first, do the work completely, and "
         "verify it before reporting — run the code and tests, open pages with run_browser, check sources.",
+        "- Verify in proportion: when you built something, run the fast checks for it (unit tests, an HTTP call, "
+        "opening the file) before reporting, and leave full end-to-end walk-throughs to the teammate who reviews "
+        "or tests it unless the assignment asks you for them. When you review or test, you own the verification: "
+        "check the real behaviour and report concrete evidence.",
+        "- Work efficiently: put independent tool calls in one response — read several files, run several "
+        "searches or fetches at once. Reads, searches and fetches in the same response run in parallel, and "
+        "every extra response costs model time.",
         "- Do not leave throwaway files in the project. Keep tests or evidence the team should keep in sensible "
         "places (e.g. tests/, docs/); delete scratch files before you finish.",
     ]
@@ -482,6 +506,8 @@ class TeamTask:
         self.plan: dict | None = None
         self.reviewer_provider: Provider | None = None
         self.parallel_batches = 0
+        self.parallel_reads = 0
+        self.meter = TaskMeter(notify=lambda text: self.channel.note(self.primary, text))
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
         self.control = Continuation()
@@ -512,7 +538,12 @@ class TeamTask:
             self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
         if event["type"] == "parallel":
             with self.lock:
-                self.parallel_batches += 1
+                if event.get("tool") == "reads":
+                    self.parallel_reads += 1
+                else:
+                    self.parallel_batches += 1
+        if event["type"] != "delta":
+            self.meter.record(event)
         if event["type"] == "delta":
             self.store.previews.fragment(self.task_id, event["agent"], event["phase"], event["text"])
         elif event["type"] in ("step", "tool_call"):
@@ -956,6 +987,9 @@ class TeamTask:
         assignment = task
         if deliverables:
             assignment += "\n\nFiles you are expected to create or update: " + ", ".join(deliverables)
+        if review:
+            assignment += ("\n\nThis assignment is a review or test: you own the verification of this work. Check "
+                           "the real behaviour end to end and report concrete evidence.")
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
         settings = self.settings.reviewer() if review else self.settings
         provider = self.reviewer_provider if review and self.reviewer_provider is not None else self.provider
@@ -999,6 +1033,9 @@ class TeamTask:
 
     def run(self) -> dict:
         self.started_at = time.monotonic() - self.control.saved.get("elapsed",0)
+        self.meter.started = time.time() - self.control.saved.get("elapsed", 0)
+        self.meter.budget_minutes = float(self.options.get("budget_minutes") or 0)
+        self.meter.budget_tokens = int(self.options.get("budget_tokens") or 0)
         me = self.group.member(self.primary)
         can_delegate = self.primary == self.group.lead and len(self.group.members) > 1
         workspace = self.store.workspace(self.primary)
@@ -1080,7 +1117,8 @@ class TeamTask:
                    + sum(a.get("prompt_cache_hit_tokens", 0) for a in self.assignments),
                    "resumed_assignments": sum(1 for a in self.assignments if a.get("resumed")),
                    "review_assignments": sum(1 for a in self.assignments if a.get("review")),
-                   "parallel_batches": self.parallel_batches,
+                   "parallel_batches": self.parallel_batches, "parallel_reads": self.parallel_reads,
+                   "time": {k: v for k, v in self.meter.snapshot().items() if k != "alerts"},
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),
                    "tool_calls": totals["tool_calls"] + sum(a["tool_calls"] for a in self.assignments)}
         self._update(status=status, finished_at=now(), final_answer=answer, error=result.error,

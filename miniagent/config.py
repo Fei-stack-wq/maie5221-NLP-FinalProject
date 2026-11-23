@@ -173,6 +173,8 @@ class Settings:
     """Recent conversation kept verbatim when compacting (Pi's keepRecentTokens)."""
     max_output_recovery_attempts: int = 2
     interaction_mode: Literal["interactive", "autonomous"] = "interactive"
+    warm_browser: bool = True
+    """Keep one browser open per agent run for run_browser instead of starting one per call."""
     reviewer_model: str = ""
     """Model for review assignments; empty means the same model as the authors."""
     reviewer_thinking: str = ""
@@ -253,6 +255,7 @@ class Settings:
             keep_recent_tokens=integer("MA_KEEP_RECENT_TOKENS", base.keep_recent_tokens),
             max_output_recovery_attempts=integer("MA_OUTPUT_RECOVERY_ATTEMPTS", 2),
             interaction_mode=env.get("MA_INTERACTION_MODE", "interactive"),
+            warm_browser=flag("MA_WARM_BROWSER", True),
             reviewer_model=env.get("MA_REVIEWER_MODEL", ""),
             reviewer_thinking=env.get("MA_REVIEWER_THINKING", ""),
             runs_dir=Path(env.get("MA_RUNS_DIR", "runs")),
@@ -283,7 +286,7 @@ _ENV_KEYS = frozenset({
     "MA_KEEP_RECENT_TOKENS", "MA_OUTPUT_RECOVERY_ATTEMPTS", "MA_INTERACTION_MODE", "MA_RUNS_DIR",
     "MA_MAX_STEPS", "MA_MAX_SECONDS", "MA_MAX_TOTAL_TOKENS", "MA_LEAD_MAX_STEPS", "MA_MAX_DELEGATIONS",
     "MA_RESUME_MEMBERS", "MA_PARALLEL_DELEGATIONS", "MA_REVIEW_LOOPS", "MA_PLANS", "MA_RETROSPECTIVE",
-    "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING",
+    "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING", "MA_WARM_BROWSER",
 })
 
 

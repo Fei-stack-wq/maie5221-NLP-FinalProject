@@ -160,6 +160,10 @@ class Bench:
                        prompt_tokens=metrics.get("prompt_tokens", 0),
                        prompt_cache_hit_tokens=metrics.get("prompt_cache_hit_tokens", 0),
                        completion_tokens=metrics.get("completion_tokens", 0),
+                       model_minutes=round((metrics.get("time") or {}).get("model_s", 0) / 60, 1),
+                       tool_minutes=round((metrics.get("time") or {}).get("tool_s", 0) / 60, 1),
+                       cost_usd=(metrics.get("time") or {}).get("cost_usd", 0),
+                       parallel_reads=metrics.get("parallel_reads", 0),
                        files=len(store.project.files()),
                        assignments=[{k: a.get(k) for k in ("agent", "status", "steps", "prompt_tokens", "resumed")}
                                     for a in record.get("assignments", [])])
@@ -200,14 +204,17 @@ class Bench:
 
 def summarize(out: Path) -> str:
     rows = [json.loads(line) for line in (out / "results.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-    lines = ["| Arm | Scenario | Task | Status | Minutes | Steps | Hand-offs (continued) | Prompt tokens | Cache hit | Files |",
-             "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    lines = ["| Arm | Scenario | Task | Status | Minutes | Model / tool min | Steps | Hand-offs (continued) | "
+             "Prompt tokens | Cache hit | Est. USD | Files |",
+             "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in sorted(rows, key=lambda r: (r["arm"], r["scenario"], r["task"])):
         prompt = row.get("prompt_tokens", 0)
         hit = row.get("prompt_cache_hit_tokens", 0)
         lines.append(f"| {row['arm']} | {row['scenario']} | {row['task']} | {row['status']} | {row.get('minutes', 0)} | "
+                     f"{row.get('model_minutes', 0)} / {row.get('tool_minutes', 0)} | "
                      f"{row.get('steps', 0)} | {row.get('delegations', 0)} ({row.get('resumed_assignments', 0)}) | "
-                     f"{prompt:,} | {(100 * hit / prompt if prompt else 0):.0f}% | {row.get('files', 0)} |")
+                     f"{prompt:,} | {(100 * hit / prompt if prompt else 0):.0f}% | {row.get('cost_usd', 0):.2f} | "
+                     f"{row.get('files', 0)} |")
     lines += ["", "| Arm | Tasks completed | Minutes | Prompt tokens | Completion tokens |", "| --- | ---: | ---: | ---: | ---: |"]
     for arm in sorted({r["arm"] for r in rows}):
         mine = [r for r in rows if r["arm"] == arm]

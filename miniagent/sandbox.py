@@ -41,6 +41,7 @@ class Sandbox:
         self.agent_name = agent_name
         self.process_env: dict[str, str] = {}
         self.command_sessions = None
+        self.browser_session = None
         self.command_tmpdir: Path | None = None
         self.command_wrapper: Callable[[list[str]], list[str]] | None = None
         self.track_shell_group: Callable[[int], None] | None = None

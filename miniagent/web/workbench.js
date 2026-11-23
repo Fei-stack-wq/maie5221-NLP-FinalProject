@@ -227,6 +227,9 @@ async function taskDetail(id) {
     } else if (name==="轨迹") {
       const widget=toolWidget(id); body.append(widget);widget.open=true;
       if (!["running","queued","paused"].includes(t.status)) widget.update(null,t.status);
+    } else if (name==="耗时") {
+      const live=state.live && state.live.task_id===id ? state.live.meter : null;
+      body.append(timeReport(live || t.metrics?.time, Boolean(live)));
     } else if (name==="对话") {
       for (const e of d.events) body.append(el("p",{},[e.agent||e.kind,e.text||e.task||e.question||e.status].filter(Boolean).join(" · ")));
     } else {
@@ -236,7 +239,7 @@ async function taskDetail(id) {
       if (!detail.diagnostics.length) pane.textContent="没有诊断记录";
     }
   }
-  for (const name of ["概览","对话","轨迹","产物","诊断"]) tabs.append(button(name,()=>render(name)));
+  for (const name of ["概览","耗时","对话","轨迹","产物","诊断"]) tabs.append(button(name,()=>render(name)));
   let status=statusChip(t.status);
   const playback=el("button",{type:"button",class:"ghost"});
   function playbackState() {
