@@ -6,7 +6,8 @@ import json
 import zipfile
 from dataclasses import dataclass
 
-from . import studio_admin
+from . import studio_admin, studio_cleanup
+from .config import SUPPORTED_MODELS
 from .schemas import ToolSpec
 from .studio_tools import (CANCEL_DESCRIPTION, INSPECT_DESCRIPTION, MEMBERSHIP_DESCRIPTION, MEMBERSHIP_FIELDS,
                            SETTINGS_DESCRIPTION, SETTINGS_FIELDS, STRING)
@@ -22,6 +23,7 @@ class Turn:
     task_id: str | None = None
     arguments: dict | None = None
     issue: str | None = None
+    requested_tools: tuple[str, ...] = ()
 
 
 def action_tool(name, description, targets=()):
@@ -54,6 +56,15 @@ INSPECT = ToolSpec(name="inspect_studio_room",description=INSPECT_DESCRIPTION,pa
     "required":["group_id"]})
 DATA_MANAGEMENT = management_tool(studio_admin.MANAGE.name, studio_admin.MANAGE.description,
                                   studio_admin.MANAGE.parameters["properties"],studio_admin.MANAGE.parameters["required"])
+DELETE_ROLE = management_tool(studio_cleanup.DELETE_ROLE, "Delete a specific library role after its teams are removed.",
+                              {"role": STRING}, ["role"])
+DELETE_GROUPS = management_tool(studio_cleanup.GROUPS,
+    "Permanently delete the exact named teams and their sessions. Include only the teams the user means. "
+    "include_roles removes their exclusive library roles. include_artifacts also cleans their published copies "
+    "from bound workspaces where unchanged. Choose both scopes according to the request.",
+    {"group_ids": {"type":"array", "items":STRING}, "include_roles":{"type":"boolean"},
+     "include_artifacts":{"type":"boolean"}}, ["group_ids","include_roles","include_artifacts"])
+
 READ_TOOLS = (INSPECT,studio_admin.INSPECT)
 READ = ToolSpec(
     name="read_room_evidence",
@@ -162,6 +173,46 @@ def room_evidence(store, actor, active, pending, refs, roles):
             "attachments":list(catalog.values()), "attachments_now":refs}
 
 
+def _directory_page(content, context):
+    """Project a live overview to known identities and typed values before allowing writes."""
+    page = json.loads(content)
+    room_ids = {context["room_id"], *(r["id"] for r in context["directory"]["rooms"])}
+    role_ids = {r["id"] for r in context["directory"]["roles"]}
+    rooms = []
+    for row in page["rows"]:
+        if row["id"] in room_ids:
+            rooms.append({"id":row["id"], "has_workspace":bool(row.get("workspace_path")),
+                          **{k:v for k,v in row.items() if k in ("tasks","running","archived","pinned","waiting_for_you")
+                             and type(v) in (int,bool)}})
+    settings = page["models"]
+    options = SUPPORTED_MODELS | {"enabled","disabled",""}
+    models = {k:settings[k] for k in ("model","reviewer_model","thinking","reviewer_thinking")
+              if settings.get(k) in options}
+    models["models"] = sorted(SUPPORTED_MODELS)
+    states = {k:v for k,v in page["task_states"].items() if k in
+              ("queued","running","paused","completed","failed","incomplete","cancelled") and type(v) is int}
+    return json.dumps({"view":"overview","rows":rooms,"roles":[r["id"] for r in page["roles"] if r["id"] in role_ids],
+                       "models":models,"has_api_key":page["has_api_key"] is True,"task_states":states,
+                       "total":int(page["total"]),"next_offset":page["next_offset"] if type(page["next_offset"]) is int else None})
+
+
+def _read_batch(response, tools, reads, text):
+    if response.finish_reason != "tool_calls":
+        return []
+    inspections = [c for c in response.tool_calls if c.name in reads]
+    if not inspections or any(c.parse_error or validate_arguments(reads[c.name].parameters, c.arguments)
+                              for c in inspections):
+        return []
+    writes = [c for c in response.tool_calls if c.name not in reads]
+    if writes:
+        if any(c.name != studio_admin.INSPECT.name or c.arguments.get("view") != "overview" for c in inspections):
+            return []
+        decision, _ = _authorized(response.model_copy(update={"tool_calls":writes}), tools, text)
+        if not decision or decision.action != studio_cleanup.BATCH:
+            return []
+    return inspections
+
+
 def decide(provider, context, text, read, *, on_stream=None):
     tools = [START]
     if context.get("paused_task"):
@@ -184,25 +235,28 @@ def decide(provider, context, text, read, *, on_stream=None):
         tools.append(READ)
     system = SYSTEM
     if context["kind"] == "assistant":
-        tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT, studio_admin.INSPECT, DATA_MANAGEMENT])
+        tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT, studio_admin.INSPECT, DATA_MANAGEMENT, DELETE_ROLE, DELETE_GROUPS])
+        if proposal := context.get("pending_cleanup"):
+            tools.append(management_tool(studio_cleanup.APPLY, "Apply the last concrete cleanup list when the user confirms it.",
+                         {"plan_id":{"type":"string","enum":[proposal["id"]]}}, ["plan_id"]))
         system += (" You are the studio assistant. The directory and your dispatch receipts are reference data. "
                    "Use these for progress and capability questions. read_room_evidence with just a catalogued dispatch "
                    "task_id returns its recorded outcome; add path for a published file. A standalone request to "
                    "change an existing roster can be applied with change_group_members. For a commission that "
                    "also needs delivery, start the work with the complete request. If several tasks fit a "
                    "change, clarify the target in chat. You can inspect conversations, stop or reassign jobs, dispatch a batch, "
-                   "manage settings, roles and knowledge. The studio_capabilities record lists the actual tools available during commissioned work. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. Use a task for multi-step management or redispatch.")
+                   "manage settings, roles and knowledge. The studio_capabilities record lists the actual tools available during commissioned work. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. For a team cleanup, use delete_studio_groups or send all compatible cleanup calls in this turn. Use the preceding proposal for short confirmations. If alternatives remain ambiguous, present a concrete scope for confirmation. Use a task for redispatch.")
     messages = [{"role":"system", "content":system},
                 {"role":"user", "content":"Room records (reference data):\n" + json.dumps(context, ensure_ascii=False)},
                 {"role":"user", "content":text}]
     stream = {"on_stream":on_stream} if on_stream and getattr(provider, "supports_streaming", False) else {}
-    # A directory lookup may identify the next file to read. After the first lookup
-    # keep only read access, so text found in a workspace cannot commission work.
+    # Only a structural directory page can feed directly into a mutation. Other evidence is read-only.
     seen = set()
     remaining = 64 * 1024  # Same evidence capacity as eight 8 KiB excerpts.
     original = list(messages)
     original_tools = list(tools)
     repaired = False
+    structural_only = True
     while True:
         try:
             response = provider.chat(messages, tools=tools or None, temperature=0, **stream)
@@ -215,9 +269,8 @@ def decide(provider, context, text, read, *, on_stream=None):
         if on_stream and (response.tool_calls or response.finish_reason != "stop"):
             on_stream("discard", "")
         reads = {s.name:s for s in tools if s in (READ, *READ_TOOLS)}
-        if not (response.finish_reason == "tool_calls" and response.tool_calls and
-                all(c.name in reads and not c.parse_error and
-                    not validate_arguments(reads[c.name].parameters, c.arguments) for c in response.tool_calls)):
+        inspections = _read_batch(response, tools, reads, text)
+        if not inspections:
             if response.finish_reason == "stop" and not response.tool_calls and response.text.strip():
                 return Turn("reply", response.text.strip())
             result, issue = _authorized(response, tools, text)
@@ -225,11 +278,10 @@ def decide(provider, context, text, read, *, on_stream=None):
                 return result
             # Retry an incomplete control decision on the original conversation. Text read from a
             # file can never enter this independent authorization step or change its permissions.
-            if not repaired and (issue == "length" or seen or
-                                 len(response.tool_calls) > 1 or issue == "empty_reply"):
+            if not repaired and (issue in ("length", "empty_reply") or (seen and not structural_only and issue == "unavailable_tool")):
                 repaired = True
                 messages = [{"role":"system","content":system + " The previous attempt did not return a usable routing decision. "
-                             "Respond directly or select one authorized action from the original conversation."}, *original[1:]]
+                             "Respond directly or select authorized actions from the original conversation."}, *original[1:]]
                 tools = [tool for tool in original_tools if tool not in (READ, *READ_TOOLS)]
                 continue
             details = {"length":"模型的路由回复被截断", "unavailable_tool":"模型选择了当前会话不可用的操作",
@@ -237,10 +289,23 @@ def decide(provider, context, text, read, *, on_stream=None):
                        "ambiguous_actions":"模型给出了多个无法同时应用的操作",
                        "missing_user_authorization":"模型引用的授权文字与本条消息不符",
                        "invalid_target":"模型选中的任务与当前会话记录不符"}
-            return Turn("reply", "这次会话操作未执行：" + details.get(issue,"模型没有给出完整的路由决定") + "。", issue=issue)
+            offered = {tool.name for tool in original_tools}
+            names = tuple(c.name if c.name in offered else "unknown_tool" for c in response.tool_calls)
+            detail = details.get(issue,"模型没有给出完整的路由决定")
+            if issue == "ambiguous_actions" and names:
+                detail += "（" + "、".join(dict.fromkeys(names)) + "）"
+            return Turn("reply", "这次会话操作未执行：" + detail + "。", issue=issue, requested_tools=names)
         messages.append(response.to_assistant_message())
         next_reads = []
+        seen_before = len(seen)
+        structural_only = structural_only and all(c.name == studio_admin.INSPECT.name and c.arguments.get("view") == "overview"
+                                                   for c in inspections)
         for call in response.tool_calls:
+            if call.name not in reads:
+                messages.append({"role":"tool","tool_call_id":call.id,"content":
+                                 "Deferred until the inventory has been read. No changes applied. "
+                                 "Return the complete intended cleanup scope after reviewing the directory."})
+                continue
             ref = call.name + json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
             if ref in seen:
                 content = "This reference was already returned above."
@@ -252,6 +317,11 @@ def decide(provider, context, text, read, *, on_stream=None):
                     content = read({"studio_inspection":call.arguments})
                 else:
                     content = read({"studio_room":call.arguments} if call.name == INSPECT.name else call.arguments)
+                if structural_only:
+                    try:
+                        content = _directory_page(content, context)
+                    except (ValueError, TypeError, KeyError):
+                        structural_only = False
                 size = len(content.encode("utf-8"))
                 if size > remaining:
                     content = content.encode("utf-8")[:remaining].decode("utf-8", "ignore") + "…"
@@ -260,7 +330,10 @@ def decide(provider, context, text, read, *, on_stream=None):
                 if (tool in READ_TOOLS or "workspace_path" in call.arguments) and tool not in next_reads:
                     next_reads.append(tool)
             messages.append({"role":"tool", "tool_call_id":call.id, "content":content})
-        tools = next_reads if remaining > 0 else []
+        if structural_only:
+            tools = [t for t in original_tools if (remaining > 0 and len(seen) > seen_before) or t not in (READ, *READ_TOOLS)]
+        else:
+            tools = next_reads if remaining > 0 else []
 
 
 def _authorized(response, tools, text):
@@ -275,14 +348,19 @@ def _authorized(response, tools, text):
         if call.parse_error or validate_arguments(spec.parameters, call.arguments):
             return None, "invalid_arguments"
         if spec not in (READ, *READ_TOOLS):
+            quote = call.arguments.get("quote")
+            if not isinstance(quote, str) or not quote.strip() or quote not in text:
+                return None, "missing_user_authorization"
             calls.append((call, spec))
-    if len(calls) != 1:
+    if calls and len(calls) == len(response.tool_calls) and all(
+            spec in (DELETE_ROLE, DELETE_GROUPS) or
+            (spec == DATA_MANAGEMENT and call.arguments["operation"] in studio_cleanup.ORDER) for call, spec in calls):
+        return Turn(studio_cleanup.BATCH, arguments={"calls":[
+            {"name":call.name,"args":{k:v for k,v in call.arguments.items() if k != "quote"}} for call,_ in calls]}), None
+    if len(calls) != 1 or len(calls) != len(response.tool_calls):
         return None, "ambiguous_actions"
     call, spec = calls[0]
-    quote = call.arguments.get("quote")
-    if not isinstance(quote,str) or not quote.strip() or quote not in text:
-        return None, "missing_user_authorization"
-    if spec in (MEMBERS, CANCEL, SETTINGS, DATA_MANAGEMENT):
+    if spec in (MEMBERS, CANCEL, SETTINGS, DATA_MANAGEMENT) or call.name == studio_cleanup.APPLY:
         return Turn(call.name, arguments={k:v for k,v in call.arguments.items() if k != "quote"}), None
     allowed = spec.parameters["properties"].get("task_id", {}).get("enum", [])
     tid = call.arguments.get("task_id", allowed[0] if len(allowed) == 1 else None)

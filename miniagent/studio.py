@@ -26,7 +26,7 @@ from .store import Group, GroupStore, Store, Member, now
 from .roles import Roles
 from .attachments import Uploads
 from .assistant_room import workspace_evidence, progress, read_dispatch, legacy_dispatch_origins
-from . import checkpoint, dispatch_notices, studio_dispatch, studio_admin
+from . import checkpoint, dispatch_notices, studio_dispatch, studio_admin, studio_cleanup
 from .studio_tools import assistant_tools, update_settings
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
@@ -327,6 +327,9 @@ class Studio:
             owner_names = {}
             if assistant:
                 context.update(workspace_evidence(self, store))
+                context["room_id"] = group_id
+                if proposal := studio_cleanup.pending(store):
+                    context["pending_cleanup"] = proposal
                 context["studio_capabilities"] = {t.name:t.description for t in assistant_tools(self,catalog=True)}
                 with self._lock:
                     for item in context["dispatches"] + context["earlier_dispatches"]:
@@ -373,6 +376,7 @@ class Studio:
 
             with self._lock:
                 self._require_available(store)
+                metadata = {"requested_tools":list(turn.requested_tools)} if turn.requested_tools else {}
                 if turn.action == "start_room_task":
                     return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode, receipt=receipt)
                 if turn.action in ("pause_room_task", "resume_room_task"):
@@ -389,6 +393,16 @@ class Studio:
                         answer = f"「{updated['name']}」当前成员为 {names}，负责人是 @{updated['lead']}。"
                     except (StudioError, ValueError) as exc:
                         answer = f"群成员调整未完成：{exc}"
+                elif assistant and turn.action in (studio_cleanup.BATCH, studio_cleanup.APPLY):
+                    try:
+                        previous = studio_cleanup.pending(store)
+                        applying = turn.action == studio_cleanup.APPLY
+                        if applying and (not previous or previous["id"] != turn.arguments["plan_id"]):
+                            raise ValueError("这份清单已经失效，请重新指定清理范围。")
+                        calls = previous["calls"] if applying else turn.arguments["calls"]
+                        answer, metadata = studio_cleanup.run(self, store, calls, text, previous, applying=applying)
+                    except (ValueError, KeyError, OSError, StudioError) as exc:
+                        answer = f"清理前检查未通过：{exc}"
                 elif assistant and turn.action == studio_admin.MANAGE.name:
                     try:
                         result = studio_admin.manage(self,posting=group_id,**turn.arguments)
@@ -422,12 +436,12 @@ class Studio:
                     answer = "刚才的问题或执行已经结束。这条消息没有转交给其他任务。"
                 if settings.api_key:
                     answer = answer.replace(settings.api_key, "[redacted]")
-                return self._record_reply(store, actor, text, refs, answer, receipt, issue=turn.issue)
+                return self._record_reply(store, actor, text, refs, answer, receipt, issue=turn.issue, metadata=metadata)
 
     @staticmethod
-    def _record_reply(store, actor, text, refs, answer, receipt, *, issue=None):
+    def _record_reply(store, actor, text, refs, answer, receipt, *, issue=None, metadata=None):
         message = store.append("user_message", text=text, addressed=actor, attachments=refs, **receipt)
-        store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"], **({"routing_issue":issue} if issue else {}))
+        store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"], **(metadata or {}), **({"routing_issue":issue} if issue else {}))
         return {"route":"reply", "text":answer}
 
     def _deliver_turn(self, source, observed, action, text, refs, receipt):

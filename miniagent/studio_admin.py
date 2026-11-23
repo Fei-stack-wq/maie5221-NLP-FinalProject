@@ -188,14 +188,22 @@ def recover(studio, room):
         return result
 
 
+def role_users(studio, role, *, excluding=()):
+    users = [g.name for g in studio.store.groups()
+             if g.id not in excluding and (role in g.role_ids or any(m.id == role for m in g.members))]
+    for manifest in (studio.store.root.parent/"trash").glob("g-*/group.json"):
+        if manifest.parent.name in excluding:
+            continue
+        data = json.loads(manifest.read_bytes())
+        if role in data.get("role_ids", []) or any(m["id"] == role for m in data.get("members", [])):
+            users.append(data["name"]+"（废纸篓）")
+    return users
+
+
 def remove_role(studio, role):
     with studio._lock, studio.roles.lock:
         studio.roles.get(role)
-        users = [g.name for g in studio.store.groups() if role in g.role_ids or any(m.id == role for m in g.members)]
-        for manifest in (studio.store.root.parent/"trash").glob("g-*/group.json"):
-            data = json.loads(manifest.read_bytes())
-            if role in data.get("role_ids",[]):
-                users.append(data["name"]+"（废纸篓）")
+        users = role_users(studio, role)
         if users:
             raise ValueError("请先移除或替换以下会话中的角色：" + "、".join(users))
         path = studio.roles.path(role)
