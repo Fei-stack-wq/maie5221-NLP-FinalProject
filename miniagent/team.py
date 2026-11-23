@@ -855,6 +855,45 @@ class TeamTask:
                               "description": "Teammates to wait for (default: every hand-off still running)"}}},
             fn=lambda _ctx, args: self._wait_handoffs(args))
 
+    def _link_lead_prereq_publish(self, lead_id: str, link: dict, inputs: list[str]) -> None:
+        """If this hand-off reads files the lead just published, link that publication to the sole unclosed
+        lead-owned prerequisite step that did not declare explicit outputs."""
+        if not (self.settings.team.plan_links and self.plan and self.plan.get("linked") and inputs):
+            return
+        wanted = link.get("step_ids") or ([link["step"]] if link.get("step") else [])
+        if not wanted:
+            return
+        events = self.store.chat(self.trigger_seq - 1)
+        view = plan_view(self.record, events)
+        if not view:
+            return
+        rows = view["steps"]
+        by_id = {row["id"]: row for row in rows}
+        candidates: dict[str, dict] = {}
+        for key in wanted:
+            target = by_id.get(key)
+            if not target:
+                continue
+            for dep in target.get("after") or []:
+                if not (isinstance(dep, int) and 1 <= dep <= len(rows)):
+                    continue
+                prereq = rows[dep - 1]
+                if (not prereq.get("completed") and prereq.get("stage") not in ("completed", "submitted")
+                        and prereq.get("owner") in (None, lead_id) and not prereq.get("outputs")):
+                    candidates[prereq["id"]] = prereq
+        if len(candidates) != 1:
+            return
+        prereq_id = next(iter(candidates))
+        norm_inputs = [_norm(p) for p in inputs if _norm(p)]
+        for event in reversed(events):
+            if event.get("task_id") != self.task_id or event.get("kind") != "publish" or event.get("agent") != lead_id:
+                continue
+            published = [_norm(c.get("path", "")) for c in event.get("changes", []) if c.get("change") != "deleted"]
+            if any(_overlaps(pub, inp) for pub in published if pub for inp in norm_inputs):
+                self.store.append("plan_evidence", task_id=self.task_id, agent=lead_id,
+                                  links=[{"source_seq": event["seq"], "step_ids": [prereq_id]}])
+                return
+
     def _unclosed_lead_steps(self, lead_id: str, link: dict) -> str:
         """A soft reminder when this hand-off follows a step of the lead's own that the plan does not show as done.
 
@@ -1330,6 +1369,7 @@ class TeamTask:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
         link, warning = self._step_link(args.get("step"), args.get("step_ids", []))
+        self._link_lead_prereq_publish(lead_id, link, inputs)
         unclosed = self._unclosed_lead_steps(lead_id, link)
         conflict = self._background_conflict(assignee, deliverables, inputs)
         if conflict:
@@ -1764,6 +1804,16 @@ class TeamTask:
             problem = _resolve_after(steps)
             if problem:
                 return ToolResult.failure(problem)
+            already_done = set()
+            if self.settings.team.plan_links and self.plan and self.plan.get("linked"):
+                prior_view = plan_view(self.record, self.store.chat(self.trigger_seq - 1))
+                if prior_view:
+                    already_done = {r["id"] for r in prior_view["steps"] if r.get("completed") or r.get("stage") == "completed"}
+            for row in steps:
+                if row["status"] == "in_progress" and row.get("after"):
+                    if any(steps[k - 1]["status"] != "completed" and steps[k - 1].get("id") not in already_done
+                           for k in row["after"] if 1 <= k <= len(steps)):
+                        row["status"] = "pending"
             self.plan = {"steps": steps, "explanation": explanation, "updated_at": now(), **meta}
             self._update(plan=self.plan)
         self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation,

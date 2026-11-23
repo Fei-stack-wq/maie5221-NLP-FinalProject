@@ -338,3 +338,33 @@ class PlanLinksTest(unittest.TestCase):
         original = load_settings(path)
         self.assertFalse(original.team.plan_links)
         self.assertFalse(fast_profile(original).team.plans)
+
+    def test_update_plan_demotes_in_progress_step_whose_prerequisite_is_unfinished(self):
+        self.script.queues.update(lead=[
+            plan(step("Research topic", "in_progress", id="s1", owner="dev"),
+                 step("Draft brief", "in_progress", id="s2", after=[1])),
+            reply("Done.")])
+        tid = self.studio.post(self.gid, "Plan two dependent steps", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid, include_activity=False)
+        plan_event = next(e for e in detail["events"] if e["kind"] == "plan")
+        self.assertEqual([(s["id"], s["status"]) for s in plan_event["steps"]],
+                         [("s1", "in_progress"), ("s2", "pending")])
+
+    def test_delegating_with_lead_published_input_closes_unmarked_lead_prerequisite(self):
+        self.script.queues.update(lead=[
+            plan(step("Write technical spec", "in_progress", id="s1"),
+                 step("Implement booking app", "pending", id="s2", owner="dev", after=[1])),
+            reply("", call("write_file", path="docs/SPEC.md", content="# Spec")),
+            reply("", call("delegate_task", assignee="dev", step="s2", inputs=["docs/SPEC.md"],
+                           task="Implement the app according to docs/SPEC.md.")),
+            reply("Delivered.")],
+            dev=[reply("Implemented.")])
+        tid = self.studio.post(self.gid, "Build booking app", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid, include_activity=False)
+        s1, s2 = detail["plan_view"]["steps"]
+        self.assertEqual(s1["stage"], "completed")
+        self.assertTrue(s1["completed"])
+        self.assertEqual(s1["evidence"]["lead_work"]["files"][0]["path"], "docs/SPEC.md")
+        self.assertEqual(s2["stage"], "completed")
