@@ -146,12 +146,15 @@ class TeamTest(unittest.TestCase):
             note = [m["content"] for m in messages if "[Message from the requester" in (m.get("content") or "")]
             return reply("noted: " + (note[0].split("\n", 1)[1] if note else "nothing"))
         script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Do the work carefully.")),
+                              reply('{"action":"hold","to":[],"text":"The member received the original message."}'),
                               lambda m: reply("final: " + tool_results(m)[-1].splitlines()[2])],
                         dev=[dev_first, dev_second], room=[reply("",call("change_current_task",quote="Use Python 3.12"))])
         studio, gid, _ = self.studio(script)
         studio.post(gid, "start", queue=True)
         wait_for(lambda: "dev" in ((studio.state(gid)["live"] or {}).get("active") or []))
         self.assertEqual(studio.post(gid, "Use Python 3.12")["route"], "steering")
+        wait_for(lambda: any(e.get("mail_kind") == "decision" and e.get("action") == "hold"
+                             for e in studio.group(gid).chat()))
         gate.set()
         task = finished(studio, gid)
         self.assertEqual(task["final_answer"], "final: noted: Use Python 3.12")
