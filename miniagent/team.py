@@ -41,6 +41,7 @@ from typing import Any, Callable
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .browser_evidence import format_report
 from .plan_view import identify_steps, plan_view
+from .review import VERDICT_LINE, review_verdict
 from .checkpoint import Continuation, PauseRequested
 from .config import FAST_SOFT_MINUTES, HANDOFF_KINDS, KIND_PROFILES, Settings, kind_settings
 from .context import ContextManager
@@ -113,15 +114,6 @@ CHECKS_SCHEMA = {
         "path": {"type": "string"}, "text": {"type": "string"}, "command": {"type": "string"}},
         "required": ["kind"]},
 }
-VERDICT_LINE = re.compile(r"^\W*VERDICT:\s*(APPROVED|CHANGES\s+REQUESTED)\b.*$", re.IGNORECASE | re.MULTILINE)
-
-
-def _verdict(report: str) -> str:
-    """The reviewer's verdict marker, as AutoGen's TextMentionTermination looks for its stop text."""
-    match = VERDICT_LINE.search(report[:2000])
-    if match is None:
-        return "unclear"
-    return "approved" if match.group(1).upper() == "APPROVED" else "changes requested"
 
 
 def check_lines(evaluation: dict) -> list[str]:
@@ -365,7 +357,7 @@ def _clip(text: str, limit: int) -> str:
 
 def render_plan(plan: dict) -> str:
     marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]", "rework": "[!]",
-             "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]"}
+             "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]", "unrecorded": "[no recorded outcome]"}
     steps = plan.get("steps", [])
     numbered = any(s.get("after") for s in steps)
     rows = [f"{marks.get(s.get('stage', s['status']), '[ ]')} " + (f"{i}. " if numbered else "") + s["step"]
@@ -1362,7 +1354,7 @@ class TeamTask:
             report_extra.update(assignment_seq=entry["seq"])
             report_extra.update({k: entry[k] for k in ("step", "requested_step") if k in entry})
             if review:
-                report_extra["verdict"] = _verdict(report)
+                report_extra["verdict"] = review_verdict(report)
         if entry:
             if entry.get("kind"):  # "kind" is the chat event's own type
                 report_extra["handoff_kind"] = entry["kind"]
@@ -1373,7 +1365,7 @@ class TeamTask:
                 seq=entry["seq"] if entry else 0, member=assignee, name=member.name,
                 kind=(entry or {}).get("kind") or ("check" if review else ""), status=result.status, report=report,
                 changes=changes, checked=checked, browser=browser_handoff(browser_checks) if browser_checks else "",
-                verdict=_verdict(report) if review else ""))
+                verdict=review_verdict(report) if review else ""))
             del self.evidence[:-handoffs.EVIDENCE_KEPT]
         self._notify_background(assignee, changes)
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
@@ -1454,10 +1446,10 @@ class TeamTask:
                         break
                     state["review_browser_checks"] = reviewed.get("browser_checks")
                     state["last_review"] = reviewed["report"]
-                    state["verdict"] = _verdict(reviewed["report"])
+                    state["verdict"] = review_verdict(reviewed["report"])
                     state["rounds"].append(f"Round {number} — review by {names[reviewer]}: {state['verdict'].upper()}"
                                            + (f" ({reviewed['result'].status})" if reviewed["result"].status != "completed" else ""))
-                    if (state["verdict"] == "approved" or reviewed["result"].status in ("error", "cancelled")
+                    if (state["verdict"] != "changes requested" or reviewed["result"].status in ("error", "cancelled")
                             or number == rounds_max):
                         break
                     state["findings"] = VERDICT_LINE.sub("", reviewed["report"], count=1).strip() or reviewed["report"]
@@ -1550,9 +1542,12 @@ class TeamTask:
             self._update(plan=self.plan)
         self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation,
                           **({"linked": True} if self.settings.team.plan_links else {}))
-        done = sum(s["status"] == "completed" for s in steps)
-        ready = [str(i) for i, s in enumerate(steps, 1) if s["status"] == "pending"
-                 and all(steps[n - 1]["status"] == "completed" for n in s.get("after", []))]
+        visible = (plan_view(self.record, self.store.chat(self.trigger_seq - 1))["steps"]
+                   if self.settings.team.plan_links else steps)
+        stages = [row.get("stage", row["status"]) for row in visible]
+        done = stages.count("completed")
+        ready = [str(i + 1) for i, row in enumerate(visible) if stages[i] == "pending"
+                 and all(stages[n - 1] == "completed" for n in row.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
         ids = " Steps: " + ", ".join(f"{s['id']} {s['step']}" for s in steps) if self.settings.team.plan_links else ""
         return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{ids} The requester can see it.")

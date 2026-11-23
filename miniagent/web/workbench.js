@@ -70,7 +70,7 @@ function dispatchNotice(event) {
 function planCard(plan, scope) {
   const {in_progress, submitted, accepted, total} = plan.counts;
   const stages = {pending:"待处理", in_progress:"进行中", completed:"已确认", rework:"要求修改",
-    submitted:"已提交", unconfirmed:"已提交，尚未确认"};
+    submitted:"已提交", unconfirmed:"已提交，尚未确认", unrecorded:"未记录步骤结果"};
   function historyItem(entry) {
     const verb = entry.kind === "delegation" ? "接手" : "提交报告";
     const verdict = {approved:"通过", "changes requested":"要求修改", unclear:"未给明确结论"};
@@ -94,8 +94,11 @@ function planCard(plan, scope) {
   const list = el("ol",{class:"plan-steps"});
   for (const step of plan.steps) {
     const latest = step.history.at(-1);
+    const decision = step.decision;
+    const signedBy = decision?.agent && (decision.source === "review" ? "评审 @" : "负责人 @") + decision.agent;
     const content = el("div",{class:"plan-step-content"},
       el("div",{},el("span",{class:"plan-text"},step.step), el("small",{class:"plan-stage"},stages[step.stage]),
+        signedBy ? el("small",{class:"plan-owner"},signedBy) : null,
         step.owner ? el("span",{class:"plan-owner"},"@"+step.owner) : null,
         step.after?.length ? el("span",{class:"plan-wait"},"依赖第 "+step.after.join("、")+" 步") : null));
     if (latest) content.append(historyItem(latest));

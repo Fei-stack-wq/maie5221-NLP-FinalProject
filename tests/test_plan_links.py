@@ -8,6 +8,7 @@ from pathlib import Path
 from playwright.sync_api import expect, sync_playwright
 
 from miniagent.config import fast_profile, load_settings
+from miniagent.plan_view import plan_view
 from miniagent.server import serve
 from miniagent.studio import Studio
 from tests.helpers import FakeProvider, Script, call, reply, settings, tool_results
@@ -53,11 +54,10 @@ class PlanLinksTest(unittest.TestCase):
         self.assertEqual(detail["plan_view"]["unlinked"][0]["requested_step"], "s2")
         self.assertEqual(detail["plan_view"]["steps"][-1]["stage"], "rework")
 
-    def test_review_rounds_keep_the_step_and_do_not_change_the_leads_acceptance(self):
+    def test_review_rounds_confirm_the_step_without_a_second_plan_call(self):
         self.script.queues.update(lead=[
             plan(step("Verify release", id="qa")),
             reply("", call("review_loop", author="dev", reviewer="qa", work="Inspect the release files.", step="qa")),
-            plan(step("Verify release", "completed", id="qa")),
             reply("Accepted.")],
             qa=[reply("VERDICT: CHANGES REQUESTED\nFix text."), reply("VERDICT: APPROVED")],
             dev=[reply("", call("write_file", path="fix.md", content="Fixed")), reply("Fixed.")])
@@ -72,6 +72,66 @@ class PlanLinksTest(unittest.TestCase):
                          ["changes requested", "approved"])
         self.assertEqual(view["steps"][0]["evidence"]["reviewed"]["verdict"], "approved")
         self.assertEqual(view["counts"]["accepted"], 1)
+        self.assertEqual(view["steps"][0]["decision"], {"stage":"completed", "source":"review", "agent":"qa"})
+        self.assertEqual(sum(e["kind"] == "plan" for e in detail["events"]), 1)
+
+    def test_signed_step_does_not_confirm_other_work_or_survive_reassignment(self):
+        steps = [step("Fix build", id="fix"), step("Release", "in_progress", id="ship")]
+        record = {"id":"t", "primary":"lead", "status":"completed", "plan":{"linked":True,"steps":steps}}
+        events = []
+
+        def append(kind, **fields):
+            seq = len(events) + 1
+            events.append({"task_id":"t", "seq":seq, "time":seq, "kind":kind, **fields})
+            return seq
+
+        def view():
+            return plan_view(record, events)
+
+        def assign():
+            return append("delegation", assignee="qa", task="Review the build", review=True, step="fix")
+
+        def report(seq, verdict, **fields):
+            append("report", agent="qa", status="completed", review=True, step="fix",
+                   assignment_seq=seq, verdict=verdict, **fields)
+
+        append("plan", agent="lead", steps=steps)
+        report(assign(), "changes requested")
+        self.assertEqual(view()["steps"][0]["stage"], "rework")
+        report(assign(), "approved")
+        append("plan", agent="lead", steps=steps)
+        self.assertEqual([s["stage"] for s in view()["steps"]], ["completed","unrecorded"])
+        self.assertEqual(view()["counts"]["accepted"], 1)
+        report(assign(), "unclear")
+        self.assertEqual(view()["counts"]["accepted"], 0)
+        report(assign(), "approved", text="**VERDICT: APPROVED WITH LISTED FIXES** — see report.")
+        self.assertEqual(view()["steps"][0]["evidence"]["reviewed"]["verdict"], "unclear")
+        self.assertEqual(view()["counts"]["accepted"], 0)
+        report(assign(), "approved", checks={"passed":0,"total":1})
+        self.assertEqual(view()["counts"]["accepted"], 0)
+        old = assign()
+        newer = append("delegation", assignee="dev", task="Change build", step="fix")
+        append("report", agent="dev", status="completed", assignment_seq=newer, step="fix")
+        report(old, "approved")
+        self.assertEqual(view()["counts"]["accepted"], 0)
+        report(assign(), "approved")
+        record["plan"]["steps"] = [step("Fix build","rework", id="fix"), steps[1]]
+        append("plan", agent="lead", steps=record["plan"]["steps"])
+        self.assertEqual(view()["steps"][0]["decision"], {"stage":"rework", "source":"lead", "agent":"lead"})
+
+    def test_qualified_review_returns_to_lead_without_accepting_or_ordering_a_fix(self):
+        self.script.queues.update(lead=[
+            plan(step("Check publication", id="check")),
+            reply("", call("review_loop", author="dev", reviewer="qa", work="Check publication.", step="check")),
+            lambda messages: reply(tool_results(messages)[-1])],
+            qa=[reply("**VERDICT: APPROVED WITH LISTED FIXES** — apply edits first.")])
+        self.studio.post(self.gid, "Review publication", queue=True)
+        record = finished(self.studio, self.gid)
+        detail = self.studio.task_detail(record["id"])
+        self.assertEqual(record["delegations"], 1)
+        self.assertIn("apply edits first", record["final_answer"])
+        self.assertEqual(detail["plan_view"]["counts"]["accepted"], 0)
+        self.assertEqual(detail["plan_view"]["steps"][0]["evidence"]["reviewed"]["verdict"], "unclear")
 
     def test_next_member_sees_the_report_and_files_without_another_plan_call(self):
         self.script.queues.update(lead=[plan(step("Write draft")),

@@ -1,12 +1,10 @@
 """A real browser addresses a running member, then reopens the durable conversation."""
 import tempfile
 import unittest
-from dataclasses import replace
 from pathlib import Path
 
 from playwright.sync_api import expect, sync_playwright
 
-from miniagent.config import TeamLimits
 from miniagent.server import serve
 from miniagent.studio import Studio
 from tests.helpers import FakeProvider, Script, call, reply, settings
@@ -25,8 +23,7 @@ class CommunicationUITest(unittest.TestCase):
                             qa=[reply("R42 is signed.")],
                             room=[reply("", call("change_current_task", quote=text))])
             provider = FakeProvider(script)
-            cfg = settings(Path(tmp), team=replace(TeamLimits(), mailboxes=True, interrupts=True,
-                                                   lead_consult=True, team_talk=True))
+            cfg = settings(Path(tmp))
             studio = Studio(cfg, provider_factory=lambda _: provider)
             gid = studio.create_group("Release", TEAM, "lead", "autonomous")["id"]
             main, preview = serve(studio, 0)

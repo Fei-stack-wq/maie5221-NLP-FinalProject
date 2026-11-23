@@ -130,9 +130,9 @@ class TeamLimits:
     max_repeat_assignments: int = 3
     """Near-identical assignments to the same member before the lead is told to change course."""
 
-    mailboxes: bool = False
-    interrupts: bool = False
-    lead_consult: bool = False
+    mailboxes: bool = True
+    interrupts: bool = True
+    lead_consult: bool = True
 
     resume_members: bool = True
     """A member assigned again in the same task continues its earlier conversation instead of starting over."""
@@ -149,7 +149,7 @@ class TeamLimits:
     plan_links: bool = True
     """Associate hand-offs and their evidence with stable plan step IDs."""
 
-    team_talk: bool = False
+    team_talk: bool = True
     check_ins: int = 3
     teammate_questions: int = 3
     teammate_notes: int = 5
