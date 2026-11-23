@@ -363,7 +363,7 @@ def _clip(text: str, limit: int) -> str:
 
 def render_plan(plan: dict) -> str:
     marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]", "rework": "[!]",
-             "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]"}
+             "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]", "unrecorded": "[no recorded outcome]"}
     steps = plan.get("steps", [])
     numbered = any(s.get("after") for s in steps)
     rows = [f"{marks.get(s.get('stage', s['status']), '[ ]')} " + (f"{i}. " if numbered else "") + s["step"]
@@ -1233,9 +1233,12 @@ class TeamTask:
             self._update(plan=self.plan)
         self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation,
                           **({"linked": True} if self.settings.team.plan_links else {}))
-        done = sum(s["status"] == "completed" for s in steps)
-        ready = [str(i) for i, s in enumerate(steps, 1) if s["status"] == "pending"
-                 and all(steps[n - 1]["status"] == "completed" for n in s.get("after", []))]
+        visible = (plan_view(self.record, self.store.chat(self.trigger_seq - 1))["steps"]
+                   if self.settings.team.plan_links else steps)
+        stages = [row.get("stage", row["status"]) for row in visible]
+        done = stages.count("completed")
+        ready = [str(i + 1) for i, row in enumerate(visible) if stages[i] == "pending"
+                 and all(stages[n - 1] == "completed" for n in row.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
         ids = " Steps: " + ", ".join(f"{s['id']} {s['step']}" for s in steps) if self.settings.team.plan_links else ""
         return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{ids} The requester can see it.")

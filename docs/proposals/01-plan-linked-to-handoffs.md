@@ -35,13 +35,14 @@ Non-goals: Studio dispatching work from the plan by itself; Studio judging quali
 
 ## Design
 
-**Platform records, lead judges.** Each step carries two independent things:
+Each step carries the evidence of the work and any explicit decision about it.
 
 1. *Evidence*, derived by Studio from events: `assigned` (who, when), `submitted` (report status,
    published files with digests, check results), `reviewed` (verdict from a review assignment or
    review-loop round).
-2. *Acceptance*, set only by the lead through `update_plan`: `pending`, `in_progress`, `completed`.
-   Add `rework` ("needs changes") as a fourth value.
+2. *Acceptance* comes from the lead's `update_plan` decision or from the designated reviewer's
+   recorded verdict on the current handoff for that step. The plan names the decision maker.
+   A fresh assignment reopens the step. An ordinary submission or a passing file check records evidence.
 
 **Stable step IDs.** `update_plan` steps get an optional `id` (short slug, e.g. `draft`). Studio
 assigns `s1…sn` when missing, and on a later update keeps the ID of a step whose `id` is passed back
@@ -69,6 +70,7 @@ rounds carry it on every round.
 
 Multiple hand-offs on one step: the latest of each kind wins; the full list stays in `history`.
 After the task ends, a step that was submitted but never accepted reads "submitted, not confirmed".
+Steps without a recorded outcome are labelled accordingly once the task ends.
 
 **Prompts.** Lead: "When you delegate work for a plan step, pass its `step` ID. Studio records
 assignment, delivery and review on the plan by itself; call `update_plan` only to change the plan or
