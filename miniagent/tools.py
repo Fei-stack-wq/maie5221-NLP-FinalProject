@@ -110,6 +110,9 @@ class Tool:
     concurrent: Callable[[list[dict[str, Any]]], bool] | None = None
     """Given the arguments of several calls of this tool in one response, True if they may run at once."""
 
+    read_only: bool = False
+    """Safe to execute as a conversational lookup before a task exists."""
+
     def spec(self) -> ToolSpec:
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
 

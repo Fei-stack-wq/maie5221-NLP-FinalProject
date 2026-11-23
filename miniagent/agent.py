@@ -186,7 +186,8 @@ class Agent:
         except Exception:  # noqa: BLE001 - UI/trace sinks are best effort
             pass
 
-    def run(self, task: str, *, context: str = "", session: AgentSession | None = None) -> AgentResult:
+    def run(self, task: str, *, context: str = "", session: AgentSession | None = None,
+            initial_calls=()) -> AgentResult:
         """Run one task.
 
         A saved pause frame for this agent continues exactly where it paused. Otherwise a
@@ -245,6 +246,13 @@ class Agent:
                 ]
                 ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
             compactions_before = ctx_manager.compactions
+            if initial_calls:
+                # These calls belong to the host handoff. The worker starts a fresh model conversation
+                # with their receipts, and its normal tool loop owns validation, tracing and checkpoints.
+                pending = [ToolCall.model_validate(call) for call in initial_calls]
+                header = LLMResponse(tool_calls=pending, reasoning_content="")
+                messages.append(header.to_assistant_message())
+                step = 1
         if session is not None:
             session.messages, session.context = messages, ctx_manager
             if not saved:
@@ -264,6 +272,8 @@ class Agent:
         specs = self.registry.specs(available_only=True)
         tool_schemas = [spec.to_api() for spec in specs]
         self.emit("resume" if saved else "start", task=task, resumed=resumed)
+        if initial_calls and not saved:
+            self.emit("step", step=step, max_steps=self.limits.max_steps, origin="room_turn")
 
         def spend(response: LLMResponse) -> None:
             nonlocal usage

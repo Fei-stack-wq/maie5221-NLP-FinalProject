@@ -44,7 +44,10 @@ class BoundWorkspaceTest(unittest.TestCase):
                     if messages[-1]["role"] == "user":
                         self.assertNotIn(self.source.read_text(), str(messages))
                         return reply("", call("read_room_evidence", workspace_path="design"))
-                    self.assertEqual([t.name for t in tools], ["read_room_evidence"])
+                    if store.group.kind == "assistant":
+                        self.assertTrue({"read_room_evidence","create_group","start_task"} <= {t.name for t in tools})
+                    else:
+                        self.assertEqual([t.name for t in tools], ["read_room_evidence"])
                     item = json.loads(messages[-1]["content"])
                     if "entries" in item:
                         path = item["path"] + "/" + item["entries"][0]

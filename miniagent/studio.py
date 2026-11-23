@@ -325,12 +325,14 @@ class Studio:
             recipients = {current.task_id:ObservedTask(group_id,current,question)} if current else {}
             children = {}
             owner_names = {}
+            operations = {}
             if assistant:
                 context.update(workspace_evidence(self, store))
                 context["room_id"] = group_id
                 if proposal := studio_cleanup.pending(store):
                     context["pending_cleanup"] = proposal
-                context["studio_capabilities"] = {t.name:t.description for t in assistant_tools(self,catalog=True)}
+                operations = {t.name:t for t in assistant_tools(self, catalog=True)}
+                context["studio_capabilities"] = {name:t.description for name,t in operations.items()}
                 with self._lock:
                     for item in context["dispatches"] + context["earlier_dispatches"]:
                         tid, gid = item["id"], item["group_id"]
@@ -345,8 +347,21 @@ class Studio:
                 context["action_targets"] = {
                     tid:{"group_id":observed.group_id, "question":observed.question, "activity":progress(observed.run)}
                     for tid,observed in recipients.items()}
+            lookups = []
             try:
                 def read(args):
+                    if assistant:
+                        kind = next((k for k in ("studio_inspection","studio_room","studio_lookup") if k in args), None)
+                        details = args.get("arguments", args.get(kind, args))
+                        lookups.append({"tool":args[kind] if kind == "studio_lookup" else
+                                        {"studio_room":"inspect_studio_room","studio_inspection":"inspect_studio"}.get(kind,"read_room_evidence"),
+                                        **{k:v for k,v in details.items() if k in ("view","group_id","task_id","attachment_id","offset")}})
+                    if assistant and "studio_lookup" in args:
+                        lookup = operations[args["studio_lookup"]]
+                        if not lookup.read_only:
+                            raise ValueError("Expected a read-only Studio lookup.")
+                        result = lookup.fn(None, args["arguments"]).content
+                        return result.replace(settings.api_key, "[redacted]") if settings.api_key else result
                     if assistant and "studio_inspection" in args:
                         try:
                             result = json.dumps(studio_admin.inspect(self,**args["studio_inspection"]),ensure_ascii=False)
@@ -370,15 +385,18 @@ class Studio:
                     else:
                         excerpt = read_excerpt(store, self.uploads, context, args)
                     return excerpt.replace(settings.api_key, "[redacted]") if settings.api_key else excerpt
-                turn = decide(self.provider_factory(settings), context, text, read, on_stream=stream)
+                turn = decide(self.provider_factory(settings), context, text, read, on_stream=stream, studio_operations=operations.values())
             except (ProviderError, ValueError) as exc:
                 raise StudioError(f"无法处理会话消息：{exc}", 503) from None
 
             with self._lock:
                 self._require_available(store)
+                if lookups:
+                    receipt = {**receipt, "routing_lookups":lookups}
                 metadata = {"requested_tools":list(turn.requested_tools)} if turn.requested_tools else {}
                 if turn.action == "start_room_task":
-                    return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode, receipt=receipt)
+                    return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode,
+                                        receipt=receipt, initial_calls=(turn.arguments or {}).get("initial_calls"))
                 if turn.action in ("pause_room_task", "resume_room_task"):
                     operation = self.pause_task if turn.action == "pause_room_task" else self.resume_task
                     try:
@@ -455,7 +473,7 @@ class Studio:
             refs = [self.uploads.forward(source, target, ref, self.settings.api_key) for ref in refs]
         # receive also checks cancellation, completion and the exact pending question under its lock.
         return observed.run.channel.receive(text, attachments=refs, steer_only=not answering,
-                                            answer_to=observed.question["id"] if answering else None, **receipt)
+                                            answer_to=observed.question["id"] if answering else None, client_id=receipt.get("client_id"))
 
     def _require_available(self, store):
         if (store.root/".pending-artifact-delete.json").exists() or (store.root/".resetting-default").exists():
@@ -463,7 +481,7 @@ class Studio:
         if self._closed or store.group.archived or store.team.archived or not store.root.is_dir():
             raise StudioError("Conversation unavailable", 409)
 
-    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None, redispatched_from=None):
+    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None, redispatched_from=None, initial_calls=None):
         group_id = store.group.id
         with self._lock:
             self._require_available(store)
@@ -480,6 +498,8 @@ class Studio:
                 event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
             record = {"id":tid, "group_id":group_id, "room_kind":store.group.kind, "status":"queued", "created_at":now(), "primary":primary,
                       "text":body, "trigger_seq":event["seq"], "options":options, "active":[]}
+            if initial_calls:
+                record["initial_calls"] = initial_calls
             if redispatched_from:
                 record["redispatched_from"] = redispatched_from
             if dispatched_by:
@@ -544,6 +564,7 @@ class Studio:
             task = TeamTask(store, provider, settings, task_id=tid, text=record["text"], primary=primary,
                             trigger_seq=record["trigger_seq"], channel=running.channel, should_cancel=cancel.is_set,
                             on_activity=lambda e: self._activity(running, e))
+            task.initial_calls = record.get("initial_calls", [])
             task.group = group
             task.control = running.control = checkpoint.Continuation(saved)
             running.channel.control = task.control

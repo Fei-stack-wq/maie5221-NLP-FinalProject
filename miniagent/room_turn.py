@@ -213,7 +213,7 @@ def _read_batch(response, tools, reads, text):
     return inspections
 
 
-def decide(provider, context, text, read, *, on_stream=None):
+def decide(provider, context, text, read, *, on_stream=None, studio_operations=()):
     tools = [START]
     if context.get("paused_task"):
         tools.append(action_tool("resume_room_task", "Continue the paused execution from its saved checkpoint.", [context["paused_task"]]))
@@ -234,23 +234,39 @@ def decide(provider, context, text, read, *, on_stream=None):
             or any(t["file_changes"] for t in context["tasks"])):
         tools.append(READ)
     system = SYSTEM
-    if context["kind"] == "assistant":
+    read_names = {spec.name for spec in (READ, *READ_TOOLS)}
+    worker_names = set()
+    assistant = context["kind"] == "assistant"
+    if assistant:
         tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT, studio_admin.INSPECT, DATA_MANAGEMENT, DELETE_ROLE, DELETE_GROUPS])
         if proposal := context.get("pending_cleanup"):
             tools.append(management_tool(studio_cleanup.APPLY, "Apply the last concrete cleanup list when the user confirms it.",
                          {"plan_id":{"type":"string","enum":[proposal["id"]]}}, ["plan_id"]))
+        direct = {spec.name for spec in tools}
+        for operation in studio_operations:
+            if operation.name in direct:
+                continue
+            spec = operation.spec()
+            if operation.read_only:
+                read_names.add(spec.name)
+                tools.append(spec)
+            else:
+                worker_names.add(spec.name)
+                tools.append(management_tool(spec.name, spec.description, spec.parameters["properties"],
+                                             spec.parameters.get("required", [])))
         system += (" You are the studio assistant. The directory and your dispatch receipts are reference data. "
                    "Use these for progress and capability questions. read_room_evidence with just a catalogued dispatch "
                    "task_id returns its recorded outcome; add path for a published file. A standalone request to "
                    "change an existing roster can be applied with change_group_members. For a commission that "
                    "also needs delivery, start the work with the complete request. If several tasks fit a "
                    "change, clarify the target in chat. You can inspect conversations, stop or reassign jobs, dispatch a batch, "
-                   "manage settings, roles and knowledge. The studio_capabilities record lists the actual tools available during commissioned work. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. For a team cleanup, use delete_studio_groups or send all compatible cleanup calls in this turn. Use the preceding proposal for short confirmations. If alternatives remain ambiguous, present a concrete scope for confirmation. Use a task for redispatch.")
+                   "manage settings, roles and knowledge. You can call the Studio operations here. Creation and dispatch continue in your own durable execution with the original message and room attachments. start_room_task can also take a multi-step commission from the beginning. Use the exact requested role instructions from the original attachments. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. For a team cleanup, use delete_studio_groups or send all compatible cleanup calls in this turn. Use the preceding proposal for short confirmations. If alternatives remain ambiguous, present a concrete scope for confirmation. Use a task for redispatch.")
     messages = [{"role":"system", "content":system},
                 {"role":"user", "content":"Room records (reference data):\n" + json.dumps(context, ensure_ascii=False)},
                 {"role":"user", "content":text}]
     stream = {"on_stream":on_stream} if on_stream and getattr(provider, "supports_streaming", False) else {}
-    # Only a structural directory page can feed directly into a mutation. Other evidence is read-only.
+    # Only a structural directory page can feed directly into a mutation. After free-text
+    # evidence, a proposed mutation goes through an independent decision on the original message.
     seen = set()
     remaining = 64 * 1024  # Same evidence capacity as eight 8 KiB excerpts.
     original = list(messages)
@@ -268,12 +284,25 @@ def decide(provider, context, text, read, *, on_stream=None):
             return Turn("reply", str(exc), issue=exc.code)
         if on_stream and (response.tool_calls or response.finish_reason != "stop"):
             on_stream("discard", "")
-        reads = {s.name:s for s in tools if s in (READ, *READ_TOOLS)}
+        reads = {s.name:s for s in tools if s.name in read_names}
         inspections = _read_batch(response, tools, reads, text)
         if not inspections:
             if response.finish_reason == "stop" and not response.tool_calls and response.text.strip():
                 return Turn("reply", response.text.strip())
-            result, issue = _authorized(response, tools, text)
+            result, issue = _authorized(response, tools, text, worker_names=worker_names, read_names=read_names)
+            if assistant and not structural_only and response.tool_calls and not repaired:
+                # Never carry a proposed target, instruction or quoted approval from an attachment
+                # into the executing batch. The worker can read the originals after a clean commission.
+                repaired = True
+                structural_only = True
+                messages = [{"role":"system","content":system + " Decide from the original user message and room context. "
+                             "For commissioned work using source materials, start_room_task opens the full Studio executor "
+                             "which can read those sources. Answer an informational request directly."}, *original[1:]]
+                # An execution proposal needs only a commission decision. For a control such
+                # as steering or scoped cleanup, resolve its arguments anew with the direct controls.
+                tools = ([START] if result and result.action == START.name else
+                         [tool for tool in original_tools if tool.name not in read_names and tool.name not in worker_names])
+                continue
             if result:
                 return result
             # Retry an incomplete control decision on the original conversation. Text read from a
@@ -282,7 +311,7 @@ def decide(provider, context, text, read, *, on_stream=None):
                 repaired = True
                 messages = [{"role":"system","content":system + " The previous attempt did not return a usable routing decision. "
                              "Respond directly or select authorized actions from the original conversation."}, *original[1:]]
-                tools = [tool for tool in original_tools if tool not in (READ, *READ_TOOLS)]
+                tools = [tool for tool in original_tools if tool.name not in read_names]
                 continue
             details = {"length":"模型的路由回复被截断", "unavailable_tool":"模型选择了当前会话不可用的操作",
                        "empty_reply":"模型返回了空回复", "invalid_arguments":"模型给出的操作参数不完整或格式有误",
@@ -315,6 +344,8 @@ def decide(provider, context, text, read, *, on_stream=None):
                 seen.add(ref)
                 if call.name == studio_admin.INSPECT.name:
                     content = read({"studio_inspection":call.arguments})
+                elif call.name not in (READ.name, INSPECT.name):
+                    content = read({"studio_lookup":call.name, "arguments":call.arguments})
                 else:
                     content = read({"studio_room":call.arguments} if call.name == INSPECT.name else call.arguments)
                 if structural_only:
@@ -330,13 +361,15 @@ def decide(provider, context, text, read, *, on_stream=None):
                 if (tool in READ_TOOLS or "workspace_path" in call.arguments) and tool not in next_reads:
                     next_reads.append(tool)
             messages.append({"role":"tool", "tool_call_id":call.id, "content":content})
-        if structural_only:
-            tools = [t for t in original_tools if (remaining > 0 and len(seen) > seen_before) or t not in (READ, *READ_TOOLS)]
+        if structural_only or assistant:
+            tools = [t for t in original_tools if (remaining > 0 and len(seen) > seen_before) or t.name not in read_names]
         else:
             tools = next_reads if remaining > 0 else []
 
 
-def _authorized(response, tools, text):
+def _authorized(response, tools, text, *, worker_names=(), read_names=None):
+    if read_names is None:
+        read_names = {s.name for s in (READ, *READ_TOOLS)}
     if response.finish_reason != "tool_calls":
         return None, "empty_reply" if response.finish_reason == "stop" else response.finish_reason
     offered = {s.name:s for s in tools}
@@ -347,11 +380,22 @@ def _authorized(response, tools, text):
             return None, "unavailable_tool"
         if call.parse_error or validate_arguments(spec.parameters, call.arguments):
             return None, "invalid_arguments"
-        if spec not in (READ, *READ_TOOLS):
+        if call.name not in read_names:
             quote = call.arguments.get("quote")
             if not isinstance(quote, str) or not quote.strip() or quote not in text:
                 return None, "missing_user_authorization"
             calls.append((call, spec))
+    if worker_names and len(calls) == 1 and calls[0][1] == START and len(response.tool_calls) > 1:
+        return Turn(START.name), None
+    worker_calls = [call for call, spec in calls if spec.name in worker_names]
+    if worker_calls and all(spec.name in worker_names or spec == START for _, spec in calls):
+        # A combined lookup and mutation still needs its evidence. Start from the original
+        # request instead of pre-applying an operation whose prerequisite has not run.
+        if len(calls) != len(response.tool_calls):
+            return Turn(START.name), None
+        initial = [{"id":call.id, "name":call.name,
+                    "arguments":{k:v for k,v in call.arguments.items() if k != "quote"}} for call in worker_calls]
+        return Turn(START.name, arguments={"initial_calls":initial}), None
     if calls and len(calls) == len(response.tool_calls) and all(
             spec in (DELETE_ROLE, DELETE_GROUPS) or
             (spec == DATA_MANAGEMENT and call.arguments["operation"] in studio_cleanup.ORDER) for call, spec in calls):

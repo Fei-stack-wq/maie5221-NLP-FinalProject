@@ -188,8 +188,8 @@ class SupervisorTest(unittest.TestCase):
                             (session,{"name":"二期","folder":str(folder)})):
             self.script.queues["room"]=[reply("",call("update_group_settings",group_id=gid,quote="调整设置",**change))]
             self.assertIn("已更新",self.studio.post(self.assistant,"调整设置")["text"])
-        self.script.queues.update(room=[reply("",call("inspect_studio_room",group_id=session))],
-                                  **{"?":[lambda msgs:reply(json.loads(msgs[-1]["content"])["workspace_path"])]})
+        self.script.queues.update(room=[reply("",call("inspect_studio_room",group_id=session)),
+                                  lambda msgs:reply(json.loads(msgs[-1]["content"])["workspace_path"])])
         self.assertEqual(self.studio.post(self.assistant,"二期的目录在哪里？")["text"],str(folder))
         self.assertEqual(self.studio.tasks(self.assistant),[])
         self.assertEqual(self.studio.group(team).group.folder,"")

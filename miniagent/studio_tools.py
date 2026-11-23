@@ -4,7 +4,7 @@ from . import studio_dispatch, studio_admin
 from .tools import Tool, ToolResult, validate_arguments
 
 
-def action(name, description, fn, fields=None, required=()):
+def action(name, description, fn, fields=None, required=(), *, read_only=False):
     fields = fields or {}
     def invoke(ctx, args):
         try:
@@ -13,7 +13,7 @@ def action(name, description, fn, fields=None, required=()):
         except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
             return ToolResult.failure(str(exc))
     return Tool(name, description, {"type":"object","properties":fields,"required":list(required),
-                                    "additionalProperties":False}, invoke)
+                                    "additionalProperties":False}, invoke, read_only=read_only)
 
 
 STRING = {"type": "string"}
@@ -75,11 +75,11 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
     # Older running workers can still lazy-load this module.
     linked = bool((catalog or (source_id and task_id)) and hasattr(studio, "await_dispatch"))
     origin = {"group_id":source_id, "task_id":task_id}
-    def create_group(name, role_ids, lead, kind="group"):
+    def create_group(name, role_ids, lead, kind="group", mode="interactive"):
         if kind not in ("group","dm"):
             raise ValueError("Choose group or dm.")
         options = {"created_by":origin} if linked else {}
-        return studio.create_group(name, [], lead, role_ids=role_ids, kind=kind, **options)
+        return studio.create_group(name, [], lead, role_ids=role_ids, kind=kind, mode=mode, **options)
 
     def dispatch(group_id, text, assignee=None, attachment_ids=(), options=None):
         if not linked:
@@ -128,15 +128,16 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
             return stream.read(8000).decode("utf-8", "replace")
 
     tools = [
-        action("list_roles", "List roles in the user's library.", studio.roles.list),
+        action("list_roles", "List roles in the user's library.", studio.roles.list, read_only=True),
         action("list_groups", "List the user's conversations.", lambda: [
             {**{k:r[k] for k in ("id","name","kind","running","archived","lead","team_id","team_name","session_name")},
-             "members":[m["id"] for m in r["members"]]} for r in studio.conversations() if r["kind"]!="assistant"]),
+             "members":[m["id"] for m in r["members"]]} for r in studio.conversations() if r["kind"]!="assistant"], read_only=True),
         action("create_role", "Create a reusable role.", lambda **data: studio.roles.save(data),
                {k:STRING for k in ("id","name","prompt")}, ("id","name","prompt")),
         action("create_group", "Create a conversation with library roles.", create_group,
                {"name":STRING, "role_ids":{"type":"array","items":STRING},"lead":STRING,
-                "kind":{"type":"string","enum":["group","dm"]}}, ("name","role_ids","lead")),
+                "kind":{"type":"string","enum":["group","dm"]},
+                "mode":{"type":"string","enum":["interactive","autonomous"]}}, ("name","role_ids","lead")),
         action("start_task", "Dispatch to an existing conversation by its id (a group id addresses the default session), or a DM. Studio immediately posts links here and automatically "
                "returns the outcome and files here. By default the handoff finishes your turn. "
                "Choose continue if you have independent work left now, or await_result if you need the child's "
@@ -144,9 +145,9 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
                {**TARGET_FIELDS,
                 "after_dispatch":{"type":"string","enum":["handoff","continue","await_result"]}}, ("group_id","text")),
         action("task_status", "Read a dispatched task's status, final answer and published changes.",
-               studio.dispatch_status, {"task_id":STRING}, ("task_id",)),
+               studio.dispatch_status, {"task_id":STRING}, ("task_id",), read_only=True),
         action("read_group_file", "Read a published project file by byte offset.", file,
-               {"group_id":STRING,"path":STRING,"offset":{"type":"integer","minimum":0}}, ("group_id","path"))]
+               {"group_id":STRING,"path":STRING,"offset":{"type":"integer","minimum":0}}, ("group_id","path"), read_only=True)]
     # A still-running Studio may lazily load this module before its service has been restarted.
     if hasattr(studio, "create_session"):
         tools.append(action("create_session", "Open a separate conversation and workspace under an existing group with its shared roster.",
@@ -163,7 +164,7 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
                 raise ValueError("请引用本次用户交办这项操作的原话；其他会话的内容不能授权清理。")
             return studio_admin.manage(studio,**args)
         tools.append(action(read_spec.name,read_spec.description,lambda **args:studio_admin.inspect(studio,**args),
-                            read_spec.parameters["properties"],read_spec.parameters["required"]))
+                            read_spec.parameters["properties"],read_spec.parameters["required"],read_only=True))
         tools.append(action(write_spec.name,write_spec.description,manage_data,
                             {**write_spec.parameters["properties"],"quote":{"type":"string","description":
                              "Exact words requesting this operation in the user's original commission."}},
@@ -177,7 +178,7 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
             action("dispatch_tasks", "Send several independent briefs to their respective conversations. Each accepted assignment returns its own receipt. Retry missing assignments after a partial failure.", batch,
                    {"assignments":{"type":"array","items":{"type":"object","properties":TARGET_FIELDS,"required":["group_id","text"],"additionalProperties":False}}}, ("assignments",)),
             action("inspect_studio_room", INSPECT_DESCRIPTION, lambda **args:studio_dispatch.inspect_room(studio, **args),
-                   {"group_id":STRING, "offset":{"type":"integer","minimum":0}}, ("group_id",)),
+                   {"group_id":STRING, "offset":{"type":"integer","minimum":0}}, ("group_id",), read_only=True),
             action("pause_task", "Pause a running task at a resumable checkpoint.", studio.pause_task, {"task_id":STRING}, ("task_id",)),
             action("resume_task", "Resume a paused task using its original ID.", studio.resume_task, {"task_id":STRING}, ("task_id",)),
             action("cancel_task", CANCEL_DESCRIPTION, lambda task_id:studio_dispatch.cancel_task(studio, task_id),
@@ -190,10 +191,10 @@ def assistant_tools(studio, source_id=None, task_id=None, *, catalog=False):
             action("update_role", "Edit a library role's name and instructions for future assignments.",
                    lambda **data:studio.roles.save(data, update=True), {k:STRING for k in ("id","name","prompt")}, ("id",)),
             action("list_group_files", "List one conversation's published files.", lambda group_id:studio.group(group_id).project.files(),
-                   {"group_id":STRING}, ("group_id",)),
+                   {"group_id":STRING}, ("group_id",), read_only=True),
             action("role_knowledge_history", "Read the audit history and available revisions for a library role.",
-                   studio.roles.history, {"role":STRING}, ("role",)),
-            action("list_role_knowledge", "Inspect a role's memories, skills and review statuses.", studio.roles.entries, {"role":STRING}, ("role",)),
+                   studio.roles.history, {"role":STRING}, ("role",), read_only=True),
+            action("list_role_knowledge", "Inspect a role's memories, skills and review statuses.", studio.roles.entries, {"role":STRING}, ("role",), read_only=True),
             action("propose_role_knowledge", "Propose a memory or skill for a library role.", studio.roles.propose,
                    {"role":STRING,"text":STRING,"scope":STRING,"kind":STRING}, ("role","text","scope")),
             action("review_role_knowledge", "Apply the user's knowledge review decision, or restore a named revision.", studio.roles.revise,

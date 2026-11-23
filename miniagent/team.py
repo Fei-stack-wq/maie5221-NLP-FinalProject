@@ -456,6 +456,7 @@ class TeamTask:
         self.on_activity = on_activity
         self.studio = None
         self.dispatched_by = None
+        self.initial_calls = []
         self.options = {}
         self.created_at = now()
         self.group = store.group
@@ -1026,7 +1027,7 @@ class TeamTask:
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel, stream=True, continuation=self.control)
         if not saved:
             self.channel.start_cursor(self.primary, self.trigger_seq)
-        result = agent.run(self.text, context=self._context(self.primary, self.trigger_seq))
+        result = agent.run(self.text, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls)
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
         if changes:
