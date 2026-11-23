@@ -108,8 +108,11 @@ class Tool:
     parameters: dict[str, Any]
     fn: Callable[[ToolContext, dict[str, Any]], ToolResult]
     available: Callable[[], bool] | None = None
-    concurrent: Callable[[list[dict[str, Any]]], bool] | None = None
-    """Given the arguments of several calls of this tool in one response, True if they may run at once."""
+    concurrent: Callable[[list[tuple[str, dict[str, Any]]]], bool] | None = None
+    """Given (name, arguments) of the hand-off calls in one response, True if they may start at once."""
+    phase: int = 0
+    """Order within one response: 0 runs first, in order; 1 is a hand-off — all hand-offs start together after
+    the phase-0 calls (so a plan update or a file written in the same response comes first); 2 runs after them."""
     read_only: bool = False
     """Changes nothing the agent can observe (reads, searches, fetches): safe to run alongside other reads."""
 

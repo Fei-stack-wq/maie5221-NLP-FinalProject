@@ -70,16 +70,13 @@ class PlanOverlapTest(unittest.TestCase):
                                  kind="make", step="build")),
                   lambda m: (seen.__setitem__("build", tool_results(m)[-1]),
                              reply("", call("delegate_task", assignee="qa", task="Test the finished build in app.py.",
-                                            deliverables=["docs/QA.md"], inputs=["app.py"], kind="check",
-                                            independent=True, step="qa"),
+                                            deliverables=["docs/QA.md"], inputs=["app.py"], kind="check", step="qa"),
                                    call("delegate_task", assignee="writer", task="Write release notes for the build.",
-                                        deliverables=["RELEASE_NOTES.md"], inputs=["app.py"], kind="make",
-                                        independent=True, step="release")))[1],
+                                        deliverables=["RELEASE_NOTES.md"], inputs=["app.py"], kind="make", step="release")))[1],
                   lambda m: (seen.__setitem__("pair", tool_results(m)[-2:]), reply("shipped"))[1]],
             dev=[reply("", call("write_file", path="app.py", content="print('v1')\n")), reply("built")],
             qa=[first("qa", "docs/QA.md"), reply("VERDICT: APPROVED\nAll flows pass.")],
-            writer=[first("writer", "RELEASE_NOTES.md"), reply("notes drafted"),
-                    lambda m: (seen.__setitem__("follow_up", m[-1]["content"]), reply("No change needed: QA passed."))[1]])
+            writer=[first("writer", "RELEASE_NOTES.md"), reply("notes drafted")])
         studio, gid, provider = self.studio(script)
         studio.post(gid, "Ship v1", queue=True)
         task = finished(studio, gid)
@@ -87,10 +84,9 @@ class PlanOverlapTest(unittest.TestCase):
         self.assertIn("Plan: steps 2 qa (qa); 3 release (writer) can start now", seen["build"])
         self.assertTrue(seen["qa_together"] and seen["writer_together"], "the check and the release ran at once")
         qa_result, writer_result = seen["pair"]
-        self.assertIn("As a check of finished work it did not review their results", qa_result)
-        self.assertEqual(len(provider.for_agent("qa")), 2, "the check had no follow-up turn")
-        self.assertIn("VERDICT: APPROVED", seen["follow_up"], "the release saw the check's findings")
-        self.assertIn("After seeing the parallel teammates' results: No change needed", writer_result)
+        self.assertIn("VERDICT: APPROVED", qa_result)
+        self.assertIn("notes drafted", writer_result)
+        self.assertEqual((len(provider.for_agent("qa")), len(provider.for_agent("writer"))), (2, 2), "no follow-up turn")
 
     def test_a_check_that_names_a_batch_mates_file_waits_for_it(self):
         seen = {}
@@ -103,9 +99,9 @@ class PlanOverlapTest(unittest.TestCase):
         holder = {}
         script = Script(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], independent=True, kind="make"),
+                                 deliverables=["RELEASE_NOTES.md"], kind="make"),
                         call("delegate_task", assignee="qa", task="Check RELEASE_NOTES.md for accuracy.",
-                             deliverables=["docs/QA.md"], independent=True, kind="check")),
+                             deliverables=["docs/QA.md"], kind="check")),
                   reply("done")],
             writer=[reply("notes written")], qa=[qa_first])
         studio, gid, _ = self.studio(script)

@@ -47,15 +47,14 @@ class PlanningTest(unittest.TestCase):
 
         script = Script(
             lead=[reply("", call("delegate_task", assignee="dev", task="Build the research summary from the archive.",
-                                 deliverables=["research/summary.md"], independent=True),
+                                 deliverables=["research/summary.md"]),
                         call("delegate_task", assignee="qa", task="Assess the suitability of the portfolio.",
-                             deliverables=["risk/assessment.md"], inputs=["research/"], independent=True)),
+                             deliverables=["risk/assessment.md"], inputs=["research/"])),
                   reply("done")],
             dev=member("dev", "research/summary.md"), qa=member("qa", "risk/assessment.md"))
         studio, gid, _ = self.studio(script)
         studio.post(gid, "Prepare the proposal", queue=True)
         task = finished(studio, gid)
-        self.assertEqual(task["metrics"]["parallel_batches"], 0, "marked independent, but qa reads dev's output")
         first, second = sorted(spans.values())
         self.assertLessEqual(first[1], second[0])
 

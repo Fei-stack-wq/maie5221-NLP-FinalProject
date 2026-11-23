@@ -71,28 +71,24 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(task["delegations"], 0)
 
     # 2 -------------------------------------------------------------------
-    def test_assignments_marked_independent_run_at_the_same_time_then_check_each_other(self):
+    def test_hand_offs_in_one_response_start_together(self):
         barrier = threading.Barrier(2, timeout=5)
-        follow_ups = {}
 
         def member(name, path):
             def first(messages):
                 barrier.wait()  # both members must be inside their runs at once
                 return reply("", call("write_file", path=path, content=f"by {name}\n"))
-            def check(messages):
-                follow_ups[name] = messages[-1]["content"]
-                return reply("No change needed: nothing in my file depends on theirs.")
-            return [first, reply(f"{name} wrote {path}"), check]
+            return [first, reply(f"{name} wrote {path}")]
 
         lead_calls = [call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                           deliverables=["api/"], independent=True),
+                           deliverables=["api/"]),
                       call("delegate_task", assignee="qa", task="Write the test plan in docs/test-plan.md.",
-                           deliverables=["docs/test-plan.md"], independent=True)]
+                           deliverables=["docs/test-plan.md"])]
         seen = {}
         script = Script(lead=[reply("", *lead_calls),
                               lambda m: (seen.__setitem__("results", tool_results(m)), reply("done"))[1]],
                         dev=member("dev", "api/server.py"), qa=member("qa", "docs/test-plan.md"))
-        studio, gid, _ = self.studio(script)
+        studio, gid, provider = self.studio(script)
         studio.post(gid, "Start the project", queue=True)
         task = finished(studio, gid)
         self.assertEqual([r.splitlines()[0] for r in seen["results"]],
@@ -101,50 +97,109 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(task["metrics"]["parallel_batches"], 1)
         root = studio.group(gid).project.root
         self.assertTrue((root / "api/server.py").exists() and (root / "docs/test-plan.md").exists())
-        # Each saw the other's actual result before reporting.
-        self.assertIn("### Tester (completed)", follow_ups["dev"])
-        self.assertIn("docs/test-plan.md (added)", follow_ups["dev"])
-        self.assertIn("qa wrote docs/test-plan.md", follow_ups["dev"])
-        self.assertIn("dev wrote api/server.py", follow_ups["qa"])
-        for result in seen["results"]:
-            self.assertIn("After seeing the parallel teammates' results: No change needed", result)
-            self.assertIn("afterwards checked their results", result)
-        checks = [e for e in kinds(studio, gid, "delegation") if e.get("reconcile")]
-        self.assertEqual(sorted(e["assignee"] for e in checks), ["dev", "qa"])
-        self.assertEqual(task["delegations"], 2, "the follow-up checks are not extra delegations")
-        self.assertEqual(task["metrics"]["parallel_checks"], 2)
+        self.assertEqual((len(provider.for_agent("dev")), len(provider.for_agent("qa"))), (2, 2), "no follow-up turn")
+        self.assertFalse(any("Waited for" in r for r in seen["results"]))
+        self.assertEqual(task["delegations"], 2)
         self.assertEqual(len(kinds(studio, gid, "report")), 2, "one report per assignment")
 
-    def test_a_wrong_independence_mark_is_corrected_by_the_follow_up(self):
-        # The lead says the guide needs nothing from the server, but the guide guessed the port.
-        def writer_check(messages):
-            text = messages[-1]["content"]
-            self.assertIn("listens on port 8080", text)
-            return reply("", call("write_file", path="docs/guide.md", content="Open http://localhost:8080\n"))
+    def run_pair(self, first_call, second_call):
+        """Two hand-offs in one response; returns the start/end order and the lead's results."""
+        order, seen = [], {}
 
-        lead_calls = [call("delegate_task", assignee="dev", task="Build the web server in app/server.py.",
-                           deliverables=["app/server.py"], independent=True),
-                      call("delegate_task", assignee="qa", task="Write the user guide in docs/guide.md.",
-                           deliverables=["docs/guide.md"], independent=True)]
-        seen = {}
-        script = Script(
-            lead=[reply("", *lead_calls), lambda m: (seen.__setitem__("results", tool_results(m)), reply("done"))[1]],
-            dev=[reply("", call("write_file", path="app/server.py", content="PORT = 8080\n")),
-                 reply("The server listens on port 8080."),
-                 reply("No change needed: the guide does not affect the server.")],
-            qa=[reply("", call("write_file", path="docs/guide.md", content="Open http://localhost:3000\n")),
-                reply("Wrote the guide; I assumed port 3000."),
-                writer_check,
-                reply("Updated docs/guide.md: the port is 8080, not 3000.")])
+        def member(name, path):
+            def start(messages):
+                order.append(name + " start")
+                time.sleep(0.05)
+                return reply("", call("write_file", path=path, content=name))
+            def end(messages):
+                order.append(name + " end")
+                return reply(f"{name} done")
+            return [start, end]
+
+        script = Script(lead=[reply("", first_call, second_call),
+                              lambda m: (seen.__setitem__("results", tool_results(m)[-2:]), reply("done"))[1]],
+                        dev=member("dev", "api/server.py"), qa=member("qa", "qa/report.md"))
         studio, gid, _ = self.studio(script)
-        studio.post(gid, "Ship the server and its guide", queue=True)
+        studio.post(gid, "go", queue=True)
+        task = finished(studio, gid)
+        return order, seen["results"], task
+
+    def test_a_hand_off_that_reads_another_ones_output_waits_for_it(self):
+        order, results, _ = self.run_pair(
+            call("delegate_task", assignee="dev", task="Write the backend in api/server.py.", deliverables=["api/server.py"]),
+            call("delegate_task", assignee="qa", task="Test the backend and write qa/report.md.",
+                 deliverables=["qa/report.md"], inputs=["api/server.py"]))
+        self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
+        self.assertIn("Waited for dev to finish before starting: it reads api/server.py, which dev produces.", results[1])
+
+    def test_a_brief_that_names_another_assignment_waits_for_it(self):
+        order, results, _ = self.run_pair(
+            call("delegate_task", assignee="dev", task="Write the backend in api/server.py.", deliverables=["api/server.py"]),
+            call("delegate_task", assignee="qa", task="Test api/server.py and write qa/report.md.",
+                 deliverables=["qa/report.md"]))
+        self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
+        self.assertIn("its brief names api/server.py, which dev produces", results[1])
+
+    def test_a_file_both_would_write_makes_the_second_wait(self):
+        order, results, _ = self.run_pair(
+            call("delegate_task", assignee="dev", task="Write the user guide.", deliverables=["docs/"]),
+            call("delegate_task", assignee="qa", task="Write the release notes.", deliverables=["docs/notes.md"]))
+        self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
+        self.assertIn("both write docs/notes.md", results[1])
+
+    def test_two_hand_offs_for_one_teammate_run_in_order(self):
+        seen = {}
+        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Research AI course offerings."),
+                                    call("delegate_task", assignee="dev", task="Research peer universities.")),
+                              lambda m: (seen.__setitem__("results", tool_results(m)[-2:]), reply("done"))[1]],
+                        dev=[reply("courses researched"), reply("peers researched")])
+        studio, gid, _ = self.studio(script)
+        studio.post(gid, "Research", queue=True)
         finished(studio, gid)
-        root = studio.group(gid).project.root
-        self.assertEqual((root / "docs/guide.md").read_text(), "Open http://localhost:8080\n")
-        qa_result = seen["results"][1]
-        self.assertIn("I assumed port 3000.", qa_result)
-        self.assertIn("After seeing the parallel teammates' results: Updated docs/guide.md: the port is 8080", qa_result)
-        self.assertIn("docs/guide.md (added)", qa_result)
+        self.assertIn("courses researched", seen["results"][0])
+        self.assertIn("Waited for dev to finish before starting: dev works on one assignment at a time.",
+                      seen["results"][1])
+
+    def test_hand_offs_without_declared_files_are_not_held_up(self):
+        barrier = threading.Barrier(2, timeout=5)
+
+        def first(messages):
+            barrier.wait()
+            return reply("noted")
+
+        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Summarise the API options."),
+                                    call("delegate_task", assignee="qa", task="Summarise the test tools.")),
+                              reply("done")],
+                        dev=[first], qa=[first])
+        studio, gid, _ = self.studio(script)
+        studio.post(gid, "Summaries", queue=True)
+        self.assertEqual(finished(studio, gid)["status"], "completed")
+
+    def test_a_plan_update_or_a_file_in_the_same_response_comes_before_the_hand_offs(self):
+        # S1T1-v3.6: a record_plan_result in the same response as the hand-offs. Here the lead even lists the
+        # hand-offs first; the file it writes in that response is still in the members' copies.
+        barrier = threading.Barrier(2, timeout=5)
+        seen = {}
+
+        def member(name):
+            def first(messages):
+                seen[name] = "brief v2" in next(m["content"] for m in messages if "Assignment from" in m.get("content", ""))
+                barrier.wait()
+                return reply(f"{name} done")
+            return [first]
+
+        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Build from the brief.",
+                                             inputs=["brief.md"], deliverables=["app.py"]),
+                                    call("delegate_task", assignee="qa", task="Plan tests from the brief.",
+                                         inputs=["brief.md"], deliverables=["qa/plan.md"]),
+                                    call("write_file", path="brief.md", content="brief v2\n")),
+                              reply("done")],
+                        dev=member("dev"), qa=member("qa"))
+        studio, gid, _ = self.studio(script)
+        studio.post(gid, "go", queue=True)
+        task = finished(studio, gid)
+        self.assertEqual(seen, {"dev": True, "qa": True}, "both saw the file written in the same response")
+        self.assertEqual(task["metrics"]["parallel_batches"], 1)
 
     def test_recovery_after_a_crash_keeps_the_original_assignment_outstanding(self):
         from types import SimpleNamespace
@@ -164,8 +219,8 @@ class CollaborationTest(unittest.TestCase):
                                         "deliverables": ["api/"], "follow_up_check_started": True}])
 
     def test_a_concurrent_batch_gets_one_thread_per_call(self):
-        # Parallel hand-offs wait for each other before their follow-up, so a call queued behind the
-        # others in a small thread pool would never start. Eight calls must all be running at once.
+        # A hand-off may wait for another, so a call queued behind the others in a small thread pool
+        # could wait forever. Eight hand-off calls must all be running at once.
         from miniagent.agent import Agent
         from miniagent.config import Limits
         from miniagent.sandbox import Sandbox
@@ -177,7 +232,7 @@ class CollaborationTest(unittest.TestCase):
             barrier.wait()
             return ToolResult(ok=True, content="done " + args["name"])
         registry = ToolRegistry([Tool("work", "", {"type": "object", "properties": {"name": {"type": "string"}}},
-                                      waiting, concurrent=lambda batch: True)])
+                                      waiting, concurrent=lambda batch: True, phase=1)])
         calls = [call("work", name=str(i)) for i in range(8)]
         provider = FakeProvider(Script(worker=[reply("", *calls), reply("all done")]))
         agent = Agent("worker", provider, registry, Sandbox(self.tmp, "worker"), settings(self.tmp),
@@ -186,86 +241,21 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(agent.run("work").status, "completed")
         self.assertEqual(tool_results(provider.requests[-1]["messages"]), [f"done {i}" for i in range(8)])
 
-    def test_an_assignment_marked_not_independent_keeps_the_response_in_order(self):
-        order = []
-
-        def member(name, path):
-            def first(messages):
-                order.append(name + " start")
-                return reply("", call("write_file", path=path, content=name))
-            def last(messages):
-                order.append(name + " end")
-                return reply(f"{name} done")
-            return [first, last]
-
-        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                                             deliverables=["api/"]),
-                                    call("delegate_task", assignee="qa", task="Write the test plan in docs/plan.md.",
-                                         deliverables=["docs/plan.md"], independent=False)),
-                              reply("done")],
-                        dev=member("dev", "api/server.py"), qa=member("qa", "docs/plan.md"))
-        studio, gid, _ = self.studio(script)
-        studio.post(gid, "go", queue=True)
-        task = finished(studio, gid)
-        self.assertEqual(task["metrics"]["parallel_batches"], 0)
-        self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
-        self.assertFalse([e for e in kinds(studio, gid, "delegation") if e.get("reconcile")])
-
-    def test_a_brief_that_names_another_assignment_runs_after_it(self):
-        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                                             deliverables=["api/server.py"], independent=True),
-                                    call("delegate_task", assignee="qa", task="Test api/server.py and write qa/report.md.",
-                                         deliverables=["qa/report.md"], independent=True)),
-                              reply("done")],
-                        dev=[reply("", call("write_file", path="api/server.py", content="x")), reply("dev done")],
-                        qa=[reply("", call("write_file", path="qa/report.md", content="ok")), reply("qa done")])
-        studio, gid, _ = self.studio(script)
-        studio.post(gid, "go", queue=True)
-        self.assertEqual(finished(studio, gid)["metrics"]["parallel_batches"], 0)
-
-    def test_a_refused_assignment_in_a_parallel_batch_does_not_hold_up_the_other(self):
+    def test_a_refused_assignment_does_not_hold_up_the_other(self):
         seen = {}
         script = Script(
             lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                                 deliverables=["api/"], independent=True),
+                                 deliverables=["api/"]),
                         call("delegate_task", assignee="qa", task="Write the test plan in docs/plan.md.",
-                             deliverables=["docs/plan.md"], independent=True,
-                             checks=[{"kind": "exists", "path": "../secret"}])),
+                             deliverables=["docs/plan.md"], checks=[{"kind": "exists", "path": "../secret"}])),
                   lambda m: (seen.__setitem__("results", tool_results(m)), reply("done"))[1]],
             dev=[reply("", call("write_file", path="api/server.py", content="x")), reply("dev done")])
         studio, gid, _ = self.studio(script)
         studio.post(gid, "go", queue=True)
         task = finished(studio, gid, timeout=10)
-        self.assertEqual(task["metrics"]["parallel_batches"], 1)
+        self.assertEqual(task["status"], "completed")
         self.assertIn("dev done", seen["results"][0])
-        self.assertIn("did not run (no teammate's assignment ran)", seen["results"][0])
         self.assertIn("Invalid checks", seen["results"][1])
-
-    def test_overlapping_or_undeclared_files_run_one_after_another(self):
-        spans = {}
-
-        def member(name, path):
-            def first(messages):
-                spans[name] = [time.monotonic()]
-                time.sleep(0.05)
-                return reply("", call("write_file", path=path, content=name))
-            def last(messages):
-                spans[name].append(time.monotonic())
-                return reply(f"{name} done")
-            return [first, last]
-
-        script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Write the user guide.",
-                                             deliverables=["docs/"], independent=True),
-                                    call("delegate_task", assignee="qa", task="Write the release notes.",
-                                         deliverables=["docs/guide.md"], independent=True)),
-                              reply("done")],
-                        dev=member("dev", "docs/guide.md"), qa=member("qa", "docs/notes.md"))
-        studio, gid, _ = self.studio(script)
-        studio.post(gid, "Write a guide", queue=True)
-        task = finished(studio, gid)
-        self.assertEqual(task["metrics"]["parallel_batches"], 0)
-        first, second = sorted(spans.values())
-        self.assertLessEqual(first[1], second[0], "the second assignment started after the first ended")
 
     def test_parallel_hand_offs_can_be_switched_off(self):
         tools = {}
@@ -279,7 +269,7 @@ class CollaborationTest(unittest.TestCase):
         studio, gid, _ = self.studio(respond, team=TeamLimits(lead_max_steps=12, parallel_delegations=False))
         studio.post(gid, "go", queue=True)
         finished(studio, gid)
-        self.assertNotIn("run at the same time", tools["delegate"])
+        self.assertNotIn("start together", tools["delegate"])
 
     # 3 -------------------------------------------------------------------
     def test_review_loop_sends_findings_straight_to_the_author(self):

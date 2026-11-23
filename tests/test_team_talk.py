@@ -129,8 +129,8 @@ class TeamTalkTest(unittest.TestCase):
             answered.set()
             return reply("", call("write_file", path="qa.md", content="Checked"))
         script = Script(default=lambda *_: reply("Reviewed shared files."),
-                        lead=[reply("", delegation("dev", "Publish dev evidence.", independent=True, deliverables=["dev.md"]),
-                                   delegation("qa", "Write independent QA notes.", independent=True, deliverables=["qa.md"])),
+                        lead=[reply("", delegation("dev", "Publish dev evidence.", deliverables=["dev.md"]),
+                                   delegation("qa", "Write independent QA notes.", deliverables=["qa.md"])),
                               reply("Delivered")],
                         qa=[ask_during_work, finish_qa])
         seen = []

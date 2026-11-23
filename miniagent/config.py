@@ -433,7 +433,7 @@ KIND_PROFILES = {
     "make": KindProfile("enabled", "low", 100),
     "check": KindProfile("enabled", "max", 50, browser_timeout=60),
     "fix": KindProfile("enabled", "low", 40),
-    "adapt": KindProfile("disabled", "low", 25, browser=False, tool_timeout=60, background=True),
+    "adapt": KindProfile("disabled", "low", 25, browser=False, tool_timeout=60),
 }
 
 

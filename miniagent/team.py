@@ -62,50 +62,59 @@ MODEL_ERROR_RETRIES = 1
 """After a failed model request, a member continues its own session this many times before reporting."""
 MODEL_ERROR_PAUSE = 5.0
 """Seconds to wait before continuing after a failed model request."""
-RECONCILE_STEPS = 30
-"""Step budget for a teammate's check of its parallel teammates' results."""
-BATCH_WAIT_SECONDS = 6 * 3600
-"""Upper bound on waiting for the rest of a parallel batch (every exit path also releases the wait)."""
 PLAN_NUDGE_STEP = 6
 """Step at which a coordinating lead with no plan and no delegations is reminded once to plan and delegate."""
 
 
-class ParallelBatch:
-    """Delegations the lead started together, joined again before anyone reports (a deferred fan-in).
+class Claim:
+    """One hand-off's hold on its teammates and files, from dispatch until it reports.
 
-    Every member arrives exactly once, with its outcome, with nothing (refused before it ran), or by
-    breaking the batch (a pause or an exception), so no member can wait for one that will never come.
+    Every hand-off in a response starts at once. A hand-off waits only for an earlier, unfinished one
+    that it conflicts with: the same teammate, a file both would write, or a file the earlier one
+    produces that this one reads (declared in ``inputs`` or named in the brief). Earlier means
+    registered earlier, so the waits form no cycle.
     """
 
-    def __init__(self, calls: set[tuple[str, str]]):
-        self.calls = calls
-        self.joined: set[str] = set()
-        self.arrived: set[str] = set()
-        self.outcomes: dict[str, dict] = {}
-        self.broken = False
-        self._cond = threading.Condition()
+    def __init__(self, label: str, members, writes, reads, text: str, background: bool = False):
+        self.label = label
+        self.members = set(members)
+        self.writes = [p for p in (_norm(w) for w in writes) if p]
+        self.reads = [p for p in (_norm(r) for r in reads) if p]
+        self.text = text
+        self.background = background
+        self.started = False
+        self.taken = True
+        """False while announced for a response but not yet picked up by its call."""
+        self.created = time.monotonic()
+        self.in_thread = False
+        """A background hand-off: its run, not its tool call, releases the claim."""
+        self.done = threading.Event()
 
-    def arrive(self, member: str, outcome: dict | None = None) -> None:
-        with self._cond:
-            if outcome is not None:
-                self.outcomes[member] = outcome
-            self.arrived.add(member)
-            self._cond.notify_all()
+    def conflict(self, later: "Claim") -> str:
+        """Why ``later`` must wait for this claim, or "" when they may overlap."""
+        shared = sorted(self.members & later.members)
+        if shared:
+            return f"{', '.join(shared)} works on one assignment at a time"
+        clash = next((w for w in later.writes for mine in self.writes if _overlaps(w, mine)), None)
+        if clash:
+            return f"both write {clash}"
+        read = next((r for r in later.reads for mine in self.writes if _overlaps(r, mine)), None)
+        if read:
+            return f"it reads {read}, which {self.label} produces"
+        named = next((mine for mine in self.writes if _mentions(later.text, mine)), None)
+        if named:
+            return f"its brief names {named}, which {self.label} produces"
+        return ""
 
-    def abort(self) -> None:
-        with self._cond:
-            self.broken = True
-            self._cond.notify_all()
 
-    def wait(self, should_cancel: Callable[[], bool], timeout: float = BATCH_WAIT_SECONDS) -> bool:
-        """True when every member arrived; False if the batch broke, the task was cancelled or time ran out."""
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while len(self.arrived) < len(self.calls) and not self.broken:
-                if should_cancel() or time.monotonic() >= deadline:
-                    return False
-                self._cond.wait(0.5)
-            return not self.broken
+ANNOUNCE_GRACE = 5.0
+"""Seconds after which a hand-off announced for a response but never picked up stops blocking others."""
+
+
+def _claim_args(name: str, args: dict) -> tuple:
+    """A stable key for one hand-off call, to find the claim registered when its response arrived."""
+    return name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+
 
 PLAN_STEP_IDS = {"type":"array", "items":{"type":"string"}, "maxItems":20,
                  "description":"All stable plan step IDs this single handoff covers"}
@@ -205,18 +214,16 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         ]
         if settings.team.parallel_delegations:
             parts.append(
-                "- Assignments that need nothing from each other can run at the same time: call `delegate_task` "
-                "several times in one response, each with its own `deliverables` and the `inputs` it reads (mark one "
-                "`independent: false` to keep the response in order). To run them together, send all of them in the "
-                "same response — a single hand-off cannot overlap with anything. When they finish, each teammate sees the others' results and fixes anything that "
-                "turned out to depend on them. Good candidates: release notes, a user guide or a test plan drafted "
-                "while the build or the tests run; separate research topics for separate researchers. Not "
-                "candidates: anything that reviews, summarises, prices, presents or builds on work that does not "
-                "exist yet — a risk review before the research, an outline before the reporting, client material "
-                "before the analysis. Those go one after another. A check of work that is already finished can run "
-                "alongside other work that does not change it — QA testing the finished build while the release "
-                "notes are drafted from it. When a report comes back, Studio names the plan steps that can start "
-                "together.")
+                "- Work that can overlap goes in one response: every `delegate_task` and `review_loop` you send in "
+                "the same response starts at once. Studio makes one wait only when it must — the same teammate, a "
+                "file both would write, or a file it reads (its `inputs`, or a path named in its brief) that another "
+                "one in progress produces — and its result says what it waited for. So declare `deliverables` and "
+                "`inputs`. Good to overlap: release notes, a user guide or a test plan drafted while the build or the "
+                "tests run; QA testing a finished build while the docs are written from it; separate research topics "
+                "for separate researchers. Not: anything that reviews, summarises, prices or presents work that does "
+                "not exist yet — a risk review before the research, an outline before the reporting, client material "
+                "before the analysis; send that after the work it needs. When a report comes back, Studio names the plan "
+                "steps that can start together.")
         parts.append(
             "- Add `checks` to an assignment when 'done' can be checked mechanically (a file exists, contains a "
             "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
@@ -530,11 +537,13 @@ class TeamTask:
         """Fast mode: members' own work runs on a provider without thinking."""
         self.deadline: float | None = None
         self.parallel_batches = 0
-        self.batch: ParallelBatch | None = None
-        """The parallel batch whose assignments are about to start (see _can_run_together)."""
         self.parallel_reads = 0
-        self.batch_refusals: dict[tuple[str, str], str] = {}
-        """Why delegations sent in one response ran one after another, reported in their results."""
+        self.claims: list[Claim] = []
+        """Hand-offs waiting or running, in dispatch order (see Claim)."""
+        self.announced: dict[tuple, list[Claim]] = {}
+        """Claims registered for a response's hand-offs before their threads start, so order is kept."""
+        self.waiting_turns = 0
+        self.bg_claims: dict[str, Claim] = {}
         self.meter = TaskMeter(notify=lambda text: self.channel.note(self.primary, text))
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
@@ -789,14 +798,7 @@ class TeamTask:
         if team.background_handoffs:
             properties["background"] = {
                 "type": "boolean",
-                "description": ("Start the hand-off and return at once; its report arrives as a message later "
-                                "(default true for adapt, false otherwise)")}
-        if team.parallel_delegations:
-            properties["independent"] = {
-                "type": "boolean",
-                "description": "Hand-offs in one response run at the same time when they go to different teammates "
-                               "and declare separate deliverables; afterwards each teammate checks the others' results. "
-                               "Set false when this one needs another hand-off in the same response to finish first."}
+                "description": "Return at once instead of waiting for the report; it arrives as a message later"}
         if team.resume_members:
             properties["fresh"] = {"type": "boolean",
                                    "description": "Start the teammate in a clean session instead of continuing "
@@ -806,13 +808,15 @@ class TeamTask:
             description=("Give one assignment to one teammate and wait for their report. The teammate works in a "
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report, the published files and the results of any checks."
-                         + (" Several calls in one response run at the same time when they go to different teammates, "
-                            "each declares deliverables and no two share a file." if team.parallel_delegations else "")
+                         + (" Hand-offs in one response start together; one waits only for another it conflicts "
+                            "with (same teammate, a file both write, or a file it reads that the other produces)."
+                            if team.parallel_delegations else "")
                          + (" With background: true it returns at once and the report arrives later."
                             if team.background_handoffs else "")),
             parameters=self._delegate_schema(properties),
             fn=lambda _ctx, args: self._delegate(lead_id, args),
-            concurrent=self._can_run_together if team.parallel_delegations else None)
+            concurrent=self._start_together if team.parallel_delegations else None,
+            phase=1 if team.parallel_delegations else 0)
 
     def _delegate_schema(self, properties: dict) -> dict:
         self.delegate_parameters = {"type": "object", "properties": properties, "required": ["assignee", "task"]}
@@ -842,7 +846,9 @@ class TeamTask:
                 "max_rounds": {"type": "integer", "minimum": 1, "maximum": 5,
                                "description": "Most review rounds (default 3)"},
             }, "required": ["author", "reviewer", "work"]},
-            fn=lambda _ctx, args: self._review_loop(lead_id, args))
+            fn=lambda _ctx, args: self._review(lead_id, args),
+            concurrent=self._start_together if self.settings.team.parallel_delegations else None,
+            phase=1 if self.settings.team.parallel_delegations else 0)
 
     def _wait_tool(self, lead_id: str) -> Tool:
         return Tool(
@@ -853,7 +859,7 @@ class TeamTask:
             parameters={"type": "object", "properties": {
                 "assignees": {"type": "array", "items": {"type": "string", "enum": self._member_ids(lead_id)},
                               "description": "Teammates to wait for (default: every hand-off still running)"}}},
-            fn=lambda _ctx, args: self._wait_handoffs(args))
+            fn=lambda _ctx, args: self._wait_handoffs(args), phase=2)
 
     def _link_lead_prereq_publish(self, lead_id: str, link: dict, inputs: list[str]) -> None:
         """If this hand-off reads files the lead just published, link that publication to the sole unclosed
@@ -972,32 +978,13 @@ class TeamTask:
     def lead_suspended(self) -> bool:
         """The lead is inside a synchronous hand-off, a review loop or wait_handoffs, so it is not reading mail."""
         with self.lock:
-            return self.waiting_handoffs or any(not row.get("background") for row in self.inflight.values())
+            return (self.waiting_handoffs or self.waiting_turns > 0
+                    or any(not row.get("background") for row in self.inflight.values()))
 
     def _wants_background(self, args: dict) -> bool:
         if not self.settings.team.background_handoffs:
             return False
-        flag = args.get("background")
-        if isinstance(flag, bool):
-            return flag
-        kind = args.get("kind")
-        return bool(self.settings.team.handoff_kinds and kind in KIND_PROFILES and KIND_PROFILES[kind].background)
-
-    def _background_conflict(self, assignee: str, deliverables: list[str], inputs: list[str]) -> str:
-        with self.bg_cond:
-            running = {name: list(row["deliverables"]) for name, row in self.background.items()}
-        if assignee in running:
-            return (f"{assignee} is still working on a hand-off in the background. Call wait_handoffs for that "
-                    "report first, or give this assignment to another teammate.")
-        for other, produced in running.items():
-            theirs = [_norm(p) for p in produced if _norm(p)]
-            clash = [p for p in deliverables if any(_overlaps(_norm(p), q) for q in theirs)]
-            reads = [p for p in inputs if any(_overlaps(_norm(p), q) for q in theirs)]
-            if clash or reads:
-                return (f"{other} is still producing {', '.join(clash or reads)} in the background. Call "
-                        "wait_handoffs first, so this hand-off " + ("does not overwrite it." if clash
-                                                                     else "reads the finished version."))
-        return ""
+        return args.get("background") is True
 
     def _provider_for(self, settings: Settings, review: bool) -> Provider:
         """One provider per (model, thinking, effort); the task's own providers are reused when they match."""
@@ -1040,8 +1027,14 @@ class TeamTask:
                                   changes=[c.as_dict() for c in own])
             self.lead_baseline = self.store.project.checkout(workspace)
 
-    def _start_background(self, entry: dict) -> None:
+    def _start_background(self, entry: dict, claim: Claim | None = None) -> None:
         assignee = entry["assignee"]
+        if claim is None:  # a resumed task: the hand-off holds its teammate and files again
+            claim = self._register(Claim(assignee, [assignee], entry["run"]["deliverables"], entry.get("inputs") or [],
+                                         entry["run"]["task"], background=True))
+        claim.started = True
+        claim.in_thread = True
+        self.bg_claims[assignee] = claim
         thread = threading.Thread(target=self._background_run, args=(entry,), daemon=True,
                                   name=f"handoff-{self.task_id}-{assignee}")
         with self.bg_cond:
@@ -1077,6 +1070,7 @@ class TeamTask:
                               steps=0, tool_calls=0, background=True,
                               **({"handoff_kind": entry["kind"]} if entry.get("kind") else {}))
         finally:
+            self._release(self.bg_claims.pop(assignee, None))
             self._background_finished(assignee, text)
 
     def _background_finished(self, assignee: str, text: str) -> None:
@@ -1149,21 +1143,18 @@ class TeamTask:
             result = _combined(result, again)
         return result
 
-    def _notify_background(self, author: str, changes) -> None:
-        """Tell teammates working in the background when files they read or produce were just published."""
+    def _notify_running(self, author: str, changes) -> None:
+        """Tell teammates still working when files they read or produce were just published."""
         if not changes:
             return
-        with self.bg_cond:
-            running = [name for name in self.background if name != author]
-        with self.lock:
-            entries = {name: self.inflight.get(name) for name in running}
         paths = [c.path for c in changes]
-        for name, entry in entries.items():
-            if not entry:
+        with self.lock:
+            running = [c for c in self.claims if c.started and not c.done.is_set() and author not in c.members]
+        for claim in running:
+            hit = [p for p in paths if any(_overlaps(p, w) for w in claim.writes + claim.reads)]
+            if not hit:
                 continue
-            watched = [_norm(p) for p in list(entry.get("inputs") or []) + list(entry["run"]["deliverables"])]
-            hit = [p for p in paths if any(_overlaps(p, w) for w in watched if w)]
-            if hit:
+            for name in sorted(claim.members):
                 self.channel.deliver(name, f"[Studio] {self.group.member(author).name} ({author}) just published "
                                      f"files you read or produce: {', '.join(hit[:20])}. They are in the team "
                                      "project, not in your workspace copy; say in your report if they change your work.")
@@ -1224,102 +1215,99 @@ class TeamTask:
             fn=lambda _ctx, args: self._update_plan(lead_id, args))
 
     # -- delegation ---------------------------------------------------------
-    def _can_run_together(self, batch: list[dict]) -> bool:
-        """Delegations in one response run at once unless one says ``independent: false``: valid arguments,
-        distinct teammates, declared and disjoint files, no brief naming another's files or teammate, budget left.
+    def _claim_for(self, name: str, args: dict) -> Claim:
+        """The claim a hand-off call holds: its teammates, the files it writes and the files it reads."""
+        if name == "review_loop":
+            members = [str(args.get(k, "")).strip() for k in ("author", "reviewer")]
+            return Claim(" and ".join(members), members, args.get("deliverables") or [], [],
+                         str(args.get("work", "")))
+        assignee = str(args.get("assignee", "")).strip()
+        return Claim(assignee, [assignee], args.get("deliverables") or [], args.get("inputs") or [],
+                     str(args.get("task", "")), background=self._wants_background(args))
 
-        Sending several in one response is how the lead expresses parallel intent; the old requirement to
-        also mark each ``independent: true`` was easy to forget and silently serialised the work.
-
-        The lead can still be wrong about independence; the follow-up in _reconcile covers that case.
-        A check (review) may join; it reports without that follow-up, since it judges finished work.
-        """
-        if any(args.get("independent") is False for args in batch):
-            return False  # the lead asked for these to run in order
-        reason = self._batch_refusal(batch)
-        if reason:
-            # No silent fallback: each result says why the hand-offs in this response ran in order.
-            with self.lock:
-                for args in batch:
-                    key = (str(args.get("assignee", "")).strip(), str(args.get("task", "")).strip())
-                    self.batch_refusals[key] = reason
-        return not reason
-
-    def _batch_refusal(self, batch: list[dict]) -> str:
-        """Why these delegations cannot run at once, in words for the lead; "" when they can."""
-        assignees = [str(args.get("assignee", "")).strip() for args in batch]
-        repeated = sorted({a for a in assignees if assignees.count(a) > 1})
-        if repeated:
-            return (f"{', '.join(repeated)} had more than one of them, and one teammate works on one assignment at a "
-                    "time. To overlap them, give the pieces to different teammates or combine them into one assignment.")
-        # A check of finished work may run alongside other work, and a background hand-off starts right away
-        # whatever its position in the response; the rules below refuse any call that reads, names or reviews
-        # what another call in the response produces.
-        schema = getattr(self, "delegate_parameters", None)
-        if schema is None or any(validate_arguments(schema, args) for args in batch):
-            return "one of the calls had invalid arguments"  # a call that never starts could not release its teammates
-        if any(len(str(args.get("task", "")).strip()) < 10 for args in batch):
-            return "one of the briefs was empty or too short"
-        claimed: list[list[str]] = []
-        for name, args in zip(assignees, batch):
-            paths = [_norm(p) for p in args.get("deliverables") or [] if _norm(p)]
-            if not paths:
-                return f"the call for {name} declared no deliverables, so Studio could not rule out a file clash"
-            claimed.append(paths)
-        for i, mine in enumerate(claimed):
-            for j in range(i + 1, len(claimed)):
-                clash = next((a for a in mine for b in claimed[j] if _overlaps(a, b)), None)
-                if clash:
-                    return f"{assignees[i]} and {assignees[j]} would both write {clash}"
-        # Declared inputs make a dependency explicit: nothing may read what another call in the batch produces.
-        for i, args in enumerate(batch):
-            reads = [_norm(p) for p in args.get("inputs") or [] if _norm(p)]
-            for j, theirs in enumerate(claimed):
-                hit = next((a for a in reads for b in theirs if i != j and _overlaps(a, b)), None)
-                if hit:
-                    return f"{assignees[i]} reads {hit}, which {assignees[j]} produces in the same response"
-        # A brief that names another assignment's files or teammate probably needs its output.
-        for i, args in enumerate(batch):
-            text = str(args.get("task", ""))
-            for j in range(len(batch)):
-                named = next((name for name in [*claimed[j], assignees[j]] if i != j and _mentions(text, name)), None)
-                if named:
-                    return f"{assignees[i]}'s brief names {named}, which belongs to {assignees[j]}'s assignment"
+    def _register(self, claim: Claim) -> Claim:
         with self.lock:
-            new = sum(1 for name in assignees if name not in self.inflight)
-            if self.settings.team.max_delegations - self.delegations < new:
-                return "the delegation budget had too few delegations left for all of them"
-            # Only foreground hand-offs are joined (and check each other's results afterwards); background ones
-            # start in their own thread and report through the lead's inbox, as when sent alone.
-            joined = {(a, str(args.get("task", "")).strip()) for a, args in zip(assignees, batch)
-                      if not self._wants_background(args)}
-            # A batch resumed after a pause has lost its finished members; they are not joined again.
-            if new == len(assignees) and len(joined) > 1:
-                self.batch = ParallelBatch(joined)
-        return ""
+            self.claims.append(claim)
+        return claim
 
-    def _join_batch(self, assignee: str, task: str) -> ParallelBatch | None:
+    def _start_together(self, calls: list[tuple[str, dict]]) -> bool:
+        """The hand-offs of one response start together; their claims are registered now, in response order."""
         with self.lock:
-            batch = self.batch
-            if batch and (assignee, task) in batch.calls and assignee not in batch.joined:
-                batch.joined.add(assignee)
-                if len(batch.joined) == len(batch.calls):
-                    self.batch = None
-                return batch
-        return None
+            for name, args in calls:
+                claim = self._claim_for(name, args)
+                claim.taken = False
+                self.announced.setdefault(_claim_args(name, args), []).append(self._register(claim))
+        return True
+
+    def _take_claim(self, name: str, args: dict) -> Claim:
+        with self.lock:
+            queued = self.announced.get(_claim_args(name, args))
+            if queued:
+                claim = queued.pop(0)
+                claim.taken = True
+                return claim
+        return self._register(self._claim_for(name, args))
+
+    def _drop_announced(self, claim: Claim) -> None:
+        with self.lock:
+            for queue in self.announced.values():
+                if claim in queue:
+                    queue.remove(claim)
+        self._release(claim)
+
+    def _release(self, claim: Claim | None) -> None:
+        if claim is None:
+            return
+        claim.done.set()
+        with self.lock:
+            if claim in self.claims:
+                self.claims.remove(claim)
+
+    def _wait_turn(self, claim: Claim) -> list[str]:
+        """Wait for every earlier, unfinished hand-off this one conflicts with; returns why it waited."""
+        with self.lock:
+            position = self.claims.index(claim) if claim in self.claims else len(self.claims)
+            blockers = [(other, why) for other in self.claims[:position]
+                        if not other.done.is_set() and (why := other.conflict(claim))]
+            if blockers:
+                self.waiting_turns += 1
+        waited = []
+        try:
+            for other, why in blockers:
+                while not other.done.wait(0.5):
+                    self.control.boundary()
+                    if self.should_cancel():
+                        return waited
+                    if not other.taken and time.monotonic() - other.created > ANNOUNCE_GRACE:
+                        self._drop_announced(other)  # its call never ran (refused before dispatch or interrupted)
+                        break
+                else:
+                    waited.append(f"Waited for {other.label} to finish before starting: {why}.")
+                # A hand-off stopped by a pause also ends its claim; this one pauses too instead of starting.
+                self.control.boundary()
+        finally:
+            if blockers:
+                with self.lock:
+                    self.waiting_turns -= 1
+        claim.started = True
+        return waited
 
     def _delegate(self, lead_id: str, args: dict) -> ToolResult:
-        assignee = str(args.get("assignee", "")).strip()
-        batch = self._join_batch(assignee, str(args.get("task", "")).strip())
+        claim = self._take_claim("delegate_task", args)
         try:
-            outcome = self._delegate_one(lead_id, args, batch)
-        except BaseException:
-            if batch is not None and assignee not in batch.arrived:
-                batch.abort()  # paused or failed: the others report without the follow-up
-            raise
-        if batch is not None and assignee not in batch.arrived:
-            batch.arrive(assignee)  # refused before it ran; the others still check each other's results
-        return outcome
+            return self._delegate_one(lead_id, args, claim)
+        finally:
+            if not claim.in_thread:  # a background hand-off releases its claim when it reports
+                self._release(claim)
+
+    def _review(self, lead_id: str, args: dict) -> ToolResult:
+        claim = self._take_claim("review_loop", args)
+        try:
+            waited = self._wait_turn(claim)
+            result = self._review_loop(lead_id, args)
+            return result if not waited else ToolResult(ok=result.ok, content="\n".join(waited + [result.content]))
+        finally:
+            self._release(claim)
 
     def _step_link(self, requested, extra=()):
         if not (self.settings.team.plan_links and self.settings.team.plans):
@@ -1336,7 +1324,7 @@ class TeamTask:
             return link, f"Unknown plan steps: {', '.join(invalid)}. Valid step IDs: {', '.join(ids) or '(no plan yet)'}."
         return link, ""
 
-    def _delegate_one(self, lead_id: str, args: dict, batch: ParallelBatch | None) -> ToolResult:
+    def _delegate_one(self, lead_id: str, args: dict, claim: Claim) -> ToolResult:
         assignee = str(args.get("assignee", "")).strip()
         task = str(args.get("task", "")).strip()
         deliverables = [str(p).strip() for p in args.get("deliverables") or [] if str(p).strip()][:40]
@@ -1352,7 +1340,7 @@ class TeamTask:
             kind = "check"  # review: true is the older spelling of a check hand-off
         elif kind is not None:
             review = kind == "check"
-        background = self._wants_background(args) and batch is None
+        background = claim.background
         try:
             checks = validate(list(args.get("checks") or []))
         except ValueError as exc:
@@ -1361,6 +1349,7 @@ class TeamTask:
         missing = []
         # The lead's files go to the project first: inputs it just wrote are present, and the plan sees its outputs.
         self._publish_lead(lead_id)
+        waited = self._wait_turn(claim)
         if inputs:
             manifest = self.store.project.manifest()
             missing = [p for p in inputs if not _present(p, manifest)]
@@ -1371,14 +1360,11 @@ class TeamTask:
         link, warning = self._step_link(args.get("step"), args.get("step_ids", []))
         self._link_lead_prereq_publish(lead_id, link, inputs)
         unclosed = self._unclosed_lead_steps(lead_id, link)
-        conflict = self._background_conflict(assignee, deliverables, inputs)
-        if conflict:
-            return ToolResult.failure(conflict)
         spec = {k: v for k, v in (("kind", kind), ("inputs", inputs or None)) if v}
         if background:
             spec["background"] = True
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
-                               fresh=fresh, checks=checks, review=review, batch=batch, link=link, spec=spec)
+                               fresh=fresh, checks=checks, review=review, link=link, spec=spec, claim=claim)
         if isinstance(outcome, ToolResult):
             return outcome
         if "started" in outcome:
@@ -1389,6 +1375,7 @@ class TeamTask:
                        "when your next step needs it. Until then, do not edit, assign or build on the files it produces."]
             if warning:
                 lines.insert(0, warning)
+            lines[1:1] = waited
             if missing:
                 lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing) + ".")
             if unclosed:
@@ -1403,10 +1390,7 @@ class TeamTask:
                          + ". If the work depended on them, run it again after the step that produces them.")
         if unclosed:
             lines.append(unclosed)
-        with self.lock:
-            refused = self.batch_refusals.pop((assignee, str(args.get("task", "")).strip()), None)
-        if refused:
-            lines.append(f"The hand-offs in that response ran one after another: {refused.rstrip('.')}.")
+        lines.extend(waited)
         if ready := self._ready_note():
             lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
@@ -1415,8 +1399,8 @@ class TeamTask:
 
     def _assign(self, lead_id: str, assignee: str, task: str, *, deliverables: list[str], max_steps=None,
                 fresh: bool = False, checks: list[dict] | None = None, review: bool = False,
-                loop: dict | None = None, batch: ParallelBatch | None = None, link: dict | None = None,
-                spec: dict | None = None) -> dict | ToolResult:
+                loop: dict | None = None, link: dict | None = None,
+                spec: dict | None = None, claim: Claim | None = None) -> dict | ToolResult:
         """Run one member assignment; returns its outcome, or a refusal for the lead.
 
         ``spec`` carries the hand-off kind, its inputs and whether it runs in the background; a background
@@ -1440,93 +1424,21 @@ class TeamTask:
             if isinstance(entry, ToolResult):
                 return entry
             if spec.get("background"):
-                self._start_background(entry)
+                if claim is not None:
+                    claim.in_thread = True  # the background run releases the claim when it reports
+                self._start_background(entry, claim)
                 return {"started": entry}
         member = self.group.member(assignee)
-        if batch is not None:
-            entry["peers"] = sorted(name for name, _ in batch.calls if name != assignee)
-        parallel = None
-        if "first" in entry:  # paused during the follow-up check: finish that check
-            again, more, more_skipped = self._run_member(member, task, deliverables, entry, RECONCILE_STEPS,
-                                                         review=review, reconcile=True)
-            result, changes, skipped = _after_follow_up(entry["first"], again, more, more_skipped)
-            parallel = self._parallel_note(entry["peers"], checked=True)
-        else:
-            result, changes, skipped = self._run_member(member, task, deliverables, entry, max_steps,
-                                                        fresh=fresh, review=review)
-            if batch is not None:
-                result, changes, skipped, parallel = self._reconcile(batch, member, deliverables, entry, review,
-                                                                     result, changes, skipped)
-            elif entry.get("peers"):
-                parallel = self._parallel_note(entry["peers"], reason="the task was paused while they ran")
+        result, changes, skipped = self._run_member(member, task, deliverables, entry, max_steps,
+                                                    fresh=fresh, review=review)
         with self.lock:
             self.inflight.pop(assignee, None)
             self.lead_baseline = self.store.project.checkout(self.store.workspace(lead_id))
-        outcome = self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop,
-                                         entry.get("browser_checks"), entry)
-        if parallel:
-            outcome["parallel"] = parallel
-        return outcome
-
-    def _parallel_note(self, peers: list[str], *, checked: bool = False, reason: str = "") -> str:
-        names = ", ".join(f"{self.group.member(p).name} ({p})" if self._known(p) else p for p in peers)
-        if checked:
-            return f"Ran at the same time as {names}; afterwards checked their results (included in the report)."
-        return (f"Ran at the same time as {names}. The follow-up check against their results did not run ({reason}). "
-                "If this work depends on theirs, delegate a follow-up.")
+        return self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop,
+                                      entry.get("browser_checks"), entry)
 
     def _known(self, member_id: str) -> bool:
         return any(m.id == member_id for m in self.group.members)
-
-    def _reconcile(self, batch: ParallelBatch, member: Member, deliverables, entry, review, result, changes, skipped):
-        """After a parallel batch, each teammate checks the others' results (a deferred join).
-
-        Like a LangGraph node with defer=True, this waits until every branch of the batch has finished.
-        The lead may have been wrong that the assignments were independent; this step is where a teammate
-        replaces assumptions with the others' actual results. Returns (result, changes, skipped, note).
-        """
-        batch.arrive(member.id, {"name": member.name, "status": result.status,
-                                 "report": result.answer or result.error or "(no report)",
-                                 "files": [f"{c.path} ({c.change})" for c in changes]})
-        peers = entry["peers"]
-        if review:  # a check judges finished work; its batch-mates see its findings, it does not review theirs
-            names = ", ".join(f"{self.group.member(p).name} ({p})" if self._known(p) else p for p in peers)
-            return result, changes, skipped, (f"Ran at the same time as {names}. As a check of finished work it "
-                                               "did not review their results; delegate a check if they need one.")
-        if not batch.wait(self.should_cancel):
-            reason = "the task was cancelled" if self.should_cancel() else "a teammate's run was paused or failed"
-            return result, changes, skipped, self._parallel_note(peers, reason=reason)
-        others = [o for key, o in batch.outcomes.items() if key != member.id]
-        if entry.get("report_request"):
-            return result, changes, skipped, self._parallel_note(peers, reason="the lead requested a final report")
-        if result.status in ("error", "cancelled"):
-            return result, changes, skipped, self._parallel_note(peers, reason="this run did not finish")
-        if not others:
-            return result, changes, skipped, self._parallel_note(peers, reason="no teammate's assignment ran")
-        lines = ["While you worked, these teammates finished assignments that ran at the same time as yours:"]
-        if not self.settings.team.resume_members:
-            lines.insert(0, "Your report on your assignment was:\n" + _clip(result.answer or "(no report)", 4000) + "\n")
-        for other in others:
-            lines.append(f"\n### {other['name']} ({other['status']})\nPublished: "
-                         f"{', '.join(other['files']) or 'no files'}\n{_clip(other['report'], 3000)}")
-        lines.append("\nYour assignment ran in parallel on the assumption that it needed nothing from theirs. Check "
-                     "whether that holds. If their results change anything in your work (numbers, facts, assumptions, "
-                     "files you rely on), update your files now and report exactly what you changed. If nothing needs "
-                     "to change, reply 'No change needed' and say why in one sentence.")
-        text = "\n".join(lines)
-        event = self.store.append("delegation", task_id=self.task_id, agent=self.primary, assignee=member.id,
-                                  task=text, deliverables=deliverables, reconcile=True, continues_assignment=entry["seq"],
-                                  **{k:entry[k] for k in ("step", "step_ids") if k in entry})
-        # Kept in the in-flight entry, so a pause during the check can finish it on resume.
-        entry["first"] = {"status": result.status, "answer": result.answer, "error": result.error,
-                          "changes": [c.as_dict() for c in changes], "skipped": list(skipped)}
-        entry["seq"] = event["seq"]
-        entry.pop("baseline", None)  # check out again so the teammates' files are in the workspace
-        again, more, more_skipped = self._run_member(member, text, deliverables, entry, RECONCILE_STEPS,
-                                                     review=review, reconcile=True)
-        combined, merged, all_skipped = _after_follow_up(entry["first"], again, more, more_skipped,
-                                                         first_result=result)
-        return combined, merged, all_skipped, self._parallel_note(peers, checked=True)
 
     def _publish_lead(self, lead_id: str) -> None:
         """Publish the lead's own edits to the team project; a second call publishes nothing new."""
@@ -1611,7 +1523,7 @@ class TeamTask:
                 changes=changes, checked=checked, browser=browser_handoff(browser_checks) if browser_checks else "",
                 verdict=review_verdict(report) if review else ""))
             del self.evidence[:-handoffs.EVIDENCE_KEPT]
-        self._notify_background(assignee, changes)
+        self._notify_running(assignee, changes)
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
                           changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
                           **report_extra)
@@ -1634,8 +1546,6 @@ class TeamTask:
             lines.append("No files were changed by this assignment.")
         if outcome["missing"]:
             lines.append("Expected files that do not exist in the project: " + ", ".join(outcome["missing"]))
-        if outcome.get("parallel"):
-            lines.append(outcome["parallel"])
         if outcome["skipped"]:
             lines.append("Not published (skipped): " + ", ".join(outcome["skipped"][:20]))
         if outcome["checks"]:
@@ -2153,26 +2063,6 @@ def _combined(first: AgentResult, second: AgentResult) -> AgentResult:
     return replace(second, steps=first.steps + second.steps, tool_calls=first.tool_calls + second.tool_calls,
                    usage=first.usage.merged(second.usage), duration_s=round(first.duration_s + second.duration_s, 2),
                    compactions=first.compactions + second.compactions, resumed=first.resumed)
-
-
-def _after_follow_up(first: dict, again: AgentResult, more: list, more_skipped: list, *,
-                     first_result: AgentResult | None = None):
-    """One report for an assignment and its parallel follow-up check."""
-    merged = {c["path"]: Change(**c) for c in first["changes"]}
-    for change in more:  # as seen from before the assignment: a file it added and then edited is "added"
-        earlier = merged.get(change.path)
-        if earlier is not None and earlier.change == "added" and change.change == "deleted":
-            del merged[change.path]
-        elif earlier is not None and earlier.change == "added":
-            merged[change.path] = replace(change, change="added", conflict=earlier.conflict or change.conflict)
-        else:
-            merged[change.path] = change
-    answer = ((first["answer"] or "(no report)") + "\n\nAfter seeing the parallel teammates' results: "
-              + (again.answer or again.error or "(no reply)"))
-    base = _combined(first_result, again) if first_result is not None else again
-    status = first["status"] if again.status == "completed" else again.status
-    result = replace(base, answer=answer, status=status, error=again.error or first["error"])
-    return result, list(merged.values()), list(first["skipped"]) + list(more_skipped)
 
 
 def _last_note(messages: list[dict]) -> str:

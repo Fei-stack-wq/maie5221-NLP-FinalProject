@@ -450,45 +450,50 @@ class Agent:
                         break
                     if response.text.strip():
                         self.emit("say", text=response.text.strip())
+                    calls = self._ordered(calls, messages[-1])
                     pending = calls
                     last_batch = [call.name for call in calls]
                     next_call = 0
                     batch_ok, handed_off = True, False
-                if next_call == 0 and len(pending) > 1 and not self.report_requested():
-                    if control:
-                        control.boundary()
-                    rejoin_batch, in_tool = in_tool, True
-                    try:
-                        together = self._run_together(pending, tool_ctx, rejoining=rejoin_batch)
-                    except BatchPaused as paused:
-                        # Keep what finished; only the paused calls run again on resume.
-                        for index in sorted(paused.done):
-                            call, result = pending[index], paused.done[index]
-                            batch_ok = batch_ok and result.ok
-                            handed_off = handed_off or result.handed_off
-                            tool_calls += 1
-                            messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
-                            guard.record(call.name, call.arguments, result.ok, result.content)
-                        pending = [call for index, call in enumerate(pending) if index not in paused.done]
-                        next_call = 0
-                        raise PauseRequested() from None
-                    if together is None:
-                        in_tool = rejoin_batch
-                    else:
-                        in_tool = False
-                        for call, result in zip(pending, together):
-                            batch_ok = batch_ok and result.ok
-                            handed_off = handed_off or result.handed_off
-                            tool_calls += 1
-                            messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
-                            guard.record(call.name, call.arguments, result.ok, result.content)
-                        next_call = len(pending)
-                for index in range(next_call, len(pending)):
+                index = next_call
+                while index < len(pending):
                     next_call = index
                     call = pending[index]
                     if control:
                         control.boundary()
+                    segment = self._segment(pending, index)
+                    if segment and not self.report_requested() and not self.should_cancel():
+                        rejoin_batch, in_tool = in_tool, True
+                        try:
+                            together = self._run_together([pending[i] for i in segment], tool_ctx,
+                                                          rejoining=rejoin_batch)
+                        except BatchPaused as paused:
+                            # Keep what finished; only the paused calls (and any after them) run again on resume.
+                            done_at = {segment[k]: result for k, result in paused.done.items()}
+                            for at in sorted(done_at):
+                                call, result = pending[at], done_at[at]
+                                batch_ok = batch_ok and result.ok
+                                handed_off = handed_off or result.handed_off
+                                tool_calls += 1
+                                messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
+                                guard.record(call.name, call.arguments, result.ok, result.content)
+                            pending = [c for at, c in enumerate(pending) if at >= index and at not in done_at]
+                            next_call = 0
+                            raise PauseRequested() from None
+                        if together is not None:
+                            in_tool = False
+                            for at, result in zip(segment, together):
+                                call = pending[at]
+                                batch_ok = batch_ok and result.ok
+                                handed_off = handed_off or result.handed_off
+                                tool_calls += 1
+                                messages.append({"role": "tool", "tool_call_id": call.id, "content": result.content})
+                                guard.record(call.name, call.arguments, result.ok, result.content)
+                            index = segment[-1] + 1
+                            continue
+                        in_tool = rejoin_batch
                     executed = index + 1
+                    index += 1
                     if self.report_requested():
                         batch_ok = False
                         messages.append({"role": "tool", "tool_call_id": call.id,
@@ -581,8 +586,39 @@ class Agent:
         return result
 
     # ------------------------------------------------------------------
+    def _phase(self, call: ToolCall) -> int:
+        tool = self.registry.get(call.name)
+        return tool.phase if tool is not None else 0
+
+    def _ordered(self, calls: list[ToolCall], assistant: dict) -> list[ToolCall]:
+        """Hand-offs start after the response's other calls, all together; calls of later phases follow.
+
+        Within one response the model sees no result before all calls finish, so no call can depend on a
+        hand-off's outcome; running plan updates, writes and reads first means the hand-offs see them. The
+        assistant message lists the calls in the same order, so every result follows its call.
+        """
+        ordered = sorted(calls, key=self._phase)
+        if [c.id for c in ordered] != [c.id for c in calls] and assistant.get("tool_calls"):
+            rank = {c.id: n for n, c in enumerate(ordered)}
+            assistant["tool_calls"] = sorted(assistant["tool_calls"], key=lambda row: rank.get(row.get("id"), 0))
+        return ordered
+
+    def _segment(self, pending: list[ToolCall], index: int) -> list[int] | None:
+        """Positions to run together from ``index``: a response made only of reads, or the run of hand-offs."""
+        if index == 0 and len(pending) > 1 and all(getattr(self.registry.get(c.name), "read_only", False)
+                                                    for c in pending):
+            return list(range(len(pending)))
+        if self._phase(pending[index]) != 1:
+            return None
+        end = index
+        while end < len(pending) and self._phase(pending[end]) == 1:
+            end += 1
+        if end - index < 2 or end > self.limits.max_tool_calls_per_step:
+            return None
+        return list(range(index, end))
+
     def _run_together(self, calls: list[ToolCall], ctx: ToolContext, *, rejoining: bool = False) -> list[ToolResult] | None:
-        """Run a batch of calls to one tool concurrently when that tool allows it; results keep call order.
+        """Run reads, or the hand-offs of one response, concurrently when allowed; results keep call order.
 
         Codex dispatches tools that declare parallel support under a shared lock and
         everything else exclusively; here the tool decides per batch from the arguments.
@@ -599,18 +635,18 @@ class Agent:
         if all(tool.read_only for tool in tools):
             label = "reads"
         else:
-            tool = tools[0]
-            if len({call.name for call in calls}) != 1 or tool.concurrent is None:
+            # Hand-offs of different tools (delegate_task, review_loop) may start together.
+            if any(tool.phase != 1 or tool.concurrent is None for tool in tools):
                 return None
             try:
-                if not tool.concurrent([call.arguments for call in calls]):
+                if not tools[0].concurrent([(call.name, call.arguments) for call in calls]):
                     return None
             except Exception:  # noqa: BLE001 - a failing predicate just means "one after another"
                 return None
-            label = tool.name
+            label = calls[0].name if len({call.name for call in calls}) == 1 else "handoffs"
         self.emit("parallel", tool=label, count=len(calls))
-        # Reads share a small pool. A tool's own concurrent batch gets one thread per call: parallel
-        # hand-offs wait for each other before their follow-up check, so none may queue behind another.
+        # Reads share a small pool. Hand-offs get one thread each: one may wait for another to finish,
+        # so none may queue behind another for a thread.
         workers = min(len(calls), 6) if label == "reads" else len(calls)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"{self.name}-tools") as pool:
             futures = [pool.submit(self._execute, call, ctx, rejoining=rejoining) for call in calls]

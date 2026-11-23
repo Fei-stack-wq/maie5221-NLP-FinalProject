@@ -19,7 +19,7 @@ class HandoffKindsUITest(unittest.TestCase):
                 lead=[reply("", call("delegate_task", assignee="dev", task="Build the export button.",
                                      deliverables=["app.py"], kind="make")),
                       reply("", call("delegate_task", assignee="writer", task="Write the release notes.",
-                                     deliverables=["RELEASE_NOTES.md"], kind="adapt")),
+                                     deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
                       reply("", call("wait_handoffs")), reply("Shipped.")],
                 dev=[reply("built")], writer=[reply("notes written")])
             provider = FakeProvider(script)

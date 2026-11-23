@@ -66,13 +66,10 @@ def lead_guidance(*, kinds: bool, background: bool) -> list[str]:
             "builds on in `inputs`: Studio includes their contents, so the teammate starts at once.")
     if background:
         parts.append(
-            "- `background: true` starts a hand-off and returns at once, so you can keep working"
-            + ("; `adapt` hand-offs run in the background unless you set `background: false`" if kinds else "")
-            + ". Its report arrives as a message at your next step after it finishes. Call `wait_handoffs` when "
-            "your next step needs a result, or when you have nothing else to do — before your final answer. "
-            "While it runs, do not edit, assign or build on the files it produces. Sent in the same response as "
-            "other hand-offs, it starts at the same time as them, wherever it appears, as long as it neither reads "
-            "nor names what they produce; otherwise the response runs in order.")
+            "- `background: true` starts a hand-off and returns at once, so you can keep working. Its report "
+            "arrives as a message at your next step after it finishes. Call `wait_handoffs` when your next step "
+            "needs a result, or when you have nothing else to do — before your final answer. While it runs, do not "
+            "edit or build on the files it produces.")
     return parts
 
 

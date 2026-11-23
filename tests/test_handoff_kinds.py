@@ -180,7 +180,7 @@ class HandoffKindsTest(unittest.TestCase):
 
         script = Script(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], kind="adapt")),
+                                 deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
                   lead_second,
                   lambda m: (seen.__setitem__("waited", tool_results(m)[-1]),
                              reply("", call("read_file", path="RELEASE_NOTES.md")))[1],
@@ -211,7 +211,7 @@ class HandoffKindsTest(unittest.TestCase):
 
         script = Script(
             lead=[reply("", call("delegate_task", assignee="writer", task="Draft the announcement post.",
-                                 deliverables=["post.md"], kind="adapt")),
+                                 deliverables=["post.md"], kind="adapt", background=True)),
                   lead_second,
                   lambda m: (seen.__setitem__("notes", notes(m)), reply("done"))[1]],
             writer=[reply("", call("write_file", path="post.md", content="post\n")), reply("Post drafted.")])
@@ -236,7 +236,7 @@ class HandoffKindsTest(unittest.TestCase):
 
         script = Script(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], kind="adapt")),
+                                 deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
                   lead_second,
                   lambda m: (seen.update(follow_up=notes(m)[-1], waited=tool_results(m)[-1]),
                              reply("final with notes"))[1]],
@@ -250,34 +250,33 @@ class HandoffKindsTest(unittest.TestCase):
         self.assertEqual(task["final_answer"], "final with notes")
         self.assertEqual([e["text"] for e in self.chat(studio, gid, "final")], ["final with notes"])
 
-    def test_busy_assignee_and_files_in_progress_are_refused(self):
-        release, seen = threading.Event(), {}
+    def test_a_hand_off_waits_for_a_busy_teammate_and_for_files_still_being_written(self):
+        go, seen = threading.Event(), {}
 
         def writer_first(m):
-            release.wait(5)
+            go.wait(5)
             return reply("notes written")
 
-        def lead_third(m):
-            seen["refusals"] = tool_results(m)[-2:]
-            release.set()
-            return reply("", call("wait_handoffs"))
+        def lead_second(m):
+            go.set()
+            return reply("", call("delegate_task", assignee="writer", task="Also write the blog post.", kind="adapt"),
+                         call("delegate_task", assignee="dev", task="Fix typos in the release notes.",
+                              deliverables=["RELEASE_NOTES.md"], kind="fix"))
 
         script = Script(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], kind="adapt")),
-                  reply("", call("delegate_task", assignee="writer", task="Also write the blog post.", kind="adapt",
-                                 background=False),
-                        call("delegate_task", assignee="dev", task="Fix typos in the release notes.",
-                             deliverables=["RELEASE_NOTES.md"], kind="fix")),
-                  lead_third, reply("done")],
-            writer=[writer_first])
+                                 deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
+                  lead_second,
+                  lambda m: (seen.__setitem__("results", tool_results(m)[-2:]), reply("done"))[1]],
+            writer=[writer_first, reply("blog written")], dev=[reply("typos fixed")])
         studio, gid, _ = self.studio(script)
         studio.post(gid, "Release v1", queue=True)
         task = finished(studio, gid)
-        busy, files = seen["refusals"]
-        self.assertIn("writer is still working on a hand-off in the background", busy)
-        self.assertIn("still producing RELEASE_NOTES.md in the background", files)
-        self.assertEqual(task["delegations"], 1)
+        blog, typos = seen["results"]
+        self.assertIn("Waited for writer to finish before starting: writer works on one assignment at a time.", blog)
+        self.assertIn("blog written", blog)
+        self.assertIn("Waited for writer to finish before starting: both write RELEASE_NOTES.md.", typos)
+        self.assertEqual(task["delegations"], 3)
 
     def test_switches_off_restore_the_synchronous_untagged_hand_off(self):
         team = TeamLimits(lead_max_steps=12, handoff_kinds=False, background_handoffs=False, preload_inputs=False,
@@ -350,7 +349,7 @@ class BackgroundPauseTest(unittest.TestCase):
 
         self.script.queues.update(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], kind="adapt")),
+                                 deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
                   lead_second,
                   lambda m: (seen.__setitem__("waited", tool_results(m)[-1]), reply("shipped"))[1]],
             writer=[writer_first, reply("Release notes written.")])
@@ -386,7 +385,7 @@ class BackgroundPauseTest(unittest.TestCase):
 
         self.script.queues.update(
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
-                                 deliverables=["RELEASE_NOTES.md"], kind="adapt")),
+                                 deliverables=["RELEASE_NOTES.md"], kind="adapt", background=True)),
                   lead_second,
                   lambda m: (seen.__setitem__("waited", tool_results(m)[-1]), reply("final with notes"))[1]],
             writer=[writer_first, reply("Release notes written.")])

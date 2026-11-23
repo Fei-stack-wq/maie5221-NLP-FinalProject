@@ -1,7 +1,7 @@
 """Pausing in the middle of parallel hand-offs or a review loop, restarting Studio, and resuming.
 
-A finished parallel hand-off must not run again, the paused one continues where it
-stopped, a review loop continues the same round, and member sessions survive the
+A finished hand-off from the same response must not run again, the paused one continues
+where it stopped, a review loop continues the same round, and member sessions survive the
 checkpoint's JSON round trip.
 """
 from __future__ import annotations
@@ -64,9 +64,9 @@ class PauseCollaborationTest(unittest.TestCase):
         seen = {}
         self.script.queues.update(
             lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                                 deliverables=["api/"], independent=True),
+                                 deliverables=["api/"]),
                         call("delegate_task", assignee="qa", task="Write the test plan in docs/test-plan.md.",
-                             deliverables=["docs/test-plan.md"], independent=True)),
+                             deliverables=["docs/test-plan.md"])),
                   lambda m: (seen.__setitem__("results", tool_results(m)), reply("both done"))[1]],
             dev=[reply("", call("write_file", path="api/server.py", content="server\n")), dev_last],
             qa=[qa_first, reply("qa wrote the test plan")])
@@ -87,39 +87,27 @@ class PauseCollaborationTest(unittest.TestCase):
         ids = [e["call_id"] for e in trace if e["type"] == "tool_call"]
         self.assertEqual(len(ids), len(set(ids)), "no tool call was announced twice")
 
-    def test_pause_during_the_parallel_follow_up_check_finishes_it_on_resume(self):
-        def dev_check(messages):
-            self.assertIn("qa wrote the test plan", messages[-1]["content"])
-            self.request_pause()  # dev pauses before running this tool call
-            return reply("", call("write_file", path="api/server.py", content="server v2\n"))
+    def test_pause_while_a_hand_off_waits_for_another_resumes_both(self):
+        def dev_first(messages):
+            self.request_pause()  # qa is waiting for dev's api/server.py; dev pauses before writing it
+            return reply("", call("write_file", path="api/server.py", content="server\n"))
 
         seen = {}
         self.script.queues.update(
             lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
-                                 deliverables=["api/"], independent=True),
-                        call("delegate_task", assignee="qa", task="Write the test plan in docs/test-plan.md.",
-                             deliverables=["docs/test-plan.md"], independent=True)),
+                                 deliverables=["api/server.py"]),
+                        call("delegate_task", assignee="qa", task="Test the backend and write qa/report.md.",
+                             deliverables=["qa/report.md"], inputs=["api/server.py"])),
                   lambda m: (seen.__setitem__("results", tool_results(m)), reply("both done"))[1]],
-            dev=[reply("", call("write_file", path="api/server.py", content="server\n")),
-                 reply("dev wrote api/server.py"), dev_check, reply("Updated the server after reading the plan.")],
-            qa=[reply("", call("write_file", path="docs/test-plan.md", content="plan\n")),
-                reply("qa wrote the test plan"), reply("No change needed: the plan stands.")])
+            dev=[dev_first, reply("dev wrote api/server.py")],
+            qa=[lambda m: (seen.__setitem__("qa_saw", "=== api/server.py ===\nserver" in m[1]["content"]), reply("qa tested it"))[1]])
         self.tid = self.studio.post(self.gid, "Start", queue=True)["task_id"]
         store = self.paused_then_restarted()
-
-        record = store.load_task(self.tid)
-        self.assertEqual((record["final_answer"], record["delegations"]), ("both done", 2))
-        self.assertEqual(len(self.provider.for_agent("dev")), 4, "dev's check continued from its pause frame")
-        by_member = {r.splitlines()[0].split(" — ")[0]: r for r in seen["results"]}
-        dev_result, qa_result = by_member["Report from Developer (dev)"], by_member["Report from Tester (qa)"]
-        self.assertIn("dev wrote api/server.py", dev_result, "the first report survived the restart")
-        self.assertIn("After seeing the parallel teammates' results: Updated the server after reading the plan.",
-                      dev_result)
-        self.assertIn("api/server.py (added)", dev_result)
-        self.assertIn("After seeing the parallel teammates' results: No change needed", qa_result)
-        self.assertEqual((store.project.root / "api/server.py").read_text(), "server v2\n")
-        kinds = [e["kind"] for e in store.chat() if e.get("task_id") == self.tid]
-        self.assertEqual(kinds.count("report"), 2)
+        self.assertEqual(store.load_task(self.tid)["final_answer"], "both done")
+        self.assertTrue(seen["qa_saw"], "qa started after dev's file existed, with its contents preloaded")
+        self.assertIn("Waited for dev to finish before starting: it reads api/server.py, which dev produces.",
+                      seen["results"][1])
+        self.assertEqual(len(self.provider.for_agent("qa")), 1, "qa ran once, after the resume")
 
     def test_pause_inside_a_review_loop_resumes_the_same_round(self):
         def dev_fix(messages):
