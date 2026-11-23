@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import sys
 import threading
 import time
@@ -46,10 +47,50 @@ def _template(name: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def reopen_studio(directory, args):
+    from .instance import PACKAGE, registered_studio, runtime_version, wait_for_instance
+    owner = wait_for_instance(directory)
+    if not owner:
+        return None  # A closing owner can release the data lock without registering again.
+    if args.strict_port and owner.port != args.port:
+        print(f"此工作室已在 {owner.url} 运行。请先关闭该实例，再用固定端口 {args.port} 启动。", file=sys.stderr)
+        return 1
+    if not owner.version:
+        print("当前实例早于自动更新功能。请在任务结束后关闭旧服务，再双击启动一次。")
+    elif owner.version == runtime_version():
+        print(f"Studio 已在运行：{owner.url}")
+    elif owner.source != str(PACKAGE):
+        print(f"此数据目录正由另一份 Studio 代码使用：{owner.source}。请从该目录启动更新。")
+    else:
+        # Only the verified owner watches this instance-specific local file.
+        (directory / (".studio-update-" + owner.id)).touch()
+        if owner.busy:
+            print("有可用更新。当前任务和对话处理完后会自动切换，期间可继续使用。")
+        else:
+            print("发现新版，正在等待工作室切换…", flush=True)
+            replacement = wait_for_instance(directory, previous=owner.id, timeout=8)
+            if replacement:
+                if replacement.port != owner.port or replacement.source != owner.source:
+                    print("工作室的监听地址或来源在切换期间发生变化，请重新启动。", file=sys.stderr)
+                    return 1
+                owner = replacement
+            else:
+                current = registered_studio(directory)
+                if not current:
+                    print("新版尚未就绪，请查看 Studio 启动窗口。", file=sys.stderr)
+                    return 1
+                owner = current
+                print("工作室仍在处理请求，会在空闲时自动切换。")
+    if not args.no_browser:
+        webbrowser.open(owner.url)
+    return 0
+
+
 def cmd_studio(args) -> int:
     import signal
     settings = _settings(args)
-    from .instance import advertised_studio
+    from .instance import RestartStudio, advertised_studio, runtime_version
+    version = runtime_version()
     from .server import serve
     studio = Studio(settings)
     studio.env_file = Path(args.env_file or ".env").resolve()
@@ -62,7 +103,7 @@ def cmd_studio(args) -> int:
             return 1
         raise
     try:
-        with advertised_studio(settings.runs_dir, main.server_port, main.RequestHandlerClass.instance_id):
+        with advertised_studio(settings.runs_dir, main.server_port, main.RequestHandlerClass.instance_id, version) as update:
             studio.restore_queue()
             url = f"http://127.0.0.1:{main.server_address[1]}/"
             print(f"miniagent Studio: {url}  (project previews on port {preview.server_address[1]})")
@@ -75,8 +116,10 @@ def cmd_studio(args) -> int:
             if main_thread:
                 previous = signal.signal(signal.SIGTERM, signal.default_int_handler)
             try:
-                while True:
-                    time.sleep(3600)
+                while not update.exists():
+                    time.sleep(0.4)
+                studio.drain_for_update()
+                raise RestartStudio(main.server_port)
             finally:
                 if main_thread:
                     signal.signal(signal.SIGTERM, previous)
@@ -338,24 +381,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "studio" and args.strict_port and not 1 <= args.port <= 65535:
         parser.error("--strict-port requires a port between 1 and 65535")
     if args.command in {"studio", "demo", "run", "team", "migrate", "eval"}:
-        from .instance import session_lock, StudioInUse, wait_for_studio
+        from .instance import RestartStudio, session_lock, StudioInUse
         directory = _settings(args).runs_dir
         try:
-            with session_lock(directory):
-                return args.fn(args)
-        except StudioInUse as exc:
-            if args.command == "studio" and args.reuse:
-                url = wait_for_studio(directory)
-                if url:
-                    if args.strict_port and url != f"http://127.0.0.1:{args.port}/":
-                        print(f"此工作室已在 {url} 运行。请先关闭该实例，再用固定端口 {args.port} 启动。", file=sys.stderr)
+            for _ in range(2):
+                try:
+                    with session_lock(directory):
+                        return args.fn(args)
+                except StudioInUse as exc:
+                    if args.command != "studio" or not args.reuse:
+                        print(str(exc), file=sys.stderr)
                         return 1
-                    print(f"Studio 已在运行：{url}")
-                    if not args.no_browser:
-                        webbrowser.open(url)
-                    return 0
-                print(f"数据目录正在使用：{directory.resolve()}。请查看已运行的 Studio 窗口或稍后重试。", file=sys.stderr)
-                return 1
-            print(str(exc), file=sys.stderr)
+                    reopened = reopen_studio(directory, args)
+                    if reopened is not None:
+                        return reopened
+            print(f"数据目录正在使用：{directory.resolve()}。请查看已运行的 Studio 窗口或稍后重试。", file=sys.stderr)
             return 1
+        except RestartStudio as restart:
+            # The old listeners and directory lock are now released. Re-enter normally so a
+            # simultaneous double-click still has to win the same exclusive data lock.
+            launch = [sys.executable, "-u", "-m", "miniagent", "--runs-dir", str(directory.resolve())]
+            if args.env_file:
+                launch.extend(["--env-file", args.env_file])
+            if args.thinking:
+                launch.extend(["--thinking", args.thinking])
+            os.execv(sys.executable, [*launch, "studio", "--port", str(restart.args[0]),
+                                      "--strict-port", "--reuse", "--no-browser"])
     return args.fn(args)

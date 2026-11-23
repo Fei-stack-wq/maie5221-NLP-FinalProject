@@ -88,6 +88,19 @@ async function api(path, options = {}) {
   }
   if (init.method && init.method !== "GET") init.headers["X-Studio-Token"] = state.config.token;
   const response = await fetch("/api" + path, init);
+  const instance = response.headers.get("X-Studio-Instance");
+  if (instance) {
+    state.instance ??= instance;
+    const changed = state.instance !== instance;
+    const banner = $("#studio-update");
+    if (changed || response.headers.get("X-Studio-Update") === "pending") {
+      banner.hidden = false;
+      banner.firstElementChild.textContent = changed
+        ? "工作室已更新。准备好后刷新页面即可使用新版。"
+        : "有可用更新，当前任务和对话处理完后将自动切换。";
+      banner.querySelector("button").hidden = !changed;
+    }
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || response.statusText);
   return data;
@@ -982,6 +995,7 @@ function setupComposer() {
 // ---------------------------------------------------------------- boot
 async function boot() {
   if (window.markdownit) md = window.markdownit({ html: false, linkify: true, breaks: true });
+  $("#studio-update button").addEventListener("click", () => location.reload());
   state.config = await api("/bootstrap");
   state.templates = state.config.templates;
   if (!state.config.chat_protocol) {

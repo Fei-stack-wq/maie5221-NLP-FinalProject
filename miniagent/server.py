@@ -87,6 +87,12 @@ class StudioHandler(_Base):
     preview_port: int
     instance_id: str
 
+    def end_headers(self):
+        self.send_header("X-Studio-Instance", self.instance_id)
+        if self.studio.update_pending:
+            self.send_header("X-Studio-Update", "pending")
+        super().end_headers()
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -120,9 +126,11 @@ class StudioHandler(_Base):
     def _api_get(self, parts: list[str], query: dict):
         studio = self.studio
         if parts == ["instance"]:
-            return self._json(200, {"id": self.instance_id})
+            return self._send(200, json.dumps({"id": self.instance_id}).encode(), "application/json",
+                              {"X-Studio-Busy": "1" if studio.busy else "0"})
         if parts == ["assistant"]:
-            return self._json(200, studio.assistant())
+            with studio.writing_request():  # first visit can create the assistant room
+                return self._json(200, studio.assistant())
         if parts == ["bootstrap"]:
             return self._json(200, {"token":self.studio_token, "templates":templates(), "has_key":bool(studio.settings.api_key),
                                     "model":studio.settings.model,"thinking":studio.settings.thinking,
@@ -239,6 +247,13 @@ class StudioHandler(_Base):
         return data
 
     def _mutating(self, method: str):
+        try:
+            with self.studio.writing_request():
+                return self._apply_mutation(method)
+        except StudioError as exc:
+            return self._json(exc.status, {"error": str(exc)})
+
+    def _apply_mutation(self, method: str):
         if (not self._host_ok() or self.headers.get("Origin") != "http://" + self.headers.get("Host", "")
                 or self.headers.get("X-Studio-Token") != self.studio_token):
             self.close_connection = True

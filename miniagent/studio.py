@@ -14,7 +14,7 @@ import threading
 import uuid
 import zipfile
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -89,6 +89,8 @@ class Studio:
         self.roles = Roles(settings.runs_dir)
         self.uploads = Uploads(settings.runs_dir)
         self._closed = False
+        self._active_requests = 0
+        self.update_pending = False
         self.store = Store(settings.runs_dir)
         self.provider_factory = provider_factory or deepseek_factory
         self._running: dict[str, Running] = {}
@@ -816,6 +818,31 @@ class Studio:
 
     def tasks(self, group_id: str) -> list[dict]:
         return self.group(group_id).tasks()
+
+    @contextmanager
+    def writing_request(self):
+        with self._lock:
+            if self._closed:
+                raise StudioError("工作室正在切换版本，请稍后重试。", 503)
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._dispatch_changed:
+                self._active_requests -= 1
+                self._dispatch_changed.notify_all()
+
+    @property
+    def busy(self):
+        with self._lock:
+            return bool(self._running or self._active_requests)
+
+    def drain_for_update(self):
+        with self._dispatch_changed:
+            self.update_pending = True
+            self._dispatch_changed.wait_for(lambda: not self.busy)
+            # Admit no new writes between the idle decision and listener shutdown.
+            self._closed = True
 
     def close(self) -> None:
         with self._lock:

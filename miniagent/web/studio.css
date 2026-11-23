@@ -61,6 +61,8 @@
 #workspace-choice:hover { color: var(--cobalt-deep); border-color: #c7cfea; background: var(--cobalt-mist); }
 .workspace-path { display: block; overflow-wrap: anywhere; user-select: all; background: var(--paper-2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-family: var(--mono); font-size: 12px; }
 .workspace-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+#main:has(#studio-update:not([hidden])) { flex-direction: column; }
+#main:has(#studio-update:not([hidden])) #room { min-height: 0; }
 .key-banner {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   width: min(820px, calc(100% - 32px)); margin: 14px auto 0; padding: 11px 12px 11px 16px; border-radius: 12px;

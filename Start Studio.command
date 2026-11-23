@@ -1,5 +1,5 @@
 #!/bin/zsh
-# macOS: double-click to open the local workspace. No model task starts here.
+# Reopen the fixed local Studio; --reuse applies code updates once the service is idle.
 set -eu
 cd -- "$(dirname -- "$0")"
 if [[ ! -x .venv/bin/python ]]; then
