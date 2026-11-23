@@ -102,6 +102,22 @@ changed.
 | Dependency-aware planning (`delegate_task.inputs`, plan steps with `after`) | CrewAI validates that an asynchronous task does not take another concurrent asynchronous task as context and that no task depends on a later one: [`validate_async_task_cannot_include_sequential_async_tasks_in_context` and `validate_context_no_future_tasks`](https://github.com/crewAIInc/crewAI/blob/56c26a7fb3ece62c64de52e8b4228d15c9c81492/lib/crewai/src/crewai/crew.py#L857-L899) (MIT) | Work that runs at the same time must not consume each other's output; dependencies point backwards. | A hand-off names the project files it reads (`inputs`); calls run together only if none reads another's deliverables, on top of the existing `independent` flag, disjoint files and follow-up check. Inputs reach the member as "read these first", and inputs missing from the project are reported to the lead. Plan steps may name earlier steps in `after` (later ones are refused); the tool reply lists the steps that are ready together, and the chat shows what a step waits for. The lead's prompt names safe pairs (release notes, guides or test plans drafted while the build or tests run; separate research topics) and unsafe ones (a risk review before the research, an outline before the reporting, client material before the analysis), after the fund run of 22 Nov started a risk review in parallel with its research. |
 | Fast mode (`fast_profile`, run option `mode: fast`, composer toggle ⚡ 快速) | aider's architect mode: the main model plans and hands each answer to a separate editor model that makes the edits ([`ArchitectCoder`](https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/coders/architect_coder.py#L6-L48), [`editor_model` settings](https://github.com/Aider-AI/aider/blob/5dc9490bb35f9729ef2c95d00a19ccd30c26339c/aider/models.py#L145-L146)) (Apache-2.0) | The model that decides reasons; the model that executes is the cheaper, faster one. | DeepSeek needs the same thinking setting across one conversation, so the split is per agent: the lead and reviewers keep thinking at low effort, members' own work runs without thinking, all on `deepseek-flash`. The task has a hard 15-minute limit (every run gets the time that is left and then writes its report), a soft 10-minute budget that warns the lead, 30 member and 25 lead steps, four hand-offs, at most two review rounds, two-minute tool timeouts, and no plan updates or lessons. Prompts ask for the simplest working result and for what was left out. A `thinking: disabled` choice also turns the lead's thinking off. The quality cost has not been measured yet; `bench --arms fast` is the comparison. |
 
+### Browser checks
+
+Every context created through the supplied `browser` inherits a 5 s action timeout and a
+15 s navigation timeout, including the implicit context owned by `browser.new_page()`.
+A page or operation can override these defaults. Studio closes all the call's contexts on exit.
+Playwright implements the standalone page with an owned context. [Playwright Python browser source (v1.48.0)](https://github.com/microsoft/playwright-python/blob/v1.48.0/playwright/_impl/_browser.py)
+
+For automatic refresh or polling, pass `virtual_time: true` to `run_browser`.
+Studio installs Playwright Clock before the script navigates. After loading the page
+and changing the underlying data, call `page.clock.fast_forward(30_000)` for a 30 s
+interval and assert that the updated data appears. Each independent context has its
+own clock. Ordinary checks use real time by default, and network requests and the
+application server still run in real time. The browser regressions exercise periodic
+fetches in fresh windows through both warm and cold runners.
+[Playwright Clock source (v1.48.0)](https://github.com/microsoft/playwright-python/blob/v1.48.0/playwright/_impl/_clock.py) · [Playwright Clock guide](https://playwright.dev/python/docs/clock)
+
 ## Components
 
 **`agent.py`** — `Agent.run(task, context)`: messages are `[system, context+task,

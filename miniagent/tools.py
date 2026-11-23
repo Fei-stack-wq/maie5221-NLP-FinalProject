@@ -450,12 +450,17 @@ def _build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                          "local server you started with run_shell. Interact, assert and print what you observed; an "
                          "exception or failed assertion gives a non-zero exit code. Browser console errors are "
                          "reported at the end. Each call gets a fresh browser context (no cookies or storage from "
-                         "earlier calls). Actions and expect() fail after 5 s and navigation after 15 s; pass "
+                         "earlier calls). New windows inherit the 5 s action and 15 s navigation defaults; "
+                         "expect() waits up to 5 s. For polling or auto-refresh checks set virtual_time=true, "
+                         "advance the page clock by the app's interval, then assert the visible result. Pass "
                          "timeout= only for a step you know is slower. Wait for what you need with expect(...) or "
                          "wait_for_selector instead of fixed sleeps, and check several things in one script."),
             parameters={"type": "object", "properties": {
                 "code": {"type": "string", "description": "Python source using the Playwright sync API"},
                 "cwd": {"type": "string", "description": "Workspace-relative working directory (default: workspace root)"},
+                "virtual_time": {"type": "boolean", "description": "Install Playwright Clock before navigation in each "
+                                 "browser context. Use page.clock.fast_forward(milliseconds) for client timers. "
+                                 "Network and server time stay real. Defaults to false."},
                 "timeout": {"type": "number", "description": "Seconds, default 120"},
             }, "required": ["code"]},
             fn=run_browser,

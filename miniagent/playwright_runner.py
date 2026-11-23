@@ -1,6 +1,6 @@
 """Subprocess entry point for ``run_browser``: launch Chromium, run the agent's script.
 
-Usage: ``python playwright_runner.py <browsers_path> <home> <workspace> <code>``
+Usage: ``python playwright_runner.py <browsers_path> <home> <workspace> <code> [--virtual-time]``
 or ``python playwright_runner.py --serve <browsers_path> <home>`` to keep one Chromium
 open and run one JSON request per stdin line (``{"cwd": ..., "code": ...}``), answering
 each with one JSON line (``{"status", "stdout", "stderr"}``). Every request still gets
@@ -14,7 +14,8 @@ they are the most common reason a generated web page "does nothing".
 """
 from __future__ import annotations
 
-import io
+from contextlib import contextmanager
+from functools import wraps
 import json
 import os
 import shutil
@@ -67,7 +68,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         browser = _launch(playwright.chromium, Error)
         try:
-            return _run_script(browser, playwright, expect, Error, workspace, code)
+            return _run_script(browser, playwright, expect, Error, workspace, code, "--virtual-time" in sys.argv[5:])
         finally:
             try:
                 browser.close()
@@ -75,19 +76,55 @@ def main() -> int:
                 pass
 
 
-def _run_script(browser, playwright, expect, error, workspace: str, code: str) -> int:
+@contextmanager
+def _script_contexts(browser, virtual_time, error):
+    # Configure both public factories before returning control to the script. browser.new_page()
+    # owns its implicit context, so keep Playwright's original factory and close semantics.
+    new_context, new_page = browser.new_context, browser.new_page
+
+    def configure(context):
+        context.set_default_timeout(ACTION_TIMEOUT_MS)
+        context.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+        if virtual_time:
+            context.clock.install()
+
+    @wraps(new_context)
+    def configured_context(**options):
+        context = new_context(**options)
+        configure(context)
+        return context
+
+    @wraps(new_page)
+    def configured_page(**options):
+        page = new_page(**options)
+        configure(page.context)
+        return page
+
+    browser.new_context, browser.new_page = configured_context, configured_page
+    try:
+        yield
+    finally:
+        browser.new_context, browser.new_page = new_context, new_page
+        # The warm process belongs to one role, but all its contexts belong to this call.
+        for context in browser.contexts:
+            try:
+                context.close()
+            except error:
+                pass
+
+
+def _run_script(browser, playwright, expect, error, workspace: str, code: str, virtual_time: bool = False) -> int:
     console: list[str] = []
-    context = browser.new_context(viewport={"width": 1280, "height": 800})
-    context.set_default_timeout(ACTION_TIMEOUT_MS)
-    context.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
-    page = context.new_page()
-    page.on("console", lambda m: console.append(f"console.{m.type}: {m.text}") if m.type in {"error", "warning"} else None)
-    page.on("pageerror", lambda e: console.append(f"uncaught page error: {e}"))
-    scope = {"page": page, "context": context, "browser": browser, "playwright": playwright, "expect": expect,
-             "__name__": "__main__", "WORKSPACE": Path(workspace)}
     status = 0
     try:
-        exec(compile(code, "<run_browser>", "exec"), scope)
+        with _script_contexts(browser, virtual_time, error):
+            context = browser.new_context(viewport={"width": 1280, "height": 800})
+            page = context.new_page()
+            page.on("console", lambda m: console.append(f"console.{m.type}: {m.text}") if m.type in {"error", "warning"} else None)
+            page.on("pageerror", lambda e: console.append(f"uncaught page error: {e}"))
+            scope = {"page": page, "context": context, "browser": browser, "playwright": playwright, "expect": expect,
+                     "__name__": "__main__", "WORKSPACE": Path(workspace)}
+            exec(compile(code, "<run_browser>", "exec"), scope)
     except SystemExit as exc:
         status = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
     except BaseException:  # noqa: BLE001 - report every failure of the agent's script
@@ -96,10 +133,6 @@ def _run_script(browser, playwright, expect, error, workspace: str, code: str) -
     finally:
         if console:
             print("\n[browser console]\n" + "\n".join(console[:60]), file=sys.stderr)
-        try:
-            context.close()
-        except error:
-            pass
     return status
 
 
@@ -138,7 +171,8 @@ def serve() -> int:
                     os.chdir(request["cwd"])
                     if not browser.is_connected():  # the previous script closed it
                         browser = _launch(playwright.chromium, Error)
-                    status = _run_script(browser, playwright, expect, Error, request["workspace"], request["code"])
+                    status = _run_script(browser, playwright, expect, Error, request["workspace"], request["code"],
+                                         request.get("virtual_time", False))
                 except BaseException:  # noqa: BLE001 - keep serving after any single failure
                     traceback.print_exc()
                     status = 1

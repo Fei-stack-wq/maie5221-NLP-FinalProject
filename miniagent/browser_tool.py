@@ -108,7 +108,7 @@ class BrowserSession:
                 continue
             return None if line is None else json.loads(line)
 
-    def run(self, ctx, cwd: Path, code: str, requested_timeout) -> ToolResult:
+    def run(self, ctx, cwd: Path, code: str, requested_timeout, *, virtual_time: bool = False) -> ToolResult:
         with self.lock:
             try:
                 timeout = command_timeout(ctx, requested_timeout)
@@ -121,7 +121,8 @@ class BrowserSession:
                     return ToolResult.failure("The browser could not start:\n" + problem)
             self.calls += 1
             try:
-                self.process.stdin.write(json.dumps({"cwd": str(cwd), "workspace": str(cwd), "code": code}) + "\n")
+                request = {"cwd": str(cwd), "workspace": str(cwd), "code": code, "virtual_time": virtual_time}
+                self.process.stdin.write(json.dumps(request) + "\n")
                 self.process.stdin.flush()
                 reply = self._wait(ctx, timeout)
             except (TimeoutError, InterruptedError, BrokenPipeError, OSError) as exc:
@@ -177,9 +178,12 @@ def run_browser(ctx, args: dict) -> ToolResult:
     cwd = ctx.sandbox.resolve(args.get("cwd", "."), must_exist=True)
     if not cwd.is_dir():
         return ToolResult.failure("cwd must be a directory in the workspace.")
+    virtual_time = args.get("virtual_time", False)
     session = getattr(ctx.sandbox, "browser_session", None)
     if session is not None:
-        return session.run(ctx, cwd, code, args.get("timeout"))
+        return session.run(ctx, cwd, code, args.get("timeout"), virtual_time=virtual_time)
     with tempfile.TemporaryDirectory(prefix="miniagent-browser-", dir=ctx.sandbox.command_tmpdir) as home:
         argv = ["python", "-I", "-B", "-u", str(RUNNER), _browser_cache(), home, str(cwd), code]
+        if virtual_time:
+            argv.append("--virtual-time")
         return run_posix_argv(ctx, argv, cwd, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)

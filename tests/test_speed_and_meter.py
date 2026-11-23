@@ -215,6 +215,60 @@ class WarmBrowserTest(unittest.TestCase):
         self.assertIn("Timeout 5000ms", result.content)
         self.assertLess(time.monotonic() - started, 15)
 
+    def test_new_context_and_standalone_page_inherit_waits(self):
+        result = self.run_code("""
+from playwright.sync_api import TimeoutError
+other_context = browser.new_context(locale='fr-FR')
+other = other_context.new_page()
+assert other.evaluate('navigator.language') == 'fr-FR'
+try:
+    other.get_by_role('button', name='absent').click()
+except TimeoutError as exc:
+    assert '5000ms' in str(exc), exc
+else:
+    raise AssertionError('click unexpectedly succeeded')
+standalone = browser.new_page()
+try:
+    standalone.wait_for_url('**/never-navigated')
+except TimeoutError as exc:
+    assert '15000ms' in str(exc), exc
+else:
+    raise AssertionError('navigation unexpectedly succeeded')
+standalone.close()
+assert len(browser.contexts) == 2
+raise SystemExit(7)
+""")
+        self.assertEqual(result.meta.get("exit_code"), 7, result.content)
+        # The extra context was left open on an unsuccessful call.
+        clean = self.run_code("assert browser.contexts == [context]")
+        self.assertTrue(clean.ok, clean.content)
+
+    def test_auto_refresh_uses_virtual_time_in_each_window(self):
+        html = """<output>empty</output><script>
+          setInterval(async () => {
+            document.querySelector('output').textContent = await (await fetch('/bookings')).text()
+          }, 30000)
+        </script>"""
+        code = f"""
+from playwright.sync_api import expect
+with page.expect_popup() as opened:
+    page.evaluate("window.open('about:blank')")
+for tab in [page, opened.value, browser.new_context().new_page(), browser.new_page()]:
+    tab.route('https://rooms.test/', lambda route: route.fulfill(content_type='text/html', body={html!r}))
+    tab.route('https://rooms.test/bookings', lambda route: route.fulfill(body='new booking'))
+    tab.goto('https://rooms.test/')
+    expect(tab.locator('output')).to_have_text('empty')
+    tab.clock.fast_forward(30_000)
+    expect(tab.locator('output')).to_have_text('new booking', timeout=2000)
+"""
+        for warm in (True, False):
+            with self.subTest(warm=warm):
+                if not warm:
+                    self.sandbox.browser_session = None
+                registry = build_default_registry()
+                result = registry.dispatch("run_browser", {"code": code, "virtual_time": True}, self.ctx)
+                self.assertTrue(result.ok, result.content)
+
     def test_a_hanging_script_is_stopped_and_the_next_call_starts_a_new_browser(self):
         result = self.run_code("import time; time.sleep(30)", timeout=2)
         self.assertFalse(result.ok)
