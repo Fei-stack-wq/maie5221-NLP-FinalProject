@@ -25,7 +25,8 @@ from .store import GroupStore, Store, Member, now
 from .roles import Roles
 from .attachments import Uploads
 from .assistant_room import workspace_evidence, progress, read_dispatch, legacy_dispatch_origins
-from . import dispatch_notices
+from . import dispatch_notices, studio_dispatch
+from .studio_tools import update_settings
 from .folders import bind, sync
 from .evaluation import validate, evaluate, snapshot, task_changes
 from .provider_http import ProviderError
@@ -43,7 +44,7 @@ def deepseek_factory(settings: Settings) -> Provider:
                             deadline_seconds=settings.request_deadline_seconds, max_retries=settings.max_retries)
 
 
-class StudioError(Exception):
+class StudioError(RuntimeError):
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
@@ -316,6 +317,7 @@ class Studio:
             # Keep the identity of each observed execution and question until the model returns.
             recipients = {current.task_id:ObservedTask(group_id,current,question)} if current else {}
             children = {}
+            owner_names = {}
             if assistant:
                 context.update(workspace_evidence(self, store))
                 with self._lock:
@@ -325,11 +327,21 @@ class Studio:
                         child = self._running.get(gid)
                         if child and child.task_id == tid:
                             recipients[tid] = ObservedTask(gid, child, child.channel.pending())
+                    for gid, run in self._running.items():
+                        if gid != group_id:
+                            recipients[run.task_id] = ObservedTask(gid, run, run.channel.pending())
+                            owner_names[run.task_id] = self.group(gid).group.name
                 context["action_targets"] = {
                     tid:{"group_id":observed.group_id, "question":observed.question, "activity":progress(observed.run)}
                     for tid,observed in recipients.items()}
             try:
                 def read(args):
+                    if assistant and "studio_room" in args:
+                        try:
+                            info = studio_dispatch.inspect_room(self, **args["studio_room"])
+                            return json.dumps(info, ensure_ascii=False)
+                        except (StudioError, TypeError, ValueError) as exc:
+                            return str(exc)
                     if "workspace_path" in args:
                         if set(args) - {"workspace_path", "offset"}:
                             return "Reference a single file source."
@@ -351,39 +363,55 @@ class Studio:
                     return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode, receipt=receipt)
                 if turn.action == "change_group_members" and assistant:
                     try:
-                        updated = self.change_members(**turn.membership)
+                        updated = self.change_members(**turn.arguments)
                         names = "、".join(m["name"] for m in updated["members"])
                         answer = f"「{updated['name']}」当前成员为 {names}，负责人是 @{updated['lead']}。"
                     except (StudioError, ValueError) as exc:
                         answer = f"群成员调整未完成：{exc}"
+                elif assistant and turn.action in ("cancel_task", "update_group_settings"):
+                    try:
+                        if turn.action == "cancel_task":
+                            info = studio_dispatch.cancel_task(self, **turn.arguments)
+                            answer = f"任务 {info['task_id']} 当前状态为 {info['status']}。"
+                        else:
+                            info = update_settings(self, **turn.arguments)
+                            labels = {"name":"名称","mode":"交互模式","folder":"工作区","archived":"归档","pinned":"固定"}
+                            fields = "，".join(f"{labels[k]}＝{info['workspace_path'] if k=='folder' else info[k]}"
+                                               for k in turn.arguments if k in labels)
+                            answer = f"已更新「{info['name']}」：{fields}。"
+                    except (ValueError, KeyError, StudioError) as exc:
+                        answer = f"操作未完成：{exc}"
                 elif turn.action == "reply":
                     answer = turn.text
                 else:
                     tid = turn.task_id or (current.task_id if current else None)
-                    route = self._deliver_turn(recipients.get(tid), turn.action, text, refs, receipt if tid not in children else {})
+                    route = self._deliver_turn(store, recipients.get(tid), turn.action, text, refs, {} if tid in owner_names else receipt)
                     if route != "stale":
-                        if tid in children:
+                        if tid in owner_names:
                             verb = "答复" if route == "answer" else "修改要求"
                             self._record_reply(store, actor, text, refs,
-                                               f"已将{verb}转交给「{children[tid]['group_name']}」的任务 {tid}。", receipt)
+                                               f"已将{verb}转交给「{owner_names[tid]}」的任务 {tid}。", receipt)
                         return {"route":route, "task_id":tid}
                     answer = "刚才的问题或执行已经结束。这条消息没有转交给其他任务。"
                 if settings.api_key:
                     answer = answer.replace(settings.api_key, "[redacted]")
-                return self._record_reply(store, actor, text, refs, answer, receipt)
+                return self._record_reply(store, actor, text, refs, answer, receipt, issue=turn.issue)
 
     @staticmethod
-    def _record_reply(store, actor, text, refs, answer, receipt):
+    def _record_reply(store, actor, text, refs, answer, receipt, *, issue=None):
         message = store.append("user_message", text=text, addressed=actor, attachments=refs, **receipt)
-        store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"])
+        store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"], **({"routing_issue":issue} if issue else {}))
         return {"route":"reply", "text":answer}
 
-    def _deliver_turn(self, observed, action, text, refs, receipt):
+    def _deliver_turn(self, source, observed, action, text, refs, receipt):
         if not observed or self._running.get(observed.group_id) is not observed.run:
             return "stale"
         answering = action == "answer_open_question"
         if answering and not observed.question:
             return "stale"
+        if refs and source.group.id != observed.group_id:
+            target = self.group(observed.group_id)
+            refs = [self.uploads.forward(source, target, ref, self.settings.api_key) for ref in refs]
         # receive also checks cancellation, completion and the exact pending question under its lock.
         return observed.run.channel.receive(text, attachments=refs, steer_only=not answering,
                                             answer_to=observed.question["id"] if answering else None, **receipt)
@@ -392,7 +420,7 @@ class Studio:
         if self._closed or store.group.archived or store.team.archived or not store.root.is_dir():
             raise StudioError("Conversation unavailable", 409)
 
-    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None):
+    def _submit(self, store, text, body, primary, refs, options, settings, mode, *, dispatched_by=None, receipt=None, redispatched_from=None):
         group_id = store.group.id
         with self._lock:
             self._require_available(store)
@@ -409,6 +437,8 @@ class Studio:
                 event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
             record = {"id":tid, "group_id":group_id, "room_kind":store.group.kind, "status":"queued", "created_at":now(), "primary":primary,
                       "text":body, "trigger_seq":event["seq"], "options":options, "active":[]}
+            if redispatched_from:
+                record["redispatched_from"] = redispatched_from
             if dispatched_by:
                 record["dispatched_by"] = dispatched_by
             if running:
@@ -467,6 +497,7 @@ class Studio:
             task.dispatched_by = record.get("dispatched_by")
             task.interactive = mode == "interactive"
             task.studio = self
+            task.redispatched_from = record.get("redispatched_from")
             task.options = record["options"]
             task.created_at = record["created_at"]
             running.thread = threading.Thread(target=self._run, args=(store.group.id, task, running),

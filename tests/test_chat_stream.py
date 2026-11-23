@@ -111,7 +111,7 @@ class ChatStreamTest(unittest.TestCase):
                 chrome=Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
                 with pw.chromium.launch(**({"executable_path":str(chrome)} if chrome.exists() else {})) as browser, \
                         patch("miniagent.provider_http.urllib.request.build_opener",return_value=LocalProviderTransport()):
-                    page=browser.new_page()
+                    page=browser.new_page(viewport={"width":1440,"height":900}, reduced_motion="reduce")
                     page.goto(f"http://127.0.0.1:{main.server_port}/#{gid}")
                     requests=[]
                     page.route("**/messages",lambda route:requests.append(route))
@@ -131,6 +131,20 @@ class ChatStreamTest(unittest.TestCase):
                     public.set()
                     body=page.locator(".chat-draft .msg:not(.user) .draft-text")
                     expect(body).to_have_text("一片")
+                    def edges():
+                        return page.evaluate("""() => Object.fromEntries(['#timeline .msg.user',
+                            '#timeline .msg:not(.user)', '#composer', '#input'].map(selector => {
+                            const r=document.querySelector(selector).getBoundingClientRect();
+                            // The user bubble gains its timestamp on commit and grows toward the left.
+                            return [selector,selector.endsWith('.user') ? r.right : [r.left,r.right]];
+                        }))""")
+                    def layouts():
+                        result = {}
+                        for width in (390,1440):
+                            page.set_viewport_size({"width":width,"height":900})
+                            result[width] = edges()
+                        return result
+                    partial_layout = layouts()
                     more.set()
                     expect(body).to_have_text("一片两片")
                     self.assertFalse(any(e["kind"]=="room_reply" for e in studio.group(gid).chat()))
@@ -150,6 +164,7 @@ class ChatStreamTest(unittest.TestCase):
                     expect(page.locator(".chat-draft")).to_have_count(0)
                     expect(page.locator("#timeline .msg.user")).to_have_count(1)
                     expect(page.locator("#input")).to_have_value("下一条草稿")
+                    self.assertEqual(layouts(), partial_layout)
                     page.evaluate("lateFrame()")
                     self.assertTrue(page.evaluate("""() => document.querySelector('#timeline .msg.user')===sentBubble &&
                         document.querySelector('#timeline .msg:not(.user)')===replyBubble"""))

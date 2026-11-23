@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import deepseek_markup
 from .config import (DEFAULT_MODEL, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_REQUEST_TIMEOUT_SECONDS,
                      DEFAULT_REQUEST_DEADLINE_SECONDS, validate_provider_options)
 from .provider_http import HTTPResult, ProviderError, post_json
@@ -88,6 +89,8 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
     content, reasoning = [], []
     calls = {}
     pending = ""
+    markup_pending = ""
+    in_markup = False
     thinking_announced = False
     finish = usage = None
     try:
@@ -143,8 +146,9 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
                     if field == "reasoning_content" and part and not thinking_announced:
                         thinking_announced = True
                         notify("thinking", "")
-                    if field == "content" and part:
-                        visible = pending + part
+                    if field == "content" and part and not in_markup:
+                        visible, markup_pending, in_markup = deepseek_markup.public_prefix(markup_pending + part)
+                        visible = pending + visible
                         pending = ""
                         if secret:
                             visible = visible.replace(secret, "[redacted]")
@@ -165,8 +169,8 @@ def _collect_deepseek_stream(events: Iterator[dict], notify: Callable[[str, str]
             message["tool_calls"] = [{"id": call["id"], "type": call["type"],
                                       "function": {"name": "".join(call["names"]), "arguments": "".join(call["arguments"])}}
                                      for _, call in sorted(calls.items())]
-        if pending:
-            notify("delta", pending)
+        if pending or markup_pending:
+            notify("delta", pending + markup_pending)
         return {**identity, "usage": usage, "choices": [{"finish_reason": finish, "message": message}]}
     except Exception:
         # The next HTTP attempt starts with empty accumulators and a new preview.
@@ -317,26 +321,51 @@ class DeepSeekProvider(Provider):
                 raise ProviderError("Invalid per-request output allocation", code="invalid_config")
             payload["max_tokens"] = max_output_tokens
         started = time.perf_counter()
-        try:
-            options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
-            if on_stream is not None:
-                payload.update(stream=True, stream_options={"include_usage": True})
-                options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel, secret=self.api_key)
-            result = self._post_with_retry(payload, **options)
-        except ProviderError as exc:
-            if exc.status_code == 402 and urlsplit(self.base_url).hostname == "api.deepseek.com":
-                self._insufficient_balance = True
-                raise self._balance_error(exc.attempts) from None
-            raise
-        try:
-            response = self._parse(result.data, (time.perf_counter() - started) * 1000)
-            if self.thinking == "enabled" and tools and response.reasoning_content is None:
-                raise ProviderError("Thinking tool response is missing reasoning_content", code="invalid_response")
-        except ProviderError as exc:
-            exc.attempts = result.attempts
-            raise
-        return response.model_copy(update={"request_attempts": result.attempts,
-                                           "text":response.text.replace(self.api_key, "[redacted]")})
+        options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
+        if on_stream is not None:
+            payload.update(stream=True, stream_options={"include_usage": True})
+            options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel, secret=self.api_key)
+        attempts = 0
+        prior_usage = Usage()
+        for attempt in range(2):
+            try:
+                result = self._post_with_retry(payload, **options)
+            except ProviderError as exc:
+                exc.attempts += attempts
+                if exc.status_code == 402 and urlsplit(self.base_url).hostname == "api.deepseek.com":
+                    self._insufficient_balance = True
+                    raise self._balance_error(exc.attempts) from None
+                raise
+            attempts += result.attempts
+            try:
+                response = self._parse(result.data, (time.perf_counter() - started) * 1000)
+                if response.tool_calls and (tool_choice == "none" or (required_tool and
+                        any(call.name != required_tool for call in response.tool_calls))):
+                    raise ProviderError("Provider returned a disabled tool", code="invalid_response")
+                if self.thinking == "enabled" and tools and response.reasoning_content is None:
+                    raise ProviderError("Thinking tool response is missing reasoning_content", code="invalid_response")
+            except ProviderError as exc:
+                exc.attempts = attempts
+                if exc.code != "invalid_tool_markup" or attempt:
+                    raise
+                if on_stream:
+                    on_stream("discard", "")
+                if should_cancel and should_cancel():
+                    raise ProviderError("Provider request cancelled", code="cancelled", attempts=attempts)
+                remaining = min(self.deadline_seconds, deadline_seconds or self.deadline_seconds) - (time.perf_counter()-started)
+                if remaining <= 0:
+                    raise
+                options["deadline_seconds"] = remaining
+                prior_usage = self._parse_usage(result.data.get("usage"))
+                note = "Use the API's structured tool_calls field for invocations. Return ordinary text for a conversational answer."
+                history = payload["messages"]
+                if history[0]["role"] == "system":
+                    history[0] = {**history[0], "content":history[0]["content"] + "\n" + note}
+                else:
+                    history.insert(0, {"role":"system", "content":note})
+                continue
+            return response.model_copy(update={"request_attempts":attempts, "usage":prior_usage.merged(response.usage),
+                                               "text":response.text.replace(self.api_key, "[redacted]")})
 
     def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None,
                          stream_decoder: Callable[[Iterator[dict]], dict] | None = None) -> HTTPResult:
@@ -364,6 +393,7 @@ class DeepSeekProvider(Provider):
         _require(isinstance(finish, str) and finish in self.FINISH_REASONS, "Invalid response finish_reason")
         calls = message.get("tool_calls", [])
         _require(isinstance(calls, list), "Invalid tool_calls array")
+        content = deepseek_markup.public_content(content, calls)
         _require(finish != "tool_calls" or bool(calls), "tool_calls finish without calls")
         _require(finish != "stop" or not calls, "stop finish conflicts with tool calls")
         parsed, identities = [], set()

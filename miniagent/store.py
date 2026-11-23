@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .deepseek_markup import historic_text
 from .chat_stream import ChatStream
 from .workspace import Project
 
@@ -196,6 +197,8 @@ class GroupStore:
             for line in self._chat_path.read_text(encoding="utf-8").splitlines():
                 if line.strip():
                     event = json.loads(line)
+                    if event.get("kind") in ("room_reply", "progress", "report", "final") and event.get("text"):
+                        event["text"] = historic_text(event["text"])
                     if event["seq"] > after:
                         events.append(event)
             return events

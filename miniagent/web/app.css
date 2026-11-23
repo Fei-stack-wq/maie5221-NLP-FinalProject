@@ -181,7 +181,7 @@ input[type=checkbox] { accent-color: var(--cobalt); width: 15px; height: 15px; }
   flex: 1; overflow: auto; padding: 28px clamp(16px, 4vw, 56px) 36px;
   display: flex; flex-direction: column; gap: 18px;
 }
-#timeline > * { width: 100%; max-width: 820px; margin-inline: auto; animation: ink .45s var(--ease); }
+#timeline > *, #timeline .chat-drafts .msg { width: 100%; max-width: 820px; margin-inline: auto; animation: ink .45s var(--ease); }
 
 .msg { position: relative; min-width: 0; }
 .msg .who { font-size: 12px; color: var(--faint); margin-bottom: 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-family: var(--mono); letter-spacing: .02em; }
@@ -198,7 +198,7 @@ input[type=checkbox] { accent-color: var(--cobalt); width: 15px; height: 15px; }
   width: fit-content !important; max-width: min(640px, 84%) !important; margin-inline: auto 0 !important;
   background: var(--cobalt-wash); border-radius: 16px 16px 4px 16px; padding: 11px 16px;
 }
-#timeline > .msg.user { margin-right: max(0px, calc((100% - 820px) / 2)) !important; }
+#timeline .msg.user { margin-right: max(0px, calc((100% - 820px) / 2)) !important; }
 .msg.user .who { justify-content: flex-end; }
 .msg.user .who b { color: var(--cobalt-deep); }
 .msg.user .body { color: var(--ink); }

@@ -63,6 +63,12 @@ class Uploads:
         root = store.root / "uploads" if "session_id" in checked else self.root
         return root / checked["id"] / "original"
 
+    def forward(self, source, target, ref, key=""):
+        if source.group.id == target.group.id:
+            return self.room_ref(target, ref)
+        data = self.original(source, ref).read_bytes()
+        return self.save_in_room(target, ref["name"], data, key)
+
     def tools(self, store, agent, through_seq=None):
         def available():
             return {r["id"]: r for event in store.chat() for r in event.get("attachments", [])

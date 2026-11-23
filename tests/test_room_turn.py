@@ -191,7 +191,8 @@ class RoomTurnTest(unittest.TestCase):
         gid = self.room()
         msg = "可以解释一下吗？"
         self.script.queues["room"] = [action("start_room_task","旧的授权"), action("change_current_task",msg),
-                                     reply("",call("run_shell",command="echo hello")), reply("truncated", finish="length")]
+                                     reply("",call("run_shell",command="echo hello")), reply("truncated", finish="length"),
+                                     reply("仍未完成", finish="length")]
         for _ in range(4):
             self.assertEqual(self.studio.post(gid,msg)["route"],"reply")
         self.assertEqual(self.studio.tasks(gid),[])

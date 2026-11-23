@@ -555,6 +555,8 @@ class TeamTask:
         self.record = {"id": self.task_id, "group_id": self.group.id, "text": self.text, "primary": self.primary,
                        "status": "running", "created_at": self.created_at, "trigger_seq": self.trigger_seq, "finished_at": None, "active": [self.primary],
                        "delegations": 0, "assignments": [], "final_answer": "", "error": "", "options": self.options, "role_ids": list(self.group.role_ids)}
+        if getattr(self, "redispatched_from", None):
+            self.record["redispatched_from"] = self.redispatched_from
         self.record["room_kind"] = self.group.kind
         if self.dispatched_by:
             self.record["dispatched_by"] = self.dispatched_by
