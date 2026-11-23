@@ -118,3 +118,58 @@ class LeadStepsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackgroundInBatchTest(unittest.TestCase):
+    """S1T1-v3.5: QA (check) first and the release (adapt, background by default) second in one response."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def run_pair(self, release_inputs):
+        started, seen = threading.Event(), {}
+
+        def qa_first(messages):
+            seen["release_started_first"] = started.wait(5)
+            return reply("", call("write_file", path="QA_REPORT.md", content="pass\n"))
+
+        def release_first(messages):
+            started.set()
+            return reply("", call("write_file", path="README.md", content="guide\n"))
+
+        script = Script(
+            lead=[reply("", call("delegate_task", assignee="qa", task="Test the finished build.",
+                                 deliverables=["QA_REPORT.md"], kind="check"),
+                        call("delegate_task", assignee="writer", task="Write the user guide for the build.",
+                             deliverables=["README.md"], inputs=release_inputs, kind="adapt")),
+                  lambda m: (seen.__setitem__("results", tool_results(m)[-2:]), reply("", call("wait_handoffs")))[1],
+                  lambda m: (seen.__setitem__("waited", "\n".join([tool_results(m)[-1]] + [
+                      x["content"] for x in m if x["role"] == "user"])), reply("shipped"))[1]],
+            qa=[qa_first, reply("VERDICT: APPROVED")],
+            writer=[release_first, reply("guide written")])
+        provider = FakeProvider(script)
+        studio = Studio(settings(self.tmp), provider_factory=lambda _s: provider)
+        self.addCleanup(studio.close)
+        gid = studio.create_group("Team", TEAM4, "lead", "autonomous")["id"]
+        studio.post(gid, "Ship", queue=True)
+        task = finished(studio, gid)
+        return task, seen, studio, gid
+
+    def test_a_background_hand_off_after_a_foreground_one_starts_at_the_same_time(self):
+        task, seen, studio, gid = self.run_pair(["app.py"])
+        self.assertTrue(seen["release_started_first"], "the release was running while QA worked")
+        qa_result, release_result = seen["results"]
+        self.assertTrue(qa_result.startswith("Report from Tester (qa)"))
+        self.assertTrue(release_result.startswith("Started in the background: Writer (writer)"))
+        self.assertNotIn("ran one after another", qa_result)
+        self.assertIn("guide written", seen["waited"])
+        self.assertEqual(task["final_answer"], "shipped")
+        self.assertTrue(next(e for e in studio.group(gid).chat() if e["kind"] == "delegation"
+                             and e["assignee"] == "writer").get("background"))
+
+    def test_a_background_hand_off_that_reads_the_others_output_still_waits(self):
+        task, seen, _, _ = self.run_pair(["QA_REPORT.md"])
+        self.assertFalse(seen["release_started_first"], "the guide that reads QA's report started after QA")
+        self.assertIn("writer reads QA_REPORT.md, which qa produces in the same response", seen["results"][0])

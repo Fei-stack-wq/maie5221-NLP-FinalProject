@@ -70,8 +70,9 @@ def lead_guidance(*, kinds: bool, background: bool) -> list[str]:
             + ("; `adapt` hand-offs run in the background unless you set `background: false`" if kinds else "")
             + ". Its report arrives as a message at your next step after it finishes. Call `wait_handoffs` when "
             "your next step needs a result, or when you have nothing else to do — before your final answer. "
-            "While it runs, do not edit, assign or build on the files it produces. In one response, put a "
-            "background hand-off before the others only when it needs nothing from them.")
+            "While it runs, do not edit, assign or build on the files it produces. Sent in the same response as "
+            "other hand-offs, it starts at the same time as them, wherever it appears, as long as it neither reads "
+            "nor names what they produce; otherwise the response runs in order.")
     return parts
 
 

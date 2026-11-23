@@ -1196,11 +1196,9 @@ class TeamTask:
         if repeated:
             return (f"{', '.join(repeated)} had more than one of them, and one teammate works on one assignment at a "
                     "time. To overlap them, give the pieces to different teammates or combine them into one assignment.")
-        # A check of finished work may run alongside other work; the rules below refuse one that
-        # reads, names or reviews anything another call in the batch produces.
-        if any(self._wants_background(args) for args in batch):
-            return ("a background hand-off was in the same response; it starts in order, after what it may build on "
-                    "(put it first when it needs nothing from the others)")
+        # A check of finished work may run alongside other work, and a background hand-off starts right away
+        # whatever its position in the response; the rules below refuse any call that reads, names or reviews
+        # what another call in the response produces.
         schema = getattr(self, "delegate_parameters", None)
         if schema is None or any(validate_arguments(schema, args) for args in batch):
             return "one of the calls had invalid arguments"  # a call that never starts could not release its teammates
@@ -1235,9 +1233,13 @@ class TeamTask:
             new = sum(1 for name in assignees if name not in self.inflight)
             if self.settings.team.max_delegations - self.delegations < new:
                 return "the delegation budget had too few delegations left for all of them"
+            # Only foreground hand-offs are joined (and check each other's results afterwards); background ones
+            # start in their own thread and report through the lead's inbox, as when sent alone.
+            joined = {(a, str(args.get("task", "")).strip()) for a, args in zip(assignees, batch)
+                      if not self._wants_background(args)}
             # A batch resumed after a pause has lost its finished members; they are not joined again.
-            if new == len(assignees):
-                self.batch = ParallelBatch({(a, str(args.get("task", "")).strip()) for a, args in zip(assignees, batch)})
+            if new == len(assignees) and len(joined) > 1:
+                self.batch = ParallelBatch(joined)
         return ""
 
     def _join_batch(self, assignee: str, task: str) -> ParallelBatch | None:
