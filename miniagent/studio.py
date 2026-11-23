@@ -905,6 +905,7 @@ class Studio:
             except (OSError, ValueError):
                 record = {}
             live = {"pausing":running.control.requested.is_set(), "task_id": running.task_id, "primary": running.primary, "active": record.get("active", []),
+                    "active_modes": record.get("active_modes", {}),
                     "question": running.channel.pending(), "mailboxes":running.channel.enabled,
                     "interrupts":running.channel.interrupts, "mail":running.channel.recent(), "activity": activity[-400:], "activity_seq": cursor,
                     "meter": running.meter.snapshot() if running.meter is not None else None}

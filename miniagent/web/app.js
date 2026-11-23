@@ -649,11 +649,15 @@ function renderLive(live) {
     $("#question-banner").hidden=true;
     return;
   }
-  if (state.stepsTask !== live.task_id) { state.steps = {}; state.stepsTask = live.task_id; }
+  if (state.stepsTask !== live.task_id) { state.steps = {}; state.modes = {}; state.stepsTask = live.task_id; }
   const steps = state.steps;
+  const modes = state.modes || (state.modes = {});
   let last = null;
   for (const a of live.activity) {
     if (a.type === "step") steps[a.agent] = `${a.step}/${a.max_steps}`;
+    if (["start", "resume", "model_call"].includes(a.type) && a.thinking) {
+      modes[a.agent] = { model: a.model, thinking: a.thinking, reasoning_effort: a.reasoning_effort };
+    }
     if (["tool_call", "say", "delta", "question"].includes(a.type)) last = a;
   }
   state.lastActivity = state.lastActivity || {};
@@ -661,6 +665,10 @@ function renderLive(live) {
   const active = (live.active && live.active.length ? live.active : [live.primary]);
   const current = active[active.length - 1];
   const step = steps[current] ? ` · 第 ${steps[current]} 步` : "";
+  const mode = (live.active_modes && live.active_modes[current]) || modes[current];
+  const thinkingTag = mode?.thinking === "enabled"
+    ? ` · 思考(${mode.reasoning_effort || "默认"})`
+    : mode?.thinking === "disabled" ? " · 关闭思考" : "";
   let doing = "";
   const a = state.lastActivity;
   if (a && a.agent === current) {
@@ -673,7 +681,7 @@ function renderLive(live) {
   $("#live-status").replaceChildren(live.question ? el("span", { class: "dot waiting" }) : el("span", { class: "spinner" }),
     ...active.slice(-2).map(id => avatar(id, memberName(id), "sm")),
     el("span", { class: "text" }, live.question ? `${memberName(live.question.agent)} 在等你回答` :
-      `${active.map(memberName).join(" › ")} 正在工作${step}${doing}`), bar);
+      `${active.map(memberName).join(" › ")} 正在工作${step}${thinkingTag}${doing}`), bar);
   const meter = $("#live-meter");
   const line = meterLine(live.meter);
   meter.hidden = !line;

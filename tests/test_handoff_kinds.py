@@ -401,6 +401,45 @@ class BackgroundPauseTest(unittest.TestCase):
         self.assertEqual(len(self.provider.for_agent("lead")), 3, "the lead did not start over after the resume")
         self.assertEqual([e["text"] for e in store.chat() if e["kind"] == "final"], ["final with notes"])
 
+    def test_role_thinking_and_effort_are_observable_in_live_state_trace_and_reports(self):
+        entered, release = threading.Event(), threading.Event()
+        seen_live = {}
+
+        def qa_step(_m):
+            entered.set()
+            release.wait(5)
+            return reply("VERDICT: APPROVED")
+
+        self.script.queues.update(
+            lead=[
+                reply("", call("delegate_task", assignee="qa", task="Verify the app thoroughly.",
+                               deliverables=["QA.md"], kind="check")),
+                reply("", call("delegate_task", assignee="writer", task="Draft release notes.",
+                               deliverables=["NOTES.md"], kind="adapt", background=False)),
+                reply("All done."),
+            ],
+            qa=[qa_step],
+            writer=[reply("Notes ready.")],
+        )
+        tid = self.studio.post(self.gid, "Check and document", queue=True)["task_id"]
+        self.assertTrue(entered.wait(5))
+        seen_live.update(self.studio.state(self.gid)["live"] or {})
+        release.set()
+        wait_for(lambda: self.studio.group(self.gid).load_task(tid)["status"] == "completed", timeout=15)
+
+        modes = seen_live.get("active_modes") or {}
+        self.assertEqual(modes.get("qa", {}).get("thinking"), "enabled")
+        self.assertEqual(modes.get("qa", {}).get("reasoning_effort"), "high")
+
+        detail = self.studio.task_detail(tid)
+        reports = {e["agent"]: e for e in detail["events"] if e["kind"] == "report"}
+        self.assertEqual((reports["qa"].get("thinking"), reports["qa"].get("reasoning_effort")), ("enabled", "high"))
+        self.assertEqual((reports["writer"].get("thinking"), reports["writer"].get("reasoning_effort")), ("disabled", None))
+
+        starts = {e["agent"]: e for e in detail["activity"] if e.get("type") == "start"}
+        self.assertEqual((starts["qa"].get("thinking"), starts["qa"].get("reasoning_effort")), ("enabled", "high"))
+        self.assertEqual((starts["writer"].get("thinking"), starts["writer"].get("reasoning_effort")), ("disabled", None))
+
 
 if __name__ == "__main__":
     unittest.main()

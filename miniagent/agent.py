@@ -302,7 +302,9 @@ class Agent:
         )
         specs = self.registry.specs(available_only=True)
         tool_schemas = [spec.to_api() for spec in specs]
-        self.emit("resume" if saved else "start", task=task, resumed=resumed)
+        effort = self.settings.reasoning_effort if self.settings.thinking == "enabled" else None
+        self.emit("resume" if saved else "start", task=task, resumed=resumed,
+                  model=self.settings.model, thinking=self.settings.thinking, reasoning_effort=effort)
         if initial_calls and not saved:
             self.emit("step", step=step, max_steps=self.limits.max_steps, origin="room_turn")
 
@@ -339,6 +341,8 @@ class Agent:
                                               temperature=self.settings.temperature, **options)
             except ProviderError as exc:
                 self.emit("model_call", seconds=round(time.monotonic() - asked, 3), model=self.settings.model,
+                          thinking=self.settings.thinking,
+                          reasoning_effort=self.settings.reasoning_effort if self.settings.thinking == "enabled" else None,
                           error=exc.code)
                 if tools_enabled and control and control.requested.is_set() and not self.should_cancel():
                     step -= 1
@@ -665,6 +669,8 @@ class Agent:
         """One model operation for the task meter (duration and token usage, per OpenTelemetry GenAI)."""
         usage = response.usage
         self.emit("model_call", seconds=round(seconds, 3), model=self.settings.model, purpose=purpose,
+                  thinking=self.settings.thinking,
+                  reasoning_effort=self.settings.reasoning_effort if self.settings.thinking == "enabled" else None,
                   prompt_tokens=usage.prompt_tokens, cached_tokens=usage.prompt_cache_hit_tokens or 0,
                   output_tokens=usage.completion_tokens, reasoning_tokens=usage.reasoning_tokens or 0,
                   finish=response.finish_reason)

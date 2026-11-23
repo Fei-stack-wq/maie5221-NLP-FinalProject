@@ -546,6 +546,7 @@ class TeamTask:
         self.bg_claims: dict[str, Claim] = {}
         self.meter = TaskMeter(notify=lambda text: self.channel.note(self.primary, text))
         self.active: list[str] = []
+        self.active_modes: dict[str, dict[str, Any]] = {}
         self.record: dict[str, Any] = {}
         self.control = Continuation()
         self.inflight: dict[str, dict] = {}
@@ -605,10 +606,21 @@ class TeamTask:
         event = {"task_id": self.task_id, **event}
         if event["type"] in ("start","resume"):
             self.channel.activate(event["agent"])
+            if "thinking" in event:
+                with self.lock:
+                    self.active_modes[event["agent"]] = {
+                        "model": event.get("model"),
+                        "thinking": event.get("thinking"),
+                        "reasoning_effort": event.get("reasoning_effort"),
+                    }
+                    self._update(active_modes=dict(self.active_modes))
         if event["type"] in ("start", "resume") and event.get("agent") == self.primary:
             self.lead_live = True
         if event["type"] == "end":
             self.channel.deactivate(event["agent"])
+            with self.lock:
+                if self.active_modes.pop(event["agent"], None) is not None:
+                    self._update(active_modes=dict(self.active_modes))
             if event.get("agent") == self.primary:
                 with self.bg_cond:
                     self.lead_live = False
@@ -1516,6 +1528,8 @@ class TeamTask:
                 report_extra["handoff_kind"] = entry["kind"]
             if entry.get("background"):
                 report_extra["background"] = True
+            if entry.get("runtime"):
+                report_extra.update(entry["runtime"])
         with self.lock:
             self.evidence.append(handoffs.evidence_row(
                 seq=entry["seq"] if entry else 0, member=assignee, name=member.name,
@@ -1797,6 +1811,11 @@ class TeamTask:
                                                 paths=list(entry.get("inputs") or []) + list(deliverables))
                 if block:
                     assignment += "\n\n" + block
+        entry["runtime"] = {
+            "model": settings.model,
+            "thinking": settings.thinking,
+            "reasoning_effort": settings.reasoning_effort if settings.thinking == "enabled" else None,
+        }
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
         registry = self._registry(member.id, lead=False)
         if kind and not KIND_PROFILES[kind].browser:

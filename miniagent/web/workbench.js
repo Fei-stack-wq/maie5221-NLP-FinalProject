@@ -118,22 +118,31 @@ function planCard(plan, scope) {
       ...plan.unlinked.map(e=>el("p",{},`@${e.assignee} · ${e.task}`))) : null);
 }
 
+function thinkingBadge(mode) {
+  if (!mode?.thinking) return null;
+  const text = mode.thinking === "enabled" ? `思考(${mode.reasoning_effort || "默认"})` : "关闭思考";
+  return el("small", { class: "tree-mode muted" }, text);
+}
+
 function taskTree(task, events, scope) {
-  const root=el("div",{class:"tree-root"},el("strong",{},"@"+(task.primary||"—")),statusChip(task.status),el("p",{},task.text));
+  const root=el("div",{class:"tree-root"},el("strong",{},"@"+(task.primary||"—")),statusChip(task.status),
+    thinkingBadge(task.active_modes?.[task.primary]),el("p",{},task.text));
   const list=el("ol",{class:"branches"}), pending=new Map();
   const active=["running","queued","paused"].includes(task.status);
   for (const e of events) {
     if (e.kind==="delegation") {
       const badge=el("small",{class:"tree-status"},active?"等待回报":"无回报记录");
+      const modeSlot=el("span",{class:"tree-mode-slot"},thinkingBadge(active ? task.active_modes?.[e.assignee] : null));
       const panel=el("details",{class:"branch","data-assignment":e.seq},el("summary",{},
-        el("span",{class:"tree-actor"},"@"+e.agent+" → @"+e.assignee),badge,el("span",{class:"tree-brief"},e.task)));
+        el("span",{class:"tree-actor"},"@"+e.agent+" → @"+e.assignee),badge,modeSlot,el("span",{class:"tree-brief"},e.task)));
       if (e.deliverables?.length) panel.append(el("p",{},el("strong",{},"委托交付　"),e.deliverables.join("、")));
       list.append(el("li",{},panel));
-      const queue=pending.get(e.assignee)||[]; queue.push({panel,badge}); pending.set(e.assignee,queue);
+      const queue=pending.get(e.assignee)||[]; queue.push({panel,badge,modeSlot}); pending.set(e.assignee,queue);
     } else if (e.kind==="report") {
       const branch=pending.get(e.agent)?.shift();
       if (!branch) continue;
       branch.badge.replaceWith(statusChip(e.status));
+      if (e.thinking) branch.modeSlot.replaceChildren(thinkingBadge(e));
       branch.panel.append(el("p",{class:"muted"},"成员回报 · "+fmtTime(e.time)),
         documentBody(e.text,scope));
       const counts=e.talk || task.assignments?.filter(a=>a.assignment_seq===e.assignment_seq && a.talk).at(-1)?.talk;
