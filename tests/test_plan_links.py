@@ -104,6 +104,9 @@ class PlanLinksTest(unittest.TestCase):
         self.assertEqual(view()["counts"]["accepted"], 1)
         report(assign(), "unclear")
         self.assertEqual(view()["counts"]["accepted"], 0)
+        report(assign(), "approved", text="**VERDICT: APPROVED WITH LISTED FIXES** — see report.")
+        self.assertEqual(view()["steps"][0]["evidence"]["reviewed"]["verdict"], "unclear")
+        self.assertEqual(view()["counts"]["accepted"], 0)
         report(assign(), "approved", checks={"passed":0,"total":1})
         self.assertEqual(view()["counts"]["accepted"], 0)
         old = assign()
@@ -115,6 +118,20 @@ class PlanLinksTest(unittest.TestCase):
         record["plan"]["steps"] = [step("Fix build","rework", id="fix"), steps[1]]
         append("plan", agent="lead", steps=record["plan"]["steps"])
         self.assertEqual(view()["steps"][0]["decision"], {"stage":"rework", "source":"lead", "agent":"lead"})
+
+    def test_qualified_review_returns_to_lead_without_accepting_or_ordering_a_fix(self):
+        self.script.queues.update(lead=[
+            plan(step("Check publication", id="check")),
+            reply("", call("review_loop", author="dev", reviewer="qa", work="Check publication.", step="check")),
+            lambda messages: reply(tool_results(messages)[-1])],
+            qa=[reply("**VERDICT: APPROVED WITH LISTED FIXES** — apply edits first.")])
+        self.studio.post(self.gid, "Review publication", queue=True)
+        record = finished(self.studio, self.gid)
+        detail = self.studio.task_detail(record["id"])
+        self.assertEqual(record["delegations"], 1)
+        self.assertIn("apply edits first", record["final_answer"])
+        self.assertEqual(detail["plan_view"]["counts"]["accepted"], 0)
+        self.assertEqual(detail["plan_view"]["steps"][0]["evidence"]["reviewed"]["verdict"], "unclear")
 
     def test_next_member_sees_the_report_and_files_without_another_plan_call(self):
         self.script.queues.update(lead=[plan(step("Write draft")),

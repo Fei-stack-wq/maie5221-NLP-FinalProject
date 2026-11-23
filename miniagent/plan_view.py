@@ -1,6 +1,7 @@
 """Project a lead's plan and the work the team actually recorded onto the same steps."""
 import re
 from collections import defaultdict
+from .review import review_verdict
 
 
 def identify_steps(rows, previous):
@@ -90,6 +91,7 @@ def plan_view(record, events):
             continue
         evidence = row["evidence"]
         entry = {"seq": event["seq"], "time": event["time"]}
+        verdict = event.get("verdict")
         if event["kind"] == "delegation":
             entry.update(agent=event["assignee"], task=event["task"])
             if event.get("review"):
@@ -104,9 +106,13 @@ def plan_view(record, events):
                 entry["checks"] = {k: event["checks"][k] for k in ("passed", "total")}
             evidence["submitted"] = entry
             if event.get("review"):
-                evidence["reviewed"] = {**entry, "verdict": event.get("verdict", "unclear")}
+                # Older records accepted any suffix after APPROVED. Validate
+                # those derived markers against the preserved review text.
+                if verdict in ("approved", "changes requested") and event.get("text"):
+                    verdict = review_verdict(event["text"])
+                evidence["reviewed"] = {**entry, "verdict": verdict or "unclear"}
         row["history"].append({**entry, "kind": event["kind"], **({"loop": event["loop"]} if event.get("loop") else {}),
-                               **({"verdict": event["verdict"]} if event.get("verdict") else {})})
+                               **({"verdict": verdict} if verdict else {})})
 
     live = record.get("status") in ("running", "queued", "paused")
     counts = {"total": len(rows), "submitted": 0, "in_progress": 0, "accepted": 0}

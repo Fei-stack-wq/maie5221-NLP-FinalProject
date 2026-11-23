@@ -41,6 +41,7 @@ from typing import Any, Callable
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .browser_evidence import format_report
 from .plan_view import identify_steps, plan_view
+from .review import VERDICT_LINE, review_verdict
 from .checkpoint import Continuation, PauseRequested
 from .config import FAST_SOFT_MINUTES, Settings
 from .context import ContextManager
@@ -113,15 +114,6 @@ CHECKS_SCHEMA = {
         "path": {"type": "string"}, "text": {"type": "string"}, "command": {"type": "string"}},
         "required": ["kind"]},
 }
-VERDICT_LINE = re.compile(r"^\W*VERDICT:\s*(APPROVED|CHANGES\s+REQUESTED)\b.*$", re.IGNORECASE | re.MULTILINE)
-
-
-def _verdict(report: str) -> str:
-    """The reviewer's verdict marker, as AutoGen's TextMentionTermination looks for its stop text."""
-    match = VERDICT_LINE.search(report[:2000])
-    if match is None:
-        return "unclear"
-    return "approved" if match.group(1).upper() == "APPROVED" else "changes requested"
 
 
 def check_lines(evaluation: dict) -> list[str]:
@@ -1061,7 +1053,7 @@ class TeamTask:
             report_extra.update(assignment_seq=entry["seq"])
             report_extra.update({k: entry[k] for k in ("step", "requested_step") if k in entry})
             if review:
-                report_extra["verdict"] = _verdict(report)
+                report_extra["verdict"] = review_verdict(report)
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
                           changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
                           **report_extra)
@@ -1139,10 +1131,10 @@ class TeamTask:
                         break
                     state["review_browser_checks"] = reviewed.get("browser_checks")
                     state["last_review"] = reviewed["report"]
-                    state["verdict"] = _verdict(reviewed["report"])
+                    state["verdict"] = review_verdict(reviewed["report"])
                     state["rounds"].append(f"Round {number} — review by {names[reviewer]}: {state['verdict'].upper()}"
                                            + (f" ({reviewed['result'].status})" if reviewed["result"].status != "completed" else ""))
-                    if (state["verdict"] == "approved" or reviewed["result"].status in ("error", "cancelled")
+                    if (state["verdict"] != "changes requested" or reviewed["result"].status in ("error", "cancelled")
                             or number == rounds_max):
                         break
                     state["findings"] = VERDICT_LINE.sub("", reviewed["report"], count=1).strip() or reviewed["report"]

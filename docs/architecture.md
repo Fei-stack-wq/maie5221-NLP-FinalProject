@@ -111,7 +111,7 @@ changed.
 A completed delegated review can confirm or return its linked step. The plan card names the
 reviewer or lead who decided. It projects historical events on read, keeping a signature
 attached to its handoff when later work reopens the step. Task completion alone supplies
-no step verdict.
+no step verdict. A qualified approval remains in the review report for the lead to decide.
 `MA_PLAN_LINKS=0` retains snapshot plans. In fast mode, a linked plan can be
 written once. The task tree and plan keep unlinked work visible.
 
