@@ -341,7 +341,9 @@ function renderEvent(event) {
       const node = card(`report ${level}`, event.agent,
         [el("b", {}, memberName(event.agent)), statusChip(event.status), verdictChip(event),
           el("span", {}, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)],
-        markdown(event.text), checkResults(event.checks), artifactCards(scope,event.changes));
+        markdown(event.text), checkResults(event.checks),
+        event.browser_checks?.findings.map(check => el("div",{},el("small",{},
+          `浏览器检查 ${check.number} / ${event.browser_checks.calls}`), browserCheckCard(check.report))), artifactCards(scope,event.changes));
       return collapsible(node, event.text);
     }
     case "question": {
@@ -733,6 +735,7 @@ function renderActivity(items) {
     let line = null;
     const who = el("span", { class: "agent" }, `[${a.agent}] `);
     if (a.type === "tool_call") line = el("div", { class: "a" }, who, `→ ${a.tool} ${JSON.stringify(a.arguments).slice(0, 400)}`);
+    else if (a.type === "tool_result" && a.browser_report) line = el("div",{class:"a"},who,browserCheckCard(a.browser_report));
     else if (a.type === "tool_result") line = el("div", { class: "a" }, who, el("span", { class: a.ok ? "ok" : "err" }, a.ok ? "✓ " : "✗ "), (a.preview || "").slice(0, 500));
     else if (a.type === "say") line = el("div", { class: "a say" }, who, a.text);
     else if (a.type === "compaction") line = el("div", { class: "a" }, who, `上下文压缩（${a.method}）：${a.before_tokens} → ${a.after_tokens} tokens`);

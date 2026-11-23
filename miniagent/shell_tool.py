@@ -96,7 +96,7 @@ def _kill_group(pid):
         pass
 
 
-def _stop_timed_out_process(process):
+def stop_command_tree(process):
     try:
         children = psutil.Process(process.pid).children(recursive=True)
     except (OSError, psutil.Error):
@@ -229,7 +229,7 @@ def run_posix_argv(ctx: ToolContext, argv: list[str], cwd: Path, requested_timeo
             timed_out = True
         finally:
             if timed_out or cancelled:
-                pending_children = _stop_timed_out_process(process)
+                pending_children = stop_command_tree(process)
             else:
                 if process.poll() is None or ctx.sandbox.track_shell_group is None:
                     # Only managed members can own a background server between calls.

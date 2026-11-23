@@ -92,6 +92,27 @@ function taskTree(task, events, scope) {
   return el("section",{class:"task-tree","aria-label":"任务树"},el("h4",{},"任务树"),root,list.children.length?list:null);
 }
 
+function browserCheckLabel(report) {
+  return ({operation_timeout:"步骤超时 · 验证未完成",script_timeout:"脚本超时 · 验证未完成",
+    assertion_failed:"断言未通过",interrupted:"验证已中断",script_exit:"脚本提前退出",
+    script_error:"脚本出错",runner_error:"浏览器检查未完成"})[report.kind] || "浏览器检查记录";
+}
+
+function browserCheckCard(report) {
+  const step=report.step, pending=report.unreached || [];
+  const line=item=>el("div",{},el("code",{},`L${item.line}　${item.source}`));
+  const last=["script_timeout","interrupted"].includes(report.kind);
+  const where=step ? ` · ${last?"最后记录在":""}第 ${step.line} 行` : " · 没有脚本位置记录";
+  const label=browserCheckLabel(report);
+  return el("details",{class:"browser-check"},el("summary",{},label+where),
+    step ? el("pre",{},step.source) : null,
+    report.observed?.length ? el("div",{},el("small",{},"断言实际观察"),el("pre",{},report.observed.join("\n"))) : null,
+    el("small",{},"运行记录"),el("pre",{},report.detail),
+    pending.length ? el("small",{},"后续未执行的脚本步骤") : null,
+    ...pending.slice(0,12).map(line),
+    pending.length>12 ? el("details",{},el("summary",{},`另外 ${pending.length-12} 步`),...pending.slice(12).map(line)) : null);
+}
+
 // Each trace widget owns its cursor and nodes. Opening history only reads that task.
 // Queue by actor and id: two model calls may reuse an id on different steps.
 function toolWidget(tid) {
@@ -114,9 +135,11 @@ function toolWidget(tid) {
       }
     }
     pending.set(key,queue);
-    row.badge.textContent=isResult?(event.ok?"完成":"失败"):"等待结果";
-    row.badge.dataset.status=isResult?(event.ok?"ok":"error"):"pending";
-    if (isResult) row.detail.append(el("small",{class:"muted"},"返回摘要"),el("pre",{class:"tool-output"},event.preview||"（无输出）"));
+    row.badge.textContent=event.browser_report ? browserCheckLabel(event.browser_report) : isResult?(event.ok?"完成":"失败"):"等待结果";
+    const incomplete=event.browser_report && ["operation_timeout","script_timeout","interrupted","runner_error"].includes(event.browser_report.kind);
+    row.badge.dataset.status=incomplete?"incomplete":isResult?(event.ok?"ok":"error"):"pending";
+    if (event.browser_report) row.detail.append(browserCheckCard(event.browser_report));
+    else if (isResult) row.detail.append(el("small",{class:"muted"},"返回摘要"),el("pre",{class:"tool-output"},event.preview||"（无输出）"));
   }
   async function refresh() {
     if (!widget.open || !widget.isConnected) return;

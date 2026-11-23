@@ -13,8 +13,9 @@ import time
 from collections import deque
 from pathlib import Path
 
+from .browser_evidence import ScriptSteps, format_report
 from .schemas import ToolResult
-from .shell_tool import INLINE_FAILURE_LIMIT, command_timeout, project_environment, run_posix_argv
+from .shell_tool import INLINE_FAILURE_LIMIT, command_timeout, project_environment, run_posix_argv, stop_command_tree
 
 RUNNER = Path(__file__).with_name("playwright_runner.py").resolve()
 SHOWN = 12_000
@@ -88,7 +89,11 @@ class BrowserSession:
 
         threading.Thread(target=read_replies, daemon=True, name="browser-replies").start()
         threading.Thread(target=read_stderr, daemon=True, name="browser-stderr").start()
-        reply = self._wait(ctx, 90)
+        try:
+            reply = self._wait(ctx, 90)
+        except (TimeoutError, InterruptedError):
+            self.close()
+            raise
         if reply is None or not reply.get("ready"):
             self.close()
             return "".join(self.stderr)[-4000:] or "the browser server did not start"
@@ -108,7 +113,7 @@ class BrowserSession:
                 continue
             return None if line is None else json.loads(line)
 
-    def run(self, ctx, cwd: Path, code: str, requested_timeout, *, virtual_time: bool = False) -> ToolResult:
+    def run(self, ctx, cwd: Path, code: str, requested_timeout, *, virtual_time: bool = False, evidence=None) -> ToolResult:
         with self.lock:
             try:
                 timeout = command_timeout(ctx, requested_timeout)
@@ -116,23 +121,33 @@ class BrowserSession:
                 return ToolResult.failure(str(exc))
             started = time.monotonic()
             if self.process is None or self.process.poll() is not None:
-                problem = self._start(ctx)
+                try:
+                    problem = self._start(ctx)
+                except TimeoutError:
+                    return ToolResult.failure("The browser startup timed out before the script began.")
+                except InterruptedError:
+                    return ToolResult.failure("Browser startup was cancelled before the script began.", cancelled=True)
                 if problem:
                     return ToolResult.failure("The browser could not start:\n" + problem)
             self.calls += 1
             try:
-                request = {"cwd": str(cwd), "workspace": str(cwd), "code": code, "virtual_time": virtual_time}
+                request = {"cwd": str(cwd), "workspace": str(cwd), "code": code, "virtual_time": virtual_time,
+                           "evidence": evidence}
                 self.process.stdin.write(json.dumps(request) + "\n")
                 self.process.stdin.flush()
                 reply = self._wait(ctx, timeout)
             except (TimeoutError, InterruptedError, BrokenPipeError, OSError) as exc:
+                # Stop at the deadline, before the script can run another step during graceful shutdown.
+                if self.process and self.process.poll() is None:
+                    stop_command_tree(self.process)
                 self.close()
                 status = "Cancelled" if isinstance(exc, InterruptedError) else f"Timed out ({timeout:g}s)"
                 if isinstance(exc, (BrokenPipeError, OSError)) and not isinstance(exc, (TimeoutError, InterruptedError)):
                     status = "The browser server stopped"
                 return ToolResult.failure(f"exit_code=None\n{status}; the browser was closed and the next "
                                           "run_browser call starts a new one.",
-                                          timed_out=isinstance(exc, TimeoutError), warm_browser=True)
+                                          timed_out=isinstance(exc, TimeoutError), cancelled=isinstance(exc, InterruptedError),
+                                          timeout_s=timeout, warm_browser=True)
             if reply is None:
                 self.close()
                 return ToolResult.failure("exit_code=None\nThe browser server stopped:\n"
@@ -179,11 +194,40 @@ def run_browser(ctx, args: dict) -> ToolResult:
     if not cwd.is_dir():
         return ToolResult.failure("cwd must be a directory in the workspace.")
     virtual_time = args.get("virtual_time", False)
-    session = getattr(ctx.sandbox, "browser_session", None)
-    if session is not None:
-        return session.run(ctx, cwd, code, args.get("timeout"), virtual_time=virtual_time)
-    with tempfile.TemporaryDirectory(prefix="miniagent-browser-", dir=ctx.sandbox.command_tmpdir) as home:
-        argv = ["python", "-I", "-B", "-u", str(RUNNER), _browser_cache(), home, str(cwd), code]
-        if virtual_time:
-            argv.append("--virtual-time")
-        return run_posix_argv(ctx, argv, cwd, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
+    steps = ScriptSteps(code)
+    with tempfile.NamedTemporaryFile(prefix="browser-steps-", dir=ctx.sandbox.command_tmpdir) as evidence:
+        evidence.truncate(steps.progress_size)
+        session = getattr(ctx.sandbox, "browser_session", None)
+        if session is not None:
+            result = session.run(ctx, cwd, code, args.get("timeout"), virtual_time=virtual_time, evidence=evidence.name)
+        else:
+            with tempfile.TemporaryDirectory(prefix="miniagent-browser-", dir=ctx.sandbox.command_tmpdir) as home:
+                argv = ["python", "-I", "-B", "-u", str(RUNNER), _browser_cache(), home, str(cwd), code,
+                        "--evidence", evidence.name]
+                if virtual_time:
+                    argv.append("--virtual-time")
+                result = run_posix_argv(ctx, argv, cwd, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
+        if not result.ok:
+            evidence.seek(0)
+            progress = evidence.read(steps.progress_size).ljust(steps.progress_size, b"\0")
+            raw = evidence.read(64_000)
+            try:
+                recorded = json.loads(raw) if raw else {}
+            except (ValueError, RecursionError):
+                recorded = {}  # a killed process can leave the diagnostic record incomplete
+            if result.meta.get("timed_out"):
+                failure = {"kind": "script_timeout", "detail": f"Script deadline reached ({result.meta['timeout_s']:g}s)."}
+            elif result.meta.get("cancelled"):
+                failure = {"kind": "interrupted", "detail": "Script cancelled."}
+            elif (isinstance(recorded, dict) and recorded.get("kind") in ("operation_timeout", "assertion_failed",
+                  "script_error", "script_exit") and isinstance(recorded.get("detail"), str)
+                  and isinstance(recorded.get("frames"), list) and isinstance(recorded.get("observed"), list)
+                  and all(isinstance(item, str) for item in recorded["observed"])):
+                failure = recorded
+            else:
+                failure = {"kind": "runner_error", "detail": _shown(result.content)[:1200]}
+            report = steps.report(progress, failure)
+            report["exit_code"] = result.meta.get("exit_code")
+            result.meta["browser_report"] = report
+            result.content = format_report(report) + "\n\n" + result.content
+        return result

@@ -1,6 +1,6 @@
 """Subprocess entry point for ``run_browser``: launch Chromium, run the agent's script.
 
-Usage: ``python playwright_runner.py <browsers_path> <home> <workspace> <code> [--virtual-time]``
+Usage: ``python playwright_runner.py <browsers_path> <home> <workspace> <code> [--virtual-time] [--evidence <path>]``
 or ``python playwright_runner.py --serve <browsers_path> <home>`` to keep one Chromium
 open and run one JSON request per stdin line (``{"cwd": ..., "code": ...}``), answering
 each with one JSON line (``{"status", "stdout", "stderr"}``). Every request still gets
@@ -23,6 +23,15 @@ import sys
 import traceback
 import tempfile
 from pathlib import Path
+
+
+# The runner is launched by absolute path with python -I, without the package on sys.path.
+if __package__:
+    from .browser_evidence import Recorder, ScriptSteps
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from browser_evidence import Recorder, ScriptSteps
+    sys.path.pop(0)
 
 
 # A failing step used to wait Playwright's default 30 s before it failed: in the Mid_Test runs,
@@ -68,7 +77,9 @@ def main() -> int:
     with sync_playwright() as playwright:
         browser = _launch(playwright.chromium, Error)
         try:
-            return _run_script(browser, playwright, expect, Error, workspace, code, "--virtual-time" in sys.argv[5:])
+            options = sys.argv[5:]
+            path = options[options.index("--evidence") + 1] if "--evidence" in options else None
+            return _run_script(browser, playwright, expect, Error, workspace, code, "--virtual-time" in options, path)
         finally:
             try:
                 browser.close()
@@ -113,10 +124,17 @@ def _script_contexts(browser, virtual_time, error):
                 pass
 
 
-def _run_script(browser, playwright, expect, error, workspace: str, code: str, virtual_time: bool = False) -> int:
+def _run_script(browser, playwright, expect, error, workspace: str, code: str, virtual_time: bool = False,
+                evidence_path=None) -> int:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
     console: list[str] = []
     status = 0
+    recorder = None
+    file = open(evidence_path, "r+b") if evidence_path else None
     try:
+        if file:
+            recorder = Recorder(ScriptSteps(code), file)
         with _script_contexts(browser, virtual_time, error):
             context = browser.new_context(viewport={"width": 1280, "height": 800})
             page = context.new_page()
@@ -124,13 +142,28 @@ def _run_script(browser, playwright, expect, error, workspace: str, code: str, v
             page.on("pageerror", lambda e: console.append(f"uncaught page error: {e}"))
             scope = {"page": page, "context": context, "browser": browser, "playwright": playwright, "expect": expect,
                      "__name__": "__main__", "WORKSPACE": Path(workspace)}
-            exec(compile(code, "<run_browser>", "exec"), scope)
+            if recorder:
+                scope[recorder.steps.name] = recorder
+                program = recorder.steps.compile()
+            else:
+                program = compile(code, "<run_browser>", "exec")
+            exec(program, scope)
     except SystemExit as exc:
         status = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-    except BaseException:  # noqa: BLE001 - report every failure of the agent's script
+        if status and recorder:
+            recorder.failure(exc, "script_exit")
+    except BaseException as exc:  # noqa: BLE001 - report every failure of the agent's script
+        if recorder:
+            kind = ("operation_timeout" if isinstance(exc, PlaywrightTimeout) else
+                    "assertion_failed" if isinstance(exc, AssertionError) else "script_error")
+            recorder.failure(exc, kind)
         traceback.print_exc()
         status = 1
     finally:
+        if recorder:
+            recorder.progress.close()
+        if file:
+            file.close()
         if console:
             print("\n[browser console]\n" + "\n".join(console[:60]), file=sys.stderr)
     return status
@@ -172,7 +205,7 @@ def serve() -> int:
                     if not browser.is_connected():  # the previous script closed it
                         browser = _launch(playwright.chromium, Error)
                     status = _run_script(browser, playwright, expect, Error, request["workspace"], request["code"],
-                                         request.get("virtual_time", False))
+                                         request.get("virtual_time", False), request.get("evidence"))
                 except BaseException:  # noqa: BLE001 - keep serving after any single failure
                     traceback.print_exc()
                     status = 1

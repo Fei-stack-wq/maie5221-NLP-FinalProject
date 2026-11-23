@@ -605,7 +605,9 @@ class Agent:
             content = content[:MAX_TOOL_RESULT_CHARS] + f"\n…[truncated: {len(content) - MAX_TOOL_RESULT_CHARS} more characters]"
         if not ok and not content.startswith(("Tool call rejected", "Error")):
             content = "Error: " + content
-        self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600], seconds=seconds)
+        report = result.meta.get("browser_report") if call.name == "run_browser" else None
+        self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600], seconds=seconds,
+                  **({"browser_report": report} if report else {}))
         return result.model_copy(update={"content":content})
 
     def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model) -> str:

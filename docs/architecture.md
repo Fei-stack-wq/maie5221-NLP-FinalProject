@@ -118,6 +118,33 @@ application server still run in real time. The browser regressions exercise peri
 fetches in fresh windows through both warm and cold runners.
 [Playwright Clock source (v1.48.0)](https://github.com/microsoft/playwright-python/blob/v1.48.0/playwright/_impl/_clock.py) · [Playwright Clock guide](https://playwright.dev/python/docs/clock)
 
+An unsuccessful `run_browser` call records a structured `browser_report` on its
+`tool_result` trace event. A Playwright operation timeout identifies the waiting
+statement and preserves the driver's call log. A failed assertion records the
+script location, the exception text and any values available from that evaluation.
+Playwright supplies its own expected/actual diagnostic. Python `assert` records
+bounded representations of evaluated operands for ordinary scalars and collections.
+Custom objects are never inspected to reconstruct a value.
+[Playwright assertion implementation (v1.48.0)](https://github.com/microsoft/playwright-python/blob/v1.48.0/playwright/_impl/_assertions.py)
+
+Small markers inserted via Python's AST record entered statements even if the
+runner is interrupted. At the whole-script deadline the location is the **last
+entered statement**. When an exception escapes, its traceback identifies the
+failing statement and callers. Later statements in those blocks that were never
+entered appear with line numbers. This is statement coverage for the submitted
+script. It cannot enumerate runtime-generated checks or untested loop iterations.
+The model receives a compact list, and the trace and expandable chat card retain
+the full list. Successful checks keep their existing output.
+[Python abstract syntax trees](https://docs.python.org/3/library/ast.html#ast.NodeTransformer)
+
+For example, if a booking check expects `Booked` but sees `Pending`, the report
+records that value and lists the following cancellation check as unreached. The
+member's handoff carries the unsuccessful calls in execution order, with their
+positions among all browser calls. The lead can use these observations to decide
+what to do next. Recording evidence triggers no extra navigation, assertion,
+model call or assignment. The regression in `tests/test_browser_evidence.py`
+follows a real Chromium result through the tool trace, lead handoff and chat UI.
+
 ## Components
 
 **`agent.py`** — `Agent.run(task, context)`: messages are `[system, context+task,

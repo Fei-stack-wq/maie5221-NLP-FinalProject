@@ -213,6 +213,8 @@ class WarmBrowserTest(unittest.TestCase):
         result = self.run_code("page.goto((WORKSPACE / 'index.html').as_uri()); page.click('#book')")
         self.assertFalse(result.ok)
         self.assertIn("Timeout 5000ms", result.content)
+        self.assertEqual(result.meta["browser_report"]["kind"], "operation_timeout")
+        self.assertEqual(result.meta["browser_report"]["step"]["source"], "page.click('#book')")
         self.assertLess(time.monotonic() - started, 15)
 
     def test_new_context_and_standalone_page_inherit_waits(self):
@@ -270,11 +272,31 @@ for tab in [page, opened.value, browser.new_context().new_page(), browser.new_pa
                 self.assertTrue(result.ok, result.content)
 
     def test_a_hanging_script_is_stopped_and_the_next_call_starts_a_new_browser(self):
-        result = self.run_code("import time; time.sleep(30)", timeout=2)
+        result = self.run_code("import time; time.sleep(30)\nraise AssertionError('later')", timeout=2)
         self.assertFalse(result.ok)
         self.assertTrue(result.meta["timed_out"])
+        report = result.meta["browser_report"]
+        self.assertEqual(report["kind"], "script_timeout")
+        self.assertEqual(report["step"]["source"], "time.sleep(30)")
+        self.assertEqual(report["unreached"], [{"line": 2, "source": "raise AssertionError('later')"}])
         self.assertIsNone(self.sandbox.browser_session.process)
         self.assertTrue(self.run_code("page.goto((WORKSPACE / 'index.html').as_uri())").ok)
+
+    def test_navigation_timeout_in_warm_and_cold_runners(self):
+        code = ("page.route('https://rooms.test/**', lambda route: None)\n"
+                "page.goto('https://rooms.test/slow', timeout=200)\n"
+                "expect(page.locator('output')).to_have_text('Booked')\n")
+        for warm in (True, False):
+            with self.subTest(warm=warm):
+                if not warm:
+                    self.sandbox.browser_session.close()
+                    self.sandbox.browser_session = None
+                result = self.run_code(code)
+                report = result.meta["browser_report"]
+                self.assertEqual((result.ok, result.meta["exit_code"], report["kind"]), (False, 1, "operation_timeout"))
+                self.assertEqual(report["step"], {"line": 2, "source": code.splitlines()[1]})
+                self.assertIn("200ms", report["detail"])
+                self.assertEqual(report["unreached"], [{"line": 3, "source": code.splitlines()[2]}])
 
     def test_agent_run_closes_its_browser(self):
         provider = FakeProvider(Script(qa=[reply("", call("run_browser", code="page.goto((WORKSPACE / 'index.html').as_uri())")),

@@ -39,6 +39,7 @@ from dataclasses import asdict, replace
 from typing import Any, Callable
 
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
+from .browser_evidence import format_report
 from .checkpoint import Continuation, PauseRequested
 from .config import FAST_SOFT_MINUTES, Settings
 from .context import ContextManager
@@ -459,6 +460,13 @@ def render_plan(plan: dict) -> str:
     return "\n".join(rows) + (f"\nNote: {plan['explanation']}" if plan.get("explanation") else "")
 
 
+def browser_handoff(checks: dict) -> str:
+    rows = [f"Browser evidence from {checks['calls']} call(s) in this assignment:"]
+    for check in checks["findings"]:
+        rows.append(f"Call {check['number']} ({check['call_id']})\n" + format_report(check["report"]))
+    return "\n".join(rows)
+
+
 def render_event(event: dict, names: dict[str, str]) -> str:
     kind = event["kind"]
     who = lambda agent: f"{names.get(agent, agent)} ({agent})"  # noqa: E731
@@ -617,6 +625,15 @@ class TeamTask:
             self.channel.finish()
         if event["type"] == "say":
             self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
+        if event["type"] == "tool_result" and event.get("tool") == "run_browser":
+            with self.lock:
+                entry = self.inflight.get(event["agent"])
+                if entry is not None:
+                    checks = entry.setdefault("browser_checks", {"calls": 0, "findings": []})
+                    checks["calls"] += 1
+                    if event.get("browser_report"):
+                        checks["findings"].append({"number": checks["calls"], "call_id": event["call_id"],
+                                                  "report": event["browser_report"]})
         if event["type"] == "parallel":
             with self.lock:
                 if event.get("tool") == "reads":
@@ -950,7 +967,8 @@ class TeamTask:
         with self.lock:
             self.inflight.pop(assignee, None)
             self.lead_baseline = self.store.project.checkout(self.store.workspace(lead_id))
-        outcome = self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop)
+        outcome = self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop,
+                                         entry.get("browser_checks"))
         if parallel:
             outcome["parallel"] = parallel
         return outcome
@@ -1042,7 +1060,8 @@ class TeamTask:
             self.inflight[assignee] = entry
         return entry
 
-    def _close_assignment(self, member, task, deliverables, result, changes, skipped, checks, review, loop):
+    def _close_assignment(self, member, task, deliverables, result, changes, skipped, checks, review, loop, browser_checks=None):
+        browser_checks = browser_checks if browser_checks and browser_checks["findings"] else None
         assignee = member.id
         report = result.answer or "(no report)"
         if result.error:
@@ -1056,18 +1075,21 @@ class TeamTask:
                         break
         manifest = self.store.project.manifest()
         missing = [p for p in deliverables if not _present(p, manifest)]
-        report_extra = {k: v for k, v in (("checks", checked), ("loop", loop), ("review", review or None)) if v}
+        report_extra = {k: v for k, v in (("checks", checked), ("loop", loop), ("review", review or None),
+                                          ("browser_checks", browser_checks)) if v}
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
                           changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
                           **report_extra)
         return {"member": member, "result": result, "report": report, "changes": changes, "skipped": skipped,
-                "missing": missing, "checks": checked}
+                "missing": missing, "checks": checked, "browser_checks": browser_checks}
 
     def _report_lines(self, outcome: dict) -> list[str]:
         member, result, changes = outcome["member"], outcome["result"], outcome["changes"]
         lines = [f"Report from {member.name} ({member.id}) — status: {result.status}"
                  + ("" if result.status == "completed" else " (the assignment did not finish normally)"),
                  "", _clip(outcome["report"], REPORT_LIMIT), ""]
+        if outcome.get("browser_checks"):
+            lines.append(browser_handoff(outcome["browser_checks"]))
         if self.settings.team.resume_members:
             lines.append(f"Session: {'continued their earlier session in this task' if result.resumed else 'new session'}.")
         if changes:
@@ -1129,6 +1151,7 @@ class TeamTask:
                     if isinstance(reviewed, ToolResult):
                         state["stop"] = reviewed.content
                         break
+                    state["review_browser_checks"] = reviewed.get("browser_checks")
                     state["last_review"] = reviewed["report"]
                     state["verdict"] = _verdict(reviewed["report"])
                     state["rounds"].append(f"Round {number} — review by {names[reviewer]}: {state['verdict'].upper()}"
@@ -1146,6 +1169,7 @@ class TeamTask:
                 if isinstance(fixed, ToolResult):
                     state["stop"] = fixed.content
                     break
+                state["fix_browser_checks"] = fixed.get("browser_checks")
                 state["last_fix"], state["last_checks"] = fixed["report"], fixed["checks"]
                 for change in fixed["changes"]:
                     state["touched"][change.path] = change.change
@@ -1169,8 +1193,12 @@ class TeamTask:
             lines.append("Stopped early: " + stop)
         if last_review:
             lines += ["", f"Last review from {names[reviewer]}:", _clip(last_review, 6000)]
+        if state.get("review_browser_checks"):
+            lines.append(browser_handoff(state["review_browser_checks"]))
         if last_fix:
             lines += ["", f"Last report from {names[author]}:", _clip(last_fix, 3000)]
+        if state.get("fix_browser_checks"):
+            lines.append(browser_handoff(state["fix_browser_checks"]))
         if touched:
             lines.append("Files changed by the fixes: " + ", ".join(f"{p} ({c})" for p, c in sorted(touched.items())))
         if last_checks:
