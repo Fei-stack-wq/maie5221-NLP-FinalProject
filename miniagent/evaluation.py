@@ -38,6 +38,8 @@ def evaluate(store, checks, settings):
                     if check["kind"] == "command":
                         result = run_shell(ctx, {"command": check["command"]})
                         details = {"passed": result.ok, "exit_code": result.meta.get("exit_code")}
+                        if not result.ok:
+                            details["output"] = result.content[-1500:]
                     else:
                         path = ctx.sandbox.resolve(check["path"])
                         passed = path.is_file()

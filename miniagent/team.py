@@ -38,8 +38,9 @@ import uuid
 from dataclasses import replace
 from typing import Any, Callable
 
-from .agent import Agent, AgentResult
+from .agent import Agent, AgentResult, AgentSession
 from .config import Settings
+from .evaluation import evaluate, validate
 from .providers import Provider
 from .sandbox import Sandbox
 from .schemas import ToolResult, Usage
@@ -48,6 +49,55 @@ from .tools import Tool, ToolRegistry, build_default_registry
 from .workspace import listing
 
 REPORT_LIMIT = 14_000
+
+CHECKS_SCHEMA = {
+    "type": "array", "maxItems": 20,
+    "description": ("Mechanical checks Studio runs on the published project after the work, for your information: "
+                    "{kind: exists, path} | {kind: contains, path, text} | {kind: command, command} (passes on exit 0)"),
+    "items": {"type": "object", "properties": {
+        "kind": {"type": "string", "enum": ["exists", "contains", "command"]},
+        "path": {"type": "string"}, "text": {"type": "string"}, "command": {"type": "string"}},
+        "required": ["kind"]},
+}
+VERDICT_LINE = re.compile(r"^\W*VERDICT:\s*(APPROVED|CHANGES\s+REQUESTED)\b.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _verdict(report: str) -> str:
+    """The reviewer's verdict marker, as AutoGen's TextMentionTermination looks for its stop text."""
+    match = VERDICT_LINE.search(report[:2000])
+    if match is None:
+        return "unclear"
+    return "approved" if match.group(1).upper() == "APPROVED" else "changes requested"
+
+
+def check_lines(evaluation: dict) -> list[str]:
+    lines = [f"Checks run by Studio on the published project (information, not a gate): "
+             f"{evaluation['passed']}/{evaluation['total']} passed"]
+    for row in evaluation["checks"]:
+        if row["kind"] == "command":
+            what = f"command `{_clip(row['command'], 200)}`" + ("" if row["passed"] else f" (exit {row.get('exit_code')})")
+        elif row["kind"] == "contains":
+            what = f"{row['path']} contains {_clip(row['text'], 80)!r}"
+        else:
+            what = f"{row['path']} exists"
+        lines.append(f"- {'✓' if row['passed'] else '✗'} {what}")
+        detail = row.get("error") or ("" if row["passed"] else row.get("output", ""))
+        if detail:
+            lines.append("  " + _clip(detail, 900).replace("\n", "\n  "))
+    return lines
+
+
+def _norm(path: Any) -> str:
+    return str(path).strip().removeprefix("./").rstrip("/")
+
+
+def _overlaps(a: str, b: str) -> bool:
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def _present(path: str, manifest: dict[str, str]) -> bool:
+    path = _norm(path)
+    return path in manifest or any(name.startswith(path + "/") for name in manifest)
 
 
 class Cancelled(Exception):
@@ -173,6 +223,32 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "- You may read files and run commands yourself to verify reports before you rely on them, and you "
             "may write files yourself when that is part of your own role.",
         ]
+        if settings.team.parallel_delegations:
+            parts.append(
+                "- Assignments that do not depend on each other can run at the same time: call `delegate_task` "
+                "several times in one response, each with its own `deliverables` and no file shared between them. "
+                "Otherwise they run one after another.")
+        parts.append(
+            "- Add `checks` to an assignment when 'done' can be checked mechanically (a file exists, contains a "
+            "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
+            "shows you the results; they inform your judgement and never block delivery. Set `review: true` on "
+            "an assignment that reviews or tests someone else's work.")
+        if settings.team.review_loops and len(members) > 2:
+            parts.append(
+                "- For an author–reviewer cycle (build → test → fix → re-test), `review_loop` runs the rounds for you: "
+                "the reviewer's findings go straight to the author's continued session, and you receive the final "
+                "verdict, the last review and the files changed.")
+        if settings.team.plans:
+            parts.append(
+                "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
+                "report (mark steps done, add or change steps). The requester sees it and may steer you.")
+        if settings.team.resume_members:
+            parts.append(
+                "- A teammate you assign again during this task continues their earlier session: they still "
+                "remember what they read, did and reported, and are told which files others changed since. A "
+                "follow-up can therefore be short — the concrete findings to fix or the next step — instead of "
+                "repeating the background. Set `fresh: true` when you want an independent check that must not "
+                "be anchored by that teammate's earlier work in this task.")
     else:
         parts += [
             "",
@@ -259,6 +335,13 @@ def _clip(text: str, limit: int) -> str:
     return text[:head] + f"\n…[{len(text) - limit} characters omitted]…\n" + text[-(limit - head):]
 
 
+def render_plan(plan: dict) -> str:
+    marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+    rows = [f"{marks.get(s['status'], '[ ]')} {s['step']}" + (f" — {s['owner']}" if s.get("owner") else "")
+            for s in plan.get("steps", [])]
+    return "\n".join(rows) + (f"\nNote: {plan['explanation']}" if plan.get("explanation") else "")
+
+
 def render_event(event: dict, names: dict[str, str]) -> str:
     kind = event["kind"]
     who = lambda agent: f"{names.get(agent, agent)} ({agent})"  # noqa: E731
@@ -285,6 +368,8 @@ def render_event(event: dict, names: dict[str, str]) -> str:
                 + (f"\nPublished: {files}" if files else ""))
     if kind == "question":
         return f"**{who(event['agent'])} asked the requester:** {_clip(event['question'], 2000)}"
+    if kind == "plan":
+        return f"**{who(event['agent'])} updated the plan:**\n" + render_plan(event)
     if kind == "answer":
         return f"**Requester answered:** {_clip(event['text'], 3000)}"
     if kind == "final":
@@ -294,13 +379,15 @@ def render_event(event: dict, names: dict[str, str]) -> str:
     return ""
 
 
-def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000) -> str:
+def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000, *, after_seq: int = 0) -> str:
     names = {m.id: m.name for m in store.group.members}
     lines: list[str] = []
     used = 0
     for event in reversed(store.chat()):
         if event["seq"] >= before_seq:
             continue
+        if event["seq"] <= after_seq:
+            break
         line = render_event(event, names)
         if not line:
             continue
@@ -361,6 +448,15 @@ class TeamTask:
         self.assignments: list[dict] = []
         self.history: dict[str, list[str]] = {}
         self.lead_baseline: dict[str, str] = {}
+        self.sessions: dict[tuple[str, str], AgentSession] = {}
+        """Member conversations kept for this task, continued by later assignments."""
+        self.session_marks: dict[tuple[str, str], dict] = {}
+        """Per member session: the project manifest after its last publish and the seq of its last assignment."""
+        self.lock = threading.RLock()
+        """Guards counters, sessions and the record while assignments run in parallel."""
+        self.plan: dict | None = None
+        self.reviewer_provider: Provider | None = None
+        self.parallel_batches = 0
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
 
@@ -371,6 +467,9 @@ class TeamTask:
             self.channel.finish()
         if event["type"] == "say":
             self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
+        if event["type"] == "parallel":
+            with self.lock:
+                self.parallel_batches += 1
         if event["type"] == "delta":
             self.store.previews.fragment(self.task_id, event["agent"], event["phase"], event["text"])
         elif event["type"] in ("step", "tool_call"):
@@ -384,6 +483,10 @@ class TeamTask:
         registry = build_default_registry()
         if lead and len(self.group.members) > 1:
             registry.add(self._delegate_tool(agent_id))
+            if self.settings.team.review_loops and len(self.group.members) > 2:
+                registry.add(self._review_tool(agent_id))
+            if self.settings.team.plans:
+                registry.add(self._plan_tool(agent_id))
         if self.interactive:
             registry.add(Tool(
                 name="ask_human",
@@ -415,8 +518,32 @@ class TeamTask:
         self._event({"type": "answer", "agent": agent, "text": answer})
         return ToolResult.success(f"The requester answered:\n{answer}")
 
+    def _resume_context(self, key: tuple[str, str], baseline: dict[str, str], through: int) -> str:
+        """What a continued member needs to know: the conversation and file changes since its last turn."""
+        mark = self.session_marks[key]
+        sections = []
+        chat = conversation(self.store, through, 24_000, after_seq=mark["seq"])
+        if chat:
+            sections.append("## Team conversation since your last assignment\n" + chat)
+        before = mark["manifest"]
+        changed = sorted([f"{path} (added)" for path in baseline.keys() - before.keys()]
+                         + [f"{path} (changed)" for path in baseline.keys() & before.keys() if baseline[path] != before[path]]
+                         + [f"{path} (deleted)" for path in before.keys() - baseline.keys()])
+        sections.append("## Project files changed by others since your last report\n"
+                        + ("\n".join(f"- {line}" for line in changed[:60])
+                           + (f"\n- …and {len(changed) - 60} more" if len(changed) > 60 else "")
+                           if changed else "(none)"))
+        if self.plan:
+            sections.append("## Team plan (kept by the lead)\n" + render_plan(self.plan))
+        sections.append("Your workspace has been refreshed to the current team project. Background processes from "
+                        "your previous assignment (servers, watchers) were stopped; start again anything you need.\n"
+                        f"Current date and time: {time.strftime('%Y-%m-%d %H:%M %Z')}.")
+        return "\n\n".join(sections)
+
     def _context(self, agent, through):
         context = agent_context(self.store, agent, through)
+        if self.plan and agent != self.primary:
+            context += "\n\n## Team plan (kept by the lead)\n" + render_plan(self.plan)
         if self.studio is not None:
             if self.group.kind == "assistant":
                 from .assistant_room import workspace_evidence
@@ -432,115 +559,338 @@ class TeamTask:
                 context += "\nMessage attachments:\n" + _clip(json.dumps(uploads, ensure_ascii=False), 6000)
         return context
 
+    # -- team tools -------------------------------------------------------
+    def _member_ids(self, lead_id: str) -> list[str]:
+        return [m.id for m in self.group.members if m.id != lead_id]
+
     def _delegate_tool(self, lead_id: str) -> Tool:
-        ids = [m.id for m in self.group.members if m.id != lead_id]
+        team = self.settings.team
+        properties: dict[str, Any] = {
+            "max_steps": {"type": "integer", "minimum": 1, "maximum": 150},
+            "assignee": {"type": "string", "enum": self._member_ids(lead_id), "description": "Teammate id"},
+            "task": {"type": "string", "description": "The complete assignment: goal, context, exact files, "
+                                                      "and how the result will be checked"},
+            "deliverables": {"type": "array", "items": {"type": "string"},
+                             "description": "Project-relative paths the teammate should create or update"},
+            "checks": CHECKS_SCHEMA,
+            "review": {"type": "boolean",
+                       "description": "True when this assignment reviews or tests someone else's work"},
+        }
+        if team.resume_members:
+            properties["fresh"] = {"type": "boolean",
+                                   "description": "Start the teammate in a clean session instead of continuing "
+                                                  "their earlier session in this task (default false)"}
         return Tool(
             name="delegate_task",
             description=("Give one assignment to one teammate and wait for their report. The teammate works in a "
                          "private copy of the team project; their file changes are published to the project when "
-                         "they finish. Returns their report and the list of published files."),
+                         "they finish. Returns their report, the published files and the results of any checks."
+                         + (" Several calls in one response run at the same time when each declares deliverables "
+                            "and no two share a file." if team.parallel_delegations else "")),
+            parameters={"type": "object", "properties": properties, "required": ["assignee", "task"]},
+            fn=lambda _ctx, args: self._delegate(lead_id, args),
+            concurrent=self._can_run_together if team.parallel_delegations else None)
+
+    def _review_tool(self, lead_id: str) -> Tool:
+        ids = self._member_ids(lead_id)
+        return Tool(
+            name="review_loop",
+            description=("Run an author–reviewer cycle without relaying each round: the reviewer reviews, and while "
+                         "they request changes their findings go straight to the author's continued session to fix, "
+                         "then back to the reviewer — until the reviewer approves or the rounds run out. Each review "
+                         "and each fix counts as one delegation. Returns the final verdict, the last review, the "
+                         "author's last report and the files changed."),
             parameters={"type": "object", "properties": {
-                "max_steps": {"type":"integer","minimum":1,"maximum":150},
-                "assignee": {"type": "string", "enum": ids, "description": "Teammate id"},
-                "task": {"type": "string", "description": "The complete assignment: goal, context, exact files, "
-                                                          "and how the result will be checked"},
+                "author": {"type": "string", "enum": ids, "description": "Teammate who produced and will fix the work"},
+                "reviewer": {"type": "string", "enum": ids, "description": "Teammate who reviews or tests it"},
+                "work": {"type": "string", "description": "What was produced and where, and what the reviewer must check"},
+                "criteria": {"type": "string", "description": "What 'acceptable' means for the reviewer's verdict"},
                 "deliverables": {"type": "array", "items": {"type": "string"},
-                                 "description": "Project-relative paths the teammate should create or update"},
-            }, "required": ["assignee", "task"]},
-            fn=lambda _ctx, args: self._delegate(lead_id, args))
+                                 "description": "Project-relative paths the author may change while fixing"},
+                "checks": CHECKS_SCHEMA,
+                "max_rounds": {"type": "integer", "minimum": 1, "maximum": 5,
+                               "description": "Most review rounds (default 3)"},
+            }, "required": ["author", "reviewer", "work"]},
+            fn=lambda _ctx, args: self._review_loop(lead_id, args))
+
+    def _plan_tool(self, lead_id: str) -> Tool:
+        return Tool(
+            name="update_plan",
+            description=("Replace the task plan the requester sees. List every step with its status; update it when "
+                         "you start or finish a step or change the approach."),
+            parameters={"type": "object", "properties": {
+                "explanation": {"type": "string", "description": "Optional short note on what changed"},
+                "steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
+                    "type": "object", "properties": {
+                        "step": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        "owner": {"type": "string", "description": "Teammate id responsible, if any"}},
+                    "required": ["step", "status"]}},
+            }, "required": ["steps"]},
+            fn=lambda _ctx, args: self._update_plan(lead_id, args))
+
+    # -- delegation ---------------------------------------------------------
+    def _can_run_together(self, batch: list[dict]) -> bool:
+        """A batch of delegations may run at once: distinct teammates, declared and disjoint files, budget left."""
+        assignees = [str(args.get("assignee", "")).strip() for args in batch]
+        if len(set(assignees)) != len(assignees) or any(args.get("review") for args in batch):
+            return False
+        claimed: list[list[str]] = []
+        for args in batch:
+            paths = [_norm(p) for p in args.get("deliverables") or [] if _norm(p)]
+            if not paths:
+                return False
+            claimed.append(paths)
+        for i, mine in enumerate(claimed):
+            for theirs in claimed[i + 1:]:
+                if any(_overlaps(a, b) for a in mine for b in theirs):
+                    return False
+        with self.lock:
+            return self.settings.team.max_delegations - self.delegations >= len(batch)
 
     def _delegate(self, lead_id: str, args: dict) -> ToolResult:
         assignee = str(args.get("assignee", "")).strip()
         task = str(args.get("task", "")).strip()
         deliverables = [str(p).strip() for p in args.get("deliverables") or [] if str(p).strip()][:40]
-        valid = [m.id for m in self.group.members if m.id != lead_id]
-        if assignee not in valid:
-            return ToolResult.failure(f"Unknown assignee {assignee!r}. Choose one of: {', '.join(valid)}.")
         if len(task) < 10:
             return ToolResult.failure("The assignment is empty or too short. Describe the work completely.")
-        if self.delegations >= self.settings.team.max_delegations:
-            return ToolResult.failure(
-                f"The delegation budget for this task ({self.settings.team.max_delegations}) is used up. "
-                "Finish now with what the team has produced and state what remains open.")
-        max_steps = args.get("max_steps")
-        if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150,self.settings.limits.max_steps)):
-            return ToolResult.failure(f"max_steps must be between 1 and {min(150,self.settings.limits.max_steps)}")
-        previous = self.history.setdefault(assignee, [])
-        similar = sum(1 for old in previous
-                      if difflib.SequenceMatcher(None, old[:3000], task[:3000]).ratio() >= 0.9)
-        if similar >= self.settings.team.max_repeat_assignments:
-            return ToolResult.failure(
-                f"Refused: you have already given {assignee} this assignment {similar} times with nearly the same "
-                "wording. Repeating it will not change the outcome. Use the previous reports, change the approach "
-                "(different instructions, a different teammate, or doing it yourself), or finish and report what "
-                "is still open.")
-        self.delegations += 1
-        previous.append(task)
+        fresh, review = args.get("fresh", False), args.get("review", False)
+        if not isinstance(fresh, bool) or not isinstance(review, bool):
+            return ToolResult.failure("fresh and review must be true or false")
+        try:
+            checks = validate(list(args.get("checks") or []))
+        except ValueError as exc:
+            return ToolResult.failure(f"Invalid checks: {exc}")
+        outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
+                               fresh=fresh, checks=checks, review=review)
+        if isinstance(outcome, ToolResult):
+            return outcome
+        lines = self._report_lines(outcome)
+        lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
+        ok = outcome["result"].status in {"completed", "max_steps", "stuck", "budget"}
+        return ToolResult(ok=ok, content="\n".join(lines))
+
+    def _assign(self, lead_id: str, assignee: str, task: str, *, deliverables: list[str], max_steps=None,
+                fresh: bool = False, checks: list[dict] | None = None, review: bool = False,
+                loop: dict | None = None) -> dict | ToolResult:
+        """Run one member assignment; returns its outcome, or a refusal for the lead."""
+        valid = self._member_ids(lead_id)
+        if assignee not in valid:
+            return ToolResult.failure(f"Unknown assignee {assignee!r}. Choose one of: {', '.join(valid)}.")
+        if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150, self.settings.limits.max_steps)):
+            return ToolResult.failure(f"max_steps must be between 1 and {min(150, self.settings.limits.max_steps)}")
+        with self.lock:
+            if self.delegations >= self.settings.team.max_delegations:
+                return ToolResult.failure(
+                    f"The delegation budget for this task ({self.settings.team.max_delegations}) is used up. "
+                    "Finish now with what the team has produced and state what remains open.")
+            previous = self.history.setdefault(assignee, [])
+            similar = sum(1 for old in previous
+                          if difflib.SequenceMatcher(None, old[:3000], task[:3000]).ratio() >= 0.9)
+            if similar >= self.settings.team.max_repeat_assignments:
+                return ToolResult.failure(
+                    f"Refused: you have already given {assignee} this assignment {similar} times with nearly the same "
+                    "wording. Repeating it will not change the outcome. Use the previous reports, change the approach "
+                    "(different instructions, a different teammate, or doing it yourself), or finish and report what "
+                    "is still open.")
+            self.delegations += 1
+            previous.append(task)
+            lead_workspace = self.store.workspace(lead_id)
+            own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
+                                                task_id=self.task_id, note="lead edits before delegation")
+            if own:
+                self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
+                self.lead_baseline = self.store.project.checkout(lead_workspace)
         member = self.group.member(assignee)
-        lead_workspace = self.store.workspace(lead_id)
-        own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
-                                            task_id=self.task_id, note="lead edits before delegation")
-        if own:
-            self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
+        extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None)) if v}
         event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
-                                  task=task, deliverables=deliverables)
-        result, changes, skipped = self._run_member(member, task, deliverables, event["seq"], max_steps)
-        self.lead_baseline = self.store.project.checkout(lead_workspace)
+                                  task=task, deliverables=deliverables, **extra)
+        result, changes, skipped = self._run_member(member, task, deliverables, event["seq"], max_steps,
+                                                    fresh=fresh, review=review)
+        with self.lock:
+            self.lead_baseline = self.store.project.checkout(self.store.workspace(lead_id))
         report = result.answer or "(no report)"
         if result.error:
             report += f"\n\n[Run problem: {result.error}]"
+        checked = evaluate(self.store, checks, self.settings) if checks else None
+        if checked is not None:
+            with self.lock:
+                for item in reversed(self.assignments):
+                    if item["agent"] == assignee and "checks" not in item:
+                        item["checks"] = {"passed": checked["passed"], "total": checked["total"]}
+                        break
+        manifest = self.store.project.manifest()
+        missing = [p for p in deliverables if not _present(p, manifest)]
+        report_extra = {k: v for k, v in (("checks", checked), ("loop", loop), ("review", review or None)) if v}
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
-                          changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls)
-        lines = [f"Report from {member.name} ({assignee}) — status: {result.status}"
+                          changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
+                          **report_extra)
+        return {"member": member, "result": result, "report": report, "changes": changes, "skipped": skipped,
+                "missing": missing, "checks": checked}
+
+    def _report_lines(self, outcome: dict) -> list[str]:
+        member, result, changes = outcome["member"], outcome["result"], outcome["changes"]
+        lines = [f"Report from {member.name} ({member.id}) — status: {result.status}"
                  + ("" if result.status == "completed" else " (the assignment did not finish normally)"),
-                 "", _clip(report, REPORT_LIMIT), ""]
+                 "", _clip(outcome["report"], REPORT_LIMIT), ""]
+        if self.settings.team.resume_members:
+            lines.append(f"Session: {'continued their earlier session in this task' if result.resumed else 'new session'}.")
         if changes:
             lines.append("Published to the team project: " + ", ".join(
                 f"{c.path} ({c.change}{', overwrote a concurrent change' if c.conflict else ''})" for c in changes))
         else:
             lines.append("No files were changed by this assignment.")
-        manifest = self.store.project.manifest()
-        def present(path: str) -> bool:
-            path = path.strip().removeprefix("./").rstrip("/")
-            return path in manifest or any(name.startswith(path + "/") for name in manifest)
-        missing = [p for p in deliverables if not present(p)]
-        if missing:
-            lines.append("Expected files that do not exist in the project: " + ", ".join(missing))
-        if skipped:
-            lines.append("Not published (skipped): " + ", ".join(skipped[:20]))
-        lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
-        ok = result.status in {"completed", "max_steps", "stuck", "budget"}
-        return ToolResult(ok=ok, content="\n".join(lines))
+        if outcome["missing"]:
+            lines.append("Expected files that do not exist in the project: " + ", ".join(outcome["missing"]))
+        if outcome["skipped"]:
+            lines.append("Not published (skipped): " + ", ".join(outcome["skipped"][:20]))
+        if outcome["checks"]:
+            lines += check_lines(outcome["checks"])
+        return lines
 
-    def _run_member(self, member: Member, task: str, deliverables: list[str], trigger_seq: int, max_steps=None):
+    def _review_loop(self, lead_id: str, args: dict) -> ToolResult:
+        author, reviewer = str(args.get("author", "")).strip(), str(args.get("reviewer", "")).strip()
+        work, criteria = str(args.get("work", "")).strip(), str(args.get("criteria", "") or "").strip()
+        deliverables = [str(p).strip() for p in args.get("deliverables") or [] if str(p).strip()][:40]
+        rounds_max = args.get("max_rounds", 3)
+        valid = self._member_ids(lead_id)
+        if author not in valid or reviewer not in valid:
+            return ToolResult.failure(f"author and reviewer must be teammates: {', '.join(valid)}")
+        if author == reviewer:
+            return ToolResult.failure("The reviewer must be someone other than the author.")
+        if len(work) < 10:
+            return ToolResult.failure("Describe the work to review and where it is.")
+        if type(rounds_max) is not int or not 1 <= rounds_max <= 5:
+            return ToolResult.failure("max_rounds must be between 1 and 5")
+        try:
+            checks = validate(list(args.get("checks") or []))
+        except ValueError as exc:
+            return ToolResult.failure(f"Invalid checks: {exc}")
+        names = {m.id: m.name for m in self.group.members}
+        loop_id = uuid.uuid4().hex[:8]
+        rounds: list[str] = []
+        verdict, last_review, last_fix, last_checks, stop = "no review", "", None, None, ""
+        touched: dict[str, str] = {}
+        for number in range(1, rounds_max + 1):
+            review_task = (f"Review round {number} of at most {rounds_max} in a review loop with "
+                           f"{names[author]} ({author}), who will fix what you find.\n\n{work}"
+                           + (f"\n\nAcceptance criteria:\n{criteria}" if criteria else "")
+                           + ("\n\n" + "\n".join(check_lines(last_checks)) if last_checks else "")
+                           + "\n\nInspect the actual files and run what is needed. Do not fix the work yourself. "
+                             "Begin your report with exactly one line: `VERDICT: APPROVED` if the work meets the "
+                             "criteria, or `VERDICT: CHANGES REQUESTED` followed by numbered, concrete findings the "
+                             "author can act on.")
+            reviewed = self._assign(lead_id, reviewer, review_task, deliverables=[], review=True,
+                                    loop={"id": loop_id, "round": number, "role": "review"})
+            if isinstance(reviewed, ToolResult):
+                stop = reviewed.content
+                break
+            last_review = reviewed["report"]
+            verdict = _verdict(last_review)
+            rounds.append(f"Round {number} — review by {names[reviewer]}: {verdict.upper()}"
+                          + (f" ({reviewed['result'].status})" if reviewed["result"].status != "completed" else ""))
+            if verdict == "approved" or reviewed["result"].status in ("error", "cancelled") or number == rounds_max:
+                break
+            findings = VERDICT_LINE.sub("", last_review, count=1).strip() or last_review
+            fix_task = (f"Review round {number}: {names[reviewer]} requested changes. Fix these findings in the "
+                        f"project, verify your fix, then report what you changed and how you verified it.\n\n{findings}")
+            fixed = self._assign(lead_id, author, fix_task, deliverables=deliverables, checks=checks,
+                                 loop={"id": loop_id, "round": number, "role": "fix"})
+            if isinstance(fixed, ToolResult):
+                stop = fixed.content
+                break
+            last_fix, last_checks = fixed, fixed["checks"]
+            for change in fixed["changes"]:
+                touched[change.path] = change.change
+            rounds[-1] += (f"; fix by {names[author]}: {fixed['result'].status}, "
+                           f"{len(fixed['changes'])} file(s) changed")
+            if fixed["result"].status in ("error", "cancelled"):
+                break
+        lines = [f"Review loop {names[author]} ⇄ {names[reviewer]}: {verdict.upper()} after {len(rounds)} review round(s).",
+                 *rounds]
+        if stop:
+            lines.append("Stopped early: " + stop)
+        if last_review:
+            lines += ["", f"Last review from {names[reviewer]}:", _clip(last_review, 6000)]
+        if last_fix:
+            lines += ["", f"Last report from {names[author]}:", _clip(last_fix["report"], 3000)]
+        if touched:
+            lines.append("Files changed by the fixes: " + ", ".join(f"{p} ({c})" for p, c in sorted(touched.items())))
+        if last_checks:
+            lines += check_lines(last_checks)
+        lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
+        return ToolResult(ok=bool(rounds), content="\n".join(lines))
+
+    def _update_plan(self, lead_id: str, args: dict) -> ToolResult:
+        steps = []
+        for item in args.get("steps") or []:
+            text = str(item.get("step", "")).strip()
+            if not 1 <= len(text) <= 300:
+                return ToolResult.failure("Each step needs 1–300 characters of text.")
+            row = {"step": text, "status": item.get("status", "pending")}
+            if item.get("owner"):
+                row["owner"] = str(item["owner"]).strip()[:60]
+            steps.append(row)
+        if not 1 <= len(steps) <= 20:
+            return ToolResult.failure("A plan has 1–20 steps.")
+        explanation = str(args.get("explanation") or "").strip()[:600]
+        with self.lock:
+            self.plan = {"steps": steps, "explanation": explanation, "updated_at": now()}
+            self._update(plan=self.plan)
+        self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation)
+        done = sum(s["status"] == "completed" for s in steps)
+        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done. The requester can see it.")
+
+    def _run_member(self, member: Member, task: str, deliverables: list[str], trigger_seq: int, max_steps=None,
+                    *, fresh: bool = False, review: bool = False):
         workspace = self.store.workspace(member.id)
         baseline = self.store.project.checkout(workspace)
+        # Review work may use another model or thinking mode, so it keeps a session of its own.
+        key = (member.id, "review" if review else "work")
+        session = None
+        if self.settings.team.resume_members:
+            with self.lock:
+                session = self.sessions.get(key)
+                if session is None or fresh:
+                    session = self.sessions[key] = AgentSession()
+        continuing = session is not None and session.resumable and key in self.session_marks
         lead = self.group.member(self.primary)
         assignment = task
         if deliverables:
             assignment += "\n\nFiles you are expected to create or update: " + ", ".join(deliverables)
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
-        agent = Agent(member.id, self.provider, self._registry(member.id, lead=False), Sandbox(workspace, member.id),
-                      self.settings, limits=self.settings.limits if max_steps is None else replace(self.settings.limits, max_steps=max_steps),
-                      system_prompt=member_prompt(member, lead, self.group.members, self.settings,
-                                                                 self.interactive),
+        settings = self.settings.reviewer() if review else self.settings
+        provider = self.reviewer_provider if review and self.reviewer_provider is not None else self.provider
+        agent = Agent(member.id, provider, self._registry(member.id, lead=False), Sandbox(workspace, member.id),
+                      settings, limits=settings.limits if max_steps is None else replace(settings.limits, max_steps=max_steps),
+                      system_prompt=member_prompt(member, lead, self.group.members, settings, self.interactive),
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel,
                       stream=True)
         self.channel.start_cursor(member.id, trigger_seq)
-        self.active.append(member.id)
-        self._update(active=list(self.active))
-        try:
-            result = agent.run(assignment, context=self._context(member.id, trigger_seq))
-        finally:
-            self.active.remove(member.id)
+        with self.lock:
+            self.active.append(member.id)
             self._update(active=list(self.active))
+        context = (self._resume_context(key, baseline, trigger_seq) if continuing
+                   else self._context(member.id, trigger_seq))
+        try:
+            result = agent.run(assignment, context=context, session=session)
+        finally:
+            with self.lock:
+                self.active.remove(member.id)
+                self._update(active=list(self.active))
         changes, skipped = self.store.project.publish(workspace, baseline, author=member.id, task_id=self.task_id,
                                                       note=task[:300])
-        self.assignments.append(_metrics(member.id, result))
-        self.store.record_assignment(member.id, {
-            "task_id": self.task_id, "assignment": task[:1500], "status": result.status,
-            "files": [c.path for c in changes], "report": (result.answer or "")[:1500]})
-        self._update(assignments=self.assignments, delegations=self.delegations)
+        with self.lock:
+            if session is not None:
+                self.session_marks[key] = {"manifest": self.store.project.manifest(), "seq": trigger_seq}
+            metrics = _metrics(member.id, result)
+            if review:
+                metrics["review"] = True
+            self.assignments.append(metrics)
+            self.store.record_assignment(member.id, {
+                "task_id": self.task_id, "assignment": task[:1500], "status": result.status,
+                "files": [c.path for c in changes], "report": (result.answer or "")[:1500]})
+            self._update(assignments=self.assignments, delegations=self.delegations)
         return result, changes, skipped
 
     # -- the task ---------------------------------------------------------
@@ -594,6 +944,11 @@ class TeamTask:
         metrics = {"duration_s": round(time.monotonic() - started, 1), "lead": totals,
                    "delegations": self.delegations, "questions": self.channel.questions,
                    "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
+                   "prompt_cache_hit_tokens": totals["prompt_cache_hit_tokens"]
+                   + sum(a.get("prompt_cache_hit_tokens", 0) for a in self.assignments),
+                   "resumed_assignments": sum(1 for a in self.assignments if a.get("resumed")),
+                   "review_assignments": sum(1 for a in self.assignments if a.get("review")),
+                   "parallel_batches": self.parallel_batches,
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),
                    "tool_calls": totals["tool_calls"] + sum(a["tool_calls"] for a in self.assignments)}
         self._update(status=status, finished_at=now(), final_answer=answer, error=result.error,
@@ -605,4 +960,6 @@ class TeamTask:
 def _metrics(agent: str, result: AgentResult) -> dict:
     return {"agent": agent, "status": result.status, "steps": result.steps, "tool_calls": result.tool_calls,
             "prompt_tokens": result.usage.prompt_tokens, "completion_tokens": result.usage.completion_tokens,
-            "duration_s": result.duration_s, "compactions": result.compactions, "error": result.error}
+            "prompt_cache_hit_tokens": result.usage.prompt_cache_hit_tokens or 0,
+            "duration_s": result.duration_s, "compactions": result.compactions, "error": result.error,
+            "resumed": result.resumed}

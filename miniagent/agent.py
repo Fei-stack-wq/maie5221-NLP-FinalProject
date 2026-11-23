@@ -17,6 +17,11 @@ lacked:
 4. **Steering is cooperative.** Messages the user sends while the agent works
    are appended at the next step boundary; the agent is never interrupted in
    the middle of a tool batch.
+5. **A session can be continued.** Passing an :class:`AgentSession` keeps the
+   conversation after the run ends. A later ``run`` with the same session
+   appends the next assignment to that history instead of starting over, as
+   Codex CLI's ``send_input`` does for a spawned agent. The new assignment is
+   anchored so compaction never summarizes it away.
 
 Loop structure follows OpenAI Agents SDK ``Runner`` (max_turns → final
 handling) and Pi ``agent-loop.ts`` (tool batch → steering check → next
@@ -31,6 +36,7 @@ import signal
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Protocol
@@ -72,10 +78,33 @@ class AgentResult:
     usage: Usage = field(default_factory=Usage)
     duration_s: float = 0.0
     compactions: int = 0
+    resumed: bool = False
+    """True when this run continued an earlier conversation of the same session."""
 
     @property
     def ok(self) -> bool:
         return self.status in ("completed", "dispatched")
+
+
+@dataclass
+class AgentSession:
+    """One agent's conversation, kept between runs so a follow-up assignment continues it.
+
+    A session can be continued only when its last run ended cleanly with a
+    final assistant message (no unanswered tool calls). After an error or a
+    cancellation the next run starts a fresh conversation.
+    """
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    context: ContextManager | None = None
+    runs: int = 0
+
+    @property
+    def resumable(self) -> bool:
+        if not self.messages or self.context is None:
+            return False
+        last = self.messages[-1]
+        return last.get("role") == "assistant" and not last.get("tool_calls")
 
 
 class ProcessScope:
@@ -147,15 +176,30 @@ class Agent:
         except Exception:  # noqa: BLE001 - UI/trace sinks are best effort
             pass
 
-    def run(self, task: str, *, context: str = "") -> AgentResult:
+    def run(self, task: str, *, context: str = "", session: AgentSession | None = None) -> AgentResult:
+        """Run one task. With a resumable ``session`` the task continues that conversation."""
         started = time.monotonic()
         deadline = started + self.limits.max_seconds if self.limits.max_seconds else None
-        first = (context.strip() + "\n\n---\n\n# Your task\n" + task) if context.strip() else task
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": first},
-        ]
-        ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
+        resumed = session is not None and session.resumable
+        if resumed:
+            messages = session.messages
+            ctx_manager = session.context
+            note = (context.strip() + "\n\n---\n\n# Your next assignment\n" + task) if context.strip() else task
+            current = {"role": "user", "content": note}
+            messages.append(current)
+            ctx_manager.anchor(current)
+        else:
+            first = (context.strip() + "\n\n---\n\n# Your task\n" + task) if context.strip() else task
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": first},
+            ]
+            ctx_manager = ContextManager(self.settings.compact_at_tokens, self.settings.keep_recent_tokens)
+            if session is not None:
+                session.messages, session.context = messages, ctx_manager
+        if session is not None:
+            session.runs += 1
+        compactions_before = ctx_manager.compactions
         guard = LoopGuard()
         usage = Usage()
         tool_calls = 0
@@ -178,7 +222,7 @@ class Agent:
         )
         specs = self.registry.specs(available_only=True)
         tool_schemas = [spec.to_api() for spec in specs]
-        self.emit("start", task=task)
+        self.emit("start", task=task, resumed=resumed)
 
         def spend(response: LLMResponse) -> None:
             nonlocal usage
@@ -292,8 +336,18 @@ class Agent:
                 executed = 0
                 batch_ok = True
                 handed_off = False
-                for call in calls:
+                together = self._run_together(calls, tool_ctx)
+                for index, call in enumerate(calls):
                     executed += 1
+                    if together is not None:
+                        tool_result = together[index]
+                        content, ok = tool_result.content, tool_result.ok
+                        batch_ok = batch_ok and ok
+                        handed_off = handed_off or tool_result.handed_off
+                        tool_calls += 1
+                        messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+                        guard.record(call.name, call.arguments, ok, content)
+                        continue
                     if self.should_cancel():
                         batch_ok = False
                         messages.append({"role": "tool", "tool_call_id": call.id,
@@ -345,13 +399,35 @@ class Agent:
             shutil.rmtree(tmpdir, ignore_errors=True)
         result = AgentResult(agent=self.name, status=status, answer=answer, error=error, steps=step,
                              tool_calls=tool_calls, usage=usage, duration_s=round(time.monotonic() - started, 2),
-                             compactions=ctx_manager.compactions)
+                             compactions=ctx_manager.compactions - compactions_before, resumed=resumed)
         self.emit("end", status=status, answer=answer, error=error, steps=step, tool_calls=tool_calls,
                   prompt_tokens=usage.prompt_tokens, completion_tokens=usage.completion_tokens,
                   duration_s=result.duration_s)
         return result
 
     # ------------------------------------------------------------------
+    def _run_together(self, calls: list[ToolCall], ctx: ToolContext) -> list[ToolResult] | None:
+        """Run a batch of calls to one tool concurrently when that tool allows it; results keep call order.
+
+        Codex dispatches tools that declare parallel support under a shared lock and
+        everything else exclusively; here the tool decides per batch from the arguments.
+        """
+        if len(calls) < 2 or len(calls) > self.limits.max_tool_calls_per_step or self.should_cancel():
+            return None
+        if len({call.name for call in calls}) != 1 or any(call.parse_error for call in calls):
+            return None
+        tool = self.registry.get(calls[0].name)
+        if tool is None or tool.concurrent is None:
+            return None
+        try:
+            if not tool.concurrent([call.arguments for call in calls]):
+                return None
+        except Exception:  # noqa: BLE001 - a failing predicate just means "one after another"
+            return None
+        self.emit("parallel", tool=tool.name, count=len(calls))
+        with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix=f"{self.name}-tools") as pool:
+            return list(pool.map(lambda call: self._execute(call, ctx), calls))
+
     def _execute(self, call: ToolCall, ctx: ToolContext) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
         self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)

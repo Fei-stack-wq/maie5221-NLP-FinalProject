@@ -187,6 +187,15 @@ class ContextManager:
     last_reported_prompt_tokens: int = 0
     reported_at_length: int = 0
     events: list[dict] = field(default_factory=list)
+    anchors: list[dict[str, Any]] = field(default_factory=list)
+    """Messages kept verbatim through compaction (the current assignment of a continued session)."""
+
+    def anchor(self, message: dict[str, Any]) -> None:
+        """Keep ``message`` verbatim; it replaces any earlier anchor."""
+        self.anchors = [message]
+
+    def _anchored(self, message: dict[str, Any]) -> bool:
+        return any(message is kept for kept in self.anchors)
 
     def note_usage(self, messages: list[dict[str, Any]], prompt_tokens: int, length_at_request: int) -> None:
         self.last_reported_prompt_tokens = prompt_tokens
@@ -214,8 +223,13 @@ class ContextManager:
         if after_prune <= int(self.compact_at_tokens * 0.6) or cut <= start or summarize is None:
             self.compactions += 1
             return CompactionResult(True, "prune", before, after_prune)
-        # Step 2: summarize the span [start, cut) into a checkpoint message.
-        span = messages[start:cut]
+        # Step 2: summarize the span [start, cut) into a checkpoint message. Anchored
+        # messages (the assignment being worked on) stay verbatim after the summary.
+        kept = [m for m in messages[start:cut] if self._anchored(m)]
+        span = [m for m in messages[start:cut] if not self._anchored(m)]
+        if not span:
+            self.compactions += 1
+            return CompactionResult(True, "prune", before, after_prune)
         previous = self.summary
         prompt_messages = [
             {"role": "system", "content": "You condense an agent's working history into a precise checkpoint."},
@@ -234,7 +248,7 @@ class ContextManager:
         self.summary = text
         summary_message = {"role": "user", "content": SUMMARY_PREFIX + text}
         pinned = messages[:min(self.pinned, len(messages))]
-        messages[:] = [*pinned, summary_message, *messages[cut:]]
+        messages[:] = [*pinned, summary_message, *kept, *messages[cut:]]
         self._reset_usage_anchor()
         self.compactions += 1
         return CompactionResult(True, "summary", before, estimate_tokens(messages, tools), usage=usage)

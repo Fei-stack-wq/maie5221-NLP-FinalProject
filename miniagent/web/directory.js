@@ -236,9 +236,19 @@ function runOptions() {
   const keys=["member_max_steps","lead_max_steps","max_delegations"];
   const inputs=keys.map(k=>editInput(opts[k]??state.config[k],{type:"number",min:k==="max_delegations"?0:1,max:k==="max_delegations"?200:1000}));
   const checks=el("textarea",{rows:3,placeholder:"[]"},JSON.stringify(opts.checks||[]));
+  const reviewerModel=el("select",{"aria-label":"评审模型"},el("option",{value:""},"与作者相同"),
+    ...["deepseek-flash","deepseek-v4-pro"].map(m=>el("option",{value:m},m)));
+  reviewerModel.value=opts.reviewer_model||"";
+  const reviewerThinking=el("select",{"aria-label":"评审思考模式"},el("option",{value:""},"与作者相同"),
+    el("option",{value:"enabled"},"开启"),el("option",{value:"disabled"},"关闭"));
+  reviewerThinking.value=opts.reviewer_thinking||"";
   sheet("下一项任务",field("工作方式",mode),...inputs.map((v,i)=>field(["成员步数","负责人步数","委派数"][i],v)),
+    field("评审用的模型",reviewerModel),field("评审的思考模式",reviewerThinking),
+    el("p",{class:"muted small"},"评审、测试类的派工和评审循环会用这里的设置；默认与作者相同。换一个模型来评审，能减少共同的盲点。"),
     field("验收检查（JSON 数组）",checks),button("应用",()=>{
       state.runOptions={interaction_mode:mode.value,checks:JSON.parse(checks.value||"[]")};
+      if (reviewerModel.value) state.runOptions.reviewer_model=reviewerModel.value;
+      if (reviewerThinking.value) state.runOptions.reviewer_thinking=reviewerThinking.value;
       keys.forEach((k,i)=>state.runOptions[k]=Number(inputs[i].value));$("#sheet").close();
     }));
 }
