@@ -186,7 +186,7 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(agent.run("work").status, "completed")
         self.assertEqual(tool_results(provider.requests[-1]["messages"]), [f"done {i}" for i in range(8)])
 
-    def test_assignments_not_marked_independent_run_one_after_another(self):
+    def test_an_assignment_marked_not_independent_keeps_the_response_in_order(self):
         order = []
 
         def member(name, path):
@@ -201,7 +201,7 @@ class CollaborationTest(unittest.TestCase):
         script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Write the backend in api/server.py.",
                                              deliverables=["api/"]),
                                     call("delegate_task", assignee="qa", task="Write the test plan in docs/plan.md.",
-                                         deliverables=["docs/plan.md"], independent=True)),
+                                         deliverables=["docs/plan.md"], independent=False)),
                               reply("done")],
                         dev=member("dev", "api/server.py"), qa=member("qa", "docs/plan.md"))
         studio, gid, _ = self.studio(script)

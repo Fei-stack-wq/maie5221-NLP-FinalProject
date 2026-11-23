@@ -204,8 +204,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         if settings.team.parallel_delegations:
             parts.append(
                 "- Assignments that need nothing from each other can run at the same time: call `delegate_task` "
-                "several times in one response, each with `independent: true`, its own `deliverables` and the "
-                "`inputs` it reads. When they finish, each teammate sees the others' results and fixes anything that "
+                "several times in one response, each with its own `deliverables` and the `inputs` it reads (mark one "
+                "`independent: false` to keep the response in order). To run them together, send all of them in the "
+                "same response — a single hand-off cannot overlap with anything. When they finish, each teammate sees the others' results and fixes anything that "
                 "turned out to depend on them. Good candidates: release notes, a user guide or a test plan drafted "
                 "while the build or the tests run; separate research topics for separate researchers. Not "
                 "candidates: anything that reviews, summarises, prices, presents or builds on work that does not "
@@ -531,7 +532,7 @@ class TeamTask:
         """The parallel batch whose assignments are about to start (see _can_run_together)."""
         self.parallel_reads = 0
         self.batch_refusals: dict[tuple[str, str], str] = {}
-        """Why delegations the lead marked independent ran one after another, reported in their results."""
+        """Why delegations sent in one response ran one after another, reported in their results."""
         self.meter = TaskMeter(notify=lambda text: self.channel.note(self.primary, text))
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
@@ -776,9 +777,9 @@ class TeamTask:
         if team.parallel_delegations:
             properties["independent"] = {
                 "type": "boolean",
-                "description": "True only if this assignment needs nothing from the other assignments in the same "
-                               "response. Such assignments run at the same time; afterwards each teammate checks the "
-                               "others' results and fixes what depended on them."}
+                "description": "Hand-offs in one response run at the same time when they go to different teammates "
+                               "and declare separate deliverables; afterwards each teammate checks the others' results. "
+                               "Set false when this one needs another hand-off in the same response to finish first."}
         if team.resume_members:
             properties["fresh"] = {"type": "boolean",
                                    "description": "Start the teammate in a clean session instead of continuing "
@@ -788,8 +789,8 @@ class TeamTask:
             description=("Give one assignment to one teammate and wait for their report. The teammate works in a "
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report, the published files and the results of any checks."
-                         + (" Several calls in one response run at the same time when each is marked independent, "
-                            "declares deliverables and no two share a file." if team.parallel_delegations else "")
+                         + (" Several calls in one response run at the same time when they go to different teammates, "
+                            "each declares deliverables and no two share a file." if team.parallel_delegations else "")
                          + (" With background: true it returns at once and the report arrives later."
                             if team.background_handoffs else "")),
             parameters=self._delegate_schema(properties),
@@ -837,6 +838,46 @@ class TeamTask:
                               "description": "Teammates to wait for (default: every hand-off still running)"}}},
             fn=lambda _ctx, args: self._wait_handoffs(args))
 
+    def _unclosed_lead_steps(self, lead_id: str, link: dict) -> str:
+        """A soft reminder when this hand-off follows a step of the lead's own that the plan does not show as done.
+
+        Nothing is refused: the plan, not the work, may be what is wrong (in S2T1-v3.4 the brief existed at another
+        path than the step declared). The lead is shown what the step expects and what it actually published.
+        """
+        if not (self.settings.team.plan_links and self.plan and self.plan.get("linked")):
+            return ""
+        wanted = link.get("step_ids") or ([link["step"]] if link.get("step") else [])
+        if not wanted:
+            return ""
+        view = plan_view(self.record, self.store.chat(self.trigger_seq - 1))
+        if not view:
+            return ""
+        rows = view["steps"]
+        numbers = {row.get("id"): n for n, row in enumerate(rows, 1)}
+        needed = sorted({k for key in wanted if key in numbers for k in rows[numbers[key] - 1].get("after", [])})
+        open_steps = [rows[k - 1] for k in needed if 1 <= k <= len(rows)
+                      and rows[k - 1].get("stage") != "completed" and rows[k - 1].get("owner") in (None, "", lead_id)]
+        if not open_steps:
+            return ""
+        manifest = self.store.project.manifest()
+        parts = []
+        for row in open_steps:
+            absent = [path for path in row.get("outputs") or [] if not _present(path, manifest)]
+            detail = f"; expects {', '.join(absent)}, which is not in the project" if absent else ""
+            parts.append(f"{row['id']} ({_clip(row['step'], 70)}{detail})")
+        events = self.store.chat(self.trigger_seq - 1)
+        plan_seq = max((e["seq"] for e in events if e["kind"] == "plan" and e.get("task_id") == self.task_id), default=0)
+        published = list(dict.fromkeys(change["path"] for e in events
+                                       if e["kind"] == "publish" and e.get("task_id") == self.task_id
+                                       and e.get("agent") == lead_id and e["seq"] > plan_seq
+                                       for change in e.get("changes", []) if change.get("change") != "deleted"))
+        line = ("Plan: this hand-off follows your own step " + "; ".join(parts)
+                + (", which the plan does not show as done." if len(parts) == 1 else ". The plan shows none of them as done."))
+        if published:
+            line += " Files you published since the plan was written: " + ", ".join(published[:8]) + "."
+        line += " Close the step with record_plan_result, or correct its outputs with update_plan."
+        return line
+
     def _ready_note(self) -> str:
         """Plan steps that can start now, read from the recorded hand-offs; costs no model call.
 
@@ -866,7 +907,7 @@ class TeamTask:
                           for n, row in ready)
         ways = []
         if team.parallel_delegations:
-            ways.append("in one response, each with `independent: true` and its own deliverables")
+            ways.append("by sending all of them in one response, each with its own deliverables")
         if team.background_handoffs:
             ways.append("start one with `background: true` and keep working")
         how = (" Start them " + ", or ".join(ways) + ".") if ways else ""
@@ -1128,15 +1169,20 @@ class TeamTask:
 
     # -- delegation ---------------------------------------------------------
     def _can_run_together(self, batch: list[dict]) -> bool:
-        """A batch of delegations may run at once: each marked independent and valid, distinct teammates,
-        declared and disjoint files, no brief naming another's files or teammate, and budget left.
+        """Delegations in one response run at once unless one says ``independent: false``: valid arguments,
+        distinct teammates, declared and disjoint files, no brief naming another's files or teammate, budget left.
+
+        Sending several in one response is how the lead expresses parallel intent; the old requirement to
+        also mark each ``independent: true`` was easy to forget and silently serialised the work.
 
         The lead can still be wrong about independence; the follow-up in _reconcile covers that case.
         A check (review) may join; it reports without that follow-up, since it judges finished work.
         """
+        if any(args.get("independent") is False for args in batch):
+            return False  # the lead asked for these to run in order
         reason = self._batch_refusal(batch)
-        if reason and any(args.get("independent") is True for args in batch):
-            # No silent fallback: the lead marked them independent, so each result says why they ran in order.
+        if reason:
+            # No silent fallback: each result says why the hand-offs in this response ran in order.
             with self.lock:
                 for args in batch:
                     key = (str(args.get("assignee", "")).strip(), str(args.get("task", "")).strip())
@@ -1155,8 +1201,6 @@ class TeamTask:
         if any(self._wants_background(args) for args in batch):
             return ("a background hand-off was in the same response; it starts in order, after what it may build on "
                     "(put it first when it needs nothing from the others)")
-        if not all(args.get("independent") is True for args in batch):
-            return "not every call in the response was marked `independent: true`"
         schema = getattr(self, "delegate_parameters", None)
         if schema is None or any(validate_arguments(schema, args) for args in batch):
             return "one of the calls had invalid arguments"  # a call that never starts could not release its teammates
@@ -1257,6 +1301,8 @@ class TeamTask:
             return ToolResult.failure(f"Invalid checks: {exc}")
         inputs = [str(p).strip() for p in args.get("inputs") or [] if str(p).strip()][:40]
         missing = []
+        # The lead's files go to the project first: inputs it just wrote are present, and the plan sees its outputs.
+        self._publish_lead(lead_id)
         if inputs:
             manifest = self.store.project.manifest()
             missing = [p for p in inputs if not _present(p, manifest)]
@@ -1265,6 +1311,7 @@ class TeamTask:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
         link, warning = self._step_link(args.get("step"), args.get("step_ids", []))
+        unclosed = self._unclosed_lead_steps(lead_id, link)
         conflict = self._background_conflict(assignee, deliverables, inputs)
         if conflict:
             return ToolResult.failure(conflict)
@@ -1285,6 +1332,8 @@ class TeamTask:
                 lines.insert(0, warning)
             if missing:
                 lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing) + ".")
+            if unclosed:
+                lines.append(unclosed)
             lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
             return ToolResult(ok=True, content="\n".join(lines))
         lines = self._report_lines(outcome)
@@ -1293,10 +1342,12 @@ class TeamTask:
         if missing:
             lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing)
                          + ". If the work depended on them, run it again after the step that produces them.")
+        if unclosed:
+            lines.append(unclosed)
         with self.lock:
             refused = self.batch_refusals.pop((assignee, str(args.get("task", "")).strip()), None)
         if refused:
-            lines.append(f"Marked independent, but the hand-offs in that response ran one after another: {refused}.")
+            lines.append(f"The hand-offs in that response ran one after another: {refused.rstrip('.')}.")
         if ready := self._ready_note():
             lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
@@ -1418,6 +1469,16 @@ class TeamTask:
                                                          first_result=result)
         return combined, merged, all_skipped, self._parallel_note(peers, checked=True)
 
+    def _publish_lead(self, lead_id: str) -> None:
+        """Publish the lead's own edits to the team project; a second call publishes nothing new."""
+        with self.lock:
+            lead_workspace = self.store.workspace(lead_id)
+            own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
+                                                task_id=self.task_id, note="lead edits before delegation")
+            if own:
+                self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
+                self.lead_baseline = self.store.project.checkout(lead_workspace)
+
     def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link, spec=None):
         """Budget, repeat check, lead publish and the delegation event; returns the in-flight entry."""
         if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150, self.settings.limits.max_steps)):
@@ -1438,12 +1499,7 @@ class TeamTask:
                     "is still open.")
             self.delegations += 1
             previous.append(task)
-            lead_workspace = self.store.workspace(lead_id)
-            own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
-                                                task_id=self.task_id, note="lead edits before delegation")
-            if own:
-                self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
-                self.lead_baseline = self.store.project.checkout(lead_workspace)
+            self._publish_lead(lead_id)
         spec = spec or {}
         extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None),
                                    ("handoff_kind", spec.get("kind")), ("background", spec.get("background")),
@@ -1700,7 +1756,8 @@ class TeamTask:
         ready = [str(i + 1) for i, row in enumerate(visible) if stages[i] == "pending"
                  and all(stages[n - 1] == "completed" for n in row.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
-        ids = " Steps: " + ", ".join(f"{s['id']} {s['step']}" for s in steps) if self.settings.team.plan_links else ""
+        ids = (" Steps: " + ", ".join(f"{s['id']} {s['step']}" + (f" (outputs: {', '.join(s['outputs'])})" if s.get("outputs") else "")
+                                      for s in steps) if self.settings.team.plan_links else "")
         kept_note = (f" Kept the dependencies of {kept} step(s) that omitted `after` (pass `after: []` to clear them)."
                      if kept else "")
         return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{kept_note}{ids} "

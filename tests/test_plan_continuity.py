@@ -73,8 +73,9 @@ class PlanContinuityTest(unittest.TestCase):
         studio.post(gid, "Research", queue=True)
         finished(studio, gid)
         for result in seen["results"]:
-            self.assertIn("Marked independent, but the hand-offs in that response ran one after another: dev had more "
-                          "than one of them, and one teammate works on one assignment at a time.", result)
+            self.assertIn("The hand-offs in that response ran one after another: dev had more than one of them, and "
+                          "one teammate works on one assignment at a time. To overlap them, give the pieces to different "
+                          "teammates or combine them into one assignment.\n", result)
 
     def test_a_dependency_inside_the_batch_is_named(self):
         seen = {}
@@ -90,17 +91,17 @@ class PlanContinuityTest(unittest.TestCase):
         finished(studio, gid)
         self.assertIn("writer reads data/summary.md, which dev produces in the same response", seen["results"][0])
 
-    def test_no_note_when_nothing_was_marked_independent(self):
+    def test_no_note_when_the_lead_asked_for_order(self):
         seen = {}
         script = Script(
             lead=[reply("", call("delegate_task", assignee="dev", task="Research AI course offerings."),
-                        call("delegate_task", assignee="dev", task="Research peer universities.")),
+                        call("delegate_task", assignee="dev", task="Research peer universities.", independent=False)),
                   lambda m: (seen.__setitem__("results", tool_results(m)[-2:]), reply("done"))[1]],
             dev=[reply("courses researched"), reply("peers researched")])
         studio, gid = self.studio(script)
         studio.post(gid, "Research", queue=True)
         finished(studio, gid)
-        self.assertFalse(any("Marked independent" in r for r in seen["results"]))
+        self.assertFalse(any("ran one after another" in r for r in seen["results"]))
 
     def test_the_lead_is_told_how_dependencies_work(self):
         members = [Member(m["id"], m["name"], m["prompt"]) for m in TEAM4]
