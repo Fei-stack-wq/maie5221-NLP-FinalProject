@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
+from .plan_view import plan_view
 from .config import Settings, fast_profile
 from .providers import DeepSeekProvider, Provider
 from .store import Group, GroupStore, Store, Member, now
@@ -67,14 +68,30 @@ class Running:
 
 def mention(text: str, store: GroupStore) -> tuple[str | None, str]:
     """``@id`` (or ``@Name``) at the very start addresses one member."""
-    match = re.match(r"\s*@([^\s,:：，]+)[\s,:：，]*", text)
-    if not match:
+    message = text.lstrip()
+    if not message.startswith("@"):
         return None, text
-    token = match.group(1).casefold()
-    for member in store.group.members:
-        if token in {member.id.casefold(), member.name.casefold()}:
-            return member.id, text[match.end():].strip() or text
-    raise StudioError(f"@{match.group(1)} is not a member of this group.")
+    aliases = sorted(((alias, member.id) for member in store.group.members
+                      for alias in (member.id, member.name)), key=lambda pair: -len(pair[0]))
+    for alias, identity in aliases:
+        match = re.match(r"@" + re.escape(alias) + r"(?=$|[\s,:：，])[\s,:：，]*", message, re.IGNORECASE)
+        if match:
+            return identity, message[match.end():].strip() or text
+    raise StudioError(f"{message.split()[0]} is not a member of this group.")
+
+
+def steer_addresses(text, store):
+    recipients = []
+    rest = text
+    while rest.lstrip().startswith("@"):
+        identity, body = mention(rest, store)
+        if identity not in recipients:
+            recipients.append(identity)
+        if body == rest:
+            break
+        rest = body
+    return recipients
+
 
 
 @dataclass(frozen=True)
@@ -285,12 +302,14 @@ class Studio:
                                                 "role_ids":bound, "lead":next_lead})
 
     # -- messages ---------------------------------------------------------
-    def post(self, group_id, text, *, attachments=(), options=None, queue=False, dispatched_by=None, client_id=None):
+    def post(self, group_id, text, *, attachments=(), options=None, queue=False, dispatched_by=None, client_id=None, urgent=False):
         store = self.group(group_id)
         if not isinstance(text, str) or len(text) > 60_000:
             raise StudioError("Expected a message of at most 60000 characters")
         if not isinstance(attachments, (list, tuple)) or len(attachments) > 20:
             raise StudioError("Expected up to 20 attachments")
+        if type(urgent) is not bool:
+            raise StudioError("urgent must be a boolean")
         if client_id is not None and (not isinstance(client_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", client_id)):
             raise StudioError("Invalid client message ID")
         receipt = {"client_id":client_id} if client_id else {}
@@ -324,7 +343,8 @@ class Studio:
                 return AssistantTurn(self, store, text, refs, settings, stream, receipt).run()
 
             stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs, client_id=client_id))
-            active = {"id":current.task_id, "primary":current.primary} if current else None
+            active = {"id":current.task_id, "primary":current.primary, "mailboxes":current.channel.enabled,
+                      "interrupts":current.channel.interrupts} if current else None
             workspace = RoomWorkspace(store, settings.api_key)
             context = room_evidence(store, actor, active, question, refs, self.roles)
             context["workspace"] = workspace.describe()
@@ -371,7 +391,11 @@ class Studio:
                     answer = turn.text
                 else:
                     tid = turn.task_id or (current.task_id if current else None)
-                    route = self._deliver_turn(store, recipients.get(tid), turn.action, text, refs, {} if tid in owner_names else receipt)
+                    args = turn.arguments or {}
+                    to = (steer_addresses(text, store) if target and turn.action == "change_current_task"
+                          and current and current.channel.enabled else args.get("recipients"))
+                    route = self._deliver_turn(store, recipients.get(tid), turn.action, text, refs, {} if tid in owner_names else receipt,
+                                               recipients=to, urgent=urgent or args.get("urgent", False))
                     if route != "stale":
                         if tid in owner_names:
                             verb = "答复" if route == "answer" else "修改要求"
@@ -389,7 +413,7 @@ class Studio:
         store.append("room_reply", text=answer, agent=actor, in_reply_to=message["seq"], **(metadata or {}), **({"routing_issue":issue} if issue else {}))
         return {"route":"reply", "text":answer}
 
-    def _deliver_turn(self, source, observed, action, text, refs, receipt):
+    def _deliver_turn(self, source, observed, action, text, refs, receipt, *, recipients=None, urgent=False):
         if not observed or self._running.get(observed.group_id) is not observed.run or observed.run.control.requested.is_set():
             return "stale"
         answering = action == "answer_open_question"
@@ -399,7 +423,10 @@ class Studio:
             target = self.group(observed.group_id)
             refs = [self.uploads.forward(source, target, ref, self.settings.api_key) for ref in refs]
         # receive also checks cancellation, completion and the exact pending question under its lock.
+        if recipients and any(not isinstance(agent, str) or agent not in observed.run.channel.names for agent in recipients):
+            raise StudioError("Unknown recipient for this running task")
         return observed.run.channel.receive(text, attachments=refs, steer_only=not answering,
+                                            recipients=recipients, urgent=urgent and observed.run.channel.interrupts,
                                             answer_to=observed.question["id"] if answering else None, client_id=receipt.get("client_id"))
 
     def _require_available(self, store):
@@ -509,6 +536,7 @@ class Studio:
             task.continued_from = record.get("continued_from")
             task.initial_calls = record.get("initial_calls", [])
             task.group = group
+            running.channel.names = {m.id:m.name for m in group.members}
             task.control = running.control = checkpoint.Continuation(saved)
             running.channel.control = task.control
             if saved:
@@ -654,7 +682,7 @@ class Studio:
         events = [e for e in store.chat() if e.get("task_id") == tid]
         run = self._running.get(store.group.id)
         pausing = bool(run and run.task_id == tid and run.control.requested.is_set())
-        return {"task":record,"pausing":pausing,"recoverable":recovery.eligible(store, record),"events":events,"activity":activity,"changes":task_changes(store,tid),
+        return {"task":record, "plan_view":plan_view(record, events), "pausing":pausing,"recoverable":recovery.eligible(store, record),"events":events,"activity":activity,"changes":task_changes(store,tid),
                 "has_snapshot":(store.root/"tasks"/tid/"artifacts.zip").is_file(),
                 "diagnostics":[e for e in activity if e.get("type") in ("loop_nudge","loop_stuck","error")
                                or (e.get("type")=="end" and e.get("status") not in ("completed","dispatched"))]}
@@ -819,6 +847,7 @@ class Studio:
         store = self.group(group_id)
         running = self._running.get(group_id)
         live = None
+        events = None
         if running is not None:
             with running.lock:
                 activity = [dict(e) for e in running.activity if e["seq"] > activity_after]
@@ -828,9 +857,14 @@ class Studio:
             except (OSError, ValueError):
                 record = {}
             live = {"pausing":running.control.requested.is_set(), "task_id": running.task_id, "primary": running.primary, "active": record.get("active", []),
-                    "question": running.channel.pending(), "activity": activity[-400:], "activity_seq": cursor,
+                    "question": running.channel.pending(), "mailboxes":running.channel.enabled,
+                    "interrupts":running.channel.interrupts, "mail":running.channel.recent(), "activity": activity[-400:], "activity_seq": cursor,
                     "meter": running.meter.snapshot() if running.meter is not None else None}
-        return {"group": self.summary(store), "events": store.chat(after), "live": live}
+            if (record.get("plan") or {}).get("linked"):
+                events = store.chat(min(after, record.get("trigger_seq", 1) - 1))
+                live["plan"] = plan_view(record, events)
+        return {"group": self.summary(store), "events": store.chat(after) if events is None else
+                [e for e in events if e["seq"] > after], "live": live}
 
     def files(self, group_id: str) -> dict:
         store = self.group(group_id)

@@ -27,6 +27,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .bench_metrics import collaboration_metrics
 from .config import Settings, fast_profile
 from .studio import Studio
 
@@ -43,7 +44,7 @@ def solo_member(template: dict) -> dict:
 
 
 def arm_settings(settings: Settings, arm: str, solo_max_steps: int) -> Settings:
-    on = dict(resume_members=True, parallel_delegations=True, review_loops=True, plans=True, retrospective=False)
+    on = dict(plan_links=True, mailboxes=True, interrupts=True, lead_consult=True, team_talk=True, resume_members=True, parallel_delegations=True, review_loops=True, plans=True, retrospective=False)
     if arm == "team":
         return replace(settings, team=replace(settings.team, **on))
     if arm == "team-fresh":
@@ -76,7 +77,11 @@ def balance(settings: Settings) -> Any:
 class Bench:
     def __init__(self, settings: Settings, templates: dict[str, dict], arms: list[str], out: Path,
                  solo_max_steps: int = 400, provider_factory=None, min_balance: float = 0.0,
-                 tasks: list[int] | None = None) -> None:
+                 tasks: list[int] | None = None, interjection: str = "", interject_after: float = 300) -> None:
+        if interject_after < 0:
+            raise ValueError("Interjection delay must be non-negative")
+        self.interjection = interjection.strip()
+        self.interject_after = interject_after
         self.tasks = tasks
         self.provider_factory = provider_factory
         self.min_balance = min_balance
@@ -118,6 +123,19 @@ class Bench:
             if guard:
                 guard.release()
 
+    def _wait_for_task(self, studio, gid, tid, row):
+        if self.interjection:
+            studio.wait(gid, self.interject_after)
+            # Exercise the running-task steering path, bound to this particular execution.
+            # If it finished early a benchmark message must not open another task.
+            with studio._lock:
+                running = studio._running.get(gid)
+                route = "finished_before_interjection"
+                if running and running.task_id == tid:
+                    route = running.channel.receive(self.interjection, steer_only=True)
+            row["interjection"] = {"route": route, "after_s": self.interject_after, "text": self.interjection}
+        studio.wait(gid)
+
     def _chain(self, studio: Studio, arm: str, name: str) -> None:
         template = self.templates[name]
         if arm == "solo":
@@ -137,7 +155,7 @@ class Bench:
                 return
             try:
                 tid = studio.post(gid, task["text"], queue=True)["task_id"]
-                studio.wait(gid)
+                self._wait_for_task(studio, gid, tid, row)
                 record = studio.group(gid).load_task(tid)
             except Exception as exc:  # noqa: BLE001 - one failed chain must not stop the others
                 row.update(status="harness_error", error=f"{type(exc).__name__}: {exc}",
@@ -170,6 +188,7 @@ class Bench:
                        files=len(store.project.files()),
                        assignments=[{k: a.get(k) for k in ("agent", "status", "steps", "prompt_tokens", "resumed")}
                                     for a in record.get("assignments", [])])
+            row.update(collaboration_metrics(store, record))
             self.record(row)
             if record["status"] in ("failed", "cancelled"):
                 return
@@ -224,4 +243,21 @@ def summarize(out: Path) -> str:
         lines.append(f"| {arm} | {sum(r['status'] == 'completed' for r in mine)}/{len(mine)} | "
                      f"{sum(r.get('minutes', 0) for r in mine):.1f} | {sum(r.get('prompt_tokens', 0) for r in mine):,} | "
                      f"{sum(r.get('completion_tokens', 0) for r in mine):,} |")
+    lines += ["", "| Arm | Scenario / task | Linked | Plan calls | Check-ins / questions / notes | Repeat briefs | "
+              "Non-owner browser min | Delivery p95 s (normal / urgent) | Consults / p95 s |",
+              "| --- | --- | ---: | ---: | --- | ---: | ---: | --- | --- |"]
+    for row in rows:
+        if "plan_link_rate" not in row:
+            continue
+        rate = row["plan_link_rate"]
+        linked = "—" if rate is None else f"{100 * rate:.0f}%"
+        latency = row.get("delivery") or {}
+        def p95(kind):
+            seconds = latency.get(kind, {}).get("p95_s")
+            return "—" if seconds is None else str(seconds)
+        non_owner = row.get("non_owner_browser_minutes")
+        lines.append(f"| {row['arm']} | {row['scenario']} / {row['task']} | {linked} | {row['update_plan_calls']} | "
+                     f"{row.get('check_ins', 0)} / {row.get('teammate_questions', 0)} / {row.get('teammate_notes', 0)} | "
+                     f"{row['re_delegations']} | {'—' if non_owner is None else non_owner} | "
+                     f"{p95('normal')} / {p95('urgent')} | {row.get('consults', 0)} / {p95('consult')} |")
     return "\n".join(lines) + "\n"

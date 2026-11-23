@@ -69,6 +69,10 @@ FAILED_REQUEST_NOTE = "(No reply: the model request failed.)"
 """Stands in for the missing answer when a session continues after a failed model request."""
 
 
+class _MessageInterrupt(Exception):
+    """An in-progress sample was discarded. Its turn may be taken again with new mail."""
+
+
 class BatchPaused(Exception):
     """A pause reached part of a concurrent batch; ``done`` holds the calls that finished."""
 
@@ -189,10 +193,12 @@ class Agent:
         self.sandbox = sandbox
         self.settings = settings
         self.system_prompt = system_prompt
+        self.report_requested: Callable[[], str | None] = lambda: None
         self.limits = limits or settings.limits
         self.on_event = on_event
         self.should_cancel = should_cancel or (lambda: False)
         self.inbox = inbox
+        self.interrupt = inbox.signal(name) if getattr(inbox, "interrupts", False) else None
         self.stream = stream
         self.continuation = continuation
 
@@ -290,7 +296,7 @@ class Agent:
         self.sandbox.command_tmpdir = Path(tmpdir)
         tool_ctx = ToolContext(
             sandbox=self.sandbox, limits=self.limits, approve=lambda _message: True,
-            deadline=deadline, should_cancel=self.should_cancel,
+            deadline=deadline, should_cancel=lambda: self.should_cancel() or self._interrupted(),
             contains_configured_secret=(lambda text: self.settings.api_key in text) if self.settings.api_key else None,
         )
         specs = self.registry.specs(available_only=True)
@@ -313,9 +319,18 @@ class Agent:
                 stream_id = uuid.uuid4().hex
                 self.emit("delta", stream_id=stream_id, phase="discard", text="")
                 options["on_stream"] = lambda phase, text: self.emit("delta", stream_id=stream_id, phase=phase, text=text)
-                options["should_cancel"] = lambda: self.should_cancel() or bool(tools_enabled and control and control.requested.is_set())
+                options["should_cancel"] = lambda: self.should_cancel() or bool(tools_enabled and
+                    (self._interrupted() or control and control.requested.is_set()))
             if specs:
                 options["tool_choice"] = "auto" if tools_enabled else "none"
+            def interrupted_sample():
+                nonlocal step
+                self.inbox.mark_interrupted(self.name)
+                self.emit("delta", phase="discard", stream_id=stream_id if "on_stream" in options else "", text="")
+                self.emit("step_interrupted", step=step)
+                step -= 1
+                raise _MessageInterrupt()
+
             length_at_request = len(messages)
             asked = time.monotonic()
             try:
@@ -327,11 +342,15 @@ class Agent:
                 if tools_enabled and control and control.requested.is_set() and not self.should_cancel():
                     step -= 1
                     raise PauseRequested()
+                if tools_enabled and self._interrupted() and not self.should_cancel():
+                    interrupted_sample()
                 raise
             self._metered(response, time.monotonic() - asked, "step" if tools_enabled else "final")
             if response.usage.source == "reported" and response.usage.prompt_tokens:
                 ctx_manager.note_usage(messages, response.usage.prompt_tokens, length_at_request)
             spend(response)
+            if tools_enabled and self._interrupted() and not self.should_cancel():
+                interrupted_sample()
             return response
 
         def summarize(prompt: list[dict[str, Any]]):
@@ -374,6 +393,11 @@ class Agent:
                 if control:
                     control.boundary()
                 if not pending:
+                    take_inbox()
+                    if reason := self.report_requested():
+                        answer = self._wrap_up(messages, "The lead requested a report: " + reason, call_model, required=True)
+                        status = "completed"
+                        break
                     if step >= self.limits.max_steps:
                         status = "max_steps"
                         break
@@ -383,7 +407,6 @@ class Agent:
                     if self.limits.max_total_tokens and usage.total >= self.limits.max_total_tokens:
                         status, error = "budget", f"token budget of {self.limits.max_total_tokens} reached"
                         break
-                    take_inbox()
                     left = self.limits.max_steps - step
                     if not warned and self.limits.max_steps >= 10 and left <= max(3, self.limits.max_steps // 10):
                         warned = True
@@ -394,13 +417,15 @@ class Agent:
                     step += 1
                     self.emit("step", step=step, max_steps=self.limits.max_steps)
                     try:
-                        response = call_model(tools_enabled=True)
-                    except ProviderError as exc:
-                        if exc.code == "context_length_exceeded":
+                        try:
+                            response = call_model(tools_enabled=True)
+                        except ProviderError as exc:
+                            if exc.code != "context_length_exceeded":
+                                raise
                             compact(force=True)
                             response = call_model(tools_enabled=True)
-                        else:
-                            raise
+                    except _MessageInterrupt:
+                        continue
                     messages.append(response.to_assistant_message())
                     calls = response.tool_calls
                     if not calls:
@@ -427,7 +452,7 @@ class Agent:
                     pending = calls
                     next_call = 0
                     batch_ok, handed_off = True, False
-                if next_call == 0 and len(pending) > 1:
+                if next_call == 0 and len(pending) > 1 and not self.report_requested():
                     if control:
                         control.boundary()
                     rejoin_batch, in_tool = in_tool, True
@@ -462,6 +487,11 @@ class Agent:
                     if control:
                         control.boundary()
                     executed = index + 1
+                    if self.report_requested():
+                        batch_ok = False
+                        messages.append({"role": "tool", "tool_call_id": call.id,
+                                         "content": "Not executed: the lead requested a report."})
+                        continue
                     if self.should_cancel():
                         batch_ok = False
                         messages.append({"role": "tool", "tool_call_id": call.id,
@@ -487,6 +517,8 @@ class Agent:
                 if handed_off and batch_ok and not self.should_cancel() and not take_inbox():
                     status = "dispatched"
                     break
+                if self._interrupted():
+                    continue
                 verdict = guard.check()
                 if verdict.nudge:
                     messages.append({"role": "user", "content": verdict.nudge})
@@ -589,16 +621,26 @@ class Agent:
                   output_tokens=usage.completion_tokens, reasoning_tokens=usage.reasoning_tokens or 0,
                   finish=response.finish_reason)
 
+    def _interrupted(self):
+        return self.interrupt is not None and self.interrupt.is_set()
+
     def _execute(self, call: ToolCall, ctx: ToolContext, *, rejoining=False) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
         if not rejoining:
             self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
         began = time.monotonic()
-        if call.parse_error:
+        if self._interrupted():
+            self.inbox.mark_interrupted(self.name)
+            result = ToolResult.failure("Interrupted by a new message; the tool was not started.")
+        elif call.parse_error:
             result = ToolResult.failure(f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
                                         "possibly cut off because the call was too large. Split the work into smaller calls.")
         else:
             result = self.registry.dispatch(call.name, call.arguments, ctx)
+            if self._interrupted() and not result.ok and (result.meta.get("cancelled") or
+                    "cancelled" in result.content.lower() or "interrupted by a new message" in result.content.lower()):
+                self.inbox.mark_interrupted(self.name)
+                result = result.model_copy(update={"content":"Interrupted by a new message.\n" + result.content})
         seconds = round(time.monotonic() - began, 3)
         content, ok = result.content, result.ok
         if len(content) > MAX_TOOL_RESULT_CHARS:
@@ -610,12 +652,16 @@ class Agent:
                   **({"browser_report": report} if report else {}))
         return result.model_copy(update={"content":content})
 
-    def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model) -> str:
+    def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model, *, required=False) -> str:
         messages.append({"role": "user", "content": WRAP_UP_INSTRUCTION.format(reason=reason)})
         try:
             response = call_model(tools_enabled=False)
         except ProviderError as exc:
+            if required:
+                raise
             return f"(No final report: the model request failed — {exc.code}.)"
-        messages.append(response.to_assistant_message())
         text = response.text.strip()
+        if required and (not text or response.tool_calls or response.finish_reason == "length"):
+            raise ProviderError("The requested report was empty or incomplete.", code="invalid_response")
+        messages.append(response.to_assistant_message())
         return text or "(The agent stopped without writing a final report.)"

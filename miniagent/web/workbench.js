@@ -67,6 +67,50 @@ function dispatchNotice(event) {
   return collapsible(card,event.text);
 }
 
+function planCard(plan, scope) {
+  const {in_progress, submitted, accepted, total} = plan.counts;
+  const stages = {pending:"待处理", in_progress:"进行中", completed:"已确认", rework:"要求修改",
+    submitted:"已提交", unconfirmed:"已提交，尚未确认"};
+  function historyItem(entry) {
+    const verb = entry.kind === "delegation" ? "接手" : "提交报告";
+    const verdict = {approved:"通过", "changes requested":"要求修改", unclear:"未给明确结论"};
+    const detail = el("div",{class:"plan-history-item"},
+      `@${entry.agent} ${verb}`, entry.time ? " · " + fmtTime(entry.time) : "",
+      entry.status ? " · " + (STATUS_LABEL[entry.status] || entry.status) : "",
+      entry.verdict ? " · 评审" + (verdict[entry.verdict] || entry.verdict) : "",
+      entry.checks ? ` · 检查 ${entry.checks.passed}/${entry.checks.total}` : "");
+    for (const file of entry.files || []) {
+      if (file.change === "deleted" || !file.sha256) {
+        detail.append(el("span",{},file.path));
+        continue;
+      }
+      const ref = {...fileRef(scope,file.path), sha256:file.sha256};
+      detail.append(el("a",{href:fileURL(ref), onclick:e=>{
+        if (!e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) { e.preventDefault(); openDocument(ref); }
+      }}, file.path));
+    }
+    return detail;
+  }
+  const list = el("ol",{class:"plan-steps"});
+  for (const step of plan.steps) {
+    const latest = step.history.at(-1);
+    const content = el("div",{class:"plan-step-content"},
+      el("div",{},el("span",{class:"plan-text"},step.step), el("small",{class:"plan-stage"},stages[step.stage]),
+        step.owner ? el("span",{class:"plan-owner"},"@"+step.owner) : null,
+        step.after?.length ? el("span",{class:"plan-wait"},"依赖第 "+step.after.join("、")+" 步") : null));
+    if (latest) content.append(historyItem(latest));
+    if (step.history.length > 1) content.append(el("details",{},el("summary",{},"先前记录"),
+      ...step.history.slice(0,-1).map(historyItem)));
+    list.append(el("li",{class:step.stage,"data-plan-step":step.id},content));
+  }
+  return el("section",{class:"linked-plan","aria-label":"任务计划"},
+    el("div",{class:"plan-heading"},el("strong",{},"任务计划"), el("span",{class:"plan-count"},
+      `进行中 ${in_progress} · 已提交 ${submitted} · 已确认 ${accepted} / ${total}`)), list,
+    plan.explanation ? el("p",{class:"plan-note"},plan.explanation) : null,
+    plan.unlinked.length ? el("details",{class:"unlinked"},el("summary",{},`其他派工（${plan.unlinked.length}）`),
+      ...plan.unlinked.map(e=>el("p",{},`@${e.assignee} · ${e.task}`))) : null);
+}
+
 function taskTree(task, events, scope) {
   const root=el("div",{class:"tree-root"},el("strong",{},"@"+(task.primary||"—")),statusChip(task.status),el("p",{},task.text));
   const list=el("ol",{class:"branches"}), pending=new Map();
@@ -85,6 +129,9 @@ function taskTree(task, events, scope) {
       branch.badge.replaceWith(statusChip(e.status));
       branch.panel.append(el("p",{class:"muted"},"成员回报 · "+fmtTime(e.time)),
         documentBody(e.text,scope));
+      const counts=e.talk || task.assignments?.filter(a=>a.assignment_seq===e.assignment_seq && a.talk).at(-1)?.talk;
+      if (counts) branch.panel.append(el("small",{class:"muted"},
+        `汇报 ${counts.check_ins || 0} · 队友提问 ${counts.teammate_questions || 0} · 留言 ${counts.teammate_notes || 0}`));
       const cards=artifactCards(scope,e.changes);
       if (cards) branch.panel.append(cards);
     }
@@ -241,6 +288,7 @@ async function taskDetail(id) {
     for (const b of tabs.children) b.setAttribute("aria-pressed",b.textContent===name);
     if (name==="概览") {
       if (t.continued_from) body.append(button("查看中断的原任务",()=>taskDetail(t.continued_from)));
+      if (d.plan_view) body.append(planCard(d.plan_view,scope));
       body.append(taskTree(t,d.events,scope));
       if (t.final_answer) body.append(el("h4",{},"最终答复"),documentBody(t.final_answer,scope));
       if (t.evaluation) body.append(el("p",{},t.evaluation.total?"验收 "+t.evaluation.passed+"/"+t.evaluation.total:"未指定验收条件"));

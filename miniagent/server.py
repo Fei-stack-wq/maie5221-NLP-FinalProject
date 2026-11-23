@@ -324,7 +324,7 @@ class StudioHandler(_Base):
                 if method == "POST" and rest == ["messages"]:
                     return self._json(200, studio.post(gid, body.get("text", ""), attachments=body.get("attachments", []),
                                                       options=body.get("options"), queue=body.get("queue") is True,
-                                                      client_id=body.get("client_id")))
+                                                      client_id=body.get("client_id"), urgent=body.get("urgent", False)))
                 if method == "POST" and len(rest) == 2 and rest[0] == "approvals":
                     return self._json(200, studio.decide_approval(gid, rest[1], body.get("decision")))
                 if method == "POST" and rest == ["cancel"]:

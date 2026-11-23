@@ -116,7 +116,8 @@ class FastModeTest(unittest.TestCase):
         self.assertEqual((s.member().thinking, s.reviewer().thinking, s.reviewer().model), ("disabled", "enabled", "deepseek-flash"))
         self.assertEqual((s.limits.max_steps, s.team.lead_max_steps, s.team.max_delegations, s.team.task_seconds),
                          (30, 25, 4, FAST_TASK_SECONDS))
-        self.assertFalse(s.team.plans or s.team.retrospective)
+        self.assertTrue(s.team.plans)
+        self.assertFalse(s.team.retrospective)
         self.assertEqual(fast_profile(Settings(thinking="disabled")).thinking, "disabled", "thinking off stays off")
         self.assertEqual(Settings().member().thinking, "enabled", "standard mode is unchanged")
         self.assertTrue(arm_settings(Settings(), "fast", 400).team.fast)
@@ -147,7 +148,7 @@ class FastModeTest(unittest.TestCase):
         self.assertTrue(kinds(studio, gid, "task_started")[0]["fast"])
         lead_request = lead_and_reviews.for_agent("lead")[0]
         self.assertIn("FAST MODE", lead_request["messages"][0]["content"])
-        self.assertNotIn("update_plan", lead_request["tools"], "no plan round trips in fast mode")
+        self.assertIn("update_plan", lead_request["tools"], "a fast task may write a linked plan once")
         self.assertIn("FAST MODE", workers.requests[0]["messages"][0]["content"])
         self.assertEqual(studio.state(gid)["group"]["id"], gid)
 

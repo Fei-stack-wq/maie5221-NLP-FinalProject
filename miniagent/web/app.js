@@ -265,6 +265,9 @@ function renderEvent(event) {
     actorId === "you" ? youAvatar() : avatar(actorId, memberName(actorId)), who(...label), ...body);
   if (event.kind !== "progress") state.worklog = null;
   switch (event.kind) {
+    case "mail":
+    case "mail_receipt":
+      return mailEvent(event,scope);
     case "assistant_group_created":
     case "dispatch_sent":
     case "dispatch_finished":
@@ -310,7 +313,7 @@ function renderEvent(event) {
       return el("div", { class: "msg user" },
         who(el("b", {}, event.during_task ? "你 · 任务进行中" : "你"),
           event.addressed ? el("span", {}, `→ @${event.addressed}`) : null),
-        markdown(event.text), (event.attachments||[]).length ? el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))) : null);
+        markdown(event.text), event.during_task ? el("div",{id:"steer-"+tid+"-"+event.seq}) : null, (event.attachments||[]).length ? el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))) : null);
     case "attachments":
       return el("div",{class:"msg user"},el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))));
     case "queued_message":
@@ -320,10 +323,12 @@ function renderEvent(event) {
       return el("div",{class:"divider"},el("span",{},event.kind==="task_paused"?"任务已暂停 · 断点已保存":"任务从断点继续"));
     case "task_started": {
       const tools=toolWidget(tid);state.toolWidgets.set(tid,tools);
+      const planHost=el("div",{hidden:true});
+      state.planHosts.set(tid,planHost);
       return el("section",{class:"chat-run"},el("div",{class:"chat-run-head"},
         el("strong",{},avatar(event.agent, memberName(event.agent), "sm"), (event.continued_from?"续作开始 · ":"任务开始 · ")+memberName(event.agent)+" 负责",
           event.fast ? el("span",{class:"fast-badge",title:"约 10–15 分钟交付简化版本，15 分钟时收尾"},"⚡ 快速模式") : null),
-        button("查看任务树",()=>taskDetail(tid))),tools);
+        button("查看任务树",()=>taskDetail(tid))),planHost,tools);
     }
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
@@ -364,6 +369,7 @@ function renderEvent(event) {
       return el("div", { class: "msg user" }, who(el("b", {}, `你的回答 → ${memberName(event.agent)}`)), markdown(event.text));
     }
     case "plan": {
+      if (event.linked) return el("div",{class:"divider"},el("span",{},"计划已更新"));
       const previous = state.planCards.get(tid);
       if (previous) previous.classList.add("superseded");
       const done = event.steps.filter((s) => s.status === "completed").length;
@@ -561,10 +567,10 @@ async function openGroup(id) {
   $("#room-name").textContent=""; $("#room-members").replaceChildren(); $("#session-controls").hidden=true;
   $("#room-avatars").replaceChildren(); $("#member-panel").hidden=true; $("#workspace-choice").textContent="工作区";
   state.current = id; state.after = 0; state.activityAfter = 0; state.rendered = new Set();
-  state.publications=new Map();state.toolWidgets=new Map();state.view="room";
+  state.publications=new Map();state.toolWidgets=new Map();state.planHosts=new Map();state.view="room";
   state.questionForms=new Map();state.planCards=new Map();state.approvalCards=new Map();state.worklog=null;setNav(null);
   $("#file-list").replaceChildren(); $("#preview").replaceChildren();
-  state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null;
+  state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null; refreshMailComposer(null);
   $("#question-banner").hidden = $("#live").hidden = true;
   history.replaceState(null, "", "#" + id);
   $("#timeline").replaceChildren(); $("#activity").replaceChildren();
@@ -616,6 +622,7 @@ async function changePlayback(button,taskId,operation,done=poll) {
 }
 
 function renderLive(live) {
+  refreshMailComposer(live);
   const box = $("#live");
   const paused=state.group?.paused_task_id;
   const interrupted=state.group?.interrupted_task_id;
@@ -689,6 +696,7 @@ function tokens(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? M
 function cachePct(t) { return t.prompt ? Math.round(100 * t.cached / t.prompt) : 0; }
 const ALERT_TEXT = {
   slow_tool: (a) => `${memberName(a.agent)}的 ${a.tool} 已运行 ${a.seconds} 秒`,
+  silence_notice: (a) => `${memberName(a.agent)} 已收到汇报提醒`,
   quiet: (a) => `${Math.round(a.seconds / 60)} 分钟没有新进展`,
   step_budget: (a) => `${memberName(a.agent)} 已用 ${a.steps}/${a.max_steps} 步`,
 };
@@ -725,7 +733,18 @@ function timeReport(m, live) {
     ...["成员", "步数", "模型", "工具", "工具调用", "Tokens（缓存）"].map((h) => el("th", {}, h)))), el("tbody", {}, ...rows));
   const slow = (m.slowest_tools || []).length ? el("div", {}, el("h4", {}, "最慢的工具调用"),
     el("ol", { class: "slow-tools" }, ...m.slowest_tools.map((t) => el("li", {}, `${t.tool} · ${memberName(t.agent)} · ${t.seconds} 秒`)))) : null;
-  return el("div", { class: "time-report" }, head, bar, legend, table, slow,
+  const comm=m.communication;
+  let exchanges=null;
+  if (comm && (comm.deliveries || comm.consults || comm.teammate_questions || comm.silence_notices)) {
+    const measurements=[`成员汇报 ${comm.check_ins} 次`,`队友提问 ${comm.teammate_questions} 次`,
+      `负责人磋商 ${comm.consults} 次`,`实际打断 ${comm.interrupts} 次`];
+    for (const [kind,label] of [["normal","普通消息"],["urgent","紧急消息"]]) {
+      const sample=comm.delivery?.[kind];
+      if (sample?.count) measurements.push(`${label}送达 p95 ${sample.p95_s} 秒（${sample.count} 次）`);
+    }
+    exchanges=el("div",{},el("h4",{},"团队沟通"),el("p",{},measurements.join(" · ")));
+  }
+  return el("div", { class: "time-report" }, head, bar, legend, table, slow, exchanges,
     el("p", { class: "muted small" }, "费用按 DeepSeek 官网价格估算（含缓存命中与高峰/低谷时段），以账户账单为准。"));
 }
 
@@ -758,6 +777,31 @@ async function poll(first = false) {
   try { await feed.fetching; } finally {
     feed.fetching = null;
     if (state.feed === feed && feed.again) { feed.again=false; poll(); }
+  }
+}
+
+function hydrateRoomPlans(data) {
+  function show(tid, host, plan) {
+    if (!plan || !host?.isConnected) return;
+    const snapshot = JSON.stringify(plan);
+    if (host.planSnapshot === snapshot) return;
+    host.planSnapshot = snapshot;
+    host.replaceChildren(planCard(plan,{gid:state.current,tid,files:state.publications.get(tid)}));
+    host.hidden = false;
+  }
+  const live = data.live;
+  if (live?.plan) show(live.task_id,state.planHosts.get(live.task_id),live.plan);
+  const changed = new Set();
+  for (const event of data.events) {
+    const host = state.planHosts.get(event.task_id);
+    if (!host || event.task_id === live?.task_id) continue;
+    if (event.linked || event.inherited_plan || (host.planSnapshot && ["task_finished","task_paused"].includes(event.kind))) {
+      changed.add(event.task_id);
+    }
+  }
+  for (const tid of changed) {
+    const host = state.planHosts.get(tid);
+    api("/tasks/"+tid+"?view=summary").then(d=>show(tid,host,d.plan_view)).catch(showError);
   }
 }
 
@@ -799,6 +843,7 @@ async function refreshRoom(feed, first) {
       else if (outgoing) outgoing.remove();
       if (draft) { draft.box.remove(); feed.items.delete(event.draft_id); }
     }
+    hydrateRoomPlans(data);
     retireDrafts();
     if (data.events.length && (first || nearBottom)) timeline.scrollTop = timeline.scrollHeight;
     if (data.live) {
@@ -879,7 +924,7 @@ function scheduleSend(item) {
       }
       item.status=item.legacy ? "正在等待完整回复…" : "等待助手接收…"; showOutgoing(item);
       await api("/groups/"+item.gid+"/messages",{method:"POST",body:{client_id:item.id,text:item.text,
-        attachments:item.uploads,options:item.options,queue:item.queue}});
+        attachments:item.uploads,options:item.options,queue:item.queue,...(item.urgent?{urgent:true}:{})}});
       if (item.legacy && state.outbox.has(item.id)) { item.node?.remove(); state.outbox.delete(item.id); }
       item.status=""; showOutgoing(item);
       if (state.current===item.gid) await poll();
@@ -901,12 +946,12 @@ function scheduleSend(item) {
   return delivery;
 }
 
-function postChatMessage(text,{files=[],options={},queue=false,clientId=crypto.randomUUID()}={}) {
+function postChatMessage(text,{files=[],options={},queue=false,urgent=false,clientId=crypto.randomUUID()}={}) {
   const gid=state.current;
   if (!gid || state.feed?.id!==gid) return Promise.resolve(false);
   const existing=state.outbox.get(clientId);
   if (existing && existing.gid===gid) return existing.failed ? scheduleSend(existing) : existing.delivery;
-  const item={id:clientId,gid,text,files,uploads:[],options,queue,legacy:!state.config.chat_protocol};
+  const item={id:clientId,gid,text,files,uploads:[],options,queue,urgent,legacy:!state.config.chat_protocol};
   state.outbox.set(item.id,item);
   const delivery=scheduleSend(item);
   renderWelcome();
@@ -924,11 +969,14 @@ function send(event) {
   if ($("#thinking").value) options.thinking=$("#thinking").value;
   if (state.fast) options.mode="fast";
   const queue=$("#queue").checked;
+  const urgent=!$("#mail-routing").hidden && $("#interrupt-mail").checked && !queue;
+  $("#interrupt-mail").checked=false;
   input.value=""; autoGrow();
   $("#uploads").value=""; renderUploads();
   $("#queue").checked=false; state.runOptions={};
   $("#composer-error").hidden=true;
-  postChatMessage(text,{files,options,queue});
+  refreshMailComposer();
+  postChatMessage(text,{files,options,queue,urgent});
   input.focus();
 }
 
@@ -1124,6 +1172,8 @@ function setupComposer() {
   setFast(remembered);
   $("#fast-mode").addEventListener("click", () => setFast(!state.fast));
   input.addEventListener("input", autoGrow);
+  input.addEventListener("input",()=>refreshMailComposer());
+  $("#queue").addEventListener("change",()=>refreshMailComposer());
   $("#uploads").addEventListener("change", renderUploads);
   $("#key-banner-open").addEventListener("click", () => connectionSheet().catch(showError));
   timeline.addEventListener("scroll", () => {

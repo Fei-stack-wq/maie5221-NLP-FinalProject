@@ -389,7 +389,7 @@ class CollaborationTest(unittest.TestCase):
                   reply("", call("update_plan", steps=[]))],
             default=lambda agent, m: reply("lead saw: " + tool_results(m)[-1]) if agent == "lead" else reply("ok"),
             dev=[lambda m: (seen.__setitem__("dev_context", m[1]["content"]), reply("Wrote api.py."))[1]])
-        studio, gid, _ = self.studio(script)
+        studio, gid, _ = self.studio(script, team=TeamLimits(plan_links=False))
         studio.post(gid, "Build it", queue=True)
         task = finished(studio, gid)
         plans = kinds(studio, gid, "plan")

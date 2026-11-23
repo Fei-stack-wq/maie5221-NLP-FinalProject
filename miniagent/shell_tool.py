@@ -101,7 +101,10 @@ def stop_command_tree(process):
         children = psutil.Process(process.pid).children(recursive=True)
     except (OSError, psutil.Error):
         children = []
-    _kill_group(process.pid)
+    if os.name == "posix":
+        _kill_group(process.pid)
+    else:
+        process.kill()
     for child in children:
         try:
             child.kill()

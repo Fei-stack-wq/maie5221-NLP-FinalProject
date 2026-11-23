@@ -238,14 +238,20 @@ def decide(provider, context, text, read, *, on_stream=None):
     if context.get("active_task"):
         tools.append(action_tool("pause_room_task", "Pause this task to continue later with its progress intact.", [context["active_task"]["id"]]))
     targets = context.get("action_targets")
+    steer = action_tool(STEER.name, STEER.description, targets or ())
+    if (context.get("active_task") or {}).get("mailboxes"):
+        steer.parameters["properties"]["recipients"] = {"type":"array", "items":{"type":"string",
+            "enum":[m["id"] for m in context["members"]]}, "description":"Named recipients. Omit for everyone working."}
+        if context["active_task"].get("interrupts"):
+            steer.parameters["properties"]["urgent"] = {"type":"boolean", "description":"Interrupt when the requester explicitly asks."}
     if targets:
-        tools.append(action_tool(STEER.name, STEER.description, targets))
+        tools.append(steer)
         waiting = [tid for tid, target in targets.items() if target["question"]]
         if waiting:
             tools.append(action_tool(ANSWER.name, ANSWER.description, waiting))
     else:
         if context["active_task"]:
-            tools.append(STEER)
+            tools.append(steer)
         if context["pending_question"]:
             tools.append(ANSWER)
     if (context.get("workspace") or context["attachments"] or context.get("dispatches") or context.get("earlier_dispatches")
@@ -409,4 +415,9 @@ def _authorized(response, tools, text, *, worker_names=(), read_names=None):
     tid = call.arguments.get("task_id", allowed[0] if len(allowed) == 1 else None)
     if allowed and tid not in allowed:
         return None, "invalid_target"
-    return Turn(call.name, task_id=tid), None
+    args = {k:v for k,v in call.arguments.items() if k in ("recipients","urgent")} if call.name == STEER.name else {}
+    if "recipients" in args:
+        choices = spec.parameters["properties"]["recipients"]["items"]["enum"]
+        if any(not isinstance(a, str) or a not in choices for a in args["recipients"]):
+            return None, "invalid_target"
+    return Turn(call.name, task_id=tid, arguments=args or None), None

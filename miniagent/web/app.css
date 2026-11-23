@@ -489,3 +489,21 @@ dialog label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5p
 #fast-mode[aria-pressed="true"] { background: var(--gold-mist); color: var(--gold-deep); border-color: #ead9a8; }
 .fast-badge { margin-left: 8px; padding: 0 8px; border-radius: 99px; border: 1px solid #ead9a8; background: var(--gold-mist);
   color: var(--gold-deep); font: 600 11px/1.7 var(--sans); letter-spacing: .04em; }
+
+#mail-routing { display: flex; gap: 16px; align-items: center; padding: 0 14px 6px; color: var(--muted); font-size: 12px; }
+#mail-routing label { display: inline-flex; gap: 5px; align-items: center; }
+#mail-routing[hidden], #mail-routing label[hidden] { display: none; }
+.team-mail .mail-content { min-width: 0; overflow-wrap: anywhere; }
+.team-mail summary { cursor: pointer; }
+.mail-receipts { display: flex; gap: 4px 10px; flex-wrap: wrap; color: var(--muted); }
+
+.linked-plan { border-left: 2px solid var(--cobalt); padding: 5px 12px; margin: 10px 0; }
+.plan-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; }
+.plan-step-content { min-width: 0; overflow-wrap: anywhere; }
+.plan-stage, .linked-plan .plan-owner { margin-left: 8px; }
+.linked-plan .submitted .plan-stage { color: var(--cobalt); }
+.linked-plan .completed .plan-stage { color: var(--celadon); }
+.linked-plan .rework .plan-stage { color: var(--gold-deep); }
+.linked-plan .unconfirmed .plan-stage, .plan-history-item { color: var(--muted); }
+.plan-history-item, .linked-plan details { font-size: 12px; }
+.plan-history-item a, .plan-history-item span { display: inline-block; margin-left: 6px; }

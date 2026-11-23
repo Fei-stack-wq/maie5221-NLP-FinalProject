@@ -9,6 +9,7 @@ record and soft budgets that warn the lead.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ SLOW_TOOL_SECONDS = 60
 QUIET_SECONDS = 180
 STEP_WARNING = 0.8
 BUDGET_MARKS = (0.5, 0.8, 1.0)
+# These tools await another model whose own time is already recorded.
+TEAM_MODEL_TOOLS = {"delegate_task", "review_loop", "ask_teammate", "check_in"}
 
 
 def price_factor(at: float) -> float:
@@ -33,6 +36,12 @@ def price_factor(at: float) -> float:
 def call_cost(model: str, prompt: int, cached: int, output: int, at: float) -> float:
     hit, miss, out = PRICES.get(model, PRICES["deepseek-flash"])
     return (cached * hit + max(prompt - cached, 0) * miss + output * out) / 1e6 * price_factor(at)
+
+
+def percentile95(seconds):
+    if not seconds:
+        return None
+    return round(sorted(seconds)[math.ceil(0.95 * len(seconds)) - 1], 3)
 
 
 class TaskMeter:
@@ -50,6 +59,11 @@ class TaskMeter:
         self.open_tools: dict[str, tuple[str, str, float]] = {}
         self.slowest: list[dict[str, Any]] = []
         self.last_progress = self.started
+        self.communication = dict(check_ins=0, teammate_questions=0, teammate_answers=0, teammate_notes=0,
+                                  silence_notices=0, deliveries=0, interrupts=0, discarded_steps=0, consults=0,
+                                  auxiliary_prompt=0, auxiliary_cached=0, auxiliary_output=0)
+        self.latencies = {"normal": [], "urgent": [], "consult": []}
+        self.silence_alerts = set()
         self.cost = 0.0
         self.crossed: set[tuple[str, float]] = set()
 
@@ -67,6 +81,28 @@ class TaskMeter:
             agent = self._agent(name)
             if kind in ("start", "resume"):
                 agent["runs"] += 1
+            elif kind in ("checkin", "teammate_question", "teammate_answer", "teammate_note", "silence_notice"):
+                counter = {"checkin": "check_ins", "teammate_question": "teammate_questions",
+                           "teammate_answer": "teammate_answers", "teammate_note": "teammate_notes",
+                           "silence_notice": "silence_notices"}[kind]
+                self.communication[counter] += 1
+                if kind == "silence_notice":
+                    self.silence_alerts.add(name)
+                elif kind == "checkin":
+                    self.silence_alerts.discard(name)
+            elif kind in ("mail_delivered", "consult"):
+                if kind == "mail_delivered":
+                    self.communication["deliveries"] += 1
+                    self.communication["interrupts"] += int(bool(event.get("interrupted")))
+                    category = ("urgent" if event.get("urgent") else "normal") if event.get("sender") == "user" else None
+                else:
+                    category = "consult"
+                if category and isinstance(event.get("latency_s"), (int, float)):
+                    self.latencies[category].append(event["latency_s"])
+            elif kind == "step_interrupted":
+                self.communication["discarded_steps"] += 1
+                agent["steps"] = max(0, agent["steps"] - 1)
+                agent["run_step"] = max(0, agent["run_step"] - 1)
             elif kind == "step":
                 agent["steps"] += 1
                 agent["run_step"] = event.get("step") or agent["run_step"] + 1
@@ -74,11 +110,17 @@ class TaskMeter:
                 self.last_progress = now
             elif kind == "end":
                 agent["run_step"] = 0
+                self.silence_alerts.discard(name)
             elif kind == "model_call":
                 agent["model_s"] += event.get("seconds", 0.0)
                 agent["model_calls"] += 1
                 prompt, cached, output = (event.get("prompt_tokens", 0), event.get("cached_tokens", 0),
                                           event.get("output_tokens", 0))
+                if event.get("purpose") in ("consult", "teammate_answer"):
+                    self.communication["consults"] += int(event["purpose"] == "consult")
+                    self.communication["auxiliary_prompt"] += prompt
+                    self.communication["auxiliary_cached"] += cached
+                    self.communication["auxiliary_output"] += output
                 agent["prompt"] += prompt
                 agent["cached"] += cached
                 agent["output"] += output
@@ -91,7 +133,7 @@ class TaskMeter:
                 seconds = event.get("seconds")
                 if seconds is None and opened:
                     seconds = now - opened[2]
-                if event.get("tool") not in ("delegate_task", "review_loop") and seconds is not None:
+                if event.get("tool") not in TEAM_MODEL_TOOLS and seconds is not None:
                     agent["tool_s"] += seconds
                     agent["tool_calls"] += 1
                     self.slowest.append({"agent": name, "tool": event.get("tool"), "seconds": round(seconds, 1)})
@@ -123,6 +165,24 @@ class TaskMeter:
                                      "is still open. Nothing is stopped for you.")
         return notes
 
+    def checkpoint(self):
+        with self.lock:
+            return {"agents": {name: dict(data) for name, data in self.agents.items()},
+                    "slowest": list(self.slowest), "cost": self.cost, "crossed": list(self.crossed),
+                    "communication": dict(self.communication), "silence_alerts": sorted(self.silence_alerts),
+                    "latencies": {name: list(values) for name, values in self.latencies.items()}}
+
+    def restore(self, saved):
+        if saved:
+            with self.lock:
+                self.agents.update(saved["agents"])
+                self.slowest = saved["slowest"]
+                self.cost = saved["cost"]
+                self.crossed.update(map(tuple, saved["crossed"]))
+                self.communication.update(saved["communication"])
+                self.silence_alerts.update(saved["silence_alerts"])
+                self.latencies.update(saved["latencies"])
+
     # -- output -----------------------------------------------------------
     def snapshot(self) -> dict[str, Any]:
         now = self.clock()
@@ -132,9 +192,9 @@ class TaskMeter:
             prompt = sum(a["prompt"] for a in self.agents.values())
             cached = sum(a["cached"] for a in self.agents.values())
             output = sum(a["output"] for a in self.agents.values())
-            alerts = []
+            alerts = [{"kind": "silence_notice", "agent": name} for name in sorted(self.silence_alerts)]
             for agent, tool, started in self.open_tools.values():
-                if tool not in ("delegate_task", "review_loop") and now - started >= SLOW_TOOL_SECONDS:
+                if tool not in TEAM_MODEL_TOOLS and now - started >= SLOW_TOOL_SECONDS:
                     alerts.append({"kind": "slow_tool", "agent": agent, "tool": tool, "seconds": round(now - started)})
             if now - self.last_progress >= QUIET_SECONDS:
                 alerts.append({"kind": "quiet", "seconds": round(now - self.last_progress)})
@@ -154,4 +214,7 @@ class TaskMeter:
                     "steps": sum(a["steps"] for a in self.agents.values()),
                     "tokens": {"prompt": prompt, "cached": cached, "output": output},
                     "cost_usd": round(self.cost, 4), "agents": agents, "slowest_tools": list(self.slowest),
-                    "alerts": alerts, "budget": budget}
+                    "alerts": alerts, "budget": budget,
+                    "communication": {**self.communication,
+                                      "delivery": {k: {"count": len(v), "p95_s": percentile95(v)}
+                                                   for k, v in self.latencies.items()}}}

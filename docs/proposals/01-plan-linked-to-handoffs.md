@@ -1,6 +1,6 @@
 # Proposal 01 — Plan steps linked to hand-offs
 
-Status: proposed · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
+Status: implemented for offline validation; real-model comparison and blind deliverable review pending · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
 Depends on: nothing. Recommended first of the three proposals.
 
 ## Problem

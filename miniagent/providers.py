@@ -324,6 +324,8 @@ class DeepSeekProvider(Provider):
         options = {"deadline_seconds": deadline_seconds} if deadline_seconds is not None else {}
         if on_stream is not None:
             payload.update(stream=True, stream_options={"include_usage": True})
+            if should_cancel is not None:
+                options["should_cancel"] = should_cancel
             options["stream_decoder"] = lambda events: _collect_deepseek_stream(events, on_stream, should_cancel, secret=self.api_key)
         attempts = 0
         prior_usage = Usage()
@@ -368,12 +370,14 @@ class DeepSeekProvider(Provider):
                                                "text":response.text.replace(self.api_key, "[redacted]")})
 
     def _post_with_retry(self, payload: dict[str, Any], *, deadline_seconds: float | None = None,
-                         stream_decoder: Callable[[Iterator[dict]], dict] | None = None) -> HTTPResult:
+                         stream_decoder: Callable[[Iterator[dict]], dict] | None = None,
+                         should_cancel: Callable[[], bool] | None = None) -> HTTPResult:
         return post_json(
             f"{self.base_url}/chat/completions", payload, api_key=self.api_key,
             timeout=self.timeout, deadline_seconds=(self.deadline_seconds if deadline_seconds is None else
                                                    min(self.deadline_seconds, deadline_seconds)),
             max_retries=self.max_retries, **({"stream_decoder": stream_decoder} if stream_decoder else {}),
+            **({"should_cancel":should_cancel} if should_cancel else {}),
         )
 
     def _parse(self, data: dict[str, Any], latency_ms: float) -> LLMResponse:

@@ -313,7 +313,8 @@ def cmd_bench(args) -> int:
     if tasks and tasks != [1] and 1 not in tasks:
         raise SystemExit("Task 2 builds on Task 1 in the same group; include task 1")
     meta = Bench(settings, templates, arms, Path(args.out), solo_max_steps=args.solo_max_steps,
-                 min_balance=args.min_balance, tasks=tasks).run(scenarios)
+                 min_balance=args.min_balance, tasks=tasks, interjection=args.interjection,
+                 interject_after=args.interject_after).run(scenarios)
     print((Path(args.out) / "summary.md").read_text(encoding="utf-8"))
     print(json.dumps({k: meta.get(k) for k in ("balance_before", "balance_after")}, ensure_ascii=False))
     return 0
@@ -369,6 +370,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--arms", default="team,team-classic,solo",
                    help="comma-separated: team, team-fresh, team-classic, solo, fast")
     p.add_argument("--scenarios", default="1,2,3", help="scenario numbers, e.g. 1,2,3")
+    p.add_argument("--interjection", default="", help="send this requirement to each still-running benchmark task")
+    p.add_argument("--interject-after", type=float, default=300, help="seconds before sending the benchmark requirement")
     p.add_argument("--solo-max-steps", type=int, default=400)
     p.add_argument("--tasks", default="", help="task numbers to run per scenario, e.g. 1 (default: all)")
     p.add_argument("--min-balance", type=float, default=5.0,

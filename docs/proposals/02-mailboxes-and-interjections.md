@@ -1,6 +1,6 @@
 # Proposal 02 — Agent mailboxes, interjections and lead decisions during hand-offs
 
-Status: proposed · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
+Status: implemented for offline validation; real-model comparison and blind deliverable review pending · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
 Depends on: nothing. Proposal 03 builds on it.
 
 ## Problem

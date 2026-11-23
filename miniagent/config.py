@@ -126,6 +126,10 @@ class TeamLimits:
     max_repeat_assignments: int = 3
     """Near-identical assignments to the same member before the lead is told to change course."""
 
+    mailboxes: bool = False
+    interrupts: bool = False
+    lead_consult: bool = False
+
     resume_members: bool = True
     """A member assigned again in the same task continues its earlier conversation instead of starting over."""
 
@@ -138,6 +142,15 @@ class TeamLimits:
     plans: bool = True
     """The lead keeps a visible plan with update_plan."""
 
+    plan_links: bool = True
+    """Associate hand-offs and their evidence with stable plan step IDs."""
+
+    team_talk: bool = False
+    check_ins: int = 3
+    teammate_questions: int = 3
+    teammate_notes: int = 5
+    silence_minutes: float = 10
+
     retrospective: bool = True
     """After a task, draft lessons for the user to approve into role knowledge."""
 
@@ -148,11 +161,16 @@ class TeamLimits:
     """Hard wall-clock limit for the whole task; 0 means none. Agents wrap up with a report when it is reached."""
 
     def __post_init__(self) -> None:
+        if type(self.team_talk) is not bool:
+            raise ValueError("team_talk must be true or false")
+        for name in ("check_ins", "teammate_questions", "teammate_notes"):
+            _integer(name, getattr(self, name), 0, 100)
+        _number("silence_minutes", self.silence_minutes, 0)
         _integer("lead_max_steps", self.lead_max_steps, 1, 1000)
         _integer("max_delegations", self.max_delegations, 0, 200)
         _integer("max_repeat_assignments", self.max_repeat_assignments, 1, 20)
         _integer("task_seconds", self.task_seconds, 0, 24 * 3600)
-        for name in ("resume_members", "parallel_delegations", "review_loops", "plans", "retrospective", "fast"):
+        for name in ("mailboxes", "interrupts", "lead_consult", "resume_members", "parallel_delegations", "review_loops", "plans", "plan_links", "retrospective", "fast"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be true or false")
 
@@ -278,10 +296,15 @@ class Settings:
             team=TeamLimits(
                 lead_max_steps=integer("MA_LEAD_MAX_STEPS", TeamLimits.lead_max_steps),
                 max_delegations=integer("MA_MAX_DELEGATIONS", TeamLimits.max_delegations),
+                mailboxes=flag("MA_MAILBOXES", TeamLimits.mailboxes),
+                interrupts=flag("MA_INTERRUPTS", TeamLimits.interrupts),
+                lead_consult=flag("MA_LEAD_CONSULT", TeamLimits.lead_consult),
                 resume_members=flag("MA_RESUME_MEMBERS", TeamLimits.resume_members),
                 parallel_delegations=flag("MA_PARALLEL_DELEGATIONS", TeamLimits.parallel_delegations),
                 review_loops=flag("MA_REVIEW_LOOPS", TeamLimits.review_loops),
                 plans=flag("MA_PLANS", TeamLimits.plans),
+                plan_links=flag("MA_PLAN_LINKS", TeamLimits.plan_links),
+                team_talk=flag("MA_TEAM_TALK", TeamLimits.team_talk),
                 retrospective=flag("MA_RETROSPECTIVE", TeamLimits.retrospective),
             ),
         )
@@ -296,8 +319,8 @@ _ENV_KEYS = frozenset({
     "DEEPSEEK_MAX_RETRIES", "MA_TEMPERATURE", "MA_CONTEXT_WINDOW_TOKENS", "MA_COMPACT_AT_TOKENS",
     "MA_KEEP_RECENT_TOKENS", "MA_OUTPUT_RECOVERY_ATTEMPTS", "MA_INTERACTION_MODE", "MA_RUNS_DIR",
     "MA_MAX_STEPS", "MA_MAX_SECONDS", "MA_MAX_TOTAL_TOKENS", "MA_LEAD_MAX_STEPS", "MA_MAX_DELEGATIONS",
-    "MA_RESUME_MEMBERS", "MA_PARALLEL_DELEGATIONS", "MA_REVIEW_LOOPS", "MA_PLANS", "MA_RETROSPECTIVE",
-    "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING", "MA_WARM_BROWSER",
+    "MA_RESUME_MEMBERS", "MA_PARALLEL_DELEGATIONS", "MA_REVIEW_LOOPS", "MA_PLANS", "MA_PLAN_LINKS", "MA_RETROSPECTIVE",
+    "MA_MAILBOXES", "MA_INTERRUPTS", "MA_LEAD_CONSULT", "MA_TEAM_TALK", "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING", "MA_WARM_BROWSER",
 })
 
 
@@ -364,7 +387,7 @@ def fast_profile(settings: Settings) -> Settings:
     thinking, at low effort, while workers run without it; ``deepseek-flash`` throughout.
     The task has a hard 15-minute limit (agents then write their report), a soft
     10-minute budget that warns the lead, smaller step and hand-off budgets, at most two
-    review rounds, short tool timeouts, and no plan updates or post-task lessons.
+    review rounds, short tool timeouts, optional event-linked planning and no post-task lessons.
     """
     return replace(
         settings, model="deepseek-flash", reasoning_effort="low",
@@ -372,6 +395,8 @@ def fast_profile(settings: Settings) -> Settings:
         limits=replace(settings.limits, max_steps=min(settings.limits.max_steps, 30),
                        tool_timeout_seconds=min(settings.limits.tool_timeout_seconds, 120)),
         team=replace(settings.team, fast=True, task_seconds=FAST_TASK_SECONDS,
+                     check_ins=min(settings.team.check_ins, 1), teammate_questions=min(settings.team.teammate_questions, 1),
+                     teammate_notes=min(settings.team.teammate_notes, 2), silence_minutes=min(settings.team.silence_minutes, 5),
                      lead_max_steps=min(settings.team.lead_max_steps, 25),
                      max_delegations=min(settings.team.max_delegations, 4),
-                     plans=False, retrospective=False))
+                     plans=settings.team.plan_links and settings.team.plans, retrospective=False))

@@ -1,6 +1,6 @@
 # Proposal 03 — Member check-ins, teammate questions and silence prompts
 
-Status: proposed · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
+Status: implemented for offline validation; real-model comparison and blind deliverable review pending · 2026-11-22 · base: `jinyuwu/model-driven-studio` at `3a9284c`
 Depends on: proposal 02 (mailboxes and the lead consult). Proposal 01 is helpful (check-ins and
 questions can name a plan step) but not required.
 

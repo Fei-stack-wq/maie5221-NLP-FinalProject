@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -26,7 +27,7 @@ from .config import Limits
 from .project_navigation import find_files, read_lines, search_files
 from .research import http_get as _http_get, read_source, search_sources
 from .sandbox import Sandbox, SandboxError
-from .shell_tool import INLINE_FAILURE_LIMIT, command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell
+from .shell_tool import INLINE_FAILURE_LIMIT, command_timeout, poll_process, project_environment, run_posix_argv, run_shell as _run_shell, stop_command_tree
 from .schemas import ToolResult, ToolSpec
 from .file_tools import (MAX_READ_CHARS, MAX_WRITE_CHARS, read_file as _read_file,
                          write_file as _write_file, edit_file as _edit_file, append_file as _append_file)
@@ -229,30 +230,36 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 
     # -I: 隔离模式（忽略 PYTHONPATH / 用户 site-packages），避免环境污染。
     # cwd 设为沙箱根目录，相对路径天然落在 agent 自己的目录里。
-    completed = subprocess.run(
-        argv,
-        cwd=str(ctx.sandbox.root),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
+    with subprocess.Popen(argv, cwd=str(ctx.sandbox.root), env=env, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                          encoding="utf-8", errors="replace") as process:
+        until = time.monotonic() + timeout
+        while True:
+            left = until - time.monotonic()
+            cancelled = bool(ctx.should_cancel and ctx.should_cancel())
+            if cancelled or left <= 0:
+                stop_command_tree(process)
+                process.communicate()
+                return ToolResult.failure("Cancelled" if cancelled else "Python command timed out.",
+                                          cancelled=cancelled, timed_out=not cancelled, exit_code=process.returncode)
+            try:
+                stdout, stderr = process.communicate(timeout=min(left, .1))
+                break
+            except subprocess.TimeoutExpired:
+                continue
 
-    parts = [f"exit_code={completed.returncode}"]
-    if completed.stdout:
-        parts.append(f"stdout:\n{completed.stdout}")
-    if completed.stderr:
-        parts.append(f"stderr:\n{completed.stderr}")
-    if not completed.stdout and not completed.stderr:
+    parts = [f"exit_code={process.returncode}"]
+    if stdout:
+        parts.append(f"stdout:\n{stdout}")
+    if stderr:
+        parts.append(f"stderr:\n{stderr}")
+    if not stdout and not stderr:
         parts.append("(no output)")
 
     return ToolResult(
-        ok=completed.returncode == 0,
+        ok=process.returncode == 0,
         content=truncate("\n".join(parts)),
-        meta={"exit_code": completed.returncode, "timeout_s": timeout},
+        meta={"exit_code": process.returncode, "timeout_s": timeout},
     )
 
 

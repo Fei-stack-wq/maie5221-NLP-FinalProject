@@ -83,7 +83,7 @@ function pickMention(id) {
   const input=$("#input"), token=mentionToken(input);
   if (!token || !state.group?.members.some(m=>m.id===id)) {hideMentions();return;}
   input.setRangeText("@"+id+" ",token.start,token.end,"end");
-  hideMentions(); input.focus(); autoGrow();
+  hideMentions(); input.focus(); autoGrow(); refreshMailComposer();
 }
 function highlightMention() {
   const list=$("#mention-list");

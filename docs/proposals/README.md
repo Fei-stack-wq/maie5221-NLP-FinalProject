@@ -15,6 +15,22 @@ delegation/report events and the plan card; 02 touches `HumanChannel`, `Agent.ru
 the router's `STEER` action and the composer. Both edit `team.py`, so merge one before the other is
 finished, or agree on who owns which functions.
 
+## Implementation status
+
+All three proposals are implemented on the collaboration branch. Offline tests use
+the normal Studio message endpoint, checkpoints and a real local browser. Real
+DeepSeek comparison and blind assessment of the original Task 1 deliverables
+remain pending authorization. The runtime switches and measurement definitions
+are documented in [the architecture](../architecture.md#team-communication-and-rollout).
+
+In the offline comparison, the three original team templates each ran Task 1
+through both the new and classic arms with scripted model responses and real
+workspace tools. Six runs produced twelve files. All six incorporated an injected
+requirement into a file and produced an independently checked SHA-256 digest.
+The enhanced arm linked six of six handoffs and used one plan update per task.
+These fixtures check orchestration and persistence. Evaluating the actual
+booking, news and fund deliverables still requires the real-model comparison.
+
 ## Rules for whoever builds these
 
 From `AGENTS.md` and how the recent changes were made:

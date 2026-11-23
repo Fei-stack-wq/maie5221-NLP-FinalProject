@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/static/workbench.css">
   <script src="/static/vendor/markdown-it.min.js" defer></script>
   <script src="/static/app.js" defer></script>
+  <script src="/static/mail.js" defer></script>
   <script src="/static/sessions.js" defer></script>
   <script src="/static/directory.js" defer></script>
   <script src="/static/reader.js" defer></script>
@@ -73,6 +74,10 @@
         <div class="composer-box">
           <div id="mention-list" role="listbox" aria-label="可提及的群成员" hidden></div>
           <textarea id="input" rows="2" aria-label="会话消息" aria-controls="mention-list" aria-autocomplete="list" aria-expanded="false" placeholder="交办工作、追问进展，或回答团队的问题。用 @成员ID 点名某位成员。"></textarea>
+          <div id="mail-routing" hidden>
+            <span id="mail-recipient"></span>
+            <label><input type="checkbox" id="interrupt-mail">立即打断</label>
+          </div>
           <div id="attachment-chips" class="chips"></div>
           <div class="composer-bar">
             <label class="tool-button" title="添加附件"><span data-icon="clip"></span>附件<input id="uploads" type="file" multiple hidden></label>

@@ -1,10 +1,10 @@
 """Bounded JSON-over-HTTPS transport, with no model or tool execution logic.
 
 The monotonic deadline covers admission, backoff, response chunks and return.
-Socket waits are capped by the remaining time. Python's blocking DNS resolver,
-TLS/connect/header handling inside urllib, and JSON decoding cannot be forcibly
-interrupted by this synchronous adapter; their elapsed time is checked when
-control returns. This is not a process-level hard wall-clock limit.
+Socket waits are capped by the remaining time. For cancellable requests an isolated opener owns DNS, TLS and response headers.
+Cancellation releases the agent immediately, and closes any late response. A blocked
+operating-system resolver can outlive that caller. Once headers arrive a cancelled
+stream wakes its reading socket. Plain synchronous requests check the deadline on return.
 
 Public error messages and normally rendered tracebacks omit request/response
 bodies, URLs, credentials and raw network exceptions. Exception contexts and
@@ -18,6 +18,10 @@ import http.client
 import json
 import math
 import random
+import socket
+import threading
+from concurrent.futures import Future, wait
+from contextlib import contextmanager
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +36,9 @@ from typing import Any
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 MAX_RETRY_DELAY = 10.0
+# urllib.open includes platform DNS, proxy/TLS negotiation and response headers. Once an
+# attempt is abandoned its isolated opener may still be blocked. Bound those resources.
+_OPEN_SLOTS = threading.BoundedSemaphore(32)
 RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
@@ -117,6 +124,86 @@ def _clamp_socket_timeout(response: Any, seconds: float) -> None:
     except AttributeError:
         return
     sock.settimeout(seconds)
+
+
+@contextmanager
+def _interruptible_reads(response, cancelled):
+    """Wake a blocked SSE read even when the peer sends no frames."""
+    sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+    if cancelled is None or sock is None or not callable(getattr(sock, "shutdown", None)):
+        yield
+        return
+    done = threading.Event()
+
+    def wake():
+        while not done.wait(.1):
+            if cancelled():
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+
+    watcher = threading.Thread(target=wake, daemon=True, name="provider-interrupt")
+    watcher.start()
+    try:
+        yield
+    finally:
+        done.set()
+        watcher.join()
+
+
+def _check_cancel(cancelled, attempts):
+    if cancelled and cancelled():
+        raise ProviderError("Provider request cancelled", code="cancelled", attempts=attempts)
+
+
+def _open_response(opener, request, deadline, timeout, cancelled, attempt):
+    if cancelled is None:
+        return opener.open(request, timeout=min(timeout, _remaining(deadline, attempt - 1)))
+    while not _OPEN_SLOTS.acquire(timeout=min(.1, _remaining(deadline, attempt - 1))):
+        _check_cancel(cancelled, attempt - 1)
+    result = Future()
+    abandoned = threading.Event()
+
+    def open_once():
+        try:
+            _check_cancel(lambda: abandoned.is_set() or cancelled(), attempt - 1)
+            response = opener.open(request, timeout=min(timeout, _remaining(deadline, attempt - 1)))
+        except Exception as exc:
+            result.set_exception(exc)
+        else:
+            result.set_result(response)
+        finally:
+            _OPEN_SLOTS.release()
+
+    def close_late(future):
+        try:
+            response = future.result()
+        except urllib.error.HTTPError as exc:
+            _close(exc)
+        except Exception:
+            pass
+        else:
+            _close(response)
+
+    try:
+        threading.Thread(target=open_once, daemon=True, name="provider-open").start()
+    except RuntimeError:
+        _OPEN_SLOTS.release()
+        raise
+    try:
+        while True:
+            _check_cancel(cancelled, attempt)
+            if result.done():
+                break
+            wait((result,), timeout=min(.1, _remaining(deadline, attempt)))
+    except ProviderError:
+        # Only this caller may retry or decode. A late opener can only close its own response.
+        abandoned.set()
+        result.add_done_callback(close_late)
+        raise
+    return result.result()
 
 
 def _response_chunks(response: Any, deadline: float, timeout: float, attempts: int) -> Iterator[bytes]:
@@ -277,6 +364,7 @@ def post_json(
     url: str, payload: dict, *, api_key: str, timeout: float = 60.0,
     deadline_seconds: float = 120.0, max_retries: int = 2,
     stream_decoder: Callable[[Iterator[dict]], dict] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> HTTPResult:
     """POST one JSON body; max_retries counts *additional* HTTP attempts.
 
@@ -295,6 +383,7 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
         raise ProviderError("Request payload is not JSON serializable", code="invalid_request") from None
     opener = urllib.request.build_opener(_NoRedirect())
     for attempt in range(1, max_retries + 2):
+        _check_cancel(should_cancel, attempt - 1)
         _remaining(deadline, attempt - 1)
         request = urllib.request.Request(
             url, data=body, method="POST",
@@ -303,7 +392,7 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
         )
         retry_after = None
         try:
-            response = opener.open(request, timeout=min(timeout, _remaining(deadline, attempt - 1)))
+            response = _open_response(opener, request, deadline, timeout, should_cancel, attempt)
             try:
                 _remaining(deadline, attempt)
                 status = response.getcode()
@@ -317,13 +406,16 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
                     data = _parse_response(_read_response(response, deadline, timeout, attempt), attempt)
                 else:
                     chunks = _response_chunks(response, deadline, timeout, attempt)
-                    data = stream_decoder(_sse_events(chunks, attempt))
+                    with _interruptible_reads(response, should_cancel):
+                        data = stream_decoder(_sse_events(chunks, attempt))
+                    _check_cancel(should_cancel, attempt)
                 _remaining(deadline, attempt)
                 return HTTPResult(data=data, attempts=attempt,
                                   latency_ms=round((time.monotonic() - started) * 1000, 2))
             finally:
                 _close(response)
         except ProviderError as exc:
+            _check_cancel(should_cancel, attempt)
             if not exc.attempts:
                 exc.attempts = attempt
             if exc.code != "incomplete_stream":
@@ -346,6 +438,7 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
             error = ProviderError("Provider network request failed", code="network_error", attempts=attempt, retryable=True)
         except Exception:
             error = ProviderError("Provider transport failed", code="transport_error", attempts=attempt)
+        _check_cancel(should_cancel, attempt)
         if not error.retryable or attempt > max_retries:
             raise error from None
         _remaining(deadline, attempt)
@@ -356,7 +449,13 @@ Retry-After is a minimum delay, never shortened to fit our cap or deadline.
         if delay > MAX_RETRY_DELAY or delay >= _remaining(deadline, attempt):
             raise ProviderError("Retry delay exceeds the configured time allowance", code="retry_after_exceeded",
                                 status_code=error.status_code, attempts=attempt, retryable=True) from None
-        time.sleep(delay)
+        if should_cancel is None:
+            time.sleep(delay)
+        else:
+            wake_at = time.monotonic() + delay
+            while (left := wake_at - time.monotonic()) > 0:
+                _check_cancel(should_cancel, attempt)
+                time.sleep(min(left, .1))
     raise AssertionError("unreachable")
 
 

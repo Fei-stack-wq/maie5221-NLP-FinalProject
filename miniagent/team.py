@@ -40,14 +40,17 @@ from typing import Any, Callable
 
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .browser_evidence import format_report
+from .plan_view import identify_steps, plan_view
 from .checkpoint import Continuation, PauseRequested
 from .config import FAST_SOFT_MINUTES, Settings
 from .context import ContextManager
 from .evaluation import evaluate, validate
+from .mailbox import Cancelled, HumanChannel
+from .consult import LeadConsult
 from .meter import TaskMeter
 from .providers import Provider
 from .sandbox import Sandbox
-from . import recovery
+from . import recovery, team_talk
 from .schemas import ToolResult, Usage
 from .store import GroupStore, Member, now
 from .tools import Tool, ToolRegistry, build_default_registry, validate_arguments
@@ -156,109 +159,6 @@ def _present(path: str, manifest: dict[str, str]) -> bool:
     return path in manifest or any(name.startswith(path + "/") for name in manifest)
 
 
-class Cancelled(Exception):
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Requester channel: questions and live messages
-# ---------------------------------------------------------------------------
-class HumanChannel:
-    """Questions agents ask the requester, plus messages the requester sends mid-task."""
-
-    def __init__(self, store: GroupStore, task_id: str, should_cancel: Callable[[], bool]) -> None:
-        self.store = store
-        self.task_id = task_id
-        self.should_cancel = should_cancel
-        self._cond = threading.Condition()
-        self._pending: dict | None = None
-        self._answer: str | None = None
-        self._messages: list[tuple[int, str]] = []
-        self._finished = False
-        self._cursors: dict[str, int] = {}
-        self._notes: dict[str, list[str]] = {}
-        self.questions = 0
-        self.control = None
-
-    def snapshot(self):
-        with self._cond:
-            return {"pending":self._pending, "answer":self._answer, "messages":list(self._messages),
-                    "cursors":dict(self._cursors), "questions":self.questions,
-                    "notes":{agent: list(items) for agent, items in self._notes.items()}}
-
-    def restore(self, saved):
-        self._pending, self._answer = saved["pending"], saved["answer"]
-        self._messages, self._cursors, self.questions = saved["messages"], saved["cursors"], saved["questions"]
-        self._notes = {agent: list(items) for agent, items in (saved.get("notes") or {}).items()}
-
-
-    # called by agent threads
-    def ask(self, agent: str, question: str) -> str:
-        with self._cond:
-            if self._pending is None:
-                qid = "q-" + uuid.uuid4().hex[:10]
-                self._pending = {"id": qid, "agent": agent, "question": question}
-                self._answer = None
-                self.questions += 1
-                self.store.append("question", task_id=self.task_id, agent=agent, question=question, qid=qid)
-            while self._answer is None:
-                if self.should_cancel():
-                    self._pending = None
-                    raise Cancelled()
-                if self.control:
-                    self.control.boundary()
-                self._cond.wait(timeout=0.5)
-            answer, self._answer, self._pending = self._answer, None, None
-            return answer
-
-    def note(self, agent: str, text: str) -> None:
-        """A Studio notice for one agent (e.g. a soft budget mark), delivered at its next step."""
-        with self._cond:
-            self._notes.setdefault(agent, []).append(text)
-
-    def take(self, agent: str) -> list[str]:
-        with self._cond:
-            cursor = self._cursors.get(agent, 0)
-            new = self._messages[cursor:]
-            self._cursors[agent] = len(self._messages)
-            notes = self._notes.pop(agent, [])
-        return notes + [f"[Message from the requester, sent while the team was working]\n{text}" for _, text in new]
-
-    def start_cursor(self, agent: str, before_seq: int) -> None:
-        """An agent that starts now has already seen all earlier messages in its context."""
-        with self._cond:
-            self._cursors[agent] = sum(seq < before_seq for seq, _ in self._messages)
-
-    def finish(self) -> None:
-        with self._cond:
-            self._finished = True
-
-    # called by the service (requester)
-    def pending(self) -> dict | None:
-        with self._cond:
-            return dict(self._pending) if self._pending and self._answer is None else None
-
-    def receive(self, text: str, *, attachments=(), answer_to=None, steer_only=False, client_id=None) -> str:
-        """Apply an answer to its exact question, or steer without consuming a question."""
-        with self._cond:
-            if self._finished or self.should_cancel():
-                return "stale"
-            pending = self._pending if self._answer is None else None
-            if answer_to is not None and (not pending or pending["id"] != answer_to):
-                return "stale"
-            receipt = {"client_id":client_id} if client_id else {}
-            if pending and not steer_only:
-                self._answer = text
-                self.store.append("answer", task_id=self.task_id, qid=pending["id"], text=text,
-                                  agent=pending["agent"], attachments=list(attachments), **receipt)
-                self._cond.notify_all()
-                return "answer"
-            message = self.store.append("user_message", task_id=self.task_id, text=text, during_task=True,
-                              attachments=list(attachments), **receipt)
-            self._messages.append((message["seq"], text))
-            return "steering"
-
-
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -326,7 +226,11 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
                 "- For an author–reviewer cycle (build → test → fix → re-test), `review_loop` runs the rounds for you: "
                 "the reviewer's findings go straight to the author's continued session, and you receive the final "
                 "verdict, the last review and the files changed.")
-        if settings.team.plans:
+        if settings.team.plans and settings.team.plan_links:
+            parts.append("- Write the plan with update_plan once the work is clear. Pass its step ID on hand-offs. "
+                         "Studio records assignments, submissions and reviews. Update the plan only when changing "
+                         "the plan or accepting or returning a step. Use after for dependencies.")
+        elif settings.team.plans:
             parts.append(
                 "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
                 "report (mark steps done, add or change steps). Give a step `after` when it needs earlier steps; "
@@ -391,6 +295,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         "of your own steps"
         + (f" and {settings.team.max_delegations} delegations." if can_delegate else "."),
     ]
+    if can_delegate and team_talk.enabled(settings):
+        parts.append("For longer assignments, name milestones where a check-in would change your decision. "
+                     "Members can ask each other factual questions and exchange notes.")
     return "\n".join(parts)
 
 
@@ -435,6 +342,11 @@ def member_prompt(me: Member, lead: Member, members: list[Member], settings: Set
         "",
         f"Budget for this assignment: up to {settings.limits.max_steps} steps.",
     ]
+    if team_talk.enabled(settings):
+        if settings.team.lead_consult:
+            parts.append("Use check_in for a blocker, an unsettled choice, a deviation or a requested milestone.")
+        if len(members) > 2:
+            parts.append("Ask a teammate about evidence they hold or send a note that changes their work.")
     return "\n".join(parts)
 
 
@@ -450,13 +362,25 @@ def _clip(text: str, limit: int) -> str:
 
 
 def render_plan(plan: dict) -> str:
-    marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]"}
+    marks = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]", "rework": "[!]",
+             "submitted": "[submitted]", "unconfirmed": "[submitted, unconfirmed]"}
     steps = plan.get("steps", [])
     numbered = any(s.get("after") for s in steps)
-    rows = [f"{marks.get(s['status'], '[ ]')} " + (f"{i}. " if numbered else "") + s["step"]
+    rows = [f"{marks.get(s.get('stage', s['status']), '[ ]')} " + (f"{i}. " if numbered else "") + s["step"]
             + (f" — {s['owner']}" if s.get("owner") else "")
             + (f" (after {', '.join(map(str, s['after']))})" if s.get("after") else "")
             for i, s in enumerate(steps, 1)]
+    for i, step in enumerate(steps):
+        if step.get("id"):
+            rows[i] += f" (ID: {step['id']})"
+        evidence = step.get("evidence", {})
+        if assigned := evidence.get("assigned"):
+            rows[i] += f" — assigned to {assigned['agent']}"
+        if submitted := evidence.get("submitted"):
+            paths = ", ".join(f["path"] for f in submitted["files"]) or "report"
+            rows[i] += f" — submitted by {submitted['agent']}: {paths}"
+        if reviewed := evidence.get("reviewed"):
+            rows[i] += f" — review: {reviewed['verdict']}"
     return "\n".join(rows) + (f"\nNote: {plan['explanation']}" if plan.get("explanation") else "")
 
 
@@ -510,7 +434,7 @@ def render_event(event: dict, names: dict[str, str]) -> str:
     return ""
 
 
-def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000, *, after_seq: int = 0) -> str:
+def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000, *, after_seq: int = 0, reader: str | None = None, mail_task: str | None = None) -> str:
     names = {m.id: m.name for m in store.group.members}
     lines: list[str] = []
     used = 0
@@ -519,6 +443,10 @@ def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000,
             continue
         if event["seq"] <= after_seq:
             break
+        if reader and event.get("recipients") and event["kind"] == "user_message":
+            # Directed instructions enter the recipient's current task once via its inbox.
+            if reader not in event["recipients"] or event.get("task_id") == mail_task:
+                continue
         line = render_event(event, names)
         if not line:
             continue
@@ -530,9 +458,9 @@ def conversation(store: GroupStore, before_seq: int, budget_chars: int = 48_000,
     return "\n\n".join(reversed(lines))
 
 
-def agent_context(store: GroupStore, agent_id: str, before_seq: int) -> str:
+def agent_context(store: GroupStore, agent_id: str, before_seq: int, *, mail_task=None) -> str:
     sections = []
-    chat = conversation(store, before_seq)
+    chat = conversation(store, before_seq, reader=agent_id, mail_task=mail_task)
     if chat:
         sections.append("## Group conversation so far\n" + chat)
     if store.group.folder:
@@ -581,6 +509,7 @@ class TeamTask:
         self.assignments: list[dict] = []
         self.history: dict[str, list[str]] = {}
         self.lead_baseline: dict[str, str] = {}
+        self.talk = team_talk.TeamTalk(self) if team_talk.enabled(settings) else None
         self.sessions: dict[tuple[str, str], AgentSession] = {}
         """Member conversations kept for this task, continued by later assignments."""
         self.session_marks: dict[tuple[str, str], dict] = {}
@@ -605,9 +534,19 @@ class TeamTask:
         self.loop_state: dict | None = None
         """Progress of the review loop in flight, so a resumed task continues the same round."""
         self.started_at = None
+        self.lead_session = AgentSession()
+        self.consults = LeadConsult(self)
+        self.channel.primary = primary
+        self.channel.enabled = settings.team.mailboxes
+        self.channel.interrupts = settings.team.mailboxes and settings.team.interrupts
+        self.channel.on_event = self._event
+        self.channel.on_user_mail = self.consults.schedule
+
+    def consult_lead(self, mail, *, checkin=False):
+        return self.consults.decide(mail, checkin=checkin)
 
     def continuation_state(self):
-        return {"task_id":self.task_id, "elapsed":time.monotonic()-self.started_at, "frames":self.control.frames, "team":self.group.to_dict(),
+        return {"task_id":self.task_id, "meter":self.meter.checkpoint(), "elapsed":time.monotonic()-self.started_at, "frames":self.control.frames, "team":self.group.to_dict(),
                 "lead_baseline":self.lead_baseline, "inflight":self.inflight, "loop_state":self.loop_state,
                 "sessions":{f"{member}|{kind}": {"messages":session.messages, "runs":session.runs,
                                                  "context":asdict(session.context) if session.context else None}
@@ -615,14 +554,22 @@ class TeamTask:
                 "session_marks":{f"{member}|{kind}": mark for (member, kind), mark in self.session_marks.items()},
                 "plan":self.plan, "parallel_batches":self.parallel_batches,
                 "delegations":self.delegations, "history":self.history, "assignments":self.assignments,
-                "channel":self.channel.snapshot()}
+                "channel":self.channel.snapshot(), "consult_calls": self.consults.calls}
 
 
     # -- plumbing ---------------------------------------------------------
     def _event(self, event: dict) -> None:
         event = {"task_id": self.task_id, **event}
-        if event["type"] == "end" and event.get("agent") == self.primary:
-            self.channel.finish()
+        if event["type"] in ("start","resume"):
+            self.channel.activate(event["agent"])
+        if event["type"] == "end":
+            self.channel.deactivate(event["agent"])
+            if event.get("agent") == self.primary:
+                self.consults.close()
+                self.channel.finish()
+        if (self.talk and event["type"] == "step" and event.get("max_steps")
+                and event["step"] >= 0.6 * event["max_steps"]):
+            self.talk.silence(event["agent"])
         if event["type"] == "say":
             self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
         if event["type"] == "tool_result" and event.get("tool") == "run_browser":
@@ -653,6 +600,9 @@ class TeamTask:
 
     def _registry(self, agent_id: str, *, lead: bool) -> ToolRegistry:
         registry = build_default_registry()
+        if self.talk and not lead and agent_id != self.primary:
+            for tool in self.talk.tools(agent_id):
+                registry.add(tool)
         if self.continued_from:
             draft = recovery.draft_tool(self.store, self.continued_from, agent_id)
             if draft:
@@ -695,11 +645,16 @@ class TeamTask:
         self._event({"type": "answer", "agent": agent, "text": answer})
         return ToolResult.success(f"The requester answered:\n{answer}")
 
+    def _member_plan(self) -> str:
+        if self.plan.get("linked"):
+            return render_plan(plan_view(self.record, self.store.chat(self.trigger_seq - 1)))
+        return render_plan(self.plan)
+
     def _resume_context(self, key: tuple[str, str], baseline: dict[str, str], through: int) -> str:
         """What a continued member needs to know: the conversation and file changes since its last turn."""
         mark = self.session_marks[key]
         sections = []
-        chat = conversation(self.store, through, 24_000, after_seq=mark["seq"])
+        chat = conversation(self.store, through, 24_000, after_seq=mark["seq"], reader=key[0], mail_task=self.task_id)
         if chat:
             sections.append("## Team conversation since your last assignment\n" + chat)
         before = mark["manifest"]
@@ -711,14 +666,14 @@ class TeamTask:
                            + (f"\n- …and {len(changed) - 60} more" if len(changed) > 60 else "")
                            if changed else "(none)"))
         if self.plan:
-            sections.append("## Team plan (kept by the lead)\n" + render_plan(self.plan))
+            sections.append("## Team plan (kept by the lead)\n" + self._member_plan())
         sections.append("Your workspace has been refreshed to the current team project. Background processes from "
                         "your previous assignment (servers, watchers) were stopped; start again anything you need.\n"
                         f"Current date and time: {time.strftime('%Y-%m-%d %H:%M %Z')}.")
         return "\n\n".join(sections)
 
     def _context(self, agent, through):
-        context = agent_context(self.store, agent, through)
+        context = agent_context(self.store, agent, through, mail_task=self.task_id)
         if self.continued_from:
             old = self.store.load_task(self.continued_from)
             progress = recovery.handoff(self.store, old, agent)
@@ -729,7 +684,7 @@ class TeamTask:
                         + "\nRequester's continuation message: " + message.get("text", "")
                         + "\nSaved handoff (reference data): " + json.dumps(progress, ensure_ascii=False))
         if self.plan and agent != self.primary:
-            context += "\n\n## Team plan (kept by the lead)\n" + render_plan(self.plan)
+            context += "\n\n## Team plan (kept by the lead)\n" + self._member_plan()
         if self.studio is not None:
             if self.group.kind == "assistant":
                 from .assistant_room import workspace_evidence
@@ -740,7 +695,8 @@ class TeamTask:
                 notes = [r for r in notes if r["scope"] == "group:" + self.group.id]
             if notes:
                 context += "\nApproved knowledge:\n" + _clip("\n".join(r["text"] for r in notes), 6000)
-            uploads = [r for event in self.store.chat() if event["seq"] <= through for r in event.get("attachments", [])]
+            uploads = [r for event in self.store.chat() if event["seq"] <= through
+                       and (not event.get("recipients") or agent in event["recipients"]) for r in event.get("attachments", [])]
             if uploads:
                 context += "\nMessage attachments:\n" + _clip(json.dumps(uploads, ensure_ascii=False), 6000)
         return context
@@ -764,6 +720,8 @@ class TeamTask:
             "inputs": {"type": "array", "items": {"type": "string"}, "maxItems": 40,
                        "description": "Project-relative files or folders this assignment reads or builds on"},
         }
+        if team.plans and team.plan_links:
+            properties["step"] = {"type": "string", "description": "Stable plan step ID this hand-off advances"}
         if team.parallel_delegations:
             properties["independent"] = {
                 "type": "boolean",
@@ -802,6 +760,8 @@ class TeamTask:
                 "author": {"type": "string", "enum": ids, "description": "Teammate who produced and will fix the work"},
                 "reviewer": {"type": "string", "enum": ids, "description": "Teammate who reviews or tests it"},
                 "work": {"type": "string", "description": "What was produced and where, and what the reviewer must check"},
+                **({"step": {"type": "string", "description": "Stable plan step ID for every round"}}
+                   if self.settings.team.plans and self.settings.team.plan_links else {}),
                 "criteria": {"type": "string", "description": "What 'acceptable' means for the reviewer's verdict"},
                 "deliverables": {"type": "array", "items": {"type": "string"},
                                  "description": "Project-relative paths the author may change while fixing"},
@@ -812,16 +772,20 @@ class TeamTask:
             fn=lambda _ctx, args: self._review_loop(lead_id, args))
 
     def _plan_tool(self, lead_id: str) -> Tool:
+        linked = self.settings.team.plan_links
         return Tool(
             name="update_plan",
             description=("Replace the task plan the requester sees. List every step with its status; update it when "
-                         "you start or finish a step or change the approach."),
+                         "you start or finish a step or change the approach." if not linked else
+                         "Replace the task plan. Use step IDs to keep assignment evidence when renaming or reordering. "
+                         "Set completed to accept a step, or rework to return it."),
             parameters={"type": "object", "properties": {
                 "explanation": {"type": "string", "description": "Optional short note on what changed"},
                 "steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
                     "type": "object", "properties": {
+                        **({"id": {"type": "string", "description": "Stable step ID. Assigned when omitted."}} if linked else {}),
                         "step": {"type": "string"},
-                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"] + (["rework"] if linked else [])},
                         "owner": {"type": "string", "description": "Teammate id responsible, if any"},
                         "after": {"type": "array", "items": {"type": "integer", "minimum": 1},
                                   "description": "Numbers of earlier steps (1-based) this step needs first"}},
@@ -900,6 +864,15 @@ class TeamTask:
             batch.arrive(assignee)  # refused before it ran; the others still check each other's results
         return outcome
 
+    def _step_link(self, requested):
+        if not requested or not (self.settings.team.plan_links and self.settings.team.plans):
+            return {}, ""
+        ids = [s["id"] for s in (self.plan or {}).get("steps", []) if s.get("id")]
+        if requested in ids:
+            return {"step": requested}, ""
+        return {"requested_step": requested}, (f"Unlinked hand-off: unknown plan step {requested!r}. "
+                                               f"Valid step IDs: {', '.join(ids) or '(no plan yet)'}.")
+
     def _delegate_one(self, lead_id: str, args: dict, batch: ParallelBatch | None) -> ToolResult:
         assignee = str(args.get("assignee", "")).strip()
         task = str(args.get("task", "")).strip()
@@ -922,11 +895,14 @@ class TeamTask:
             if missing:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
+        link, warning = self._step_link(args.get("step"))
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
-                               fresh=fresh, checks=checks, review=review, batch=batch)
+                               fresh=fresh, checks=checks, review=review, batch=batch, link=link)
         if isinstance(outcome, ToolResult):
             return outcome
         lines = self._report_lines(outcome)
+        if warning:
+            lines.insert(0, warning)
         if missing:
             lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing)
                          + ". If the work depended on them, run it again after the step that produces them.")
@@ -936,7 +912,7 @@ class TeamTask:
 
     def _assign(self, lead_id: str, assignee: str, task: str, *, deliverables: list[str], max_steps=None,
                 fresh: bool = False, checks: list[dict] | None = None, review: bool = False,
-                loop: dict | None = None, batch: ParallelBatch | None = None) -> dict | ToolResult:
+                loop: dict | None = None, batch: ParallelBatch | None = None, link: dict | None = None) -> dict | ToolResult:
         """Run one member assignment; returns its outcome, or a refusal for the lead."""
         valid = self._member_ids(lead_id)
         if assignee not in valid:
@@ -944,7 +920,7 @@ class TeamTask:
         with self.lock:
             entry = self.inflight.get(assignee)
         if entry is None:
-            entry = self._open_assignment(lead_id, assignee, task, deliverables, max_steps, checks, review, loop)
+            entry = self._open_assignment(lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link)
             if isinstance(entry, ToolResult):
                 return entry
         member = self.group.member(assignee)
@@ -968,7 +944,7 @@ class TeamTask:
             self.inflight.pop(assignee, None)
             self.lead_baseline = self.store.project.checkout(self.store.workspace(lead_id))
         outcome = self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop,
-                                         entry.get("browser_checks"))
+                                         entry.get("browser_checks"), entry)
         if parallel:
             outcome["parallel"] = parallel
         return outcome
@@ -998,6 +974,8 @@ class TeamTask:
             reason = "the task was cancelled" if self.should_cancel() else "a teammate's run was paused or failed"
             return result, changes, skipped, self._parallel_note(peers, reason=reason)
         others = [o for key, o in batch.outcomes.items() if key != member.id]
+        if entry.get("report_request"):
+            return result, changes, skipped, self._parallel_note(peers, reason="the lead requested a final report")
         if result.status in ("error", "cancelled"):
             return result, changes, skipped, self._parallel_note(peers, reason="this run did not finish")
         if not others:
@@ -1026,7 +1004,7 @@ class TeamTask:
                                                          first_result=result)
         return combined, merged, all_skipped, self._parallel_note(peers, checked=True)
 
-    def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop):
+    def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link):
         """Budget, repeat check, lead publish and the delegation event; returns the in-flight entry."""
         if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150, self.settings.limits.max_steps)):
             return ToolResult.failure(f"max_steps must be between 1 and {min(150, self.settings.limits.max_steps)}")
@@ -1054,13 +1032,13 @@ class TeamTask:
                 self.lead_baseline = self.store.project.checkout(lead_workspace)
         extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None)) if v}
         event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
-                                  task=task, deliverables=deliverables, **extra)
-        entry = {"assignee": assignee, "seq": event["seq"]}
+                                  task=task, deliverables=deliverables, **extra, **(link or {}))
+        entry = {"assignee": assignee, "seq": event["seq"], **(link or {})}
         with self.lock:
             self.inflight[assignee] = entry
         return entry
 
-    def _close_assignment(self, member, task, deliverables, result, changes, skipped, checks, review, loop, browser_checks=None):
+    def _close_assignment(self, member, task, deliverables, result, changes, skipped, checks, review, loop, browser_checks=None, entry=None):
         browser_checks = browser_checks if browser_checks and browser_checks["findings"] else None
         assignee = member.id
         report = result.answer or "(no report)"
@@ -1077,6 +1055,13 @@ class TeamTask:
         missing = [p for p in deliverables if not _present(p, manifest)]
         report_extra = {k: v for k, v in (("checks", checked), ("loop", loop), ("review", review or None),
                                           ("browser_checks", browser_checks)) if v}
+        if self.talk and entry:
+            report_extra.update(assignment_seq=entry["seq"], talk=dict(entry.get("talk", {})))
+        if self.settings.team.plan_links and entry:
+            report_extra.update(assignment_seq=entry["seq"])
+            report_extra.update({k: entry[k] for k in ("step", "requested_step") if k in entry})
+            if review:
+                report_extra["verdict"] = _verdict(report)
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
                           changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
                           **report_extra)
@@ -1128,6 +1113,7 @@ class TeamTask:
         except ValueError as exc:
             return ToolResult.failure(f"Invalid checks: {exc}")
         names = {m.id: m.name for m in self.group.members}
+        link, warning = self._step_link(args.get("step"))
         key = f"{author}>{reviewer}"
         state = self.loop_state if self.loop_state and self.loop_state.get("key") == key else None
         if state is None:  # a resumed task continues the saved round and phase instead
@@ -1147,7 +1133,7 @@ class TeamTask:
                                      "criteria, or `VERDICT: CHANGES REQUESTED` followed by numbered, concrete findings the "
                                      "author can act on.")
                     reviewed = self._assign(lead_id, reviewer, review_task, deliverables=[], review=True,
-                                            loop={"id": state["id"], "round": number, "role": "review"})
+                                            loop={"id": state["id"], "round": number, "role": "review"}, link=link)
                     if isinstance(reviewed, ToolResult):
                         state["stop"] = reviewed.content
                         break
@@ -1165,7 +1151,7 @@ class TeamTask:
                             f"project, verify your fix, then report what you changed and how you verified it.\n\n"
                             f"{state['findings']}")
                 fixed = self._assign(lead_id, author, fix_task, deliverables=deliverables, checks=checks,
-                                     loop={"id": state["id"], "round": number, "role": "fix"})
+                                     loop={"id": state["id"], "round": number, "role": "fix"}, link=link)
                 if isinstance(fixed, ToolResult):
                     state["stop"] = fixed.content
                     break
@@ -1189,6 +1175,8 @@ class TeamTask:
                                                        state["last_checks"], state["touched"])
         lines = [f"Review loop {names[author]} ⇄ {names[reviewer]}: {verdict.upper()} after {len(rounds)} review round(s).",
                  *rounds]
+        if warning:
+            lines.insert(0, warning)
         if stop:
             lines.append("Stopped early: " + stop)
         if last_review:
@@ -1220,6 +1208,8 @@ class TeamTask:
             if not 1 <= len(text) <= 300:
                 return ToolResult.failure("Each step needs 1–300 characters of text.")
             row = {"step": text, "status": item.get("status", "pending")}
+            if self.settings.team.plan_links and "id" in item:
+                row["id"] = item["id"]
             if item.get("owner"):
                 row["owner"] = str(item["owner"]).strip()[:60]
             after = item.get("after") or []
@@ -1233,14 +1223,22 @@ class TeamTask:
             return ToolResult.failure("A plan has 1–20 steps.")
         explanation = str(args.get("explanation") or "").strip()[:600]
         with self.lock:
-            self.plan = {"steps": steps, "explanation": explanation, "updated_at": now()}
+            meta = {}
+            if self.settings.team.plan_links:
+                try:
+                    meta = {"used_ids": identify_steps(steps, self.plan), "linked": True}
+                except ValueError as exc:
+                    return ToolResult.failure(str(exc))
+            self.plan = {"steps": steps, "explanation": explanation, "updated_at": now(), **meta}
             self._update(plan=self.plan)
-        self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation)
+        self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation,
+                          **({"linked": True} if self.settings.team.plan_links else {}))
         done = sum(s["status"] == "completed" for s in steps)
         ready = [str(i) for i, s in enumerate(steps, 1) if s["status"] == "pending"
                  and all(steps[n - 1]["status"] == "completed" for n in s.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
-        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint} The requester can see it.")
+        ids = " Steps: " + ", ".join(f"{s['id']} {s['step']}" for s in steps) if self.settings.team.plan_links else ""
+        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{ids} The requester can see it.")
 
     def _run_member(self, member: Member, task: str, deliverables: list[str], entry: dict, max_steps=None,
                     *, fresh: bool = False, review: bool = False, reconcile: bool = False):
@@ -1253,9 +1251,9 @@ class TeamTask:
         # Review work may use another model or thinking mode, so it keeps a session of its own.
         key = (member.id, "review" if review else "work")
         session = None
-        if self.settings.team.resume_members:
+        if self.settings.team.resume_members or self.talk:
             with self.lock:
-                session = self.sessions.get(key)
+                session = self.sessions.get(key) if self.settings.team.resume_members or rejoining else None
                 if session is None or (fresh and not rejoining):
                     session = self.sessions[key] = AgentSession()
         continuing = (not rejoining and session is not None and session.resumable and key in self.session_marks)
@@ -1287,11 +1285,14 @@ class TeamTask:
         context = ("" if rejoining else self._resume_context(key, baseline, trigger_seq) if continuing
                    else self._context(member.id, trigger_seq))
         recovered = 0
+        agent.report_requested = lambda: entry.get("report_request")
+        if self.talk:
+            self.talk.start(member.id, entry, review)
         try:
             result = agent.run(assignment, context=context, session=session)
             # A failed model request should not cost the member its work: continue the same session.
             while (result.status == "error" and result.error.startswith("model request failed")
-                   and session is not None and session.resumable and recovered < MODEL_ERROR_RETRIES
+                   and self.settings.team.resume_members and session is not None and session.resumable and recovered < MODEL_ERROR_RETRIES
                    and not self.should_cancel()):
                 recovered += 1
                 time.sleep(MODEL_ERROR_PAUSE)
@@ -1306,6 +1307,8 @@ class TeamTask:
                 if note:
                     result = replace(result, answer="(No final report: the run failed.) Last progress note: " + note)
         finally:
+            if self.talk:
+                self.talk.finish(member.id, entry)
             with self.lock:
                 self.active.remove(member.id)
                 self._update(active=list(self.active))
@@ -1315,6 +1318,8 @@ class TeamTask:
             if session is not None:
                 self.session_marks[key] = {"manifest": self.store.project.manifest(), "seq": trigger_seq}
             metrics = _metrics(member.id, result)
+            if self.talk:
+                metrics.update(assignment_seq=entry["seq"], talk=dict(entry.get("talk", {})))
             if review:
                 metrics["review"] = True
             if recovered:
@@ -1335,6 +1340,7 @@ class TeamTask:
 
     def run(self) -> dict:
         self.started_at = time.monotonic() - self.control.saved.get("elapsed",0)
+        self.meter.restore(self.control.saved.get("meter"))
         self.meter.started = time.time() - self.control.saved.get("elapsed", 0)
         self.meter.budget_minutes = float(self.options.get("budget_minutes")
                                           or (FAST_SOFT_MINUTES if self.settings.team.fast else 0))
@@ -1348,6 +1354,7 @@ class TeamTask:
         if saved:
             self.record = self.store.load_task(self.task_id)
             self.lead_baseline = saved["lead_baseline"]
+            self.consults.calls = saved.get("consult_calls", 0)
             self.delegations = saved["delegations"]
             legacy = saved.get("delegation")
             self.inflight = saved.get("inflight") or ({legacy["assignee"]: legacy} if legacy else {})
@@ -1380,6 +1387,7 @@ class TeamTask:
             self.store.save_task(self.record)
             self.store.append("task_started", task_id=self.task_id, agent=self.primary,
                               **({"continued_from":self.continued_from} if self.continued_from else {}),
+                              **({"inherited_plan":True} if self.plan and self.plan.get("linked") else {}),
                               **({"fast": True} if self.settings.team.fast else {}))
             self.lead_baseline = self.store.project.checkout(workspace)
         settings = self.settings
@@ -1402,7 +1410,8 @@ class TeamTask:
         if self.continued_from:
             assignment = ("Continue the interrupted task from the saved handoff and current project. "
                           "Carry out the outstanding work. Original assignment:\n" + self.text)
-        result = agent.run(assignment, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls)
+        result = agent.run(assignment, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls,
+                           session=self.lead_session if settings.team.mailboxes and settings.team.lead_consult else None)
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
         if changes:
@@ -1430,6 +1439,13 @@ class TeamTask:
                    "time": {k: v for k, v in self.meter.snapshot().items() if k != "alerts"},
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),
                    "tool_calls": totals["tool_calls"] + sum(a["tool_calls"] for a in self.assignments)}
+        if self.talk:
+            metrics["communication_limits"] = {name: getattr(self.settings.team, name)
+                                               for name in ("check_ins", "teammate_questions", "teammate_notes")}
+        communication = metrics["time"]["communication"]
+        metrics["prompt_tokens"] += communication["auxiliary_prompt"]
+        metrics["completion_tokens"] += communication["auxiliary_output"]
+        metrics["prompt_cache_hit_tokens"] += communication["auxiliary_cached"]
         self._update(status=status, finished_at=now(), final_answer=answer, error=result.error,
                      active=[], metrics=metrics, assignments=self.assignments, delegations=self.delegations)
         self.store.append("task_finished", task_id=self.task_id, status=status, metrics=metrics, error=result.error)
