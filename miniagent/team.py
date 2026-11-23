@@ -210,7 +210,10 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
                 "while the build or the tests run; separate research topics for separate researchers. Not "
                 "candidates: anything that reviews, summarises, prices, presents or builds on work that does not "
                 "exist yet — a risk review before the research, an outline before the reporting, client material "
-                "before the analysis. Those go one after another.")
+                "before the analysis. Those go one after another. A check of work that is already finished can run "
+                "alongside other work that does not change it — QA testing the finished build while the release "
+                "notes are drafted from it. When a report comes back, Studio names the plan steps that can start "
+                "together.")
         parts.append(
             "- Add `checks` to an assignment when 'done' can be checked mechanically (a file exists, contains a "
             "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
@@ -225,7 +228,7 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         if settings.team.plans and settings.team.plan_links:
             parts.append("- Write the plan once. For your own steps, bind outputs or on_delivery. Pass the covered "
                          "step IDs on handoffs and retest_steps for post-fix reviews. Use record_plan_result for a decision "
-                         "on individual steps. Use after for dependencies.")
+                         "on individual steps. Use after (earlier step IDs or numbers) for dependencies.")
         elif settings.team.plans:
             parts.append(
                 "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
@@ -830,6 +833,41 @@ class TeamTask:
                               "description": "Teammates to wait for (default: every hand-off still running)"}}},
             fn=lambda _ctx, args: self._wait_handoffs(args))
 
+    def _ready_note(self) -> str:
+        """Plan steps that can start now, read from the recorded hand-offs; costs no model call.
+
+        Studio never starts plan steps itself (the lead decides); it only points out, when a report comes
+        back, the steps whose dependencies are done so independent ones are not run one after another.
+        """
+        team = self.settings.team
+        if not (team.plans and team.plan_links and self.plan and self.plan.get("linked")):
+            return ""
+        steps = self.plan.get("steps", [])
+        if not any(s.get("after") for s in steps):
+            return ""  # without dependencies Studio cannot tell what is independent
+        view = plan_view(self.record, self.store.chat(self.trigger_seq - 1))
+        if not view:
+            return ""
+        rows = view["steps"]
+        stages = [row.get("stage", row["status"]) for row in rows]
+        with self.lock:
+            busy = set(self.inflight)
+        ready = [(n, row) for n, row in enumerate(rows, 1) if stages[n - 1] == "pending"
+                 and all(stages[k - 1] == "completed" for k in row.get("after", []) if 1 <= k <= len(rows))
+                 and row.get("owner") not in busy]
+        owners = {row.get("owner") or f"step {n}" for n, row in ready}
+        if len(ready) < 2 or len(owners) < 2:
+            return ""
+        names = "; ".join(f"{n} {row.get('id', '')} ({row.get('owner') or 'no owner'})".replace("  ", " ")
+                          for n, row in ready)
+        ways = []
+        if team.parallel_delegations:
+            ways.append("in one response, each with `independent: true` and its own deliverables")
+        if team.background_handoffs:
+            ways.append("start one with `background: true` and keep working")
+        how = (" Start them " + ", or ".join(ways) + ".") if ways else ""
+        return f"Plan: steps {names} can start now — their dependencies are done and none needs another.{how}"
+
     def lead_suspended(self) -> bool:
         """The lead is inside a synchronous hand-off, a review loop or wait_handoffs, so it is not reading mail."""
         with self.lock:
@@ -924,6 +962,8 @@ class TeamTask:
                                              run["checks"], run["review"], None, entry.get("browser_checks"), entry)
             lines = self._report_lines(outcome)
             lines[0] = "Background hand-off finished. " + lines[0]
+            if ready := self._ready_note():
+                lines.append(ready)
             lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
             text = "\n".join(lines)
         except PauseRequested:
@@ -1074,8 +1114,10 @@ class TeamTask:
                         "step": {"type": "string"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"] + (["rework"] if linked else [])},
                         "owner": {"type": "string", "description": "Teammate id responsible, if any"},
-                        "after": {"type": "array", "items": {"type": "integer", "minimum": 1},
-                                  "description": "Numbers of earlier steps (1-based) this step needs first"}},
+                        "after": {"type": "array",
+                                  "items": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "string"}]},
+                                  "description": ("Earlier steps this step needs first: their IDs"
+                                                  + (" or numbers (1-based)" if linked else " (1-based numbers)"))}},
                     "required": ["step", "status"]}},
             }, "required": ["steps"]},
             fn=lambda _ctx, args: self._update_plan(lead_id, args))
@@ -1086,11 +1128,14 @@ class TeamTask:
         declared and disjoint files, no brief naming another's files or teammate, and budget left.
 
         The lead can still be wrong about independence; the follow-up in _reconcile covers that case.
+        A check (review) may join; it reports without that follow-up, since it judges finished work.
         """
         assignees = [str(args.get("assignee", "")).strip() for args in batch]
-        if len(set(assignees)) != len(assignees) or any(args.get("review") for args in batch):
+        if len(set(assignees)) != len(assignees):
             return False
-        if any(self._wants_background(args) or args.get("kind") == "check" for args in batch):
+        # A check of finished work may run alongside other work; the rules below refuse one that
+        # reads, names or reviews anything another call in the batch produces.
+        if any(self._wants_background(args) for args in batch):
             return False  # in order, a background hand-off starts after what it may build on
         if not all(args.get("independent") is True for args in batch):
             return False
@@ -1227,6 +1272,8 @@ class TeamTask:
         if missing:
             lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing)
                          + ". If the work depended on them, run it again after the step that produces them.")
+        if ready := self._ready_note():
+            lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
         ok = outcome["result"].status in {"completed", "max_steps", "stuck", "budget"}
         return ToolResult(ok=ok, content="\n".join(lines))
@@ -1307,6 +1354,10 @@ class TeamTask:
                                  "report": result.answer or result.error or "(no report)",
                                  "files": [f"{c.path} ({c.change})" for c in changes]})
         peers = entry["peers"]
+        if review:  # a check judges finished work; its batch-mates see its findings, it does not review theirs
+            names = ", ".join(f"{self.group.member(p).name} ({p})" if self._known(p) else p for p in peers)
+            return result, changes, skipped, (f"Ran at the same time as {names}. As a check of finished work it "
+                                               "did not review their results; delegate a check if they need one.")
         if not batch.wait(self.should_cancel):
             reason = "the task was cancelled" if self.should_cancel() else "a teammate's run was paused or failed"
             return result, changes, skipped, self._parallel_note(peers, reason=reason)
@@ -1557,6 +1608,8 @@ class TeamTask:
             lines.append("Files changed by the fixes: " + ", ".join(f"{p} ({c})" for p, c in sorted(touched.items())))
         if last_checks:
             lines += check_lines(last_checks)
+        if ready := self._ready_note():
+            lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
         return ToolResult(ok=bool(rounds), content="\n".join(lines))
 
@@ -1589,10 +1642,9 @@ class TeamTask:
                     row["on_delivery"] = True
             after = item.get("after") or []
             if after:
-                if any(type(n) is not int or not 1 <= n <= len(steps) for n in after):
-                    return ToolResult.failure(f"Step {len(steps) + 1}: `after` may only name earlier steps "
-                                              f"(1–{len(steps)}).")
-                row["after"] = sorted(set(after))
+                if not isinstance(after, list):
+                    return ToolResult.failure(f"Step {len(steps) + 1}: `after` is a list of earlier steps.")
+                row["after"] = after  # resolved to step numbers below, once every step has its ID
             steps.append(row)
         if not 1 <= len(steps) <= 20:
             return ToolResult.failure("A plan has 1–20 steps.")
@@ -1604,6 +1656,9 @@ class TeamTask:
                     meta = {"used_ids": identify_steps(steps, self.plan), "linked": True}
                 except ValueError as exc:
                     return ToolResult.failure(str(exc))
+            problem = _resolve_after(steps)
+            if problem:
+                return ToolResult.failure(problem)
             self.plan = {"steps": steps, "explanation": explanation, "updated_at": now(), **meta}
             self._update(plan=self.plan)
         self.store.append("plan", task_id=self.task_id, agent=lead_id, steps=steps, explanation=explanation,
@@ -1878,6 +1933,36 @@ class TeamTask:
                      active=[], metrics=metrics, assignments=self.assignments, delegations=self.delegations)
         self.store.append("task_finished", task_id=self.task_id, status=status, metrics=metrics, error=result.error)
         return self.record
+
+
+def _resolve_after(steps: list[dict]) -> str:
+    """Turn each step's `after` (earlier step IDs or 1-based numbers) into sorted step numbers.
+
+    Returns an error for the lead, naming the valid references, or "" when every reference is an earlier step.
+    """
+    for number, row in enumerate(steps, 1):
+        refs = row.get("after")
+        if not refs:
+            row.pop("after", None)
+            continue
+        earlier = {s["id"]: n for n, s in enumerate(steps[:number - 1], 1) if s.get("id")}
+        resolved = []
+        for ref in refs:
+            key = ref.strip() if isinstance(ref, str) else ref
+            if type(key) is int and 1 <= key < number:
+                resolved.append(key)
+            elif isinstance(key, str) and key in earlier:
+                resolved.append(earlier[key])
+            elif isinstance(key, str) and key.isdigit() and 1 <= int(key) < number:
+                resolved.append(int(key))
+            else:
+                if number == 1:
+                    return f"Step 1 ({row.get('id') or row['step'][:40]}): `after` may only name earlier steps; the first step has none."
+                valid = f"numbers 1–{number - 1}" + (f" or IDs {', '.join(earlier)}" if earlier else "")
+                return (f"Step {number} ({row.get('id') or row['step'][:40]}): `after` may only name earlier steps, "
+                        f"and {ref!r} is not one. Use {valid}.")
+        row["after"] = sorted(set(resolved))
+    return ""
 
 
 def _combined(first: AgentResult, second: AgentResult) -> AgentResult:
