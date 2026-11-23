@@ -38,7 +38,7 @@ import uuid
 from dataclasses import asdict, replace
 from typing import Any, Callable
 
-from .agent import Agent, AgentResult, AgentSession
+from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .checkpoint import Continuation, PauseRequested
 from .config import Settings
 from .context import ContextManager
@@ -48,10 +48,56 @@ from .sandbox import Sandbox
 from . import recovery
 from .schemas import ToolResult, Usage
 from .store import GroupStore, Member, now
-from .tools import Tool, ToolRegistry, build_default_registry
-from .workspace import listing
+from .tools import Tool, ToolRegistry, build_default_registry, validate_arguments
+from .workspace import Change, listing
 
 REPORT_LIMIT = 14_000
+MODEL_ERROR_RETRIES = 1
+"""After a failed model request, a member continues its own session this many times before reporting."""
+MODEL_ERROR_PAUSE = 5.0
+"""Seconds to wait before continuing after a failed model request."""
+RECONCILE_STEPS = 30
+"""Step budget for a teammate's check of its parallel teammates' results."""
+BATCH_WAIT_SECONDS = 6 * 3600
+"""Upper bound on waiting for the rest of a parallel batch (every exit path also releases the wait)."""
+
+
+class ParallelBatch:
+    """Delegations the lead started together, joined again before anyone reports (a deferred fan-in).
+
+    Every member arrives exactly once, with its outcome, with nothing (refused before it ran), or by
+    breaking the batch (a pause or an exception), so no member can wait for one that will never come.
+    """
+
+    def __init__(self, calls: set[tuple[str, str]]):
+        self.calls = calls
+        self.joined: set[str] = set()
+        self.arrived: set[str] = set()
+        self.outcomes: dict[str, dict] = {}
+        self.broken = False
+        self._cond = threading.Condition()
+
+    def arrive(self, member: str, outcome: dict | None = None) -> None:
+        with self._cond:
+            if outcome is not None:
+                self.outcomes[member] = outcome
+            self.arrived.add(member)
+            self._cond.notify_all()
+
+    def abort(self) -> None:
+        with self._cond:
+            self.broken = True
+            self._cond.notify_all()
+
+    def wait(self, should_cancel: Callable[[], bool], timeout: float = BATCH_WAIT_SECONDS) -> bool:
+        """True when every member arrived; False if the batch broke, the task was cancelled or time ran out."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while len(self.arrived) < len(self.calls) and not self.broken:
+                if should_cancel() or time.monotonic() >= deadline:
+                    return False
+                self._cond.wait(0.5)
+            return not self.broken
 
 CHECKS_SCHEMA = {
     "type": "array", "maxItems": 20,
@@ -92,6 +138,11 @@ def check_lines(evaluation: dict) -> list[str]:
 
 def _norm(path: Any) -> str:
     return str(path).strip().removeprefix("./").rstrip("/")
+
+
+def _mentions(text: str, name: str) -> bool:
+    """``name`` (a path or a teammate id) appears in ``text`` as a whole word or path, not inside another."""
+    return re.search(r"(?<![\w./-])" + re.escape(name) + r"(?![\w-])", text) is not None
 
 
 def _overlaps(a: str, b: str) -> bool:
@@ -242,9 +293,10 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         ]
         if settings.team.parallel_delegations:
             parts.append(
-                "- Assignments that do not depend on each other can run at the same time: call `delegate_task` "
-                "several times in one response, each with its own `deliverables` and no file shared between them. "
-                "Otherwise they run one after another.")
+                "- Assignments that need nothing from each other can run at the same time: call `delegate_task` "
+                "several times in one response, each with `independent: true` and its own `deliverables`. When they "
+                "finish, each teammate sees the others' results and fixes anything that turned out to depend on "
+                "them. If one assignment needs another's output, delegate them one after another.")
         parts.append(
             "- Add `checks` to an assignment when 'done' can be checked mechanically (a file exists, contains a "
             "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
@@ -482,6 +534,8 @@ class TeamTask:
         self.plan: dict | None = None
         self.reviewer_provider: Provider | None = None
         self.parallel_batches = 0
+        self.batch: ParallelBatch | None = None
+        """The parallel batch whose assignments are about to start (see _can_run_together)."""
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
         self.control = Continuation()
@@ -633,6 +687,12 @@ class TeamTask:
             "review": {"type": "boolean",
                        "description": "True when this assignment reviews or tests someone else's work"},
         }
+        if team.parallel_delegations:
+            properties["independent"] = {
+                "type": "boolean",
+                "description": "True only if this assignment needs nothing from the other assignments in the same "
+                               "response. Such assignments run at the same time; afterwards each teammate checks the "
+                               "others' results and fixes what depended on them."}
         if team.resume_members:
             properties["fresh"] = {"type": "boolean",
                                    "description": "Start the teammate in a clean session instead of continuing "
@@ -642,11 +702,15 @@ class TeamTask:
             description=("Give one assignment to one teammate and wait for their report. The teammate works in a "
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report, the published files and the results of any checks."
-                         + (" Several calls in one response run at the same time when each declares deliverables "
-                            "and no two share a file." if team.parallel_delegations else "")),
-            parameters={"type": "object", "properties": properties, "required": ["assignee", "task"]},
+                         + (" Several calls in one response run at the same time when each is marked independent, "
+                            "declares deliverables and no two share a file." if team.parallel_delegations else "")),
+            parameters=self._delegate_schema(properties),
             fn=lambda _ctx, args: self._delegate(lead_id, args),
             concurrent=self._can_run_together if team.parallel_delegations else None)
+
+    def _delegate_schema(self, properties: dict) -> dict:
+        self.delegate_parameters = {"type": "object", "properties": properties, "required": ["assignee", "task"]}
+        return self.delegate_parameters
 
     def _review_tool(self, lead_id: str) -> Tool:
         ids = self._member_ids(lead_id)
@@ -688,9 +752,20 @@ class TeamTask:
 
     # -- delegation ---------------------------------------------------------
     def _can_run_together(self, batch: list[dict]) -> bool:
-        """A batch of delegations may run at once: distinct teammates, declared and disjoint files, budget left."""
+        """A batch of delegations may run at once: each marked independent and valid, distinct teammates,
+        declared and disjoint files, no brief naming another's files or teammate, and budget left.
+
+        The lead can still be wrong about independence; the follow-up in _reconcile covers that case.
+        """
         assignees = [str(args.get("assignee", "")).strip() for args in batch]
         if len(set(assignees)) != len(assignees) or any(args.get("review") for args in batch):
+            return False
+        if not all(args.get("independent") is True for args in batch):
+            return False
+        schema = getattr(self, "delegate_parameters", None)
+        if schema is None or any(validate_arguments(schema, args) for args in batch):
+            return False  # a call that never starts could not release its teammates
+        if any(len(str(args.get("task", "")).strip()) < 10 for args in batch):
             return False
         claimed: list[list[str]] = []
         for args in batch:
@@ -702,11 +777,45 @@ class TeamTask:
             for theirs in claimed[i + 1:]:
                 if any(_overlaps(a, b) for a in mine for b in theirs):
                     return False
+        # A brief that names another assignment's files or teammate probably needs its output.
+        for i, args in enumerate(batch):
+            text = str(args.get("task", ""))
+            for j, other in enumerate(batch):
+                if i != j and any(_mentions(text, name) for name in [*claimed[j], assignees[j]]):
+                    return False
         with self.lock:
             new = sum(1 for name in assignees if name not in self.inflight)
-            return self.settings.team.max_delegations - self.delegations >= new
+            if self.settings.team.max_delegations - self.delegations < new:
+                return False
+            # A batch resumed after a pause has lost its finished members; they are not joined again.
+            if new == len(assignees):
+                self.batch = ParallelBatch({(a, str(args.get("task", "")).strip()) for a, args in zip(assignees, batch)})
+            return True
+
+    def _join_batch(self, assignee: str, task: str) -> ParallelBatch | None:
+        with self.lock:
+            batch = self.batch
+            if batch and (assignee, task) in batch.calls and assignee not in batch.joined:
+                batch.joined.add(assignee)
+                if len(batch.joined) == len(batch.calls):
+                    self.batch = None
+                return batch
+        return None
 
     def _delegate(self, lead_id: str, args: dict) -> ToolResult:
+        assignee = str(args.get("assignee", "")).strip()
+        batch = self._join_batch(assignee, str(args.get("task", "")).strip())
+        try:
+            outcome = self._delegate_one(lead_id, args, batch)
+        except BaseException:
+            if batch is not None and assignee not in batch.arrived:
+                batch.abort()  # paused or failed: the others report without the follow-up
+            raise
+        if batch is not None and assignee not in batch.arrived:
+            batch.arrive(assignee)  # refused before it ran; the others still check each other's results
+        return outcome
+
+    def _delegate_one(self, lead_id: str, args: dict, batch: ParallelBatch | None) -> ToolResult:
         assignee = str(args.get("assignee", "")).strip()
         task = str(args.get("task", "")).strip()
         deliverables = [str(p).strip() for p in args.get("deliverables") or [] if str(p).strip()][:40]
@@ -720,7 +829,7 @@ class TeamTask:
         except ValueError as exc:
             return ToolResult.failure(f"Invalid checks: {exc}")
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
-                               fresh=fresh, checks=checks, review=review)
+                               fresh=fresh, checks=checks, review=review, batch=batch)
         if isinstance(outcome, ToolResult):
             return outcome
         lines = self._report_lines(outcome)
@@ -730,7 +839,7 @@ class TeamTask:
 
     def _assign(self, lead_id: str, assignee: str, task: str, *, deliverables: list[str], max_steps=None,
                 fresh: bool = False, checks: list[dict] | None = None, review: bool = False,
-                loop: dict | None = None) -> dict | ToolResult:
+                loop: dict | None = None, batch: ParallelBatch | None = None) -> dict | ToolResult:
         """Run one member assignment; returns its outcome, or a refusal for the lead."""
         valid = self._member_ids(lead_id)
         if assignee not in valid:
@@ -742,12 +851,82 @@ class TeamTask:
             if isinstance(entry, ToolResult):
                 return entry
         member = self.group.member(assignee)
-        result, changes, skipped = self._run_member(member, task, deliverables, entry, max_steps,
-                                                    fresh=fresh, review=review)
+        if batch is not None:
+            entry["peers"] = sorted(name for name, _ in batch.calls if name != assignee)
+        parallel = None
+        if "first" in entry:  # paused during the follow-up check: finish that check
+            again, more, more_skipped = self._run_member(member, task, deliverables, entry, RECONCILE_STEPS,
+                                                         review=review, reconcile=True)
+            result, changes, skipped = _after_follow_up(entry["first"], again, more, more_skipped)
+            parallel = self._parallel_note(entry["peers"], checked=True)
+        else:
+            result, changes, skipped = self._run_member(member, task, deliverables, entry, max_steps,
+                                                        fresh=fresh, review=review)
+            if batch is not None:
+                result, changes, skipped, parallel = self._reconcile(batch, member, deliverables, entry, review,
+                                                                     result, changes, skipped)
+            elif entry.get("peers"):
+                parallel = self._parallel_note(entry["peers"], reason="the task was paused while they ran")
         with self.lock:
             self.inflight.pop(assignee, None)
             self.lead_baseline = self.store.project.checkout(self.store.workspace(lead_id))
-        return self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop)
+        outcome = self._close_assignment(member, task, deliverables, result, changes, skipped, checks, review, loop)
+        if parallel:
+            outcome["parallel"] = parallel
+        return outcome
+
+    def _parallel_note(self, peers: list[str], *, checked: bool = False, reason: str = "") -> str:
+        names = ", ".join(f"{self.group.member(p).name} ({p})" if self._known(p) else p for p in peers)
+        if checked:
+            return f"Ran at the same time as {names}; afterwards checked their results (included in the report)."
+        return (f"Ran at the same time as {names}. The follow-up check against their results did not run ({reason}). "
+                "If this work depends on theirs, delegate a follow-up.")
+
+    def _known(self, member_id: str) -> bool:
+        return any(m.id == member_id for m in self.group.members)
+
+    def _reconcile(self, batch: ParallelBatch, member: Member, deliverables, entry, review, result, changes, skipped):
+        """After a parallel batch, each teammate checks the others' results (a deferred join).
+
+        Like a LangGraph node with defer=True, this waits until every branch of the batch has finished.
+        The lead may have been wrong that the assignments were independent; this step is where a teammate
+        replaces assumptions with the others' actual results. Returns (result, changes, skipped, note).
+        """
+        batch.arrive(member.id, {"name": member.name, "status": result.status,
+                                 "report": result.answer or result.error or "(no report)",
+                                 "files": [f"{c.path} ({c.change})" for c in changes]})
+        peers = entry["peers"]
+        if not batch.wait(self.should_cancel):
+            reason = "the task was cancelled" if self.should_cancel() else "a teammate's run was paused or failed"
+            return result, changes, skipped, self._parallel_note(peers, reason=reason)
+        others = [o for key, o in batch.outcomes.items() if key != member.id]
+        if result.status in ("error", "cancelled"):
+            return result, changes, skipped, self._parallel_note(peers, reason="this run did not finish")
+        if not others:
+            return result, changes, skipped, self._parallel_note(peers, reason="no teammate's assignment ran")
+        lines = ["While you worked, these teammates finished assignments that ran at the same time as yours:"]
+        if not self.settings.team.resume_members:
+            lines.insert(0, "Your report on your assignment was:\n" + _clip(result.answer or "(no report)", 4000) + "\n")
+        for other in others:
+            lines.append(f"\n### {other['name']} ({other['status']})\nPublished: "
+                         f"{', '.join(other['files']) or 'no files'}\n{_clip(other['report'], 3000)}")
+        lines.append("\nYour assignment ran in parallel on the assumption that it needed nothing from theirs. Check "
+                     "whether that holds. If their results change anything in your work (numbers, facts, assumptions, "
+                     "files you rely on), update your files now and report exactly what you changed. If nothing needs "
+                     "to change, reply 'No change needed' and say why in one sentence.")
+        text = "\n".join(lines)
+        event = self.store.append("delegation", task_id=self.task_id, agent=self.primary, assignee=member.id,
+                                  task=text, deliverables=deliverables, reconcile=True)
+        # Kept in the in-flight entry, so a pause during the check can finish it on resume.
+        entry["first"] = {"status": result.status, "answer": result.answer, "error": result.error,
+                          "changes": [c.as_dict() for c in changes], "skipped": list(skipped)}
+        entry["seq"] = event["seq"]
+        entry.pop("baseline", None)  # check out again so the teammates' files are in the workspace
+        again, more, more_skipped = self._run_member(member, text, deliverables, entry, RECONCILE_STEPS,
+                                                     review=review, reconcile=True)
+        combined, merged, all_skipped = _after_follow_up(entry["first"], again, more, more_skipped,
+                                                         first_result=result)
+        return combined, merged, all_skipped, self._parallel_note(peers, checked=True)
 
     def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop):
         """Budget, repeat check, lead publish and the delegation event; returns the in-flight entry."""
@@ -818,6 +997,8 @@ class TeamTask:
             lines.append("No files were changed by this assignment.")
         if outcome["missing"]:
             lines.append("Expected files that do not exist in the project: " + ", ".join(outcome["missing"]))
+        if outcome.get("parallel"):
+            lines.append(outcome["parallel"])
         if outcome["skipped"]:
             lines.append("Not published (skipped): " + ", ".join(outcome["skipped"][:20]))
         if outcome["checks"]:
@@ -936,7 +1117,7 @@ class TeamTask:
         return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done. The requester can see it.")
 
     def _run_member(self, member: Member, task: str, deliverables: list[str], entry: dict, max_steps=None,
-                    *, fresh: bool = False, review: bool = False):
+                    *, fresh: bool = False, review: bool = False, reconcile: bool = False):
         trigger_seq = entry["seq"]
         workspace = self.store.workspace(member.id)
         if "baseline" not in entry:
@@ -971,8 +1152,25 @@ class TeamTask:
             self._update(active=list(self.active))
         context = ("" if rejoining else self._resume_context(key, baseline, trigger_seq) if continuing
                    else self._context(member.id, trigger_seq))
+        recovered = 0
         try:
             result = agent.run(assignment, context=context, session=session)
+            # A failed model request should not cost the member its work: continue the same session.
+            while (result.status == "error" and result.error.startswith("model request failed")
+                   and session is not None and session.resumable and recovered < MODEL_ERROR_RETRIES
+                   and not self.should_cancel()):
+                recovered += 1
+                time.sleep(MODEL_ERROR_PAUSE)
+                agent.limits = replace(agent.limits, max_steps=max(10, agent.limits.max_steps - result.steps))
+                again = agent.run("Your previous run on this assignment stopped because a model request failed "
+                                  f"({result.error}). Your conversation and your workspace are intact. Continue "
+                                  "the same assignment from where you left off and finish with your report.",
+                                  session=session)
+                result = _combined(result, again)
+            if result.status == "error" and not result.answer and session is not None:
+                note = _last_note(session.messages)
+                if note:
+                    result = replace(result, answer="(No final report: the run failed.) Last progress note: " + note)
         finally:
             with self.lock:
                 self.active.remove(member.id)
@@ -985,6 +1183,10 @@ class TeamTask:
             metrics = _metrics(member.id, result)
             if review:
                 metrics["review"] = True
+            if recovered:
+                metrics["recovered_after_error"] = recovered
+            if reconcile:
+                metrics["reconcile"] = True
             self.assignments.append(metrics)
             self.store.record_assignment(member.id, {
                 "task_id": self.task_id, "assignment": task[:1500], "status": result.status,
@@ -1078,7 +1280,9 @@ class TeamTask:
                    "prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens,
                    "prompt_cache_hit_tokens": totals["prompt_cache_hit_tokens"]
                    + sum(a.get("prompt_cache_hit_tokens", 0) for a in self.assignments),
-                   "resumed_assignments": sum(1 for a in self.assignments if a.get("resumed")),
+                   "resumed_assignments": sum(1 for a in self.assignments if a.get("resumed") and not a.get("reconcile")),
+                   "parallel_checks": sum(1 for a in self.assignments if a.get("reconcile")),
+                   "recovered_after_error": sum(a.get("recovered_after_error", 0) for a in self.assignments),
                    "review_assignments": sum(1 for a in self.assignments if a.get("review")),
                    "parallel_batches": self.parallel_batches,
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),
@@ -1087,6 +1291,41 @@ class TeamTask:
                      active=[], metrics=metrics, assignments=self.assignments, delegations=self.delegations)
         self.store.append("task_finished", task_id=self.task_id, status=status, metrics=metrics, error=result.error)
         return self.record
+
+
+def _combined(first: AgentResult, second: AgentResult) -> AgentResult:
+    """One assignment that needed a second run of the same session."""
+    return replace(second, steps=first.steps + second.steps, tool_calls=first.tool_calls + second.tool_calls,
+                   usage=first.usage.merged(second.usage), duration_s=round(first.duration_s + second.duration_s, 2),
+                   compactions=first.compactions + second.compactions, resumed=first.resumed)
+
+
+def _after_follow_up(first: dict, again: AgentResult, more: list, more_skipped: list, *,
+                     first_result: AgentResult | None = None):
+    """One report for an assignment and its parallel follow-up check."""
+    merged = {c["path"]: Change(**c) for c in first["changes"]}
+    for change in more:  # as seen from before the assignment: a file it added and then edited is "added"
+        earlier = merged.get(change.path)
+        if earlier is not None and earlier.change == "added" and change.change == "deleted":
+            del merged[change.path]
+        elif earlier is not None and earlier.change == "added":
+            merged[change.path] = replace(change, change="added", conflict=earlier.conflict or change.conflict)
+        else:
+            merged[change.path] = change
+    answer = ((first["answer"] or "(no report)") + "\n\nAfter seeing the parallel teammates' results: "
+              + (again.answer or again.error or "(no reply)"))
+    base = _combined(first_result, again) if first_result is not None else again
+    status = first["status"] if again.status == "completed" else again.status
+    result = replace(base, answer=answer, status=status, error=again.error or first["error"])
+    return result, list(merged.values()), list(first["skipped"]) + list(more_skipped)
+
+
+def _last_note(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if (message.get("role") == "assistant" and (message.get("content") or "").strip()
+                and message["content"] != FAILED_REQUEST_NOTE):
+            return _clip(message["content"].strip(), 1500)
+    return ""
 
 
 def _metrics(agent: str, result: AgentResult) -> dict:

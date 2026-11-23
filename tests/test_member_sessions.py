@@ -131,37 +131,76 @@ class MemberSessionTest(unittest.TestCase):
         self.assertNotIn("continues their earlier session", provider.for_agent("lead")[0]["messages"][0]["content"])
         self.assertEqual(task["metrics"]["resumed_assignments"], 0)
 
-    def test_member_run_that_failed_starts_fresh_next_time(self):
+    def test_member_keeps_its_progress_after_a_failed_model_request(self):
+        # Mid_Test fund run (team arm): a network error ended the analyst's run, and the next
+        # assignment started over in a new session, repeating the research it had already done.
         def dev_fails(messages):
-            raise ProviderError("boom", code="network_error")
+            raise ProviderError("connection reset", code="network_error")
 
+        seen = {}
         script = Script(
             lead=[reply("", call("delegate_task", assignee="dev", task="Write the module please.")),
-                  reply("", call("delegate_task", assignee="dev", task="Try writing the module again.")),
-                  reply("ok")],
-            dev=[reply("", call("list_dir", path=".")), dev_fails, reply("Wrote it this time.")],
+                  lambda m: (seen.__setitem__("result", tool_results(m)[-1]), reply("ok"))[1]],
+            dev=[reply("", call("write_file", path="module.py", content="x = 1\n")), dev_fails,
+                 lambda m: (seen.__setitem__("continued", m), reply("Wrote module.py."))[1]],
         )
         studio, gid, provider = self.studio(script)
         studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
+        self.assertEqual(len(first_requests(provider, "dev")), 1, "the member was not restarted")
+        history = seen["continued"]
+        self.assertTrue(any(m["role"] == "tool" and m.get("tool_call_id") for m in history),
+                        "the continued run still has the earlier tool work")
+        self.assertIn("stopped because a model request failed", history[-1]["content"])
+        self.assertEqual(history[-2]["role"], "tool", "it continues right after its last tool result")
+        self.assertEqual([(a["status"], a.get("recovered_after_error")) for a in task["assignments"]],
+                         [("completed", 1)])
+        self.assertEqual(task["metrics"]["recovered_after_error"], 1)
+        self.assertIn("Wrote module.py.", seen["result"])
+        self.assertTrue((studio.group(gid).project.root / "module.py").exists())
+
+    def test_member_that_keeps_failing_reports_its_last_progress_and_continues_next_time(self):
+        def dev_fails(messages):
+            raise ProviderError("connection reset", code="network_error")
+
+        seen = {}
+        script = Script(
+            lead=[reply("", call("delegate_task", assignee="dev", task="Write the module please.")),
+                  lambda m: (seen.__setitem__("first", tool_results(m)[-1]),
+                             reply("", call("delegate_task", assignee="dev", task="Please finish the module.")))[1],
+                  reply("ok")],
+            dev=[reply("Writing module.py now.", call("write_file", path="module.py", content="x = 1\n")),
+                 dev_fails, dev_fails, reply("Finished module.py.")],
+        )
+        studio, gid, provider = self.studio(script)
+        studio.post(gid, "go", queue=True)
+        task = finished(studio, gid)
+        self.assertIn("Last progress note: Writing module.py now.", seen["first"])
+        self.assertIn("model request failed", seen["first"])
         runs = first_requests(provider, "dev")
         self.assertEqual(len(runs), 2)
-        self.assertEqual(len(runs[1]["messages"]), 2, "a broken history is not continued")
+        self.assertGreater(len(runs[1]["messages"]), 2, "the next assignment continues the same session")
+        self.assertEqual(runs[1]["messages"][-2], {"role": "assistant", "content": "(No reply: the model request failed.)"},
+                         "turns stay alternating after the failed request")
         self.assertEqual([a["status"] for a in task["assignments"]], ["error", "completed"])
-        self.assertEqual([a["resumed"] for a in task["assignments"]], [False, False])
+        self.assertEqual([a["resumed"] for a in task["assignments"]], [False, True])
 
 
 class SessionUnitTest(unittest.TestCase):
-    def test_only_a_cleanly_finished_conversation_is_resumable(self):
+    def test_a_conversation_is_resumable_when_every_tool_call_has_its_result(self):
         session = AgentSession()
         self.assertFalse(session.resumable)
         session.context = ContextManager(1000, 100)
-        session.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"},
-                            {"role": "assistant", "content": None,
-                             "tool_calls": [{"id": "c1", "type": "function",
-                                             "function": {"name": "list_dir", "arguments": "{}"}}]},
+        two_calls = {"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "list_dir", "arguments": "{}"}},
+                                    {"id": "c2", "type": "function", "function": {"name": "list_dir", "arguments": "{}"}}]}
+        session.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}, two_calls,
                             {"role": "tool", "tool_call_id": "c1", "content": "a.py"}]
-        self.assertFalse(session.resumable)
+        self.assertFalse(session.resumable, "cut inside a tool batch")
+        session.messages.append({"role": "tool", "tool_call_id": "c2", "content": "b.py"})
+        self.assertTrue(session.resumable, "a model error after the tool results")
+        session.messages.append({"role": "user", "content": "continue"})
+        self.assertTrue(session.resumable, "a model error before the model answered")
         session.messages.append({"role": "assistant", "content": "done"})
         self.assertTrue(session.resumable)
 

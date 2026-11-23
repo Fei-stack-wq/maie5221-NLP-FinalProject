@@ -37,7 +37,11 @@ def handoff(room, record, agent=None):
     pending = {}
     reports = []
     for e in events:
-        if e["kind"] == "delegation":
+        if e["kind"] == "delegation" and e.get("reconcile"):
+            # A follow-up check after parallel work: the original assignment stays the outstanding one.
+            if e["assignee"] in pending:
+                pending[e["assignee"]]["follow_up_check_started"] = True
+        elif e["kind"] == "delegation":
             pending[e["assignee"]] = {k:e[k] for k in ("task_id","assignee","task","deliverables","checks") if k in e}
         elif e["kind"] == "report":
             pending.pop(e["agent"], None)

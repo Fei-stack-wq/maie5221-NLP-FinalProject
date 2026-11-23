@@ -64,6 +64,10 @@ WRAP_UP_INSTRUCTION = (
 )
 
 
+FAILED_REQUEST_NOTE = "(No reply: the model request failed.)"
+"""Stands in for the missing answer when a session continues after a failed model request."""
+
+
 class BatchPaused(Exception):
     """A pause reached part of a concurrent batch; ``done`` holds the calls that finished."""
 
@@ -110,10 +114,25 @@ class AgentSession:
 
     @property
     def resumable(self) -> bool:
+        """True when every tool call in the history has its result, so a new message can follow.
+
+        A run that ended with a model error stops between steps, so its history is complete and the
+        session can continue instead of starting over (as Codex rebuilds an agent from its recorded
+        history). A history cut inside a tool batch is not continued.
+        """
         if not self.messages or self.context is None:
             return False
-        last = self.messages[-1]
-        return last.get("role") == "assistant" and not last.get("tool_calls")
+        pending: set = set()
+        for message in self.messages:
+            role = message.get("role")
+            if role == "tool":
+                pending.discard(message.get("tool_call_id"))
+                continue
+            if pending:
+                return False
+            if role == "assistant":
+                pending = {call.get("id") for call in message.get("tool_calls") or []}
+        return not pending
 
 
 class ProcessScope:
@@ -234,6 +253,9 @@ class Agent:
             if resumed:
                 messages = session.messages
                 ctx_manager = session.context
+                if messages[-1].get("role") == "user":
+                    # The last run failed before the model answered; keep the turns alternating.
+                    messages.append({"role": "assistant", "content": FAILED_REQUEST_NOTE})
                 note = (context.strip() + "\n\n---\n\n# Your next assignment\n" + task) if context.strip() else task
                 current = {"role": "user", "content": note}
                 messages.append(current)

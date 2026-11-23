@@ -12,6 +12,9 @@ from miniagent.config import Limits, Settings, TeamLimits
 from miniagent.context import estimate_tokens
 from miniagent.providers import Provider
 from miniagent.schemas import LLMResponse, ToolCall, Usage
+from miniagent import team as _team
+
+_team.MODEL_ERROR_PAUSE = 0  # tests do not wait before continuing after a failed model request
 
 _ids = itertools.count(1)
 

@@ -325,7 +325,7 @@ function renderEvent(event) {
     }
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
-        : (event.review ? "评审" : "派工");
+        : (event.reconcile ? "核对并行结果" : event.review ? "评审" : "派工");
       const node = card("delegation" + (event.loop || event.review ? " review" : ""), event.agent,
         [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, label),
           event.checks && event.checks.length ? el("span", { class: "checks-count" }, `${event.checks.length} 项检查`) : null],
