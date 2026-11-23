@@ -60,6 +60,8 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"miniagent", body)
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
         status, _, body = request(self.base + "/api/config")
+        self.assertEqual(json.loads(body)["team_communication"],
+                         {"mailboxes": True, "interrupts": True, "lead_consult": True, "team_talk": True})
         self.assertEqual(json.loads(body)["preview_port"], self.preview.server_address[1])
         self.assertTrue(templates(), "Mid_Test templates ship with the project")
 

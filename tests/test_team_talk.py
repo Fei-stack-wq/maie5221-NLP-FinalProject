@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from miniagent.agent import AgentSession
-from miniagent.config import TeamLimits, fast_profile
+from miniagent.config import Settings, TeamLimits, fast_profile
 from miniagent.providers import DeepSeekProvider
 from miniagent.studio import Studio
 from miniagent.team_talk import fork_history
@@ -25,7 +25,7 @@ class TeamTalkTest(unittest.TestCase):
         self.root = Path(tmp.name)
 
     def open(self, respond, **limits):
-        limits = TeamLimits(team_talk=True, mailboxes=True, lead_consult=True, retrospective=False, **limits)
+        limits = TeamLimits(retrospective=False, **limits)
         self.settings = settings(self.root, team=limits)
         self.provider = FakeProvider(respond)
         self.studio = Studio(self.settings, lambda _: self.provider)
@@ -180,7 +180,18 @@ class TeamTalkTest(unittest.TestCase):
         limits = fast_profile(self.settings).team
         self.assertEqual((limits.check_ins, limits.teammate_questions, limits.teammate_notes, limits.silence_minutes),
                          (1, 1, 2, 5))
-        self.assertFalse(TeamLimits().team_talk)
+
+    def test_communication_defaults_and_individual_environment_overrides(self):
+        names = ("mailboxes", "interrupts", "lead_consult", "team_talk")
+        defaults = Settings.from_env({})
+        for profile in (defaults, fast_profile(defaults)):
+            self.assertTrue(all(getattr(profile.team, name) for name in names))
+        for disabled in names:
+            with self.subTest(disabled=disabled):
+                settings_with_override = Settings.from_env({"MA_" + disabled.upper(): "0"})
+                for profile in (settings_with_override, fast_profile(settings_with_override)):
+                    for name in names:
+                        self.assertEqual(getattr(profile.team, name), name != disabled)
 
     def test_active_history_with_one_unanswered_call_is_valid_only_in_the_fork(self):
         batch = reply("", call("list_dir"), call("read_file", path="data"))

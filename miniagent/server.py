@@ -182,6 +182,8 @@ class StudioHandler(_Base):
         if parts == ["config"]:
             s = studio.settings
             return self._json(200, {**model_settings(s), "has_key": bool(s.api_key),
+                                    "team_communication": {name: getattr(s.team, name) for name in
+                                                           ("mailboxes", "interrupts", "lead_consult", "team_talk")},
                                     "preview_port": self.preview_port, "member_max_steps": s.limits.max_steps,
                                     "lead_max_steps": s.team.lead_max_steps, "max_delegations": s.team.max_delegations})
         if parts == ["templates"]:

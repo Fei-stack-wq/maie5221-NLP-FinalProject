@@ -57,7 +57,9 @@ class PauseResumeTest(unittest.TestCase):
         self.script.queues.update(
             lead=[reply("",call("write_file",path="plan.md",content="Plan"),
                         call("delegate_task",assignee="researcher",task="Research and write the report."),
-                        call("write_file",path="release.md",content="Released")),reply("Released"),reply("Second job")],
+                        call("write_file",path="release.md",content="Released")),
+                  reply('{"action":"hold","to":[],"text":"The researcher has the ISO date update."}'),
+                  reply("Released"),reply("Second job")],
             researcher=[reply("",call("write_file",path="draft.md",content="Private draft"),
                               call("ask_human",question="Which campus?"),
                               call("write_file",path="result.md",content="Confirmed")),member_report])
@@ -65,6 +67,8 @@ class PauseResumeTest(unittest.TestCase):
         pending=self.question(self.gid)
         self.script.queues["room"]=[reply("",call("change_current_task",quote="ISO dates"))]
         self.studio.post(self.gid,"Use ISO dates")
+        wait_for(lambda: any(e.get("mail_kind") == "decision" and e.get("action") == "hold"
+                             for e in self.studio.group(self.gid).chat()))
         self.pause(self.gid,tid)
         store=self.studio.group(self.gid)
         self.assertTrue((store.workspace("researcher")/"draft.md").is_file())

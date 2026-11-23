@@ -268,6 +268,8 @@ class AssistantTest(unittest.TestCase):
         self.turn("让 Desk 写一份备忘录", reply("", call("dispatch_task", group_id=self.team, text="Write a memo.")),
                   dispatched)
         wait_for(lambda: (self.studio.state(self.team)["live"] or {}).get("question"))
+        live = self.studio.state(self.team)["live"]
+        self.assertTrue(live["mailboxes"] and live["interrupts"])
         self.turn("告诉他们：面向学生", reply("", call("message_task", task_id=receipt["task_id"], text="面向学生")),
                   reply("Answered."))
         self.studio.wait(self.team)

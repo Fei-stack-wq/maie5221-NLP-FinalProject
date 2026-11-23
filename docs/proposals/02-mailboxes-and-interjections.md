@@ -125,8 +125,8 @@ Budget notices (`TaskMeter.notify`) and future silence prompts become `kind="not
 | `miniagent/web/app.js`, `index.html`, `app.css` | Recipient indicator, 立即打断 toggle, delivery receipts, consult decision cards. |
 | `docs/architecture.md` | New row with upstream links. |
 
-Switches: `MA_MAILBOXES` (targeting + receipts), `MA_INTERRUPTS`, `MA_LEAD_CONSULT` (all default on
-after measurement; off = today's broadcast).
+Studio enables `MA_MAILBOXES` (targeting and receipts), `MA_INTERRUPTS` and
+`MA_LEAD_CONSULT` by default. Set `MA_MAILBOXES=0` to use broadcast steering.
 
 ## Tests (offline, through `Studio.post` / the HTTP API)
 

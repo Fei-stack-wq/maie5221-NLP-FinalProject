@@ -111,10 +111,13 @@ changed.
 `MA_PLAN_LINKS=0` retains snapshot plans. In fast mode, a linked plan can be
 written once. The task tree and plan keep unlinked work visible.
 
-For the complete experimental collaboration profile, set `MA_MAILBOXES`,
-`MA_INTERRUPTS`, `MA_LEAD_CONSULT` and `MA_TEAM_TALK` to `1` in the Studio
-environment. The default keeps these four switches off pending real-model quality
-comparison. In a running task, address a requirement to a member with a leading
+Studio enables addressed mail, urgent steering, lead consultations and teammate
+tools by default, including for work dispatched by the Super Agent. Members decide
+when to ask or send a note. Explicit `0` values in `MA_MAILBOXES`, `MA_INTERRUPTS`,
+`MA_LEAD_CONSULT` or `MA_TEAM_TALK` in the Studio environment override the defaults.
+Peer tools depend on mailboxes and check-ins also require lead consultations.
+The local `GET /api/config` response reports the loaded switches under `team_communication`.
+In a running task, address a requirement to a member with a leading
 mention. The composer shows the intended recipients. Select **立即打断** for urgent
 steering. Each recipient's receipt reflects actual delivery. An ordinary follow-up
 still goes through conversation routing. A task checkpoint retains unread mail and
