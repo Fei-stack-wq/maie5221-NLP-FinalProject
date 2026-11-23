@@ -55,7 +55,9 @@ function dispatchNotice(event) {
   const title=finished?"执行结果":tid?(event.queued?"任务已排队":"任务已派出"):
     (event.room_kind==="dm"?"私聊已创建":"群聊已创建");
   const card=el("article",{class:"msg dispatch-notice","data-notice":event.kind},
-    el("div",{class:"who"},el("b",{},title),finished?statusChip(event.status):null,el("span",{},fmtTime(event.time))),links);
+    el("div",{class:"who"},el("b",{},title),finished?statusChip(event.status):null,
+      event.fast?el("span",{class:"fast-badge",title:"你要求的快速模式：约 10–15 分钟交付简化版本"},"⚡ 快速模式"):null,
+      el("span",{},fmtTime(event.time))),links);
   if (!finished) return card;
   const changes=event.artifacts || [], scope={gid,tid,files:fileIndex(changes)};
   if (event.text) card.append(documentBody(event.text,scope));

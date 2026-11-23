@@ -54,6 +54,9 @@ SETTINGS_DESCRIPTION = "Update a team's or conversation's name, workspace folder
 CANCEL_DESCRIPTION = "Stop exactly one running or queued assignment by task ID. A stopping receipt means cancellation is in progress."
 INSPECT_DESCRIPTION = "Look up one Studio conversation's settings, members and tasks, newest first. Use its ID from the directory."
 TASK_OPTIONS = {"type":"object", "additionalProperties":False, "properties":{
+    "mode":{"type":"string","enum":["standard","fast"],
+            "description":("Leave this out: delegated work runs in standard mode. Use \"fast\" only when the requester "
+                           "explicitly asked for fast mode (a quick, simpler result within about 10–15 minutes).")},
     "thinking":{"type":"string","enum":["enabled","disabled"]},
     "interaction_mode":{"type":"string","enum":["interactive","autonomous"]},
     **{k:{"type":"integer"} for k in ("lead_max_steps","member_max_steps","max_delegations")},

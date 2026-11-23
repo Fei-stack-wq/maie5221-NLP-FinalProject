@@ -27,7 +27,8 @@ def group_created(studio, target):
 def task_receipt(studio, target, record, *, legacy_origin=None):
     tid = record["id"]
     _deliver(studio, target, record.get("dispatched_by") or legacy_origin, "dispatch_sent", tid,
-             target_task_id=tid, queued="queued_message" in record)
+             target_task_id=tid, queued="queued_message" in record,
+             **({"fast": True} if (record.get("options") or {}).get("mode") == "fast" else {}))
 
 
 def task_outcome(studio, target, record, *, legacy_origin=None):

@@ -348,7 +348,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
              "roles and rooms. You can work here, dispatch to a role's DM or an existing room, or organize a "
              "group and dispatch to it. Use the directory to identify the right destination or role; follow the "
              "user's choice when given. Studio delivers dispatch links and the eventual result and files to this "
-             "chat automatically. Use await_result only when your own next step needs that result." if studio_assistant else
+             "chat automatically. Use await_result only when your own next step needs that result. Delegated work "
+             "runs in standard mode; set `options.mode` to \"fast\" only when the requester explicitly asks for fast "
+             "mode for that work (for example \"用快速模式\" or \"fast mode\"), never on your own judgement." if studio_assistant else
              "- Do the work yourself with your tools and verify it before you finish."),
         ]
     if settings.team.fast:

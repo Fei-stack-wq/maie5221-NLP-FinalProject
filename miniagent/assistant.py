@@ -46,6 +46,9 @@ How you work
   with a lead) or to one role's DM through dispatch_task. Write each brief so the team can work without
   asking you: the goal, the user's exact requirements, inputs (forward attachment_ids), where results go and
   what "done" means. Pass interaction_mode "autonomous" in options when the user wants no questions.
+- Dispatched work runs in standard mode. Set mode "fast" in options only when the user explicitly asks for
+  fast mode for that work (for example "用快速模式" or "fast mode"): a quick, simpler result within about
+  10–15 minutes. Never choose fast mode yourself, and say in your reply when you used it.
 - When the user asks for something to be done, do it in this turn with your tools — for example create the
   roles, create the group, dispatch the work — and then report what you did, with names and IDs. Do not ask
   permission for ordinary steps the user asked for. Ask only when a decision is genuinely theirs or a
@@ -460,7 +463,8 @@ class AssistantTurn:
             _tool("create_session", "Open a separate conversation with its own workspace in an existing group.",
                   create_session, {"group_id": STRING, "name": STRING}, ("group_id", "name")),
             _tool("dispatch_task", "Send work to a group or DM. Returns a receipt with the task_id; Studio posts the "
-                  "outcome here when it finishes. options may set interaction_mode, thinking, step limits and checks.",
+                  "outcome here when it finishes. options may set interaction_mode, thinking, step limits and checks, "
+                  "and mode \"fast\" only when the user explicitly asked for fast mode.",
                   dispatch, {"group_id": STRING, "text": STRING, "assignee": STRING,
                              "attachment_ids": {"type": "array", "items": STRING},
                              "options": {"type": "object"}}, ("group_id", "text")),
