@@ -362,7 +362,13 @@ def render_event(event: dict, names: dict[str, str]) -> str:
     kind = event["kind"]
     who = lambda agent: f"{names.get(agent, agent)} ({agent})"  # noqa: E731
     if kind == "room_reply":
-        return f"**{who(event['agent'])}:** {_clip(event['text'], 4500)}"
+        done = "; ".join(a["label"] for a in event.get("actions") or [])
+        return f"**{who(event['agent'])}:** {_clip(event['text'], 4500)}" + (f"\n(Actions: {done})" if done else "")
+    if kind == "approval_requested":
+        return ("Confirmation card " + event["approval_id"] + " waiting for the requester: "
+                + "; ".join(event.get("items", [])))
+    if kind == "approval_resolved":
+        return f"Confirmation {event['approval_id']} {event['decision']}: {_clip(event.get('text', ''), 1500)}"
     if kind == "assistant_group_created":
         return f"Studio created {event['group_name']} ({event['target_group_id']})."
     if kind == "dispatch_sent":

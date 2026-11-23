@@ -38,24 +38,36 @@ class BoundWorkspaceTest(unittest.TestCase):
                 store = self.studio.group(room)
                 before = file_hashes(store.root)
                 def inspect(agent, messages, tools, options):
+                    if store.group.kind == "assistant":
+                        return assistant(messages, tools)
                     workspace = evidence(messages)["workspace"]
                     self.assertEqual(workspace["location"], str(self.folder))
                     self.assertEqual(workspace["root_listing"]["entries"], ["design/"])
                     if messages[-1]["role"] == "user":
                         self.assertNotIn(self.source.read_text(), str(messages))
                         return reply("", call("read_room_evidence", workspace_path="design"))
-                    if store.group.kind == "assistant":
-                        self.assertTrue({"read_room_evidence","create_group","start_task"} <= {t.name for t in tools})
-                    else:
-                        self.assertEqual([t.name for t in tools], ["read_room_evidence"])
+                    self.assertEqual([t.name for t in tools], ["read_room_evidence"])
                     item = json.loads(messages[-1]["content"])
                     if "entries" in item:
                         path = item["path"] + "/" + item["entries"][0]
                         return reply("", call("read_room_evidence", workspace_path=path))
                     return reply(item["text"])
+                def assistant(messages, tools):
+                    system = messages[0]["content"]
+                    workspace = json.JSONDecoder().raw_decode(system[system.index("{"):])[0]["your_workspace"]
+                    self.assertEqual(workspace["location"], str(self.folder))
+                    self.assertEqual(workspace["root_listing"]["entries"], ["design/"])
+                    self.assertTrue({"read_workspace","create_group","dispatch_task"} <= {t.name for t in tools})
+                    if messages[-1]["role"] == "user":
+                        self.assertNotIn(self.source.read_text(), str(messages))
+                        return reply("", call("read_workspace", path="design"))
+                    item = json.loads(messages[-1]["content"])
+                    if "entries" in item:
+                        return reply("", call("read_workspace", path=item["path"] + "/" + item["entries"][0]))
+                    return reply(item["text"])
                 self.model.respond = inspect
                 response = self.studio.post(room, "设计决定是什么？")
-                self.assertEqual(response, {"route": "reply", "text": self.source.read_text()})
+                self.assertEqual({k: response[k] for k in ("route", "text")}, {"route": "reply", "text": self.source.read_text()})
                 self.assertEqual(self.studio.tasks(room), [])
                 self.assertEqual(file_hashes(self.folder), disk_before)
                 after = file_hashes(store.root)

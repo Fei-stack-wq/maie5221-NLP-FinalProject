@@ -5,7 +5,7 @@
 const $ = (selector) => document.querySelector(selector);
 const state = {
   config: null, templates: [], groups: [], current: null, group: null,
-  outbox: new Map(), sendQueues: new Map(), planCards: new Map(), questionForms: new Map(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
+  outbox: new Map(), sendQueues: new Map(), planCards: new Map(), approvalCards: new Map(), questionForms: new Map(), after: 0, activityAfter: 0, live: null, timer: null, editing: null, rendered: new Set(),
 };
 let md = null;
 
@@ -144,6 +144,48 @@ function checkResults(checks) {
     el("summary", {}, `检查 ${checks.passed}/${checks.total} 通过 · 仅供参考，不拦截交付`), el("ul", {}, ...rows));
 }
 
+// What the assistant did in a turn, as quiet ledger lines under its reply.
+function actionList(actions) {
+  if (!actions || !actions.length) return null;
+  return el("ul", { class: "action-list" }, ...actions.map((a) => el("li", { class: a.kind }, a.label)));
+}
+
+// Deletions wait for the user. The card lists exactly what will run; one click runs it.
+function approvalCard(event) {
+  const status = el("p", { class: "approval-state", role: "status" });
+  const decide = async (decision) => {
+    for (const b of node.querySelectorAll("button")) b.disabled = true;
+    status.textContent = decision === "approve" ? "正在执行…" : "";
+    try {
+      const result = await api(`/groups/${state.current}/approvals/${encodeURIComponent(event.approval_id)}`,
+        { method: "POST", body: { decision } });
+      settleApproval(node, { decision: result.decision, text: result.text });
+    } catch (error) {
+      for (const b of node.querySelectorAll("button")) b.disabled = false;
+      status.textContent = error.message;
+    }
+  };
+  const node = el("div", { class: "msg approval", "data-approval": event.approval_id },
+    el("div", { class: "who" }, el("b", {}, "需要你确认"), el("span", {}, "确认前不会做任何改动；确认后永久删除，无法恢复")),
+    el("ol", { class: "approval-items" }, ...event.items.map((item) => el("li", {}, item))),
+    event.roles_kept && event.roles_kept.length
+      ? el("p", { class: "approval-note" }, "仍有其他会话在用，保留角色：" + event.roles_kept.join("、")) : null,
+    el("div", { class: "actions" },
+      el("button", { type: "button", class: "danger", onclick: () => decide("approve") }, icon("check"), "确认执行"),
+      el("button", { type: "button", onclick: () => decide("reject") }, "取消")),
+    status);
+  state.approvalCards.set(event.approval_id, node);
+  return node;
+}
+
+function settleApproval(node, event) {
+  const labels = { approved: "已执行", partial: "部分执行", rejected: "已取消", expired: "已失效", failed: "未执行" };
+  node.classList.add("settled", event.decision);
+  node.querySelector(".actions")?.remove();
+  const state_ = node.querySelector(".approval-state");
+  state_.replaceChildren(el("b", {}, labels[event.decision] || event.decision), documentBody(event.text || "", { gid: state.current }));
+}
+
 function lessonsCard(event) {
   const decide = async (entry, row, status) => {
     for (const b of row.querySelectorAll("button")) b.disabled = true;
@@ -225,7 +267,14 @@ function renderEvent(event) {
       return el("div",{class:"divider"},el("span",{},changes.join(" · ") || "群聊设置已更新"));
     }
     case "room_reply":
-      return card("", event.agent, [el("b",{},memberName(event.agent))], markdown(event.text));
+      return card("", event.agent, [el("b",{},memberName(event.agent))], markdown(event.text), actionList(event.actions));
+    case "approval_requested":
+      return approvalCard(event);
+    case "approval_resolved": {
+      const node = state.approvalCards.get(event.approval_id);
+      if (node) settleApproval(node, event);
+      return node ? null : el("div", { class: "divider" }, el("span", {}, event.text.split("\n")[0]));
+    }
     case "progress": {
       // Agents narrate as they work; fold a burst into one quiet, expandable log.
       const log = state.worklog;
@@ -493,7 +542,7 @@ async function openGroup(id) {
   $("#room-avatars").replaceChildren(); $("#member-panel").hidden=true; $("#workspace-choice").textContent="工作区";
   state.current = id; state.after = 0; state.activityAfter = 0; state.rendered = new Set();
   state.publications=new Map();state.toolWidgets=new Map();state.view="room";
-  state.questionForms=new Map();state.planCards=new Map();state.worklog=null;setNav(null);
+  state.questionForms=new Map();state.planCards=new Map();state.approvalCards=new Map();state.worklog=null;setNav(null);
   $("#file-list").replaceChildren(); $("#preview").replaceChildren();
   state.steps = {}; state.stepsTask = null; state.lastActivity = null; state.live = null;
   $("#question-banner").hidden = $("#live").hidden = true;

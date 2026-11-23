@@ -315,7 +315,9 @@ class GroupStore:
         for folder in root.iterdir():
             path = folder / "task.json"
             if path.exists():
-                rows.append(json.loads(path.read_text(encoding="utf-8")))
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record.get("kind") != "assistant_turn":  # a chat turn's trace, not a task
+                    rows.append(record)
         return sorted(rows, key=lambda row: (row.get("created_at", 0), row.get("trigger_seq", 0)))
 
     def trace(self, task_id: str, event: dict) -> None:

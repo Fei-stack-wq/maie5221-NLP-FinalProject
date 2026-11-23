@@ -9,7 +9,7 @@ from playwright.sync_api import expect, sync_playwright
 
 from miniagent.server import serve
 from miniagent.studio import Studio
-from tests.helpers import FakeProvider, Script, call, reply, settings
+from tests.helpers import FakeProvider, Script, call, reply, settings, tool_results
 from tests.test_room_turn import action
 from tests.test_team import wait_for
 
@@ -31,11 +31,11 @@ class DispatchNoticesTest(unittest.TestCase):
     def notices(self):
         return [e for e in self.source.chat() if e.get("notice_id")]
 
-    def dispatch(self, mode="handoff", extra=()):
-        text = "Give Desk a writing assignment."
-        self.script.queues.update(room=[action("start_room_task",text)], assistant=[
-            reply("",call("start_task",group_id=self.gid,text="Write a memo.",after_dispatch=mode)), *extra])
-        return self.studio.post(self.aid,text)["task_id"]
+    def dispatch(self, *extra):
+        """The assistant dispatches in one chat turn; returns that turn's ID (the receipts' origin)."""
+        self.script.queues["assistant"] = [reply("",call("dispatch_task",group_id=self.gid,text="Write a memo.")),
+                                           *(extra or [reply("Sent to Desk.")])]
+        return self.studio.post(self.aid,"Give Desk a writing assignment.")["turn_id"]
 
     def reopen(self):
         self.studio.close()
@@ -50,7 +50,6 @@ class DispatchNoticesTest(unittest.TestCase):
         self.studio.post(self.gid,"An earlier task",queue=True)
         wait_for(lambda:(self.studio.state(self.gid)["live"] or {}).get("question"))
         parent = self.dispatch()
-        self.studio.wait(self.aid)
         sent, = self.notices()
         self.assertTrue(sent["queued"])
         self.assertEqual(sent["task_id"],parent)
@@ -76,17 +75,16 @@ class DispatchNoticesTest(unittest.TestCase):
         self.assertEqual([e["status"] for e in self.notices() if e["kind"]=="dispatch_finished"],["cancelled","interrupted"])
         self.assertEqual(len({e["notice_id"] for e in self.notices()}),4)
 
-    def test_await_result_uses_completion_signal_and_reports_failed_start(self):
+    def test_outcome_reaches_the_next_turn_and_a_failed_start_is_reported(self):
         self.script.queues["writer"] = [reply("Delivery in the other room.")]
+        parent = self.dispatch()
+        wait_for(lambda:any(e["kind"]=="dispatch_finished" for e in self.notices()))
+        self.assertEqual(self.notices()[-1]["status"],"completed")
         def synthesize(messages):
-            result = json.loads(messages[-1]["content"])
-            self.assertEqual(result["final_answer"],"Delivery in the other room.")
-            self.assertEqual(self.notices()[-1]["status"],"completed")
-            return reply("Combined the result.")
-        parent = self.dispatch("await_result",[synthesize])
-        self.studio.wait(self.aid)
-        self.assertEqual(self.source.load_task(parent)["final_answer"],"Combined the result.")
-        self.assertEqual(len(self.provider.for_agent("assistant")),2)
+            self.assertIn("Delivery in the other room.",messages[0]["content"])
+            return reply("Desk delivered the memo.")
+        self.script.queues["assistant"] = [synthesize]
+        self.assertEqual(self.studio.post(self.aid,"What did Desk deliver?")["text"],"Desk delivered the memo.")
         with patch("miniagent.studio.sync",side_effect=ValueError("target workspace moved")):
             with self.assertRaisesRegex(Exception,"workspace moved"):
                 self.studio.post(self.gid,"Launch another task",queue=True,
@@ -96,23 +94,21 @@ class DispatchNoticesTest(unittest.TestCase):
         self.assertIn("workspace moved", failed["error"])
         self.assertEqual(failed["artifacts"],[])
         self.assertEqual([e["kind"] for e in self.notices()][-2:],["dispatch_sent","dispatch_finished"])
-
-    def test_continue_and_partial_tool_batch_preserve_independent_work(self):
-        self.script.queues["writer"] = [reply("First delivered"),reply("Second delivered")]
-        parent = self.dispatch("continue",[reply("",call("write_file",path="own.md",content="Independent work")),
-                                           reply("Finished my own part.")])
-        self.studio.wait(self.aid)
-        self.assertEqual(self.source.load_task(parent)["status"],"completed")
-        self.assertTrue((self.source.project.root / "own.md").is_file())
+    def test_partial_tool_batch_keeps_the_dispatch_that_succeeded(self):
+        self.script.queues["writer"] = [reply("First delivered")]
+        def explain(messages):
+            results = tool_results(messages)
+            self.assertIn("task_id",results[-2])
+            self.assertTrue(results[-1].startswith("Error"))
+            return reply("First dispatched. The second room could not be found.")
         self.script.queues["assistant"] = [
-            reply("",call("start_task",group_id=self.gid,text="Write again"),call("start_task",group_id="unknown",text="Second job")),
-            reply("First dispatched. The second room could not be found.")]
-        result = self.studio.post(self.aid,"Two destinations",queue=True)
-        self.studio.wait(self.aid)
+            reply("",call("dispatch_task",group_id=self.gid,text="Write again"),call("dispatch_task",group_id="unknown",text="Second job")),
+            explain]
+        result = self.studio.post(self.aid,"Two destinations")
         self.studio.wait(self.gid)
-        self.assertIn("could not be found",self.source.load_task(result["task_id"])["final_answer"])
-        self.assertEqual(len([e for e in self.notices() if e["kind"]=="dispatch_sent"]),2)
-
+        self.assertIn("could not be found",result["text"])
+        self.assertEqual(len([e for e in self.notices() if e["kind"]=="dispatch_sent"]),1)
+        self.assertEqual(len(self.studio.tasks(self.gid)),1)
     def test_auto_pin_migrates_untouched_groups_and_respects_later_preferences(self):
         origin={"group_id":self.aid,"task_id":"t-000000000000"}
         new=self.studio.create_group("New",[],"writer",role_ids=["writer"],created_by=origin)
@@ -142,10 +138,11 @@ class DispatchNoticesTest(unittest.TestCase):
             return reply("",call("write_file",path="memo.md",content="# Original memo"))
         def delegate(messages):
             gid = json.loads(messages[-1]["content"])["id"]
-            return reply("",call("start_task",group_id=gid,text="Write memo.md."))
+            return reply("",call("dispatch_task",group_id=gid,text="Write memo.md."))
         text = "Create a team to write the memo."
-        self.script.queues.update(room=[action("start_room_task",text)], assistant=[
-            reply("",call("create_group",name="Writing Room",role_ids=["writer"],lead="writer")),delegate],
+        self.script.queues.update(assistant=[
+            reply("",call("create_group",name="Writing Room",role_ids=["writer"],lead="writer")),delegate,
+            reply("Created Writing Room and sent the memo.")],
             writer=[write_when_released,reply("Delivered memo.md."),reply("",call("write_file",path="memo.md",content="# New memo")),reply("Updated.")])
         main,preview = serve(self.studio,0)
         base = "http://127.0.0.1:"+str(main.server_port)+"/"
@@ -186,17 +183,13 @@ class DispatchNoticesTest(unittest.TestCase):
                     task_link=sent.get_by_role("link",name="查看任务")
                     expect(task_link).to_have_attribute("href","#"+gid+"/task/"+tid)
                     expect(returned).to_have_count(0)
-                    self.assertEqual(self.source.load_task(sent_event["task_id"])["status"],"dispatched")
+                    self.assertEqual(self.source.load_task(sent_event["task_id"])["status"],"completed")
                     task_link.click()
                     expect(page.locator("#sheet")).to_contain_text(tid)
                     page.locator("#sheet-close").click()
-                    self.assertEqual(len(self.provider.for_agent("assistant")),2)
+                    self.assertEqual(len(self.provider.for_agent("assistant")),3)
                     self.studio.restore_queue()
                     self.assertEqual(self.studio.group(gid).load_task(tid)["status"],"running")
-                    from miniagent.metrics import summarize
-                    summary = summarize([self.source.load_task(sent_event["task_id"]), {"status":"completed"}])
-                    self.assertEqual((summary["dispatched"], summary["completion_rate"]), (1, 1.0))
-                    self.assertEqual(self.studio.task_detail(sent_event["task_id"])["diagnostics"], [])
                     gate.set()
                     expect(returned).to_contain_text("Delivered memo.md.",timeout=10000)
                     self.studio.wait(gid)

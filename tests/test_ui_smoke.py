@@ -17,9 +17,11 @@ class StudioBrowserTest(unittest.TestCase):
             team = studio.create_group("文档组",[{"id":"editor","name":"编辑","prompt":"写材料"}],"editor")["id"]
             assistant = studio.assistant()["id"]
             text = "把校对拉进文档组"
-            script.queues["room"] = [reply("工作室有编辑和校对。"),
-                reply("",call("change_group_members",group_id=team,quote=text,add_role_ids=["reviewer"])),
-                reply("",call("change_group_members",group_id=team,quote="移出校对",remove_member_ids=["reviewer"]))]
+            script.queues["assistant"] = [reply("工作室有编辑和校对。"),
+                reply("",call("change_group_members",group_id=team,add_role_ids=["reviewer"])),
+                reply("文档组现在有编辑、校对。"),
+                reply("",call("change_group_members",group_id=team,remove_member_ids=["reviewer"])),
+                reply("已把校对移出文档组。")]
             main,preview = serve(studio,0)
             try:
                 chrome=Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")

@@ -213,7 +213,8 @@ def _read_batch(response, tools, reads, text):
     return inspections
 
 
-def decide(provider, context, text, read, *, on_stream=None, studio_operations=()):
+def decide(provider, context, text, read, *, on_stream=None):
+    """Route one message in a group or DM. The Studio assistant has its own agent loop (assistant.py)."""
     tools = [START]
     if context.get("paused_task"):
         tools.append(action_tool("resume_room_task", "Continue the paused execution from its saved checkpoint.", [context["paused_task"]]))
@@ -236,31 +237,6 @@ def decide(provider, context, text, read, *, on_stream=None, studio_operations=(
     system = SYSTEM
     read_names = {spec.name for spec in (READ, *READ_TOOLS)}
     worker_names = set()
-    assistant = context["kind"] == "assistant"
-    if assistant:
-        tools.extend([MEMBERS, CANCEL, SETTINGS, INSPECT, studio_admin.INSPECT, DATA_MANAGEMENT, DELETE_ROLE, DELETE_GROUPS])
-        if proposal := context.get("pending_cleanup"):
-            tools.append(management_tool(studio_cleanup.APPLY, "Apply the last concrete cleanup list when the user confirms it.",
-                         {"plan_id":{"type":"string","enum":[proposal["id"]]}}, ["plan_id"]))
-        direct = {spec.name for spec in tools}
-        for operation in studio_operations:
-            if operation.name in direct:
-                continue
-            spec = operation.spec()
-            if operation.read_only:
-                read_names.add(spec.name)
-                tools.append(spec)
-            else:
-                worker_names.add(spec.name)
-                tools.append(management_tool(spec.name, spec.description, spec.parameters["properties"],
-                                             spec.parameters.get("required", [])))
-        system += (" You are the studio assistant. The directory and your dispatch receipts are reference data. "
-                   "Use these for progress and capability questions. read_room_evidence with just a catalogued dispatch "
-                   "task_id returns its recorded outcome; add path for a published file. A standalone request to "
-                   "change an existing roster can be applied with change_group_members. For a commission that "
-                   "also needs delivery, start the work with the complete request. If several tasks fit a "
-                   "change, clarify the target in chat. You can inspect conversations, stop or reassign jobs, dispatch a batch, "
-                   "manage settings, roles and knowledge. You can call the Studio operations here. Creation and dispatch continue in your own durable execution with the original message and room attachments. start_room_task can also take a multi-step commission from the beginning. Use the exact requested role instructions from the original attachments. Use inspect_studio for current facts across rooms. Use manage_studio_data for explicit cleanup, including permanent deletion; distinguish a single conversation from its team. For a team cleanup, use delete_studio_groups or send all compatible cleanup calls in this turn. Use the preceding proposal for short confirmations. If alternatives remain ambiguous, present a concrete scope for confirmation. Use a task for redispatch.")
     messages = [{"role":"system", "content":system},
                 {"role":"user", "content":"Room records (reference data):\n" + json.dumps(context, ensure_ascii=False)},
                 {"role":"user", "content":text}]
@@ -290,19 +266,6 @@ def decide(provider, context, text, read, *, on_stream=None, studio_operations=(
             if response.finish_reason == "stop" and not response.tool_calls and response.text.strip():
                 return Turn("reply", response.text.strip())
             result, issue = _authorized(response, tools, text, worker_names=worker_names, read_names=read_names)
-            if assistant and not structural_only and response.tool_calls and not repaired:
-                # Never carry a proposed target, instruction or quoted approval from an attachment
-                # into the executing batch. The worker can read the originals after a clean commission.
-                repaired = True
-                structural_only = True
-                messages = [{"role":"system","content":system + " Decide from the original user message and room context. "
-                             "For commissioned work using source materials, start_room_task opens the full Studio executor "
-                             "which can read those sources. Answer an informational request directly."}, *original[1:]]
-                # An execution proposal needs only a commission decision. For a control such
-                # as steering or scoped cleanup, resolve its arguments anew with the direct controls.
-                tools = ([START] if result and result.action == START.name else
-                         [tool for tool in original_tools if tool.name not in read_names and tool.name not in worker_names])
-                continue
             if result:
                 return result
             # Retry an incomplete control decision on the original conversation. Text read from a
@@ -361,7 +324,7 @@ def decide(provider, context, text, read, *, on_stream=None, studio_operations=(
                 if (tool in READ_TOOLS or "workspace_path" in call.arguments) and tool not in next_reads:
                     next_reads.append(tool)
             messages.append({"role":"tool", "tool_call_id":call.id, "content":content})
-        if structural_only or assistant:
+        if structural_only:
             tools = [t for t in original_tools if (remaining > 0 and len(seen) > seen_before) or t.name not in read_names]
         else:
             tools = next_reads if remaining > 0 else []

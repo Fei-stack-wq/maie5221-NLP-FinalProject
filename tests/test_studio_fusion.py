@@ -74,17 +74,19 @@ class StudioFusionTest(unittest.TestCase):
         text="Please  deliver\nthe memo."
         def dispatch(messages):
             gid=json.loads(messages[-1]["content"])["id"]
-            return reply("",call("start_task",group_id=gid,text=text))
-        self.script.queues.update(room=[reply("",call("start_room_task",quote="Organize a desk"))], assistant=[
+            return reply("",call("dispatch_task",group_id=gid,text=text))
+        self.script.queues.update(assistant=[
             reply("",call("create_role",id="editor", name="Editor",prompt="Write memos.")),
-            reply("",call("create_group",name="Desk",role_ids=["dev","editor"],lead="dev")),dispatch],
+            reply("",call("create_group",name="Desk",role_ids=["dev","editor"],lead="dev")),dispatch,
+            reply("Created Desk and sent the memo.")],
             dev=[reply("",call("delegate_task",assignee="editor",task=text)),reply("The editor delivered memo.md.")],
             editor=[reply("",call("write_file",path="memo.md",content="Prepared.")),reply("Here is the memo.")])
-        self.service.post(assistant,"Organize a desk and send the memo assignment."); self.service.wait(assistant)
+        self.service.post(assistant,"Organize a desk and send the memo assignment.")
         source=self.service.group(assistant)
         receipt=next(e for e in source.chat() if e["kind"]=="dispatch_sent")
         gid=receipt["target_group_id"]
         self.service.wait(gid)
+        wait_for(lambda:any(e["kind"]=="dispatch_finished" for e in source.chat()))
         data=next(e for e in source.chat() if e["kind"]=="dispatch_finished")
         self.assertEqual(data["status"],"completed")
         self.assertEqual(data["artifacts"][0]["path"],"memo.md")
@@ -92,7 +94,7 @@ class StudioFusionTest(unittest.TestCase):
         self.assertEqual(self.service.group(gid).load_task(receipt["target_task_id"])["delegations"],1)
         self.assertIn(text,self.provider.for_agent("editor")[0]["messages"][1]["content"])
         self.assertEqual(self.service.group(gid).chat()[1]["text"],text)
-        self.assertNotIn("start_task",self.provider.for_agent("editor")[0]["tools"])
+        self.assertNotIn("dispatch_task",self.provider.for_agent("editor")[0]["tools"])
 
     def test_queue_steering_attachments_and_project_conflict(self):
         gid=self.dm(); local=self.root/"workspace";local.mkdir();(local/"draft.md").write_text("original")

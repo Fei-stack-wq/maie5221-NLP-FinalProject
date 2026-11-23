@@ -315,6 +315,11 @@ class Studio:
             if queue:
                 return self._submit(store, text, body, target or store.group.lead, refs, options, settings, mode,
                                     dispatched_by=dispatched_by, receipt=receipt)
+            if assistant:
+                # The assistant answers, looks things up and acts in one agent loop (assistant.py).
+                from .assistant import AssistantTurn
+                stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs, client_id=client_id))
+                return AssistantTurn(self, store, text, refs, settings, stream, receipt).run()
 
             stream = turn_scope.enter_context(store.previews.room_turn(actor, text, refs, client_id=client_id))
             active = {"id":current.task_id, "primary":current.primary} if current else None
@@ -325,55 +330,9 @@ class Studio:
             recipients = {current.task_id:ObservedTask(group_id,current,question)} if current else {}
             children = {}
             owner_names = {}
-            operations = {}
-            if assistant:
-                context.update(workspace_evidence(self, store))
-                context["room_id"] = group_id
-                if proposal := studio_cleanup.pending(store):
-                    context["pending_cleanup"] = proposal
-                operations = {t.name:t for t in assistant_tools(self, catalog=True)}
-                context["studio_capabilities"] = {name:t.description for name,t in operations.items()}
-                with self._lock:
-                    for item in context["dispatches"] + context["earlier_dispatches"]:
-                        tid, gid = item["id"], item["group_id"]
-                        children[tid] = item
-                        child = self._running.get(gid)
-                        if child and child.task_id == tid:
-                            recipients[tid] = ObservedTask(gid, child, child.channel.pending())
-                    for gid, run in self._running.items():
-                        if gid != group_id:
-                            recipients[run.task_id] = ObservedTask(gid, run, run.channel.pending())
-                            owner_names[run.task_id] = self.group(gid).group.name
-                context["action_targets"] = {
-                    tid:{"group_id":observed.group_id, "question":observed.question, "activity":progress(observed.run)}
-                    for tid,observed in recipients.items()}
             lookups = []
             try:
                 def read(args):
-                    if assistant:
-                        kind = next((k for k in ("studio_inspection","studio_room","studio_lookup") if k in args), None)
-                        details = args.get("arguments", args.get(kind, args))
-                        lookups.append({"tool":args[kind] if kind == "studio_lookup" else
-                                        {"studio_room":"inspect_studio_room","studio_inspection":"inspect_studio"}.get(kind,"read_room_evidence"),
-                                        **{k:v for k,v in details.items() if k in ("view","group_id","task_id","attachment_id","offset")}})
-                    if assistant and "studio_lookup" in args:
-                        lookup = operations[args["studio_lookup"]]
-                        if not lookup.read_only:
-                            raise ValueError("Expected a read-only Studio lookup.")
-                        result = lookup.fn(None, args["arguments"]).content
-                        return result.replace(settings.api_key, "[redacted]") if settings.api_key else result
-                    if assistant and "studio_inspection" in args:
-                        try:
-                            result = json.dumps(studio_admin.inspect(self,**args["studio_inspection"]),ensure_ascii=False)
-                            return result.replace(settings.api_key,"[redacted]") if settings.api_key else result
-                        except (ValueError, KeyError, OSError, StudioError) as exc:
-                            return str(exc)
-                    if assistant and "studio_room" in args:
-                        try:
-                            info = studio_dispatch.inspect_room(self, **args["studio_room"])
-                            return json.dumps(info, ensure_ascii=False)
-                        except (StudioError, TypeError, ValueError) as exc:
-                            return str(exc)
                     if "workspace_path" in args:
                         if set(args) - {"workspace_path", "offset"}:
                             return "Reference a single file source."
@@ -385,7 +344,7 @@ class Studio:
                     else:
                         excerpt = read_excerpt(store, self.uploads, context, args)
                     return excerpt.replace(settings.api_key, "[redacted]") if settings.api_key else excerpt
-                turn = decide(self.provider_factory(settings), context, text, read, on_stream=stream, studio_operations=operations.values())
+                turn = decide(self.provider_factory(settings), context, text, read, on_stream=stream)
             except (ProviderError, ValueError) as exc:
                 raise StudioError(f"无法处理会话消息：{exc}", 503) from None
 
@@ -404,42 +363,6 @@ class Studio:
                         answer = "已请求暂停，将在保存断点后停下。" if turn.action == "pause_room_task" else f"已继续任务 {info['task_id']}。"
                     except StudioError as exc:
                         answer = str(exc)
-                elif turn.action == "change_group_members" and assistant:
-                    try:
-                        updated = self.change_members(**turn.arguments)
-                        names = "、".join(m["name"] for m in updated["members"])
-                        answer = f"「{updated['name']}」当前成员为 {names}，负责人是 @{updated['lead']}。"
-                    except (StudioError, ValueError) as exc:
-                        answer = f"群成员调整未完成：{exc}"
-                elif assistant and turn.action in (studio_cleanup.BATCH, studio_cleanup.APPLY):
-                    try:
-                        previous = studio_cleanup.pending(store)
-                        applying = turn.action == studio_cleanup.APPLY
-                        if applying and (not previous or previous["id"] != turn.arguments["plan_id"]):
-                            raise ValueError("这份清单已经失效，请重新指定清理范围。")
-                        calls = previous["calls"] if applying else turn.arguments["calls"]
-                        answer, metadata = studio_cleanup.run(self, store, calls, text, previous, applying=applying)
-                    except (ValueError, KeyError, OSError, StudioError) as exc:
-                        answer = f"清理前检查未通过：{exc}"
-                elif assistant and turn.action == studio_admin.MANAGE.name:
-                    try:
-                        result = studio_admin.manage(self,posting=group_id,**turn.arguments)
-                        answer = studio_admin.receipt(result)
-                    except (ValueError, KeyError, OSError, StudioError) as exc:
-                        answer = f"管理操作未完成：{exc}"
-                elif assistant and turn.action in ("cancel_task", "update_group_settings"):
-                    try:
-                        if turn.action == "cancel_task":
-                            info = studio_dispatch.cancel_task(self, **turn.arguments)
-                            answer = f"任务 {info['task_id']} 当前状态为 {info['status']}。"
-                        else:
-                            info = update_settings(self, **turn.arguments)
-                            labels = {"name":"名称","mode":"交互模式","folder":"工作区","archived":"归档","pinned":"固定"}
-                            fields = "，".join(f"{labels[k]}＝{info['workspace_path'] if k=='folder' else info[k]}"
-                                               for k in turn.arguments if k in labels)
-                            answer = f"已更新「{info['name']}」：{fields}。"
-                    except (ValueError, KeyError, StudioError) as exc:
-                        answer = f"操作未完成：{exc}"
                 elif turn.action == "reply":
                     answer = turn.text
                 else:
@@ -664,6 +587,13 @@ class Studio:
             return self.create_group("工作室助手", [{"id":"assistant","name":"工作室助手",
                 "prompt":"Manage the user's Studio through its tools. Inspect current records, coordinate roles and assignments, and manage conversations, deliverables and trash at the requested scope."}],
                 "assistant", kind="assistant")
+
+    def decide_approval(self, group_id, approval_id, decision):
+        from .assistant import decide_approval
+        store = self.group(group_id)
+        if store.group.kind != "assistant":
+            raise StudioError("Confirmations belong to the Studio assistant.", 404)
+        return decide_approval(self, store, approval_id, decision)
 
     def dispatch_status(self, task_id):
         store, task = self.find_task(task_id)

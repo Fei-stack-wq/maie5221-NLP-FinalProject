@@ -8,7 +8,7 @@ from unittest.mock import patch
 from miniagent.provider_http import HTTPResult, ProviderError
 from miniagent.providers import DeepSeekProvider, _collect_deepseek_stream
 from miniagent.studio import Studio
-from tests.helpers import FakeProvider, Script, call, reply, settings
+from tests.helpers import FakeProvider, Script, call, reply, settings, tool_results
 from tests.test_team import wait_for
 
 
@@ -17,6 +17,15 @@ def markup(name, body):
     params = "".join(f'<{tag}parameter name="{k}" string="{str(isinstance(v,str)).lower()}">{v}</{tag}parameter>'
                      for k,v in body.items())
     return f'<{tag}calls><{tag}invoke name="{name}">{params}</{tag}invoke></{tag}calls>'
+
+
+def completions(calls, content=None):
+    """One DeepSeek reply carrying several native tool calls."""
+    msg = {"role":"assistant","content":content,"reasoning_content":"reason","tool_calls":[
+        {"type":"function","id":f"call-{i}","function":{"name":name,"arguments":json.dumps(args,ensure_ascii=False)}}
+        for i,(name,args) in enumerate(calls)]}
+    return HTTPResult({"choices":[{"message":msg,"finish_reason":"tool_calls"}],
+                       "usage":{"prompt_tokens":10,"completion_tokens":3}},1)
 
 
 def completion(content=None, tool=None):
@@ -73,8 +82,15 @@ class SupervisorTest(unittest.TestCase):
     def replay(self, room, text, frames):
         provider = DeepSeekProvider("synthetic")
         real_factory = self.studio.provider_factory
-        # Only the fast chat decision uses the recorded DeepSeek HTTP envelopes.
-        self.studio.provider_factory = lambda _:(provider if frames else self.fake)
+        # Only the first provider (the chat turn itself) uses the recorded DeepSeek HTTP envelopes;
+        # teams started during the turn use the offline script.
+        handed = []
+        def factory(_):
+            if frames and not handed:
+                handed.append(provider)
+                return provider
+            return self.fake
+        self.studio.provider_factory = factory
         def take(*args,**kwargs):
             return frames.pop(0)
         try:
@@ -104,26 +120,25 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual((result["route"],len(room.tasks()),len(frames)),("task",1,0))
         self.assertIn("核查报告",self.fake.for_agent("lead")[0]["messages"][1]["content"])
 
-    def test_three_approvals_replay_once_and_tolerate_partial_delivery(self):
+    def test_three_dispatches_replay_once_and_tolerate_partial_delivery(self):
         text = "那你下发吧 三个都开"
         source = self.studio.group(self.assistant)
         source.append("room_reply",agent="assistant",text="可以把 task2 分给编辑、软件、投资三个组。")
-        jobs = [{"group_id":gid,"text":"继续该组的 task2"} for gid in self.rooms]
-        partial = [jobs[0],{"group_id":"missing","text":"bad"},jobs[2]]
-        self.script.queues["assistant"] = [reply("",call("dispatch_tasks",assignments=partial)),
-                                            reply("",call("dispatch_tasks",assignments=jobs))]
-        self.replay(self.assistant,text,[completion(markup("start_room_task",{"quote":text})),
-                                        completion(tool=("start_room_task",{"quote":text}))])
-        self.studio.wait(self.assistant)
+        jobs = [("dispatch_task",{"group_id":gid,"text":"继续该组的 task2"}) for gid in self.rooms]
+        partial = [jobs[0],("dispatch_task",{"group_id":"missing","text":"bad"}),jobs[2]]
+        # The first reply arrives as DeepSeek's text markup; the provider asks again and gets native calls.
+        self.replay(self.assistant,text,[completion(markup("dispatch_task",jobs[0][1])),completions(partial),
+                                        completions(jobs),completion("三个组都已下发。")])
         for gid in self.rooms:
             self.studio.wait(gid)
-            self.assertEqual(len(self.studio.tasks(gid)),1)
+            self.assertEqual(len(self.studio.tasks(gid)),1,"a repeated dispatch is not sent twice")
+        wait_for(lambda:sum(e["kind"]=="dispatch_finished" for e in source.chat())==3)
         events=source.chat()
         for kind in ("dispatch_sent","dispatch_finished"):
             self.assertEqual({e["target_group_id"] for e in events if e["kind"]==kind},set(self.rooms))
             self.assertEqual(sum(e["kind"]==kind for e in events),3)
         self.assertNotIn("DSML",json.dumps(events,ensure_ascii=False))
-
+        self.assertEqual([e["text"] for e in events if e["kind"]=="room_reply"][-1],"三个组都已下发。")
     def test_cancel_queued_and_transfer_original_attachment_without_stopping_successor(self):
         gid, destination, _ = self.rooms
         source = self.studio.group(gid)
@@ -134,12 +149,10 @@ class SupervisorTest(unittest.TestCase):
         queued = self.studio.post(gid,"Use facts",attachments=[ref],queue=True)["task_id"]
         self.studio.post(gid,"Third",queue=True)
         target=self.studio.create_session(destination,"第二期")["id"]
-        self.script.queues["room"]=[reply("",call("start_room_task",quote="重新派发"))]
         args={"task_id":queued,"group_id":target}
         self.script.queues["assistant"]=[reply("",call("redispatch_task",**args)),
                                          reply("",call("redispatch_task",**args)),reply("转交完成")]
         self.studio.post(self.assistant,"重新派发")
-        self.studio.wait(self.assistant)
         self.studio.wait(target)
         items=self.studio.tasks(target)
         self.assertEqual([(t["text"],t["redispatched_from"]) for t in items],[("Use facts",queued)])
@@ -147,15 +160,15 @@ class SupervisorTest(unittest.TestCase):
         copied=next(e["attachments"][0] for e in room.chat() if e.get("attachments"))
         self.assertEqual((copied["session_id"],self.studio.uploads.original(room,copied).read_bytes()),(target,b"original inputs"))
         self.assertEqual((source.load_task(queued)["status"],source.load_task(original)["status"]),("cancelled","running"))
-        self.script.queues["room"]=[reply("",call("cancel_task",task_id=original,quote="停掉第一项"))]
+        echo=lambda m:reply(tool_results(m)[-1])
+        self.script.queues["assistant"]=[reply("",call("cancel_task",task_id=original)),echo]
         self.assertIn("stopping",self.studio.post(self.assistant,"停掉第一项")["text"])
         wait_for(lambda:all(t["status"] not in ("queued","running") for t in source.tasks()))
         self.assertEqual([r["status"] for r in source.tasks()],["cancelled","cancelled","completed"])
-        self.script.queues["room"]=[reply("",call("cancel_task",task_id=original,quote="再停"))]
+        self.script.queues["assistant"]=[reply("",call("cancel_task",task_id=original)),echo]
         self.assertIn("cancelled",self.studio.post(self.assistant,"再停")["text"])
         for request in self.fake.for_agent("lead"):
             self.assertNotIn("cancel_task",request["tools"])
-
     def test_rejected_target_leaves_source_in_place_and_attached_steering_is_readable(self):
         source_id, target, _ = self.rooms
         self.script.queues["lead"] = [reply("",call("ask_human",question="Title?")),reply("Finished")]
@@ -163,33 +176,35 @@ class SupervisorTest(unittest.TestCase):
         source = self.studio.group(source_id)
         wait_for(lambda:(self.studio.state(source_id)["live"] or {}).get("question"))
         self.studio.update_group(target,{"archived":True})
-        self.script.queues["room"] = [reply("",call("start_room_task",quote="重派")),
-                                      reply("",call("change_current_task",task_id=tid,quote="附上材料")),
-                                      reply("",call("answer_open_question",task_id=tid,quote="香港"))]
-        self.script.queues["assistant"] = [reply("",call("redispatch_task",task_id=tid,group_id=target)),
-                                           reply("目标已归档，原任务仍在。")]
+        def refused(messages):
+            self.assertIn("Error",tool_results(messages)[-1])
+            return reply("目标已归档，原任务仍在。")
+        self.script.queues["assistant"] = [reply("",call("redispatch_task",task_id=tid,group_id=target)),refused]
         self.studio.post(self.assistant,"重派")
-        self.studio.wait(self.assistant)
         self.assertEqual(self.studio.tasks(target),[])
         self.assertEqual(source.load_task(tid)["status"],"running")
         ref = self.studio.uploads.save_in_room(self.studio.group(self.assistant),"update.txt",b"late steer")
-        self.assertEqual(self.studio.post(self.assistant,"附上材料",attachments=[ref])["route"],"steering")
+        self.script.queues["assistant"] = [reply("",call("message_task",task_id=tid,text="附上材料",kind="change",
+                                                         attachment_ids=[ref["id"]])),reply("已转交。")]
+        self.studio.post(self.assistant,"附上材料",attachments=[ref])
         copied = next(e["attachments"][0] for e in source.chat() if e.get("during_task"))
         self.assertEqual(self.studio.uploads.original(source,copied).read_bytes(),b"late steer")
+        self.assertTrue((self.studio.state(source_id)["live"] or {}).get("question"), "the question is still open")
+        self.script.queues["assistant"] = [reply("",call("message_task",task_id=tid,text="香港")),reply("已回答。")]
         self.studio.post(self.assistant,"香港")
         self.studio.wait(source_id)
         self.assertEqual(source.load_task(tid)["status"],"completed")
-
     def test_settings_and_directory_through_chat(self):
         team=self.rooms[0]
         session=self.studio.create_session(team,"一期")["id"]
         folder=self.root/"project"; folder.mkdir()
         for gid, change in ((team,{"name":"新编辑部","pinned":True,"mode":"autonomous"}),
                             (session,{"name":"二期","folder":str(folder)})):
-            self.script.queues["room"]=[reply("",call("update_group_settings",group_id=gid,quote="调整设置",**change))]
+            self.script.queues["assistant"]=[reply("",call("update_group_settings",group_id=gid,**change)),reply("已更新。")]
             self.assertIn("已更新",self.studio.post(self.assistant,"调整设置")["text"])
-        self.script.queues.update(room=[reply("",call("inspect_studio_room",group_id=session)),
-                                  lambda msgs:reply(json.loads(msgs[-1]["content"])["workspace_path"])])
+        self.script.queues["assistant"]=[reply("",call("inspect_room",group_id=session)),
+                                         lambda msgs:reply(json.loads(tool_results(msgs)[-1])["workspace_path"])]
         self.assertEqual(self.studio.post(self.assistant,"二期的目录在哪里？")["text"],str(folder))
         self.assertEqual(self.studio.tasks(self.assistant),[])
         self.assertEqual(self.studio.group(team).group.folder,"")
+        self.assertEqual(self.studio.group(team).group.name,"新编辑部")
