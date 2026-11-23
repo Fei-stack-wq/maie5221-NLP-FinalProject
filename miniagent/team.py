@@ -228,7 +228,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
         if settings.team.plans and settings.team.plan_links:
             parts.append("- Write the plan once. For your own steps, bind outputs or on_delivery. Pass the covered "
                          "step IDs on handoffs and retest_steps for post-fix reviews. Use record_plan_result for a decision "
-                         "on individual steps. Use after (earlier step IDs or numbers) for dependencies.")
+                         "on individual steps. Give a step `after` (earlier step IDs or numbers) when it needs earlier steps; steps "
+                         "whose `after` steps are done can be started together, and Studio names them when a report "
+                         "comes back. Dependencies are kept when a later update omits `after`.")
         elif settings.team.plans:
             parts.append(
                 "- Keep a short plan with `update_plan`: write it once you understand the task and update it after each "
@@ -528,6 +530,8 @@ class TeamTask:
         self.batch: ParallelBatch | None = None
         """The parallel batch whose assignments are about to start (see _can_run_together)."""
         self.parallel_reads = 0
+        self.batch_refusals: dict[tuple[str, str], str] = {}
+        """Why delegations the lead marked independent ran one after another, reported in their results."""
         self.meter = TaskMeter(notify=lambda text: self.channel.note(self.primary, text))
         self.active: list[str] = []
         self.record: dict[str, Any] = {}
@@ -1130,50 +1134,67 @@ class TeamTask:
         The lead can still be wrong about independence; the follow-up in _reconcile covers that case.
         A check (review) may join; it reports without that follow-up, since it judges finished work.
         """
+        reason = self._batch_refusal(batch)
+        if reason and any(args.get("independent") is True for args in batch):
+            # No silent fallback: the lead marked them independent, so each result says why they ran in order.
+            with self.lock:
+                for args in batch:
+                    key = (str(args.get("assignee", "")).strip(), str(args.get("task", "")).strip())
+                    self.batch_refusals[key] = reason
+        return not reason
+
+    def _batch_refusal(self, batch: list[dict]) -> str:
+        """Why these delegations cannot run at once, in words for the lead; "" when they can."""
         assignees = [str(args.get("assignee", "")).strip() for args in batch]
-        if len(set(assignees)) != len(assignees):
-            return False
+        repeated = sorted({a for a in assignees if assignees.count(a) > 1})
+        if repeated:
+            return (f"{', '.join(repeated)} had more than one of them, and one teammate works on one assignment at a "
+                    "time. To overlap them, give the pieces to different teammates or combine them into one assignment.")
         # A check of finished work may run alongside other work; the rules below refuse one that
         # reads, names or reviews anything another call in the batch produces.
         if any(self._wants_background(args) for args in batch):
-            return False  # in order, a background hand-off starts after what it may build on
+            return ("a background hand-off was in the same response; it starts in order, after what it may build on "
+                    "(put it first when it needs nothing from the others)")
         if not all(args.get("independent") is True for args in batch):
-            return False
+            return "not every call in the response was marked `independent: true`"
         schema = getattr(self, "delegate_parameters", None)
         if schema is None or any(validate_arguments(schema, args) for args in batch):
-            return False  # a call that never starts could not release its teammates
+            return "one of the calls had invalid arguments"  # a call that never starts could not release its teammates
         if any(len(str(args.get("task", "")).strip()) < 10 for args in batch):
-            return False
+            return "one of the briefs was empty or too short"
         claimed: list[list[str]] = []
-        for args in batch:
+        for name, args in zip(assignees, batch):
             paths = [_norm(p) for p in args.get("deliverables") or [] if _norm(p)]
             if not paths:
-                return False
+                return f"the call for {name} declared no deliverables, so Studio could not rule out a file clash"
             claimed.append(paths)
         for i, mine in enumerate(claimed):
-            for theirs in claimed[i + 1:]:
-                if any(_overlaps(a, b) for a in mine for b in theirs):
-                    return False
+            for j in range(i + 1, len(claimed)):
+                clash = next((a for a in mine for b in claimed[j] if _overlaps(a, b)), None)
+                if clash:
+                    return f"{assignees[i]} and {assignees[j]} would both write {clash}"
         # Declared inputs make a dependency explicit: nothing may read what another call in the batch produces.
         for i, args in enumerate(batch):
             reads = [_norm(p) for p in args.get("inputs") or [] if _norm(p)]
             for j, theirs in enumerate(claimed):
-                if i != j and any(_overlaps(a, b) for a in reads for b in theirs):
-                    return False
+                hit = next((a for a in reads for b in theirs if i != j and _overlaps(a, b)), None)
+                if hit:
+                    return f"{assignees[i]} reads {hit}, which {assignees[j]} produces in the same response"
         # A brief that names another assignment's files or teammate probably needs its output.
         for i, args in enumerate(batch):
             text = str(args.get("task", ""))
-            for j, other in enumerate(batch):
-                if i != j and any(_mentions(text, name) for name in [*claimed[j], assignees[j]]):
-                    return False
+            for j in range(len(batch)):
+                named = next((name for name in [*claimed[j], assignees[j]] if i != j and _mentions(text, name)), None)
+                if named:
+                    return f"{assignees[i]}'s brief names {named}, which belongs to {assignees[j]}'s assignment"
         with self.lock:
             new = sum(1 for name in assignees if name not in self.inflight)
             if self.settings.team.max_delegations - self.delegations < new:
-                return False
+                return "the delegation budget had too few delegations left for all of them"
             # A batch resumed after a pause has lost its finished members; they are not joined again.
             if new == len(assignees):
                 self.batch = ParallelBatch({(a, str(args.get("task", "")).strip()) for a, args in zip(assignees, batch)})
-            return True
+        return ""
 
     def _join_batch(self, assignee: str, task: str) -> ParallelBatch | None:
         with self.lock:
@@ -1272,6 +1293,10 @@ class TeamTask:
         if missing:
             lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing)
                          + ". If the work depended on them, run it again after the step that produces them.")
+        with self.lock:
+            refused = self.batch_refusals.pop((assignee, str(args.get("task", "")).strip()), None)
+        if refused:
+            lines.append(f"Marked independent, but the hand-offs in that response ran one after another: {refused}.")
         if ready := self._ready_note():
             lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
@@ -1645,6 +1670,8 @@ class TeamTask:
                 if not isinstance(after, list):
                     return ToolResult.failure(f"Step {len(steps) + 1}: `after` is a list of earlier steps.")
                 row["after"] = after  # resolved to step numbers below, once every step has its ID
+            elif "after" not in item:
+                row["_keep_after"] = True  # omitted (not []): keep this step's dependencies from the previous plan
             steps.append(row)
         if not 1 <= len(steps) <= 20:
             return ToolResult.failure("A plan has 1–20 steps.")
@@ -1656,6 +1683,9 @@ class TeamTask:
                     meta = {"used_ids": identify_steps(steps, self.plan), "linked": True}
                 except ValueError as exc:
                     return ToolResult.failure(str(exc))
+            kept = _inherit_after(steps, self.plan) if self.settings.team.plan_links else 0
+            for row in steps:
+                row.pop("_keep_after", None)
             problem = _resolve_after(steps)
             if problem:
                 return ToolResult.failure(problem)
@@ -1671,7 +1701,10 @@ class TeamTask:
                  and all(stages[n - 1] == "completed" for n in row.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
         ids = " Steps: " + ", ".join(f"{s['id']} {s['step']}" for s in steps) if self.settings.team.plan_links else ""
-        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{ids} The requester can see it.")
+        kept_note = (f" Kept the dependencies of {kept} step(s) that omitted `after` (pass `after: []` to clear them)."
+                     if kept else "")
+        return ToolResult(ok=True, content=f"Plan updated: {done}/{len(steps)} steps done.{hint}{kept_note}{ids} "
+                                           "The requester can see it.")
 
     def _run_member(self, member: Member, task: str, deliverables: list[str], entry: dict, max_steps=None,
                     *, fresh: bool = False, review: bool = False, reconcile: bool = False):
@@ -1933,6 +1966,29 @@ class TeamTask:
                      active=[], metrics=metrics, assignments=self.assignments, delegations=self.delegations)
         self.store.append("task_finished", task_id=self.task_id, status=status, metrics=metrics, error=result.error)
         return self.record
+
+
+def _inherit_after(steps: list[dict], previous: dict | None) -> int:
+    """A whole-plan update that omits `after` for a step keeps that step's earlier dependencies.
+
+    Updating statuses should not erase the dependency graph (S1T1-v3.3 lost it in its closing update).
+    Kept references are step IDs, so they follow reordering; ones that are gone or no longer earlier are
+    dropped. Returns how many steps kept dependencies.
+    """
+    old = (previous or {}).get("steps", [])
+    old_ids = [s.get("id") for s in old]
+    by_id = {s.get("id"): s for s in old if s.get("id")}
+    kept = 0
+    for number, row in enumerate(steps, 1):
+        if not row.get("_keep_after") or row.get("id") not in by_id:
+            continue
+        earlier = {s.get("id") for s in steps[:number - 1]}
+        refs = [old_ids[n - 1] for n in by_id[row["id"]].get("after", []) if 1 <= n <= len(old_ids)]
+        refs = [ref for ref in refs if ref in earlier]
+        if refs:
+            row["after"] = refs
+            kept += 1
+    return kept
 
 
 def _resolve_after(steps: list[dict]) -> str:
