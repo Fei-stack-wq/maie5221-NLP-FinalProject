@@ -82,6 +82,7 @@
           <div class="composer-bar">
             <label class="tool-button" title="添加附件"><span data-icon="clip"></span>附件<input id="uploads" type="file" multiple hidden></label>
             <label class="pill-select" title="思考模式"><span data-icon="bulb"></span><select id="thinking" aria-label="思考模式"><option value="">思考 · 默认</option><option value="enabled">思考 · 开</option><option value="disabled">思考 · 关</option></select></label>
+            <label class="pill-select" title="思考强度：开启思考时生效。默认由工作室按派工类型调整（检查用工作室设置，其余用低强度）。选定后所有角色都用这个强度。"><span data-icon="gauge"></span><select id="effort" aria-label="思考强度"><option value="">强度 · 默认</option><option value="low">强度 · 低</option><option value="high">强度 · 高</option><option value="max">强度 · 最高</option></select></label>
             <button id="fast-mode" type="button" class="tool-button" aria-pressed="false" title="快速模式：约 10–15 分钟交付一个可用的简化版本。只有负责人和评审开启思考，成员不开思考、少做复核，15 分钟时收尾。质量可能低于标准模式。"><span class="bolt" aria-hidden="true">⚡</span>快速</button>
             <button id="task-options" type="button" class="tool-button" title="步数、协作方式和验收"><span data-icon="sliders"></span>运行选项</button>
             <label class="toggle" id="queue-toggle" title="当前任务结束后再开始这条消息" hidden><input type="checkbox" id="queue">排队为新任务</label>

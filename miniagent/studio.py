@@ -441,6 +441,7 @@ class Studio:
             self._require_available(store)
             store.group.member(primary)
             queued = group_id in self._running or any(t["status"]=="paused" for t in store.tasks())
+            pinned = "thinking" in options  # chosen by the requester or the assistant, not filled in below
             options = {**options, "thinking":settings.thinking, "interaction_mode":mode,
                        "member_max_steps":settings.limits.max_steps, "lead_max_steps":settings.team.lead_max_steps,
                        "max_delegations":settings.team.max_delegations}
@@ -452,6 +453,8 @@ class Studio:
                 event = store.append("user_message", task_id=tid, text=text, attachments=refs, addressed=primary, **receipt)
             record = {"id":tid, "group_id":group_id, "room_kind":store.group.kind, "status":"queued", "created_at":now(), "primary":primary,
                       "text":body, "trigger_seq":event["seq"], "options":options, "active":[]}
+            if pinned:
+                record["thinking_pinned"] = True
             if continued_from:
                 record["continued_from"] = continued_from
             if initial_calls:
@@ -472,11 +475,13 @@ class Studio:
     def _task_settings(self, store, options):
         if not isinstance(options, dict) or options.keys() - {
                 "thinking","interaction_mode","member_max_steps","lead_max_steps","max_delegations","checks",
-                "budget_minutes","budget_tokens","mode",
+                "budget_minutes","budget_tokens","mode","reasoning_effort",
                 "reviewer_model","reviewer_thinking"}:
             raise StudioError("Invalid task options")
         if options.get("mode", "standard") not in ("standard", "fast"):
             raise StudioError("mode must be standard or fast")
+        if options.get("reasoning_effort", "high") not in ("low", "high", "max"):
+            raise StudioError("reasoning_effort must be low, high or max")
         mode = options.get("interaction_mode", store.group.mode)
         if mode not in ("interactive","autonomous"):
             raise StudioError("Unknown interaction mode")
@@ -487,12 +492,15 @@ class Studio:
                 raise StudioError(f"{key} must be a number from 0 to {top}")
         base = self.settings
         settings = replace(base, thinking=options.get("thinking", base.thinking),
+                           reasoning_effort=options.get("reasoning_effort", base.reasoning_effort),
                            reviewer_model=options.get("reviewer_model", base.reviewer_model),
                            reviewer_thinking=options.get("reviewer_thinking", base.reviewer_thinking),
                            limits=replace(base.limits, max_steps=options.get("member_max_steps", base.limits.max_steps)),
                            team=replace(base.team, **{k:options[k] for k in ("max_delegations","lead_max_steps") if k in options}))
         if options.get("mode") == "fast":
             settings = fast_profile(settings)
+            if "reasoning_effort" in options:  # the requester's explicit effort wins over fast mode's low
+                settings = replace(settings, reasoning_effort=options["reasoning_effort"])
         return settings, mode
 
     def _start(self, store, record, saved=None):
@@ -548,6 +556,9 @@ class Studio:
             task.redispatched_from = record.get("redispatched_from")
             task.reviewer_provider = reviewer_provider
             task.member_provider = member_provider
+            task.provider_factory = self.provider_factory
+            task.thinking_pinned = bool(record.get("thinking_pinned"))
+            task.effort_pinned = "reasoning_effort" in (record.get("options") or {})  # only set when chosen
             task.options = record["options"]
             task.created_at = record["created_at"]
             running.thread = threading.Thread(target=self._run, args=(store.group.id, task, running),

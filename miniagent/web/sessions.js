@@ -45,8 +45,8 @@ function switchComposerRoom(id) {
   const input = $("#input"), uploads = $("#uploads");
   if (composerRoom) {
     const draft = {text:input.value,files:Array.from(uploads.files),options:state.runOptions,
-      thinking:$("#thinking").value,queue:$("#queue").checked};
-    if (draft.text || draft.files.length || draft.thinking || draft.queue || Object.keys(draft.options || {}).length)
+      thinking:$("#thinking").value,effort:$("#effort").value,queue:$("#queue").checked};
+    if (draft.text || draft.files.length || draft.thinking || draft.effort || draft.queue || Object.keys(draft.options || {}).length)
       composerDrafts.set(composerRoom,draft);
     else composerDrafts.delete(composerRoom);
   }
@@ -59,7 +59,8 @@ function switchComposerRoom(id) {
     uploads.files=transfer.files;
   }
   state.runOptions=next?.options || {};
-  $("#thinking").value=next?.thinking || ""; $("#queue").checked=Boolean(next?.queue);
+  $("#thinking").value=next?.thinking || ""; $("#effort").value=next?.effort || ""; $("#queue").checked=Boolean(next?.queue);
+  if (typeof syncEffort === "function") syncEffort();
   $("#composer-error").hidden=true;
   hideMentions(); renderUploads(); autoGrow();
 }

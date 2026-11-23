@@ -42,7 +42,7 @@ from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .browser_evidence import format_report
 from .plan_view import identify_steps, plan_view
 from .checkpoint import Continuation, PauseRequested
-from .config import FAST_SOFT_MINUTES, Settings
+from .config import FAST_SOFT_MINUTES, HANDOFF_KINDS, KIND_PROFILES, Settings, kind_settings
 from .context import ContextManager
 from .evaluation import evaluate, validate
 from .mailbox import Cancelled, HumanChannel
@@ -50,7 +50,7 @@ from .consult import LeadConsult
 from .meter import TaskMeter
 from .providers import Provider
 from .sandbox import Sandbox
-from . import recovery, team_talk
+from . import handoffs, recovery, team_talk
 from .schemas import ToolResult, Usage
 from .store import GroupStore, Member, now
 from .tools import Tool, ToolRegistry, build_default_registry, validate_arguments
@@ -221,6 +221,7 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             "phrase, a command exits 0). Studio runs them on the published project after the teammate finishes and "
             "shows you the results; they inform your judgement and never block delivery. Set `review: true` on "
             "an assignment that reviews or tests someone else's work.")
+        parts += handoffs.lead_guidance(kinds=settings.team.handoff_kinds, background=settings.team.background_handoffs)
         if settings.team.review_loops and len(members) > 2:
             parts.append(
                 "- For an author–reviewer cycle (build → test → fix → re-test), `review_loop` runs the rounds for you: "
@@ -255,7 +256,8 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
              "user's choice when given. Studio delivers dispatch links and the eventual result and files to this "
              "chat automatically. Use await_result only when your own next step needs that result. Delegated work "
              "runs in standard mode; set `options.mode` to \"fast\" only when the requester explicitly asks for fast "
-             "mode for that work (for example \"用快速模式\" or \"fast mode\"), never on your own judgement." if studio_assistant else
+             "mode for that work (for example \"用快速模式\" or \"fast mode\"), never on your own judgement. Likewise set "
+             "`options.thinking` or `options.reasoning_effort` (low, high, max) only when the requester asks for them." if studio_assistant else
              "- Do the work yourself with your tools and verify it before you finish."),
         ]
     if settings.team.fast:
@@ -535,12 +537,33 @@ class TeamTask:
         """Progress of the review loop in flight, so a resumed task continues the same round."""
         self.started_at = None
         self.lead_session = AgentSession()
+        self.provider_factory: Callable[[Settings], Provider] | None = None
+        """Builds providers for hand-off kinds whose thinking or effort differ, cached per setting."""
+        self.providers: dict[tuple, Provider] = {}
+        self.thinking_pinned = False
+        """The task's options set thinking explicitly, so hand-off kinds do not change it."""
+        self.effort_pinned = False
+        """The task's options set reasoning_effort explicitly, so hand-off kinds do not lower it."""
+        self.background: dict[str, dict] = {}
+        """Hand-offs running in the background, by assignee (the thread and its declared files)."""
+        self.bg_cond = threading.Condition()
+        self.bg_finished: list[str] = []
+        """Background reports collected while the lead waits or after it finished."""
+        self.bg_untaken = 0
+        """Background reports delivered to the lead's inbox that it has not read yet."""
+        self.waiting_handoffs = False
+        self.lead_live = False
+        self.lead_stale = False
+        """Background hand-offs published files after the lead's workspace was last refreshed."""
+        self.evidence: list[dict] = []
+        """Finished hand-offs, for the check, fix and adapt hand-offs that follow (handoffs.evidence_block)."""
         self.consults = LeadConsult(self)
         self.channel.primary = primary
         self.channel.enabled = settings.team.mailboxes
         self.channel.interrupts = settings.team.mailboxes and settings.team.interrupts
         self.channel.on_event = self._event
         self.channel.on_user_mail = self.consults.schedule
+        self.channel.before_take = self._refresh_lead
 
     def consult_lead(self, mail, *, checkin=False):
         return self.consults.decide(mail, checkin=checkin)
@@ -554,7 +577,8 @@ class TeamTask:
                 "session_marks":{f"{member}|{kind}": mark for (member, kind), mark in self.session_marks.items()},
                 "plan":self.plan, "parallel_batches":self.parallel_batches,
                 "delegations":self.delegations, "history":self.history, "assignments":self.assignments,
-                "channel":self.channel.snapshot(), "consult_calls": self.consults.calls}
+                "channel":self.channel.snapshot(), "consult_calls": self.consults.calls,
+                "bg_finished": list(self.bg_finished), "bg_untaken": self.bg_untaken, "evidence": self.evidence}
 
 
     # -- plumbing ---------------------------------------------------------
@@ -562,11 +586,17 @@ class TeamTask:
         event = {"task_id": self.task_id, **event}
         if event["type"] in ("start","resume"):
             self.channel.activate(event["agent"])
+        if event["type"] in ("start", "resume") and event.get("agent") == self.primary:
+            self.lead_live = True
         if event["type"] == "end":
             self.channel.deactivate(event["agent"])
             if event.get("agent") == self.primary:
-                self.consults.close()
-                self.channel.finish()
+                with self.bg_cond:
+                    self.lead_live = False
+                    still_open = bool(self.background or self.bg_finished or self.bg_untaken)
+                if not still_open:  # otherwise the lead runs again for the background reports (see run)
+                    self.consults.close()
+                    self.channel.finish()
         if (self.talk and event["type"] == "step" and event.get("max_steps")
                 and event["step"] >= 0.6 * event["max_steps"]):
             self.talk.silence(event["agent"])
@@ -613,6 +643,8 @@ class TeamTask:
                 registry.add(self._review_tool(agent_id))
             if self.settings.team.plans:
                 registry.add(self._plan_tool(agent_id))
+            if self.settings.team.background_handoffs:
+                registry.add(self._wait_tool(agent_id))
         if self.interactive:
             registry.add(Tool(
                 name="ask_human",
@@ -722,6 +754,17 @@ class TeamTask:
         }
         if team.plans and team.plan_links:
             properties["step"] = {"type": "string", "description": "Stable plan step ID this hand-off advances"}
+        if team.handoff_kinds:
+            properties["kind"] = {
+                "type": "string", "enum": list(HANDOFF_KINDS),
+                "description": ("Shape of the work: research (find out), make (produce a deliverable), check (review "
+                                "or test someone else's work), fix (address findings), adapt (turn finished work into "
+                                "other material). Sets thinking, step budget and tools.")}
+        if team.background_handoffs:
+            properties["background"] = {
+                "type": "boolean",
+                "description": ("Start the hand-off and return at once; its report arrives as a message later "
+                                "(default true for adapt, false otherwise)")}
         if team.parallel_delegations:
             properties["independent"] = {
                 "type": "boolean",
@@ -738,7 +781,9 @@ class TeamTask:
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report, the published files and the results of any checks."
                          + (" Several calls in one response run at the same time when each is marked independent, "
-                            "declares deliverables and no two share a file." if team.parallel_delegations else "")),
+                            "declares deliverables and no two share a file." if team.parallel_delegations else "")
+                         + (" With background: true it returns at once and the report arrives later."
+                            if team.background_handoffs else "")),
             parameters=self._delegate_schema(properties),
             fn=lambda _ctx, args: self._delegate(lead_id, args),
             concurrent=self._can_run_together if team.parallel_delegations else None)
@@ -770,6 +815,214 @@ class TeamTask:
                                "description": "Most review rounds (default 3)"},
             }, "required": ["author", "reviewer", "work"]},
             fn=lambda _ctx, args: self._review_loop(lead_id, args))
+
+    def _wait_tool(self, lead_id: str) -> Tool:
+        return Tool(
+            name="wait_handoffs",
+            description=("Wait until hand-offs running in the background finish and return their reports. Use it "
+                         "when your next step needs their results, or when you have nothing else to do — before "
+                         "your final answer."),
+            parameters={"type": "object", "properties": {
+                "assignees": {"type": "array", "items": {"type": "string", "enum": self._member_ids(lead_id)},
+                              "description": "Teammates to wait for (default: every hand-off still running)"}}},
+            fn=lambda _ctx, args: self._wait_handoffs(args))
+
+    def lead_suspended(self) -> bool:
+        """The lead is inside a synchronous hand-off, a review loop or wait_handoffs, so it is not reading mail."""
+        with self.lock:
+            return self.waiting_handoffs or any(not row.get("background") for row in self.inflight.values())
+
+    def _wants_background(self, args: dict) -> bool:
+        if not self.settings.team.background_handoffs:
+            return False
+        flag = args.get("background")
+        if isinstance(flag, bool):
+            return flag
+        kind = args.get("kind")
+        return bool(self.settings.team.handoff_kinds and kind in KIND_PROFILES and KIND_PROFILES[kind].background)
+
+    def _background_conflict(self, assignee: str, deliverables: list[str], inputs: list[str]) -> str:
+        with self.bg_cond:
+            running = {name: list(row["deliverables"]) for name, row in self.background.items()}
+        if assignee in running:
+            return (f"{assignee} is still working on a hand-off in the background. Call wait_handoffs for that "
+                    "report first, or give this assignment to another teammate.")
+        for other, produced in running.items():
+            theirs = [_norm(p) for p in produced if _norm(p)]
+            clash = [p for p in deliverables if any(_overlaps(_norm(p), q) for q in theirs)]
+            reads = [p for p in inputs if any(_overlaps(_norm(p), q) for q in theirs)]
+            if clash or reads:
+                return (f"{other} is still producing {', '.join(clash or reads)} in the background. Call "
+                        "wait_handoffs first, so this hand-off " + ("does not overwrite it." if clash
+                                                                     else "reads the finished version."))
+        return ""
+
+    def _provider_for(self, settings: Settings, review: bool) -> Provider:
+        """One provider per (model, thinking, effort); the task's own providers are reused when they match."""
+        key = (settings.model, settings.thinking, settings.reasoning_effort)
+        known = [(self.settings, self.provider)]
+        if self.reviewer_provider is not None:
+            known.append((self.settings.reviewer(), self.reviewer_provider))
+        if self.member_provider is not None:
+            known.append((self.settings.member(), self.member_provider))
+        for base, provider in known:
+            if (base.model, base.thinking, base.reasoning_effort) == key:
+                return provider
+        if self.provider_factory is None:
+            fallback = self.reviewer_provider if review else self.member_provider
+            return fallback if fallback is not None else self.provider
+        with self.lock:
+            if key not in self.providers:
+                self.providers[key] = self.provider_factory(settings)
+            return self.providers[key]
+
+    def _refresh_lead(self, agent: str) -> None:
+        """Before the lead takes its mail: its notes are read now, and its workspace takes in new files."""
+        if agent != self.primary:
+            return
+        with self.bg_cond:
+            self.bg_untaken = 0
+        self._refresh_workspace()
+
+    def _refresh_workspace(self) -> None:
+        """At a lead step boundary, bring in what background hand-offs published (the lead's own edits go first)."""
+        if not self.lead_stale:
+            return
+        with self.lock:
+            self.lead_stale = False
+            workspace = self.store.workspace(self.primary)
+            own, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
+                                                task_id=self.task_id, note="lead edits before a background report")
+            if own:
+                self.store.append("publish", task_id=self.task_id, agent=self.primary,
+                                  changes=[c.as_dict() for c in own])
+            self.lead_baseline = self.store.project.checkout(workspace)
+
+    def _start_background(self, entry: dict) -> None:
+        assignee = entry["assignee"]
+        thread = threading.Thread(target=self._background_run, args=(entry,), daemon=True,
+                                  name=f"handoff-{self.task_id}-{assignee}")
+        with self.bg_cond:
+            self.background[assignee] = {"thread": thread, "deliverables": entry["run"]["deliverables"],
+                                         "seq": entry["seq"]}
+        thread.start()
+
+    def _background_run(self, entry: dict) -> None:
+        """A hand-off in its own thread, like a Codex spawned agent; the lead collects it with wait_handoffs."""
+        run, assignee = entry["run"], entry["assignee"]
+        member = self.group.member(assignee)
+        text = ""
+        try:
+            result, changes, skipped = self._run_member(member, run["task"], run["deliverables"], entry,
+                                                        run["max_steps"], fresh=run["fresh"], review=run["review"])
+            with self.lock:
+                self.inflight.pop(assignee, None)
+            outcome = self._close_assignment(member, run["task"], run["deliverables"], result, changes, skipped,
+                                             run["checks"], run["review"], None, entry.get("browser_checks"), entry)
+            lines = self._report_lines(outcome)
+            lines[0] = "Background hand-off finished. " + lines[0]
+            lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
+            text = "\n".join(lines)
+        except PauseRequested:
+            pass  # the entry stays in flight with the member's frame; the resumed task starts it again
+        except Exception as exc:  # noqa: BLE001 - report the failure instead of losing the hand-off
+            with self.lock:
+                self.inflight.pop(assignee, None)
+            text = f"Background hand-off to {member.name} ({assignee}) failed: {exc}"
+            self.store.append("report", task_id=self.task_id, agent=assignee, status="error", text=text, changes=[],
+                              steps=0, tool_calls=0, background=True,
+                              **({"handoff_kind": entry["kind"]} if entry.get("kind") else {}))
+        finally:
+            self._background_finished(assignee, text)
+
+    def _background_finished(self, assignee: str, text: str) -> None:
+        with self.bg_cond:
+            self.background.pop(assignee, None)
+            if text:
+                self.lead_stale = True
+                if self.waiting_handoffs or not self.lead_live:
+                    self.bg_finished.append(text)
+                else:
+                    self.bg_untaken += 1
+                    self.channel.deliver(self.primary, text)
+            self.bg_cond.notify_all()
+
+    def _wait_handoffs(self, args: dict) -> ToolResult:
+        wanted = [str(a).strip() for a in args.get("assignees") or [] if str(a).strip()]
+        with self.bg_cond:
+            targets = [a for a in (wanted or list(self.background)) if a in self.background]
+            if not targets and not self.bg_finished:
+                return ToolResult(ok=True, content=(
+                    "No hand-off is running in the background" + (f" for {', '.join(wanted)}" if wanted else "")
+                    + ". Reports of finished ones arrive as messages at your next step."))
+            self.waiting_handoffs = True
+            try:
+                while True:
+                    # A member stopped by a pause leaves without a report: the wait pauses too and resumes with it.
+                    self.control.boundary()
+                    if not any(a in self.background for a in targets) or self.should_cancel():
+                        break
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        break
+                    self.bg_cond.wait(0.5)
+                texts, self.bg_finished = self.bg_finished, []
+            finally:
+                self.waiting_handoffs = False
+            still = sorted(self.background)
+        self._refresh_workspace()
+        lines = texts or ["(No new reports.)"]
+        if still:
+            lines.append("Still running in the background: " + ", ".join(still) + ".")
+        return ToolResult(ok=True, content="\n\n".join(lines))
+
+    def _join_background(self, timeout: float | None = None) -> None:
+        with self.bg_cond:
+            threads = [row["thread"] for row in self.background.values()]
+        for thread in threads:
+            thread.join(timeout)
+
+    def _after_background(self, agent: Agent, result: AgentResult) -> AgentResult:
+        """The lead answered while background hand-offs were open: it waits for them and may update its answer.
+
+        The wait is a ``wait_handoffs`` call inside the lead's own loop, so a pause during it saves the
+        lead's frame like any other tool call and the resumed task continues the wait.
+        """
+        for round_ in range(2):
+            with self.bg_cond:
+                still_open = bool(self.background or self.bg_finished or self.bg_untaken)
+            with self.lock:  # a hand-off stopped by a pause is still in flight
+                still_open = still_open or any(row.get("background") for row in self.inflight.values())
+            if not still_open or self.should_cancel() or result.status in ("cancelled", "error", "dispatched"):
+                return result
+            agent.limits = self._time_boxed(replace(agent.limits, max_steps=8))
+            note = ("[Studio] You answered while hand-offs you started in the background were still open. Studio "
+                    "waits for their reports now (the wait_handoffs call below). Check them against your answer. If "
+                    "something must still be fixed you may delegate it; otherwise reply with your final message to "
+                    "the requester again, complete and updated with these results (plain text).")
+            wait = {"id": f"call_studio_wait_{self.task_id}_{round_}", "name": "wait_handoffs", "arguments": {},
+                    "raw_arguments": "{}"}
+            again = agent.run(note, session=self.lead_session, initial_calls=[wait])
+            result = _combined(result, again)
+        return result
+
+    def _notify_background(self, author: str, changes) -> None:
+        """Tell teammates working in the background when files they read or produce were just published."""
+        if not changes:
+            return
+        with self.bg_cond:
+            running = [name for name in self.background if name != author]
+        with self.lock:
+            entries = {name: self.inflight.get(name) for name in running}
+        paths = [c.path for c in changes]
+        for name, entry in entries.items():
+            if not entry:
+                continue
+            watched = [_norm(p) for p in list(entry.get("inputs") or []) + list(entry["run"]["deliverables"])]
+            hit = [p for p in paths if any(_overlaps(p, w) for w in watched if w)]
+            if hit:
+                self.channel.deliver(name, f"[Studio] {self.group.member(author).name} ({author}) just published "
+                                     f"files you read or produce: {', '.join(hit[:20])}. They are in the team "
+                                     "project, not in your workspace copy; say in your report if they change your work.")
 
     def _plan_tool(self, lead_id: str) -> Tool:
         linked = self.settings.team.plan_links
@@ -803,6 +1056,8 @@ class TeamTask:
         assignees = [str(args.get("assignee", "")).strip() for args in batch]
         if len(set(assignees)) != len(assignees) or any(args.get("review") for args in batch):
             return False
+        if any(self._wants_background(args) or args.get("kind") == "check" for args in batch):
+            return False  # in order, a background hand-off starts after what it may build on
         if not all(args.get("independent") is True for args in batch):
             return False
         schema = getattr(self, "delegate_parameters", None)
@@ -882,6 +1137,14 @@ class TeamTask:
         fresh, review = args.get("fresh", False), args.get("review", False)
         if not isinstance(fresh, bool) or not isinstance(review, bool):
             return ToolResult.failure("fresh and review must be true or false")
+        kind = args.get("kind") if self.settings.team.handoff_kinds else None
+        if kind is not None and kind not in KIND_PROFILES:
+            return ToolResult.failure(f"kind must be one of: {', '.join(HANDOFF_KINDS)}")
+        if kind is None and review and self.settings.team.handoff_kinds:
+            kind = "check"  # review: true is the older spelling of a check hand-off
+        elif kind is not None:
+            review = kind == "check"
+        background = self._wants_background(args) and batch is None
         try:
             checks = validate(list(args.get("checks") or []))
         except ValueError as exc:
@@ -896,10 +1159,28 @@ class TeamTask:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
         link, warning = self._step_link(args.get("step"))
+        conflict = self._background_conflict(assignee, deliverables, inputs)
+        if conflict:
+            return ToolResult.failure(conflict)
+        spec = {k: v for k, v in (("kind", kind), ("inputs", inputs or None)) if v}
+        if background:
+            spec["background"] = True
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
-                               fresh=fresh, checks=checks, review=review, batch=batch, link=link)
+                               fresh=fresh, checks=checks, review=review, batch=batch, link=link, spec=spec)
         if isinstance(outcome, ToolResult):
             return outcome
+        if "started" in outcome:
+            member = self.group.member(assignee)
+            lines = [f"Started in the background: {member.name} ({assignee}) is working on this"
+                     + (f" ({kind} hand-off)." if kind else ".")
+                     + " The report arrives as a message at your next step after they finish; call wait_handoffs "
+                       "when your next step needs it. Until then, do not edit, assign or build on the files it produces."]
+            if warning:
+                lines.insert(0, warning)
+            if missing:
+                lines.append("Inputs that were not in the project when the assignment started: " + ", ".join(missing) + ".")
+            lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
+            return ToolResult(ok=True, content="\n".join(lines))
         lines = self._report_lines(outcome)
         if warning:
             lines.insert(0, warning)
@@ -912,17 +1193,33 @@ class TeamTask:
 
     def _assign(self, lead_id: str, assignee: str, task: str, *, deliverables: list[str], max_steps=None,
                 fresh: bool = False, checks: list[dict] | None = None, review: bool = False,
-                loop: dict | None = None, batch: ParallelBatch | None = None, link: dict | None = None) -> dict | ToolResult:
-        """Run one member assignment; returns its outcome, or a refusal for the lead."""
+                loop: dict | None = None, batch: ParallelBatch | None = None, link: dict | None = None,
+                spec: dict | None = None) -> dict | ToolResult:
+        """Run one member assignment; returns its outcome, or a refusal for the lead.
+
+        ``spec`` carries the hand-off kind, its inputs and whether it runs in the background; a background
+        hand-off returns ``{"started": entry}`` at once and reports through the lead's inbox.
+        """
         valid = self._member_ids(lead_id)
         if assignee not in valid:
             return ToolResult.failure(f"Unknown assignee {assignee!r}. Choose one of: {', '.join(valid)}.")
         with self.lock:
             entry = self.inflight.get(assignee)
+        if entry is not None and entry.get("background"):
+            return ToolResult.failure(f"{assignee} is still working on a hand-off in the background. Call "
+                                      "wait_handoffs for that report first, or choose another teammate.")
+        spec = dict(spec or {})
         if entry is None:
-            entry = self._open_assignment(lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link)
+            if spec.get("background"):
+                spec["run"] = {"task": task, "deliverables": deliverables, "max_steps": max_steps, "fresh": fresh,
+                               "checks": checks or [], "review": review}
+            entry = self._open_assignment(lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link,
+                                          spec)
             if isinstance(entry, ToolResult):
                 return entry
+            if spec.get("background"):
+                self._start_background(entry)
+                return {"started": entry}
         member = self.group.member(assignee)
         if batch is not None:
             entry["peers"] = sorted(name for name, _ in batch.calls if name != assignee)
@@ -1004,7 +1301,7 @@ class TeamTask:
                                                          first_result=result)
         return combined, merged, all_skipped, self._parallel_note(peers, checked=True)
 
-    def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link):
+    def _open_assignment(self, lead_id, assignee, task, deliverables, max_steps, checks, review, loop, link, spec=None):
         """Budget, repeat check, lead publish and the delegation event; returns the in-flight entry."""
         if max_steps is not None and (type(max_steps) is not int or not 1 <= max_steps <= min(150, self.settings.limits.max_steps)):
             return ToolResult.failure(f"max_steps must be between 1 and {min(150, self.settings.limits.max_steps)}")
@@ -1030,10 +1327,14 @@ class TeamTask:
             if own:
                 self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
                 self.lead_baseline = self.store.project.checkout(lead_workspace)
-        extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None)) if v}
+        spec = spec or {}
+        extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None),
+                                   ("handoff_kind", spec.get("kind")), ("background", spec.get("background")),
+                                   ("inputs", spec.get("inputs"))) if v}
         event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
                                   task=task, deliverables=deliverables, **extra, **(link or {}))
-        entry = {"assignee": assignee, "seq": event["seq"], **(link or {})}
+        entry = {"assignee": assignee, "seq": event["seq"], **(link or {}),
+                 **{k: v for k, v in spec.items() if k in ("kind", "inputs", "background", "run", "evidence")}}
         with self.lock:
             self.inflight[assignee] = entry
         return entry
@@ -1062,6 +1363,19 @@ class TeamTask:
             report_extra.update({k: entry[k] for k in ("step", "requested_step") if k in entry})
             if review:
                 report_extra["verdict"] = _verdict(report)
+        if entry:
+            if entry.get("kind"):  # "kind" is the chat event's own type
+                report_extra["handoff_kind"] = entry["kind"]
+            if entry.get("background"):
+                report_extra["background"] = True
+        with self.lock:
+            self.evidence.append(handoffs.evidence_row(
+                seq=entry["seq"] if entry else 0, member=assignee, name=member.name,
+                kind=(entry or {}).get("kind") or ("check" if review else ""), status=result.status, report=report,
+                changes=changes, checked=checked, browser=browser_handoff(browser_checks) if browser_checks else "",
+                verdict=_verdict(report) if review else ""))
+            del self.evidence[:-handoffs.EVIDENCE_KEPT]
+        self._notify_background(assignee, changes)
         self.store.append("report", task_id=self.task_id, agent=assignee, status=result.status, text=report,
                           changes=[c.as_dict() for c in changes], steps=result.steps, tool_calls=result.tool_calls,
                           **report_extra)
@@ -1133,7 +1447,8 @@ class TeamTask:
                                      "criteria, or `VERDICT: CHANGES REQUESTED` followed by numbered, concrete findings the "
                                      "author can act on.")
                     reviewed = self._assign(lead_id, reviewer, review_task, deliverables=[], review=True,
-                                            loop={"id": state["id"], "round": number, "role": "review"}, link=link)
+                                            loop={"id": state["id"], "round": number, "role": "review"}, link=link,
+                                            spec={"kind": "check"} if self.settings.team.handoff_kinds else None)
                     if isinstance(reviewed, ToolResult):
                         state["stop"] = reviewed.content
                         break
@@ -1151,7 +1466,9 @@ class TeamTask:
                             f"project, verify your fix, then report what you changed and how you verified it.\n\n"
                             f"{state['findings']}")
                 fixed = self._assign(lead_id, author, fix_task, deliverables=deliverables, checks=checks,
-                                     loop={"id": state["id"], "round": number, "role": "fix"}, link=link)
+                                     loop={"id": state["id"], "round": number, "role": "fix"}, link=link,
+                                     # the findings are in the brief already
+                                     spec={"kind": "fix", "evidence": False} if self.settings.team.handoff_kinds else None)
                 if isinstance(fixed, ToolResult):
                     state["stop"] = fixed.content
                     break
@@ -1248,8 +1565,24 @@ class TeamTask:
             entry["baseline"] = self.store.project.checkout(workspace)
         baseline = entry["baseline"]
         rejoining = member.id in self.control.frames
-        # Review work may use another model or thinking mode, so it keeps a session of its own.
-        key = (member.id, "review" if review else "work")
+        kind = entry.get("kind") if self.settings.team.handoff_kinds else None
+        # Reviews keep the lead's thinking (or the reviewer settings); in fast mode members' own work does not think.
+        prompt_settings = self.settings.reviewer() if review else self.settings.member()
+        if kind:
+            settings = kind_settings(self.settings, kind, keep_thinking=self.thinking_pinned,
+                                     keep_effort=self.effort_pinned)
+            provider = self._provider_for(settings, review)
+            if max_steps is None:
+                max_steps = min(KIND_PROFILES[kind].max_steps, settings.limits.max_steps)
+        else:
+            settings = prompt_settings
+            if review:
+                provider = self.reviewer_provider if self.reviewer_provider is not None else self.provider
+            else:
+                provider = self.member_provider if self.member_provider is not None else self.provider
+        # Review work may use another model or thinking mode, so it keeps a session of its own; adapt works
+        # without thinking and without a browser, and a conversation keeps one thinking mode and tool list.
+        key = (member.id, "review" if review else "adapt" if kind == "adapt" else "work")
         session = None
         if self.settings.team.resume_members or self.talk:
             with self.lock:
@@ -1261,20 +1594,32 @@ class TeamTask:
         assignment = task
         if deliverables:
             assignment += "\n\nFiles you are expected to create or update: " + ", ".join(deliverables)
-        if review:
+        limits = settings.limits if max_steps is None else replace(settings.limits, max_steps=max_steps)
+        if kind:
+            assignment += f"\n\n{handoffs.KIND_NOTES[kind]} Step budget for this hand-off: {limits.max_steps} steps."
+        elif review:
             assignment += ("\n\nThis assignment is a review or test: you own the verification of this work. Check "
                            "the real behaviour end to end and report concrete evidence.")
+        if not reconcile and not rejoining:
+            if entry.get("inputs") and self.settings.team.preload_inputs:
+                block = handoffs.preload(workspace, entry["inputs"])
+                if block:
+                    assignment += "\n\n" + block
+            if kind and self.settings.team.handoff_evidence and entry.get("evidence", True):
+                with self.lock:
+                    rows = [row for row in self.evidence if row["seq"] < trigger_seq]
+                block = handoffs.evidence_block(rows, kind=kind, member=member.id, continuing=continuing,
+                                                paths=list(entry.get("inputs") or []) + list(deliverables))
+                if block:
+                    assignment += "\n\n" + block
         assignment = f"Assignment from {lead.name} ({lead.id}):\n\n" + assignment
-        # Reviews keep the lead's thinking (or the reviewer settings); in fast mode members' own work does not think.
-        settings = self.settings.reviewer() if review else self.settings.member()
-        if review:
-            provider = self.reviewer_provider if self.reviewer_provider is not None else self.provider
-        else:
-            provider = self.member_provider if self.member_provider is not None else self.provider
-        limits = settings.limits if max_steps is None else replace(settings.limits, max_steps=max_steps)
-        agent = Agent(member.id, provider, self._registry(member.id, lead=False), Sandbox(workspace, member.id),
+        registry = self._registry(member.id, lead=False)
+        if kind and not KIND_PROFILES[kind].browser:
+            registry.remove("run_browser")
+        agent = Agent(member.id, provider, registry, Sandbox(workspace, member.id),
                       settings, limits=self._time_boxed(limits, reserve=45),
-                      system_prompt=member_prompt(member, lead, self.group.members, settings, self.interactive),
+                      # The system prompt stays the same for every kind, so a continued session keeps its cache.
+                      system_prompt=member_prompt(member, lead, self.group.members, prompt_settings, self.interactive),
                       on_event=self._event, should_cancel=self.should_cancel, inbox=self.channel,
                       stream=True, continuation=self.control)
         if not rejoining:
@@ -1322,6 +1667,10 @@ class TeamTask:
                 metrics.update(assignment_seq=entry["seq"], talk=dict(entry.get("talk", {})))
             if review:
                 metrics["review"] = True
+            if kind:
+                metrics["kind"] = kind
+            if entry.get("background"):
+                metrics["background"] = True
             if recovered:
                 metrics["recovered_after_error"] = recovered
             if reconcile:
@@ -1369,6 +1718,9 @@ class TeamTask:
             self.session_marks = {tuple(name.split("|", 1)): mark
                                   for name, mark in (saved.get("session_marks") or {}).items()}
             self.history, self.assignments = saved["history"], saved["assignments"]
+            self.bg_finished = list(saved.get("bg_finished") or [])
+            self.bg_untaken = saved.get("bg_untaken", 0)
+            self.evidence = list(saved.get("evidence") or [])
             self._update(status="running", active=[self.primary])
         else:
             self.record = {"id": self.task_id, "group_id": self.group.id, "text": self.text, "primary": self.primary,
@@ -1410,8 +1762,20 @@ class TeamTask:
         if self.continued_from:
             assignment = ("Continue the interrupted task from the saved handoff and current project. "
                           "Carry out the outstanding work. Original assignment:\n" + self.text)
-        result = agent.run(assignment, context=self._context(self.primary, self.trigger_seq), initial_calls=self.initial_calls,
-                           session=self.lead_session if settings.team.mailboxes and settings.team.lead_consult else None)
+        keep_session = (settings.team.mailboxes and settings.team.lead_consult) or settings.team.background_handoffs
+        try:
+            for entry in list(self.inflight.values()):
+                if entry.get("background"):  # resumed task: background hand-offs continue from their frames
+                    self._start_background(entry)
+            result = agent.run(assignment, context=self._context(self.primary, self.trigger_seq),
+                               initial_calls=self.initial_calls, session=self.lead_session if keep_session else None)
+            result = self._after_background(agent, result)
+        except PauseRequested:
+            self._join_background()  # each background member saves its frame before the checkpoint is written
+            raise
+        self._join_background(timeout=60)  # after a cancel, members stop at their next boundary
+        self.consults.close()
+        self.channel.finish()
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
                                                 task_id=self.task_id, note="final edits")
         if changes:
@@ -1435,6 +1799,9 @@ class TeamTask:
                    "parallel_checks": sum(1 for a in self.assignments if a.get("reconcile")),
                    "recovered_after_error": sum(a.get("recovered_after_error", 0) for a in self.assignments),
                    "review_assignments": sum(1 for a in self.assignments if a.get("review")),
+                   "background_handoffs": sum(1 for a in self.assignments if a.get("background")),
+                   "handoff_kinds": {k: n for k in HANDOFF_KINDS
+                                     if (n := sum(1 for a in self.assignments if a.get("kind") == k))},
                    "parallel_batches": self.parallel_batches, "parallel_reads": self.parallel_reads,
                    "time": {k: v for k, v in self.meter.snapshot().items() if k != "alerts"},
                    "steps": totals["steps"] + sum(a["steps"] for a in self.assignments),

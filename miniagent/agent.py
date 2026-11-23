@@ -228,6 +228,7 @@ class Agent:
         recoveries = 0
         empty_answers = 0
         warned = False
+        single_reads, nudges = 0, 0
         status: Status = "max_steps"
         error = ""
         answer = ""
@@ -450,6 +451,7 @@ class Agent:
                     if response.text.strip():
                         self.emit("say", text=response.text.strip())
                     pending = calls
+                    last_batch = [call.name for call in calls]
                     next_call = 0
                     batch_ok, handed_off = True, False
                 if next_call == 0 and len(pending) > 1 and not self.report_requested():
@@ -514,6 +516,16 @@ class Agent:
                     messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                     guard.record(call.name, call.arguments, ok, content)
                 pending = []
+                # Several single reads in a row cost a model call each; remind once or twice per run.
+                batch = locals().get("last_batch") or []
+                read_only = len(batch) == 1 and getattr(self.registry.get(batch[0]), "read_only", False)
+                single_reads = single_reads + 1 if read_only else 0
+                if single_reads >= 3 and nudges < 2 and self.settings.team.batch_nudge:
+                    nudges, single_reads = nudges + 1, 0
+                    messages.append({"role": "user", "content": (
+                        "[Studio] Several single reads in a row. Put independent reads, searches and fetches in one "
+                        "response, or use read_files for several files: they run together and save a model call each.")})
+                    self.emit("batch_nudge")
                 if handed_off and batch_ok and not self.should_cancel() and not take_inbox():
                     status = "dispatched"
                     break

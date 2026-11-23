@@ -43,6 +43,8 @@ class HumanChannel:
         self.interrupt_mail = {}
         self.interrupted = set()
         self.on_event = self.on_user_mail = None
+        self.before_take = None
+        """Called with the agent before it takes its mail (the team refreshes the lead's workspace there)."""
 
     def snapshot(self):
         with self._cond:
@@ -159,7 +161,15 @@ class HumanChannel:
             with self._cond:
                 self._notes.setdefault(agent, []).append(text)
 
+    def deliver(self, agent: str, text: str) -> None:
+        """Text for one agent's next step that is not a chat message, e.g. a background hand-off's report."""
+        with self._cond:
+            self._notes.setdefault(agent, []).append(text)
+            self._cond.notify_all()
+
     def take(self, agent: str) -> list[str]:
+        if self.before_take:
+            self.before_take(agent)
         with self._cond:
             cursor = self._cursors.get(agent, 0)
             new = self._messages[cursor:]

@@ -124,6 +124,9 @@ class ToolRegistry:
     def __init__(self, tools: list[Tool] | None = None) -> None:
         self._tools: dict[str, Tool] = {tool.name: tool for tool in tools or []}
 
+    def remove(self, name: str) -> None:
+        self._tools.pop(name, None)
+
     def add(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
@@ -269,8 +272,35 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 # Reads, searches and fetches run together when one response asks for several of them, as Codex
 # marks its read and web-search tools as supporting parallel calls. Fetched sources are saved under
 # content-hash names, so parallel fetches never write the same file differently.
-READ_ONLY_TOOLS = frozenset({"read_file", "read_lines", "list_dir", "find_files", "search_files",
+READ_ONLY_TOOLS = frozenset({"read_file", "read_files", "read_lines", "list_dir", "find_files", "search_files",
                              "read_source", "http_get", "search_sources"})
+READ_FILES_TOTAL = 80_000
+READ_FILES_EACH = 20_000
+
+
+def _read_files(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+    """Several files in one call, as aider keeps read-only files in the chat: fewer round trips per member."""
+    paths = [str(p) for p in args.get("paths") or []][:20]
+    if not paths:
+        return ToolResult.failure("Give 1–20 workspace-relative paths.")
+    each = min(int(args.get("limit") or READ_FILES_EACH), READ_FILES_EACH)
+    parts, used, cut = [], 0, []
+    for path in paths:
+        if used >= READ_FILES_TOTAL:
+            cut.append(path)
+            continue
+        try:
+            result = _read_file(ctx, {"path": path, "limit": max(1, min(each, READ_FILES_TOTAL - used))})
+            body = result.content if result.ok else "Error: " + result.content
+        except PauseRequested:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one unreadable file must not hide the others
+            body = f"Error: {exc}"
+        parts.append(f"=== {path} ===\n{body}")
+        used += len(body)
+    if cut:
+        parts.append("Not read (80000-character limit for one call): " + ", ".join(cut))
+    return ToolResult(ok=True, content="\n\n".join(parts))
 
 
 def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
@@ -299,6 +329,18 @@ def _build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                 "required": ["path"],
             },
             fn=_read_file,
+        )
+    )
+    registry.add(
+        Tool(
+            name="read_files",
+            description=("Read several UTF-8 workspace files in one call (up to 20 paths, 20000 characters each, "
+                         "80000 in total). Prefer this to several read_file calls."),
+            parameters={"type": "object", "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}, "description": "Workspace-relative paths"},
+                "limit": {"type": "integer", "description": "Characters per file, at most 20000"}},
+                "required": ["paths"]},
+            fn=_read_files,
         )
     )
     registry.add(

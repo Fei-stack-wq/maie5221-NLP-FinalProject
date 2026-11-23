@@ -24,6 +24,7 @@ function el(tag, attrs = {}, ...children) {
 }
 
 const ICONS = {
+  gauge: "M4.5 17a7.5 7.5 0 1 1 15 0M12 17l3.5-5M12 17h.01",
   plus: "M12 5v14M5 12h14", spark: "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z",
   grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z", chat: "M5 5h14v10H9l-4 4z",
   users: "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM2 21a7 7 0 0 1 14 0M17 3.5a4 4 0 0 1 0 7.5M22 21a7 7 0 0 0-4-6.3",
@@ -333,8 +334,11 @@ function renderEvent(event) {
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
         : (event.reconcile ? "核对并行结果" : event.review ? "评审" : "派工");
+      const kindLabel = {research: "调研", make: "制作", check: "检查", fix: "修改", adapt: "改写"}[event.handoff_kind];
       const node = card("delegation" + (event.loop || event.review ? " review" : ""), event.agent,
         [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, label),
+          kindLabel ? el("span", { class: "checks-count", title: "派工类型：决定思考、步数和工具" }, kindLabel) : null,
+          event.background ? el("span", { class: "checks-count", title: "后台运行，负责人继续工作" }, "后台") : null,
           event.checks && event.checks.length ? el("span", { class: "checks-count" }, `${event.checks.length} 项检查`) : null],
         markdown(event.task),
         event.deliverables && event.deliverables.length
@@ -345,6 +349,7 @@ function renderEvent(event) {
       const level = event.status === "completed" ? "" : (event.status === "error" || event.status === "cancelled" ? "failed" : "incomplete");
       const node = card(`report ${level}`, event.agent,
         [el("b", {}, memberName(event.agent)), statusChip(event.status), verdictChip(event),
+          event.background ? el("span", { class: "checks-count" }, "后台") : null,
           el("span", {}, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)],
         markdown(event.text), checkResults(event.checks),
         event.browser_checks?.findings.map(check => el("div",{},el("small",{},
@@ -967,13 +972,14 @@ function send(event) {
   if ((!text && !files.length) || !gid || state.feed?.id!==gid) return;
   const options={...state.runOptions};
   if ($("#thinking").value) options.thinking=$("#thinking").value;
+  if ($("#effort").value && !$("#effort").disabled) options.reasoning_effort=$("#effort").value;
   if (state.fast) options.mode="fast";
   const queue=$("#queue").checked;
   const urgent=!$("#mail-routing").hidden && $("#interrupt-mail").checked && !queue;
   $("#interrupt-mail").checked=false;
   input.value=""; autoGrow();
   $("#uploads").value=""; renderUploads();
-  $("#queue").checked=false; state.runOptions={};
+  $("#queue").checked=false; state.runOptions={}; $("#effort").value=""; syncEffort();
   $("#composer-error").hidden=true;
   refreshMailComposer();
   postChatMessage(text,{files,options,queue,urgent});
@@ -1165,12 +1171,20 @@ function setFast(on) {
   try { localStorage.setItem("studio.fast", on ? "1" : "0"); } catch (_) { /* private mode */ }
 }
 
+// Effort only matters while thinking is on; with thinking off the selector is disabled.
+function syncEffort() {
+  const off = $("#thinking").value === "disabled";
+  $("#effort").disabled = off;
+  if (off) $("#effort").value = "";
+}
+
 function setupComposer() {
   const input = $("#input"), timeline = $("#timeline"), bottom = $("#bottom");
   let remembered = false;
   try { remembered = localStorage.getItem("studio.fast") === "1"; } catch (_) { /* private mode */ }
   setFast(remembered);
   $("#fast-mode").addEventListener("click", () => setFast(!state.fast));
+  $("#thinking").addEventListener("change", syncEffort);
   input.addEventListener("input", autoGrow);
   input.addEventListener("input",()=>refreshMailComposer());
   $("#queue").addEventListener("change",()=>refreshMailComposer());

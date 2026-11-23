@@ -107,7 +107,7 @@ class ToolTest(unittest.TestCase):
     def test_registry_exposes_workspace_and_research_tools(self) -> None:
         self.assertEqual(
             self.registry.names(),
-            ["append_file", "delete_file", "edit_file", "find_files", "http_get", "list_dir", "poll_process", "read_file", "read_lines", "read_source", "run_browser", "run_python", "run_shell", "search_files", "search_sources", "write_file"],
+            ["append_file", "delete_file", "edit_file", "find_files", "http_get", "list_dir", "poll_process", "read_file", "read_files", "read_lines", "read_source", "run_browser", "run_python", "run_shell", "search_files", "search_sources", "write_file"],
         )
         for spec in self.registry.specs():
             self.assertEqual(spec.to_api()["type"], "function")

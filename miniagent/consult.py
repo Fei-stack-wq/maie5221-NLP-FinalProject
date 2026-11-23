@@ -38,6 +38,9 @@ class LeadConsult:
 
     def assignments(self):
         with self.task.lock:
+            suspended = getattr(self.task, "lead_suspended", None)
+            if suspended is not None and not suspended():
+                return {}  # the lead is working (hand-offs run in the background) and reads its mail itself
             return {agent: row["seq"] for agent, row in self.task.inflight.items()}
 
     def schedule(self, mail):

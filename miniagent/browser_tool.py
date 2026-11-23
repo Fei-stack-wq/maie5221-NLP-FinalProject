@@ -194,19 +194,23 @@ def run_browser(ctx, args: dict) -> ToolResult:
     if not cwd.is_dir():
         return ToolResult.failure("cwd must be a directory in the workspace.")
     virtual_time = args.get("virtual_time", False)
+    requested = args.get("timeout")
+    cap = getattr(ctx.limits, "browser_timeout_seconds", 0)
+    if cap:  # a check hand-off keeps each browser script short; long flows are split into several
+        requested = min(float(requested), cap) if isinstance(requested, (int, float)) else cap
     steps = ScriptSteps(code)
     with tempfile.NamedTemporaryFile(prefix="browser-steps-", dir=ctx.sandbox.command_tmpdir) as evidence:
         evidence.truncate(steps.progress_size)
         session = getattr(ctx.sandbox, "browser_session", None)
         if session is not None:
-            result = session.run(ctx, cwd, code, args.get("timeout"), virtual_time=virtual_time, evidence=evidence.name)
+            result = session.run(ctx, cwd, code, requested, virtual_time=virtual_time, evidence=evidence.name)
         else:
             with tempfile.TemporaryDirectory(prefix="miniagent-browser-", dir=ctx.sandbox.command_tmpdir) as home:
                 argv = ["python", "-I", "-B", "-u", str(RUNNER), _browser_cache(), home, str(cwd), code,
                         "--evidence", evidence.name]
                 if virtual_time:
                     argv.append("--virtual-time")
-                result = run_posix_argv(ctx, argv, cwd, args.get("timeout"), failure_evidence_limit=INLINE_FAILURE_LIMIT)
+                result = run_posix_argv(ctx, argv, cwd, requested, failure_evidence_limit=INLINE_FAILURE_LIMIT)
         if not result.ok:
             evidence.seek(0)
             progress = evidence.read(steps.progress_size).ljust(steps.progress_size, b"\0")

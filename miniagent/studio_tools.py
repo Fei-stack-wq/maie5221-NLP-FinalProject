@@ -57,7 +57,12 @@ TASK_OPTIONS = {"type":"object", "additionalProperties":False, "properties":{
     "mode":{"type":"string","enum":["standard","fast"],
             "description":("Leave this out: delegated work runs in standard mode. Use \"fast\" only when the requester "
                            "explicitly asked for fast mode (a quick, simpler result within about 10–15 minutes).")},
-    "thinking":{"type":"string","enum":["enabled","disabled"]},
+    "thinking":{"type":"string","enum":["enabled","disabled"],
+                "description":"Leave this out unless the requester asks to turn thinking on or off for this work."},
+    "reasoning_effort":{"type":"string","enum":["low","high","max"],
+                        "description":("Thinking effort for every role in this work. Leave this out unless the requester "
+                                       "asks for one (for example \"思考强度调到最高\" or \"low effort\"); otherwise Studio "
+                                       "sizes the effort per hand-off.")},
     "interaction_mode":{"type":"string","enum":["interactive","autonomous"]},
     **{k:{"type":"integer"} for k in ("lead_max_steps","member_max_steps","max_delegations")},
     "checks":{"type":"array","items":{"type":"object","properties":{

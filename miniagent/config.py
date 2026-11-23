@@ -103,6 +103,8 @@ class Limits:
     """Tool calls executed from a single model response; extra calls are refused."""
 
     tool_timeout_seconds: float = 600.0
+    browser_timeout_seconds: float = 0
+    """Upper bound for one run_browser script; 0 means the same as tool_timeout_seconds."""
     """Upper bound for one foreground command."""
 
     def __post_init__(self) -> None:
@@ -111,6 +113,8 @@ class Limits:
         _integer("max_total_tokens", self.max_total_tokens, 0, 1_000_000_000)
         _integer("max_tool_calls_per_step", self.max_tool_calls_per_step, 1, 32)
         _number("tool_timeout_seconds", self.tool_timeout_seconds, 0)
+        if type(self.browser_timeout_seconds) not in (int, float) or self.browser_timeout_seconds < 0:
+            raise ValueError("browser_timeout_seconds must be 0 (no extra cap) or more")
 
 
 @dataclass
@@ -160,6 +164,21 @@ class TeamLimits:
     task_seconds: int = 0
     """Hard wall-clock limit for the whole task; 0 means none. Agents wrap up with a report when it is reached."""
 
+    handoff_kinds: bool = True
+    """A hand-off tagged research/make/check/fix/adapt gets that kind's thinking, step budget and tools."""
+
+    background_handoffs: bool = True
+    """The lead may run a hand-off in the background and keep working (adapt hand-offs default to it)."""
+
+    handoff_evidence: bool = True
+    """check, fix and adapt hand-offs receive the task's earlier reports, check results and browser evidence."""
+
+    batch_nudge: bool = True
+    """After three single reads in a row, an agent is reminded to put independent reads in one response."""
+
+    preload_inputs: bool = True
+    """The files a hand-off declares as inputs are included in its assignment (bounded)."""
+
     def __post_init__(self) -> None:
         if type(self.team_talk) is not bool:
             raise ValueError("team_talk must be true or false")
@@ -170,7 +189,8 @@ class TeamLimits:
         _integer("max_delegations", self.max_delegations, 0, 200)
         _integer("max_repeat_assignments", self.max_repeat_assignments, 1, 20)
         _integer("task_seconds", self.task_seconds, 0, 24 * 3600)
-        for name in ("mailboxes", "interrupts", "lead_consult", "resume_members", "parallel_delegations", "review_loops", "plans", "plan_links", "retrospective", "fast"):
+        for name in ("mailboxes", "interrupts", "lead_consult", "resume_members", "parallel_delegations", "review_loops", "plans", "plan_links", "retrospective", "fast",
+                     "handoff_kinds", "background_handoffs", "handoff_evidence", "batch_nudge", "preload_inputs"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be true or false")
 
@@ -304,6 +324,11 @@ class Settings:
                 review_loops=flag("MA_REVIEW_LOOPS", TeamLimits.review_loops),
                 plans=flag("MA_PLANS", TeamLimits.plans),
                 plan_links=flag("MA_PLAN_LINKS", TeamLimits.plan_links),
+                handoff_kinds=flag("MA_HANDOFF_KINDS", TeamLimits.handoff_kinds),
+                background_handoffs=flag("MA_BACKGROUND_HANDOFFS", TeamLimits.background_handoffs),
+                handoff_evidence=flag("MA_HANDOFF_EVIDENCE", TeamLimits.handoff_evidence),
+                batch_nudge=flag("MA_BATCH_NUDGE", TeamLimits.batch_nudge),
+                preload_inputs=flag("MA_PRELOAD_INPUTS", TeamLimits.preload_inputs),
                 team_talk=flag("MA_TEAM_TALK", TeamLimits.team_talk),
                 retrospective=flag("MA_RETROSPECTIVE", TeamLimits.retrospective),
             ),
@@ -319,6 +344,7 @@ _ENV_KEYS = frozenset({
     "DEEPSEEK_MAX_RETRIES", "MA_TEMPERATURE", "MA_CONTEXT_WINDOW_TOKENS", "MA_COMPACT_AT_TOKENS",
     "MA_KEEP_RECENT_TOKENS", "MA_OUTPUT_RECOVERY_ATTEMPTS", "MA_INTERACTION_MODE", "MA_RUNS_DIR",
     "MA_MAX_STEPS", "MA_MAX_SECONDS", "MA_MAX_TOTAL_TOKENS", "MA_LEAD_MAX_STEPS", "MA_MAX_DELEGATIONS",
+    "MA_HANDOFF_KINDS", "MA_BACKGROUND_HANDOFFS", "MA_HANDOFF_EVIDENCE", "MA_BATCH_NUDGE", "MA_PRELOAD_INPUTS",
     "MA_RESUME_MEMBERS", "MA_PARALLEL_DELEGATIONS", "MA_REVIEW_LOOPS", "MA_PLANS", "MA_PLAN_LINKS", "MA_RETROSPECTIVE",
     "MA_MAILBOXES", "MA_INTERRUPTS", "MA_LEAD_CONSULT", "MA_TEAM_TALK", "MA_REVIEWER_MODEL", "MA_REVIEWER_THINKING", "MA_WARM_BROWSER",
 })
@@ -374,6 +400,71 @@ def load_settings(env_file: Path | None = None) -> Settings:
         raise FileNotFoundError(str(env_file))
     merged.update({key: value for key, value in os.environ.items() if key in _ENV_KEYS})
     return Settings.from_env(merged)
+
+
+HANDOFF_KINDS = ("research", "make", "check", "fix", "adapt")
+
+
+@dataclass(frozen=True)
+class KindProfile:
+    """How Studio runs a hand-off of one kind. The shape of the work decides the settings, not the domain."""
+
+    thinking: str
+    """"enabled" or "disabled"; a requester's or fast mode's "disabled" always wins."""
+    effort: str
+    """Highest reasoning effort when thinking ("low", "high", "max"); the requester's lower choice wins."""
+    max_steps: int
+    """Default step budget when the lead does not set max_steps."""
+    browser: bool = True
+    """Whether run_browser is offered."""
+    tool_timeout: float = 0
+    """Cap for one command (seconds); 0 keeps the task's setting."""
+    browser_timeout: float = 0
+    """Cap for one browser script (seconds); 0 keeps the tool timeout."""
+    background: bool = False
+    """Runs in the background by default, so the lead can continue."""
+
+
+# research finds things out, make produces a deliverable, check judges someone else's work, fix addresses
+# findings, adapt turns finished work into other material (release notes, social posts, client introductions).
+# Only check keeps the requester's effort: it is the independent judgement. Untagged hand-offs keep today's settings.
+KIND_PROFILES = {
+    "research": KindProfile("enabled", "low", 60),
+    "make": KindProfile("enabled", "low", 100),
+    "check": KindProfile("enabled", "max", 50, browser_timeout=60),
+    "fix": KindProfile("enabled", "low", 40),
+    "adapt": KindProfile("disabled", "low", 25, browser=False, tool_timeout=60, background=True),
+}
+
+
+EFFORTS = ("low", "high", "max")
+
+
+def kind_settings(settings: Settings, kind: str, *, keep_thinking: bool = False, keep_effort: bool = False) -> Settings:
+    """Settings for one hand-off of ``kind``, as Codex lets a spawned agent take its role's reasoning effort.
+
+    A kind only lowers cost against what the requester chose: it may switch thinking off and lower the
+    effort, never switch thinking on or raise the effort. ``check`` starts from the reviewer settings, the
+    others from the members' (so fast mode's workers stay without thinking). With ``keep_thinking`` (the
+    requester or the Studio assistant set ``thinking`` for this task) every kind keeps that thinking mode and
+    effort, and the kind sets only the step budget and tools. With ``keep_effort`` (the task set
+    ``reasoning_effort``) every kind that thinks uses that effort; ``adapt`` still works without thinking
+    unless the thinking mode was chosen too.
+    """
+    profile = KIND_PROFILES[kind]
+    base = settings.reviewer() if kind == "check" else settings.member()
+    if keep_thinking:
+        thinking, effort = base.thinking, base.reasoning_effort
+    else:
+        thinking = "disabled" if "disabled" in (base.thinking, profile.thinking) else "enabled"
+        effort = base.reasoning_effort if keep_effort else min(base.reasoning_effort, profile.effort, key=EFFORTS.index)
+    limits = base.limits
+    if profile.tool_timeout:
+        limits = replace(limits, tool_timeout_seconds=min(limits.tool_timeout_seconds, profile.tool_timeout))
+    if profile.browser_timeout:
+        cap = limits.browser_timeout_seconds
+        limits = replace(limits, browser_timeout_seconds=min(cap, profile.browser_timeout) if cap else profile.browser_timeout)
+    return replace(base, thinking=thinking, reasoning_effort=effort, limits=limits)
 
 
 FAST_TASK_SECONDS = 15 * 60

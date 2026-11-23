@@ -115,6 +115,14 @@ class TeamTalk:
                                           **{k: args[k] for k in ("summary", "step", "decision", "options") if k in args})
             entry["open_checkin"] = mail
             self._trace("checkin", sender, entry, mail_id=mail["id"], step=args.get("step"))
+        if entry.get("background") and not self.team.lead_suspended():
+            # The lead is not waiting on this hand-off; like Codex send_message, it reads the note at its next step.
+            entry.pop("open_checkin", None)
+            name = self.team.group.member(sender).name
+            self.team.channel.deliver(self.team.primary, f"[Check-in from {name} ({sender}), working in the "
+                                      f"background]\n{mail['text']}")
+            return ToolResult(ok=True, content="The lead is working and will read this check-in at its next step. "
+                                               "Continue with your best judgement and say in your report what you chose.")
         try:
             decision = self.team.consult_lead(mail, checkin=True)
         except PauseRequested:
