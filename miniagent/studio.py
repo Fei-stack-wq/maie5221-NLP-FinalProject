@@ -18,7 +18,7 @@ from collections import deque
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from .config import Settings
 from .providers import DeepSeekProvider, Provider
@@ -62,6 +62,7 @@ class Running:
     activity: deque = field(default_factory=lambda: deque(maxlen=3000))
     activity_seq: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+    meter: Any = None
 
 
 def mention(text: str, store: GroupStore) -> tuple[str | None, str]:
@@ -444,12 +445,17 @@ class Studio:
     def _task_settings(self, store, options):
         if not isinstance(options, dict) or options.keys() - {
                 "thinking","interaction_mode","member_max_steps","lead_max_steps","max_delegations","checks",
+                "budget_minutes","budget_tokens",
                 "reviewer_model","reviewer_thinking"}:
             raise StudioError("Invalid task options")
         mode = options.get("interaction_mode", store.group.mode)
         if mode not in ("interactive","autonomous"):
             raise StudioError("Unknown interaction mode")
         validate(options.get("checks", []))
+        for key, top in (("budget_minutes", 24 * 60), ("budget_tokens", 1_000_000_000)):
+            value = options.get(key, 0)
+            if type(value) not in (int, float) or not 0 <= value <= top:
+                raise StudioError(f"{key} must be a number from 0 to {top}")
         base = self.settings
         settings = replace(base, thinking=options.get("thinking", base.thinking),
                            reviewer_model=options.get("reviewer_model", base.reviewer_model),
@@ -505,6 +511,7 @@ class Studio:
             task.dispatched_by = record.get("dispatched_by")
             task.interactive = mode == "interactive"
             task.studio = self
+            running.meter = task.meter
             task.redispatched_from = record.get("redispatched_from")
             task.reviewer_provider = reviewer_provider
             task.options = record["options"]
@@ -815,7 +822,8 @@ class Studio:
             except (OSError, ValueError):
                 record = {}
             live = {"pausing":running.control.requested.is_set(), "task_id": running.task_id, "primary": running.primary, "active": record.get("active", []),
-                    "question": running.channel.pending(), "activity": activity[-400:], "activity_seq": cursor}
+                    "question": running.channel.pending(), "activity": activity[-400:], "activity_seq": cursor,
+                    "meter": running.meter.snapshot() if running.meter is not None else None}
         return {"group": self.summary(store), "events": store.chat(after), "live": live}
 
     def files(self, group_id: str) -> dict:

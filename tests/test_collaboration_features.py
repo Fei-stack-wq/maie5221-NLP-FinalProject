@@ -163,6 +163,29 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual(outstanding, [{"task_id": "t1", "assignee": "dev", "task": "Write api/server.py.",
                                         "deliverables": ["api/"], "follow_up_check_started": True}])
 
+    def test_a_concurrent_batch_gets_one_thread_per_call(self):
+        # Parallel hand-offs wait for each other before their follow-up, so a call queued behind the
+        # others in a small thread pool would never start. Eight calls must all be running at once.
+        from miniagent.agent import Agent
+        from miniagent.config import Limits
+        from miniagent.sandbox import Sandbox
+        from miniagent.schemas import ToolResult
+        from miniagent.tools import Tool, ToolRegistry
+
+        barrier = threading.Barrier(8, timeout=5)
+        def waiting(_ctx, args):
+            barrier.wait()
+            return ToolResult(ok=True, content="done " + args["name"])
+        registry = ToolRegistry([Tool("work", "", {"type": "object", "properties": {"name": {"type": "string"}}},
+                                      waiting, concurrent=lambda batch: True)])
+        calls = [call("work", name=str(i)) for i in range(8)]
+        provider = FakeProvider(Script(worker=[reply("", *calls), reply("all done")]))
+        agent = Agent("worker", provider, registry, Sandbox(self.tmp, "worker"), settings(self.tmp),
+                      limits=Limits(max_steps=12, max_tool_calls_per_step=8),
+                      system_prompt="You are Worker (id `worker`).")
+        self.assertEqual(agent.run("work").status, "completed")
+        self.assertEqual(tool_results(provider.requests[-1]["messages"]), [f"done {i}" for i in range(8)])
+
     def test_assignments_not_marked_independent_run_one_after_another(self):
         order = []
 

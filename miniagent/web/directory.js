@@ -265,6 +265,8 @@ function runOptions() {
   const keys=["member_max_steps","lead_max_steps","max_delegations"];
   const inputs=keys.map(k=>editInput(opts[k]??state.config[k],{type:"number",min:k==="max_delegations"?0:1,max:k==="max_delegations"?200:1000}));
   const checks=el("textarea",{rows:3,placeholder:"[]"},JSON.stringify(opts.checks||[]));
+  const budgetMinutes=editInput(opts.budget_minutes||"",{type:"number",min:0,max:1440,placeholder:"不限"});
+  const budgetTokens=editInput(opts.budget_tokens?opts.budget_tokens/1e6:"",{type:"number",min:0,step:0.5,placeholder:"不限"});
   const studioDefault=v=>v?`工作室设置（${v}）`:"工作室设置（与作者相同）";
   const reviewerModel=el("select",{"aria-label":"评审模型"},el("option",{value:""},studioDefault(state.config.reviewer_model)),
     ...["deepseek-flash","deepseek-v4-pro"].map(m=>el("option",{value:m},m)));
@@ -275,8 +277,12 @@ function runOptions() {
   sheet("下一项任务",field("工作方式",mode),...inputs.map((v,i)=>field(["成员步数","负责人步数","委派数"][i],v)),
     field("评审用的模型",reviewerModel),field("评审的思考模式",reviewerThinking),
     el("p",{class:"muted small"},"只对下一项任务生效。工作室的默认模型在侧栏「模型连接」里设置。"),
+    el("div",{class:"model-pair"},field("时间预算（分钟）",budgetMinutes),field("Token 预算（百万）",budgetTokens)),
+    el("p",{class:"muted small"},"软预算：用到 50%、80% 和 100% 时提醒负责人收敛范围、优先完成，不会中途强行停止。"),
     field("验收检查（JSON 数组）",checks),button("应用",()=>{
       state.runOptions={interaction_mode:mode.value,checks:JSON.parse(checks.value||"[]")};
+      if (Number(budgetMinutes.value)>0) state.runOptions.budget_minutes=Number(budgetMinutes.value);
+      if (Number(budgetTokens.value)>0) state.runOptions.budget_tokens=Math.round(Number(budgetTokens.value)*1e6);
       if (reviewerModel.value) state.runOptions.reviewer_model=reviewerModel.value;
       if (reviewerThinking.value) state.runOptions.reviewer_thinking=reviewerThinking.value;
       keys.forEach((k,i)=>state.runOptions[k]=Number(inputs[i].value));$("#sheet").close();

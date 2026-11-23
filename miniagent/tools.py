@@ -109,6 +109,8 @@ class Tool:
     available: Callable[[], bool] | None = None
     concurrent: Callable[[list[dict[str, Any]]], bool] | None = None
     """Given the arguments of several calls of this tool in one response, True if they may run at once."""
+    read_only: bool = False
+    """Changes nothing the agent can observe (reads, searches, fetches): safe to run alongside other reads."""
 
     read_only: bool = False
     """Safe to execute as a conversational lookup before a task exists."""
@@ -257,7 +259,23 @@ def _run_python(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
 # ---------------------------------------------------------------------------
 # 默认工具集
 # ---------------------------------------------------------------------------
+# Reads, searches and fetches run together when one response asks for several of them, as Codex
+# marks its read and web-search tools as supporting parallel calls. Fetched sources are saved under
+# content-hash names, so parallel fetches never write the same file differently.
+READ_ONLY_TOOLS = frozenset({"read_file", "read_lines", "list_dir", "find_files", "search_files",
+                             "read_source", "http_get", "search_sources"})
+
+
 def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
+    registry = _build_default_registry(read_only=read_only)
+    for name in READ_ONLY_TOOLS:
+        tool = registry.get(name)
+        if tool is not None:
+            tool.read_only = True
+    return registry
+
+
+def _build_default_registry(*, read_only: bool = False) -> ToolRegistry:
     registry = ToolRegistry()
 
     registry.add(
@@ -431,7 +449,10 @@ def build_default_registry(*, read_only: bool = False) -> ToolRegistry:
                          "predefined. Open a workspace file with page.goto((WORKSPACE / 'index.html').as_uri()) or a "
                          "local server you started with run_shell. Interact, assert and print what you observed; an "
                          "exception or failed assertion gives a non-zero exit code. Browser console errors are "
-                         "reported at the end. Each call starts a fresh browser."),
+                         "reported at the end. Each call gets a fresh browser context (no cookies or storage from "
+                         "earlier calls). Actions and expect() fail after 5 s and navigation after 15 s; pass "
+                         "timeout= only for a step you know is slower. Wait for what you need with expect(...) or "
+                         "wait_for_selector instead of fixed sleeps, and check several things in one script."),
             parameters={"type": "object", "properties": {
                 "code": {"type": "string", "description": "Python source using the Playwright sync API"},
                 "cwd": {"type": "string", "description": "Workspace-relative working directory (default: workspace root)"},

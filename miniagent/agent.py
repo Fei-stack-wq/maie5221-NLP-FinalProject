@@ -44,6 +44,7 @@ from typing import Any, Callable, Literal, Protocol
 import psutil
 
 from .checkpoint import Continuation, PauseRequested
+from .browser_tool import BrowserSession
 from .config import Limits, Settings
 from .context import ContextManager
 from .loop_guard import LoopGuard
@@ -282,6 +283,7 @@ class Agent:
         processes = ProcessScope()
         tmpdir = tempfile.mkdtemp(prefix="miniagent-run-")
         self.sandbox.command_sessions = CommandSessions()
+        self.sandbox.browser_session = BrowserSession() if self.settings.warm_browser else None
         if saved:
             self.sandbox.command_sessions.restore(saved["processes"])
         self.sandbox.track_shell_group = processes.track
@@ -315,21 +317,27 @@ class Agent:
             if specs:
                 options["tool_choice"] = "auto" if tools_enabled else "none"
             length_at_request = len(messages)
+            asked = time.monotonic()
             try:
                 response = self.provider.chat(messages, tools=specs or None,
                                               temperature=self.settings.temperature, **options)
-            except ProviderError:
+            except ProviderError as exc:
+                self.emit("model_call", seconds=round(time.monotonic() - asked, 3), model=self.settings.model,
+                          error=exc.code)
                 if tools_enabled and control and control.requested.is_set() and not self.should_cancel():
                     step -= 1
                     raise PauseRequested()
                 raise
+            self._metered(response, time.monotonic() - asked, "step" if tools_enabled else "final")
             if response.usage.source == "reported" and response.usage.prompt_tokens:
                 ctx_manager.note_usage(messages, response.usage.prompt_tokens, length_at_request)
             spend(response)
             return response
 
         def summarize(prompt: list[dict[str, Any]]):
+            asked = time.monotonic()
             response = self.provider.chat(prompt, temperature=0.0)
+            self._metered(response, time.monotonic() - asked, "compaction")
             spend(response)
             if response.finish_reason == "length":
                 raise ValueError("summary was truncated")
@@ -515,6 +523,9 @@ class Agent:
                 sessions.close()
             processes.close()
             self.sandbox.close_command_venv()
+            browser, self.sandbox.browser_session = getattr(self.sandbox, "browser_session", None), None
+            if browser is not None:
+                browser.close()
             self.sandbox.command_tmpdir = None
             shutil.rmtree(tmpdir, ignore_errors=True)
         result = AgentResult(agent=self.name, status=status, answer=answer, error=error, steps=step,
@@ -536,18 +547,28 @@ class Agent:
         """
         if len(calls) < 2 or len(calls) > self.limits.max_tool_calls_per_step or self.should_cancel():
             return None
-        if len({call.name for call in calls}) != 1 or any(call.parse_error for call in calls):
+        if any(call.parse_error for call in calls):
             return None
-        tool = self.registry.get(calls[0].name)
-        if tool is None or tool.concurrent is None:
+        tools = [self.registry.get(call.name) for call in calls]
+        if any(tool is None for tool in tools):
             return None
-        try:
-            if not tool.concurrent([call.arguments for call in calls]):
+        if all(tool.read_only for tool in tools):
+            label = "reads"
+        else:
+            tool = tools[0]
+            if len({call.name for call in calls}) != 1 or tool.concurrent is None:
                 return None
-        except Exception:  # noqa: BLE001 - a failing predicate just means "one after another"
-            return None
-        self.emit("parallel", tool=tool.name, count=len(calls))
-        with ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix=f"{self.name}-tools") as pool:
+            try:
+                if not tool.concurrent([call.arguments for call in calls]):
+                    return None
+            except Exception:  # noqa: BLE001 - a failing predicate just means "one after another"
+                return None
+            label = tool.name
+        self.emit("parallel", tool=label, count=len(calls))
+        # Reads share a small pool. A tool's own concurrent batch gets one thread per call: parallel
+        # hand-offs wait for each other before their follow-up check, so none may queue behind another.
+        workers = min(len(calls), 6) if label == "reads" else len(calls)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"{self.name}-tools") as pool:
             futures = [pool.submit(self._execute, call, ctx, rejoining=rejoining) for call in calls]
         done: dict[int, ToolResult] = {}
         paused = False
@@ -560,21 +581,31 @@ class Agent:
             raise BatchPaused(done)
         return [done[index] for index in range(len(calls))]
 
+    def _metered(self, response: LLMResponse, seconds: float, purpose: str) -> None:
+        """One model operation for the task meter (duration and token usage, per OpenTelemetry GenAI)."""
+        usage = response.usage
+        self.emit("model_call", seconds=round(seconds, 3), model=self.settings.model, purpose=purpose,
+                  prompt_tokens=usage.prompt_tokens, cached_tokens=usage.prompt_cache_hit_tokens or 0,
+                  output_tokens=usage.completion_tokens, reasoning_tokens=usage.reasoning_tokens or 0,
+                  finish=response.finish_reason)
+
     def _execute(self, call: ToolCall, ctx: ToolContext, *, rejoining=False) -> ToolResult:
         preview = {k: (v if not isinstance(v, str) or len(v) <= 300 else v[:300] + "…") for k, v in call.arguments.items()}
         if not rejoining:
             self.emit("tool_call", tool=call.name, call_id=call.id, arguments=preview)
+        began = time.monotonic()
         if call.parse_error:
             result = ToolResult.failure(f"Tool call rejected: {call.parse_error}. The arguments were not valid JSON — "
                                         "possibly cut off because the call was too large. Split the work into smaller calls.")
         else:
             result = self.registry.dispatch(call.name, call.arguments, ctx)
+        seconds = round(time.monotonic() - began, 3)
         content, ok = result.content, result.ok
         if len(content) > MAX_TOOL_RESULT_CHARS:
             content = content[:MAX_TOOL_RESULT_CHARS] + f"\n…[truncated: {len(content) - MAX_TOOL_RESULT_CHARS} more characters]"
         if not ok and not content.startswith(("Tool call rejected", "Error")):
             content = "Error: " + content
-        self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600])
+        self.emit("tool_result", tool=call.name, call_id=call.id, ok=ok, preview=content[:600], seconds=seconds)
         return result.model_copy(update={"content":content})
 
     def _wrap_up(self, messages: list[dict[str, Any]], reason: str, call_model) -> str:

@@ -655,6 +655,10 @@ function renderLive(live) {
     ...active.slice(-2).map(id => avatar(id, memberName(id), "sm")),
     el("span", { class: "text" }, live.question ? `${memberName(live.question.agent)} 在等你回答` :
       `${active.map(memberName).join(" › ")} 正在工作${step}${doing}`), bar);
+  const meter = $("#live-meter");
+  const line = meterLine(live.meter);
+  meter.hidden = !line;
+  if (line) meter.replaceChildren(...line);
   const banner = $("#question-banner");
   if (live.question) {
     banner.hidden = false;
@@ -666,6 +670,56 @@ function renderLive(live) {
     banner.hidden = true;
     $("#input").placeholder = "询问进展、补充要求，或勾选「排队为新任务」交办下一项工作……";
   }
+}
+
+// ---- Time, steps and tokens --------------------------------------------------
+function clock(seconds) {
+  seconds = Math.max(0, Math.round(seconds || 0));
+  const h = Math.floor(seconds / 3600), m = Math.floor(seconds % 3600 / 60), s = seconds % 60;
+  return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(s).padStart(2, "0");
+}
+function tokens(n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(n || 0); }
+function cachePct(t) { return t.prompt ? Math.round(100 * t.cached / t.prompt) : 0; }
+const ALERT_TEXT = {
+  slow_tool: (a) => `${memberName(a.agent)}的 ${a.tool} 已运行 ${a.seconds} 秒`,
+  quiet: (a) => `${Math.round(a.seconds / 60)} 分钟没有新进展`,
+  step_budget: (a) => `${memberName(a.agent)} 已用 ${a.steps}/${a.max_steps} 步`,
+};
+function meterLine(m) {
+  if (!m) return null;
+  const parts = [`⏱ ${clock(m.elapsed_s)}`, `模型 ${clock(m.model_s)}`, `工具 ${clock(m.tool_s)}`, `${m.steps} 步`,
+    `${tokens(m.tokens.prompt + m.tokens.output)} tokens（缓存 ${cachePct(m.tokens)}%）`, `约 $${m.cost_usd.toFixed(2)}`];
+  const budgets = Object.entries(m.budget || {}).map(([name, b]) => {
+    const share = b.limit ? b.used / b.limit : 0;
+    return el("span", { class: "budget" + (share >= 1 ? " over" : share >= 0.8 ? " near" : "") },
+      name === "minutes" ? `时间 ${Math.round(b.used)}/${b.limit} 分钟` : `Token ${tokens(b.used)}/${tokens(b.limit)}`);
+  });
+  const alerts = (m.alerts || []).map((a) => el("span", { class: "alert" }, (ALERT_TEXT[a.kind] || (() => a.kind))(a)));
+  const title = (m.agents || []).map((a) => `${memberName(a.agent)}：${a.steps} 步 · 模型 ${clock(a.model_s)} · 工具 ${clock(a.tool_s)}`).join("\n");
+  return [el("span", { class: "meter-figures", title }, parts.join(" · ")), ...budgets, ...alerts];
+}
+function timeReport(m, live) {
+  if (!m) return el("p", { class: "muted" }, "这个任务没有耗时记录（早于计时功能的任务）。");
+  const other = Math.max(0, m.elapsed_s - m.model_s - m.tool_s);
+  const total = Math.max(1, m.model_s + m.tool_s + other);
+  const bar = el("div", { class: "time-bar", role: "img",
+    "aria-label": `模型 ${clock(m.model_s)}，工具 ${clock(m.tool_s)}，其他 ${clock(other)}` },
+    ...[["model", m.model_s], ["tool", m.tool_s], ["other", other]].map(([k, v]) => {
+      const seg = el("i", { class: k }); seg.style.width = (100 * v / total).toFixed(1) + "%"; return seg; }));
+  const head = el("p", { class: "time-head" },
+    `${live ? "已用" : "总耗时"} ${clock(m.elapsed_s)} · 模型 ${clock(m.model_s)}（${m.model_calls} 次调用）· 工具 ${clock(m.tool_s)} · `
+    + `${m.steps} 步 · ${tokens(m.tokens.prompt)} 输入（缓存 ${cachePct(m.tokens)}%）+ ${tokens(m.tokens.output)} 输出 · 约 $${m.cost_usd.toFixed(2)}`);
+  const legend = el("p", { class: "time-legend" }, el("span", { class: "model" }, "等模型"), el("span", { class: "tool" }, "运行工具"),
+    el("span", { class: "other" }, "其他（并行重叠、交接、等待）"));
+  const rows = (m.agents || []).map((a) => el("tr", {}, el("td", {}, memberName(a.agent)), el("td", {}, String(a.steps)),
+    el("td", {}, clock(a.model_s)), el("td", {}, clock(a.tool_s)), el("td", {}, String(a.tool_calls)),
+    el("td", {}, `${tokens(a.prompt + a.output)}（${a.prompt ? Math.round(100 * a.cached / a.prompt) : 0}%）`)));
+  const table = el("table", { class: "time-table" }, el("thead", {}, el("tr", {},
+    ...["成员", "步数", "模型", "工具", "工具调用", "Tokens（缓存）"].map((h) => el("th", {}, h)))), el("tbody", {}, ...rows));
+  const slow = (m.slowest_tools || []).length ? el("div", {}, el("h4", {}, "最慢的工具调用"),
+    el("ol", { class: "slow-tools" }, ...m.slowest_tools.map((t) => el("li", {}, `${t.tool} · ${memberName(t.agent)} · ${t.seconds} 秒`)))) : null;
+  return el("div", { class: "time-report" }, head, bar, legend, table, slow,
+    el("p", { class: "muted small" }, "费用按 DeepSeek 官网价格估算（含缓存命中与高峰/低谷时段），以账户账单为准。"));
 }
 
 function renderActivity(items) {
