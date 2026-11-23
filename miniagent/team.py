@@ -66,6 +66,8 @@ RECONCILE_STEPS = 30
 """Step budget for a teammate's check of its parallel teammates' results."""
 BATCH_WAIT_SECONDS = 6 * 3600
 """Upper bound on waiting for the rest of a parallel batch (every exit path also releases the wait)."""
+PLAN_NUDGE_STEP = 6
+"""Step at which a coordinating lead with no plan and no delegations is reminded once to plan and delegate."""
 
 
 class ParallelBatch:
@@ -559,6 +561,8 @@ class TeamTask:
         """Background reports delivered to the lead's inbox that it has not read yet."""
         self.waiting_handoffs = False
         self.lead_live = False
+        self.can_delegate = False
+        self.plan_nudged = False
         self.lead_stale = False
         """Background hand-offs published files after the lead's workspace was last refreshed."""
         self.evidence: list[dict] = []
@@ -606,6 +610,19 @@ class TeamTask:
         if (self.talk and event["type"] == "step" and event.get("max_steps")
                 and event["step"] >= 0.6 * event["max_steps"]):
             self.talk.silence(event["agent"])
+        if (event["type"] == "step" and event.get("agent") == self.primary
+                and self.can_delegate and self.settings.team.plans
+                and not self.plan_nudged and not self.plan and self.delegations == 0
+                and event.get("step", 0) >= PLAN_NUDGE_STEP):
+            self.plan_nudged = True
+            self.channel.note(
+                self.primary,
+                "[Studio] You have run several steps without setting a plan or delegating to your team. "
+                "Call update_plan now with clear step IDs and dependencies (`after`), then delegate "
+                "deep research or execution to teammates with delegate_task instead of doing everything yourself.",
+            )
+            self.store.trace(self.task_id, {"task_id": self.task_id, "type": "plan_nudge",
+                                            "agent": self.primary, "step": event.get("step")})
         if event["type"] == "say":
             self.store.append("progress", task_id=self.task_id, agent=event["agent"], text=event["text"])
         if event["type"] == "tool_result" and event.get("tool") == "run_browser":
@@ -1906,6 +1923,7 @@ class TeamTask:
         self.meter.budget_tokens = int(self.options.get("budget_tokens") or 0)
         me = self.group.member(self.primary)
         can_delegate = self.primary == self.group.lead and len(self.group.members) > 1
+        self.can_delegate = can_delegate
         workspace = self.store.workspace(self.primary)
         saved = self.control.saved
         if saved:

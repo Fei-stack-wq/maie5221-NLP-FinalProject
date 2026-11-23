@@ -270,6 +270,34 @@ class TeamTest(unittest.TestCase):
         finished(studio, gid)
         self.assertIn("Requester prefers SQLite.", provider.for_agent("lead")[-1]["messages"][1]["content"])
 
+    def test_lead_plan_nudge_fires_once_after_solo_steps_without_plan(self):
+        steps = [reply("", call("write_file", path=f"n{i}.txt", content=f"note {i}")) for i in range(7)] + [reply("done")]
+        script = Script(lead=steps)
+        studio, gid, provider = self.studio(script)
+        studio.post(gid, "investigate and report", queue=True)
+        task = finished(studio, gid)
+        self.assertEqual(task["status"], "completed")
+        final_messages = provider.for_agent("lead")[-1]["messages"]
+        nudges = [m["content"] for m in final_messages
+                  if m["role"] == "user" and "without setting a plan or delegating" in m["content"]]
+        self.assertEqual(len(nudges), 1)
+
+    def test_lead_plan_nudge_skipped_when_plan_already_set(self):
+        steps = [
+            reply("", call("update_plan", steps=[{"id": "s1", "step": "Check workspace", "status": "in_progress"}])),
+            *[reply("", call("write_file", path=f"n{i}.txt", content=f"note {i}")) for i in range(7)],
+            reply("done"),
+        ]
+        script = Script(lead=steps)
+        studio, gid, provider = self.studio(script)
+        studio.post(gid, "investigate with plan", queue=True)
+        task = finished(studio, gid)
+        self.assertEqual(task["status"], "completed")
+        final_messages = provider.for_agent("lead")[-1]["messages"]
+        nudges = [m["content"] for m in final_messages
+                  if m["role"] == "user" and "without setting a plan or delegating" in m["content"]]
+        self.assertEqual(nudges, [])
+
 
 if __name__ == "__main__":
     unittest.main()
