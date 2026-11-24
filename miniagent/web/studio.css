@@ -146,6 +146,9 @@
 #room-members small { color: var(--muted); font: 11px var(--mono); }
 #room-members li.working .avatar { box-shadow: 0 0 0 2px var(--paper), 0 0 0 3.5px var(--cobalt); }
 #room-members li.working small::after { content: " · 工作中"; color: var(--cobalt); font-family: var(--sans); font-weight: 600; }
+#room-members li.working.has-kind small::after { content: none; }
+#room-members .member-work-state { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 3px; font: 600 11px var(--sans); color: var(--cobalt); }
+#room-members .member-kind-badge { font-size: 10.5px; line-height: 1.5; padding: 0 6px; }
 body:has(#files:not([hidden])) #member-panel { display: none; }
 @media (max-width: 1100px) { #member-panel { display: none; } }
 

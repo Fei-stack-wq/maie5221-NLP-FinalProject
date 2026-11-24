@@ -125,7 +125,7 @@ def _linked_work(record, events):
                         yield step["id"], {**e, "changes": files, "work_complete": len(files) == len(outputs)}
             elif kind == "final" and e.get("status") == "completed":
                 ids += [s["id"] for s in steps if s.get("on_delivery") and s.get("owner") == record["primary"]]
-        if not ids and kind == "delegation":
+        if not ids and kind in ("delegation", "report"):
             yield None, e
         for key in dict.fromkeys(ids):
             yield key, e
@@ -139,6 +139,8 @@ def plan_view(record, events):
     rows = [{**row, "evidence": {}, "history": []} for row in plan["steps"]]
     by_id = {row["id"]: row for row in rows}
     unlinked = []
+    unlinked_by_seq = {}
+    unlinked_open = defaultdict(list)
     outstanding = defaultdict(set)
     deliveries = defaultdict(dict)
     declarations = {}
@@ -159,13 +161,33 @@ def plan_view(record, events):
             continue
         row = by_id.get(key)
         if row is None:
-            if kind == "delegation":
-                unlinked.append({k: event[k] for k in ("seq", "assignee", "task", "step", "requested_step") if k in event})
+            if kind == "delegation" and event["seq"] not in unlinked_by_seq:
+                item = {k: event[k] for k in ("seq", "assignee", "task", "step", "requested_step", "handoff_kind") if k in event}
+                unlinked.append(item)
+                unlinked_by_seq[event["seq"]] = item
+                unlinked_open[event["assignee"]].append(item)
+            elif kind == "report":
+                assignment = event.get("assignment_seq")
+                if assignment is not None:
+                    item = unlinked_by_seq.get(assignment)
+                elif unlinked_open.get(event.get("agent")):
+                    item = unlinked_open[event["agent"]].pop(0)
+                else:
+                    item = None
+                if item is not None and "status" not in item:
+                    item["status"] = event.get("status", "completed")
+                    queue = unlinked_open.get(item["assignee"])
+                    if queue and item in queue:
+                        queue.remove(item)
             continue
         evidence = row["evidence"]
         entry = {"seq": event["seq"], "time": event["time"], "kind": kind}
         if kind == "delegation":
             entry.update(agent=event["assignee"], task=event["task"])
+            if event.get("handoff_kind"):
+                entry["handoff_kind"] = event["handoff_kind"]
+            if event.get("inferred_step"):
+                entry["inferred_step"] = True
             if event.get("review"):
                 entry["review"] = True
             evidence["assigned"] = entry
@@ -182,6 +204,8 @@ def plan_view(record, events):
             outstanding[key].discard(assignment)
             entry.update(agent=event["agent"], status=event["status"], files=event.get("changes", []),
                          assignment_seq=assignment)
+            if event.get("handoff_kind"):
+                entry["handoff_kind"] = event["handoff_kind"]
             if event.get("checks"):
                 entry["checks"] = {k: event["checks"][k] for k in ("passed", "total")}
             checks = entry.get("checks", {})
@@ -219,6 +243,17 @@ def plan_view(record, events):
         row["history"].append(entry)
 
     live = record.get("status") in ("running", "queued", "paused")
+    for item in unlinked:
+        status = item.get("status")
+        if status == "completed":
+            item["stage"] = "completed"
+        elif status:
+            item["stage"] = "incomplete"
+        elif live:
+            item["stage"] = "in_progress"
+        else:
+            item["stage"] = "unrecorded"
+        item["active"] = item["stage"] == "in_progress"
     counts = dict(total=len(rows), completed=0, submitted=0, in_progress=0, confirmed=0)
     for row in rows:
         key, evidence = row["id"], row["evidence"]

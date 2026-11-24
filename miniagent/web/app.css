@@ -217,6 +217,22 @@ input[type=checkbox] { accent-color: var(--cobalt); width: 15px; height: 15px; }
 .msg.delegation.review { border-left-color: #5a4b8a; }
 .checks-count { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 0 7px; }
 
+/* Handoff kind badges: quiet porcelain glaze tints within the cobalt/indigo/celadon ink family. */
+.kind-badge {
+  display: inline-flex; align-items: baseline; gap: 4px; vertical-align: middle; white-space: nowrap;
+  font: 600 11px/1.6 var(--sans); letter-spacing: .02em;
+  border: 1px solid var(--line); border-radius: 99px; padding: 0 8px;
+  color: var(--ink-2); background: var(--paper-2);
+}
+.kind-badge .kind-code, .kind-badge .kind-mult { font: 500 10px/1 var(--mono); opacity: .8; letter-spacing: 0; }
+.kind-badge[data-kind=research] { color: #265f6e; background: #e8f2f4; border-color: #c2dce2; }
+.kind-badge[data-kind=make] { color: var(--cobalt); background: var(--cobalt-mist); border-color: #c7cfea; }
+.kind-badge[data-kind=check] { color: #4f407d; background: #f1eef8; border-color: #d6cee9; }
+.kind-badge[data-kind=fix] { color: #2f6158; background: var(--celadon-wash); border-color: #c4dbd4; }
+.kind-badge[data-kind=adapt] { color: var(--ink-2); background: var(--paper-2); border-color: var(--line-strong); }
+.kind-summary { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+#live-status .live-kind-badge { line-height: 1.45; padding: 0 7px; vertical-align: 1px; }
+
 /* Checks Studio ran on the published files: a quiet ledger, open only when something failed. */
 .check-results { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; font-size: 12.5px; }
 .check-results > summary { font: 12px var(--mono); color: var(--gold-deep); }
@@ -506,4 +522,13 @@ dialog label { display: flex; flex-direction: column; gap: 6px; font-size: 12.5p
 .linked-plan .rework .plan-stage { color: var(--gold-deep); }
 .linked-plan .unconfirmed .plan-stage, .plan-history-item { color: var(--muted); }
 .plan-history-item, .linked-plan details { font-size: 12px; }
-.plan-history-item a, .plan-history-item span { display: inline-block; margin-left: 6px; }
+.plan-history-item a, .plan-history-item > span { display: inline-block; margin-left: 6px; }
+.plan-history-item > .kind-badge { display: inline-flex; }
+.linked-plan .unlinked { margin-top: 8px; }
+.linked-plan .unlinked > summary { color: var(--muted); font-weight: 600; }
+.linked-plan .unlinked.has-active > summary { color: var(--cobalt); }
+.unlinked-item { margin: 5px 0; color: var(--ink-2); }
+.unlinked-stage { margin-left: 6px; font: 600 11px var(--sans); color: var(--muted); }
+.unlinked-item.in_progress .unlinked-stage { color: var(--cobalt); }
+.unlinked-item.completed .unlinked-stage { color: var(--celadon); }
+.unlinked-item.incomplete .unlinked-stage { color: var(--gold-deep); }

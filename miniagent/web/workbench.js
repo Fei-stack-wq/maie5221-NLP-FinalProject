@@ -75,7 +75,10 @@ function planCard(plan, scope) {
     const verb = {delegation:"接手", report:"提交报告", publish:"发布产物", plan_work:"完成工作", plan_decision:entry.status === "rework" ? "要求修改" : "确认此步", final:"提交最终交付"}[entry.kind];
     const verdict = {approved:"通过", "changes requested":"要求修改", unclear:"未给明确结论"};
     const detail = el("div",{class:"plan-history-item"},
-      `#${entry.seq} @${entry.agent} ${verb}`, entry.time ? " · " + fmtTime(entry.time) : "",
+      `#${entry.seq} @${entry.agent} ${verb}`,
+      entry.handoff_kind ? [" ", kindBadge(entry.handoff_kind, { withCode: true })] : null,
+      entry.inferred_step ? " · 自动续挂" : "",
+      entry.time ? " · " + fmtTime(entry.time) : "",
       entry.status ? " · " + (STATUS_LABEL[entry.status] || entry.status) : "",
       entry.verdict ? " · 评审" + (verdict[entry.verdict] || entry.verdict) : "",
       entry.checks ? ` · 检查 ${entry.checks.passed}/${entry.checks.total}` : "");
@@ -110,12 +113,28 @@ function planCard(plan, scope) {
       ...step.history.slice(0,-1).map(historyItem)));
     list.append(el("li",{class:step.stage,"data-plan-step":step.id},content));
   }
+  const unlinked = plan.unlinked || [];
+  const activeUnlinked = unlinked.filter(e => e.active || e.stage === "in_progress").length;
+  const unlinkedSummary = activeUnlinked
+    ? `其他派工（${unlinked.length} · ${activeUnlinked} 进行中）`
+    : `其他派工（${unlinked.length}）`;
+  const countText = `已完成 ${completed} / ${total} · 已确认 ${confirmed} / ${total} · 进行中 ${in_progress}`
+    + (activeUnlinked ? ` · 计划外进行中 ${activeUnlinked}` : "");
   return el("section",{class:"linked-plan","aria-label":"任务计划"},
-    el("div",{class:"plan-heading"},el("strong",{},"任务计划"), el("span",{class:"plan-count"},
-      `已完成 ${completed} / ${total} · 已确认 ${confirmed} / ${total} · 进行中 ${in_progress}`)), list,
+    el("div",{class:"plan-heading"},el("strong",{},"任务计划"), el("span",{class:"plan-count"}, countText)), list,
     plan.explanation ? el("p",{class:"plan-note"},plan.explanation) : null,
-    plan.unlinked.length ? el("details",{class:"unlinked"},el("summary",{},`其他派工（${plan.unlinked.length}）`),
-      ...plan.unlinked.map(e=>el("p",{},`@${e.assignee} · ${e.task}`))) : null);
+    unlinked.length ? el("details",{class:"unlinked" + (activeUnlinked ? " has-active" : ""), open: activeUnlinked > 0},
+      el("summary",{}, unlinkedSummary),
+      ...unlinked.map(e=>{
+        const stageText = e.stage === "in_progress" ? "进行中"
+          : e.status ? (STATUS_LABEL[e.status] || e.status)
+          : (stages[e.stage] || null);
+        return el("p",{class:"unlinked-item" + (e.stage ? " " + e.stage : ""), "data-assignment": e.seq},
+          `@${e.assignee}`,
+          e.handoff_kind ? [" ", kindBadge(e.handoff_kind, { withCode: true })] : null,
+          stageText ? [" ", el("small",{class:"unlinked-stage"}, stageText)] : null,
+          ` · ${e.task}`);
+      })) : null);
 }
 
 function thinkingBadge(mode) {
@@ -125,24 +144,34 @@ function thinkingBadge(mode) {
 }
 
 function taskTree(task, events, scope) {
+  const rootKinds=kindSummaryChips(taskKindCounts(task,events),"tree-root-kinds");
   const root=el("div",{class:"tree-root"},el("strong",{},"@"+(task.primary||"—")),statusChip(task.status),
-    thinkingBadge(task.active_modes?.[task.primary]),el("p",{},task.text));
+    thinkingBadge(task.active_modes?.[task.primary]),rootKinds,el("p",{},task.text));
   const list=el("ol",{class:"branches"}), pending=new Map();
   const active=["running","queued","paused"].includes(task.status);
   for (const e of events) {
     if (e.kind==="delegation") {
+      const kind=e.handoff_kind || null;
+      const kindSlot=el("span",{class:"tree-kind-slot"},
+        kind ? kindBadge(kind,{withCode:true,extraClass:"tree-kind"}) : null,
+        e.background ? el("span",{class:"tree-bg-badge",title:"后台并行运行"},"后台") : null);
       const badge=el("small",{class:"tree-status"},active?"等待回报":"无回报记录");
       const modeSlot=el("span",{class:"tree-mode-slot"},thinkingBadge(active ? task.active_modes?.[e.assignee] : null));
-      const panel=el("details",{class:"branch","data-assignment":e.seq},el("summary",{},
-        el("span",{class:"tree-actor"},"@"+e.agent+" → @"+e.assignee),badge,modeSlot,el("span",{class:"tree-brief"},e.task)));
+      const panel=el("details",{class:"branch","data-assignment":e.seq,"data-handoff-kind":kind || undefined},el("summary",{},
+        el("span",{class:"tree-actor"},"@"+e.agent+" → @"+e.assignee),kindSlot,badge,modeSlot,el("span",{class:"tree-brief"},e.task)));
       if (e.deliverables?.length) panel.append(el("p",{},el("strong",{},"委托交付　"),e.deliverables.join("、")));
       list.append(el("li",{},panel));
-      const queue=pending.get(e.assignee)||[]; queue.push({panel,badge,modeSlot}); pending.set(e.assignee,queue);
+      const queue=pending.get(e.assignee)||[]; queue.push({panel,badge,modeSlot,kindSlot,kind}); pending.set(e.assignee,queue);
     } else if (e.kind==="report") {
       const branch=pending.get(e.agent)?.shift();
       if (!branch) continue;
       branch.badge.replaceWith(statusChip(e.status));
       if (e.thinking) branch.modeSlot.replaceChildren(thinkingBadge(e));
+      if (!branch.kind && e.handoff_kind) {
+        branch.kind=e.handoff_kind;
+        branch.panel.setAttribute("data-handoff-kind",e.handoff_kind);
+        branch.kindSlot.prepend(kindBadge(e.handoff_kind,{withCode:true,extraClass:"tree-kind"}));
+      }
       branch.panel.append(el("p",{class:"muted"},"成员回报 · "+fmtTime(e.time)),
         documentBody(e.text,scope));
       const counts=e.talk || task.assignments?.filter(a=>a.assignment_seq===e.assignment_seq && a.talk).at(-1)?.talk;
@@ -150,6 +179,17 @@ function taskTree(task, events, scope) {
         `汇报 ${counts.check_ins || 0} · 队友提问 ${counts.teammate_questions || 0} · 留言 ${counts.teammate_notes || 0}`));
       const cards=artifactCards(scope,e.changes);
       if (cards) branch.panel.append(cards);
+    }
+  }
+  if (active) {
+    for (const [assignee,queue] of pending.entries()) {
+      const liveKind=task.active_modes?.[assignee]?.handoff_kind;
+      const open=queue.at(-1);
+      if (liveKind && open && !open.kind) {
+        open.kind=liveKind;
+        open.panel.setAttribute("data-handoff-kind",liveKind);
+        open.kindSlot.prepend(kindBadge(liveKind,{withCode:true,extraClass:"tree-kind"}));
+      }
     }
   }
   return el("section",{class:"task-tree","aria-label":"任务树"},el("h4",{},"任务树"),root,list.children.length?list:null);
@@ -263,7 +303,8 @@ async function workbenchView() {
     for (const t of filtered) {
       const date=new Date(t.created_at*1000);
       list.append(el("button",{type:"button",class:"bench-row",onclick:()=>taskDetail(t.id).catch(showError)},
-        el("span",{class:"bench-row-main"},el("small",{},t.group_name+" · @"+(t.primary||"—")),el("strong",{},t.text)),
+        el("span",{class:"bench-row-main"},el("small",{},t.group_name+" · @"+(t.primary||"—")),el("strong",{},t.text),
+          kindSummaryChips(taskKindCounts(t),"bench-kinds")),
         statusChip(t.status),el("time",{},Number.isNaN(date.getTime())?"":date.toLocaleDateString())));
     }
     if (!filtered.length) list.append(el("p",{class:"muted"},"暂无"+categories[index][0]));
@@ -320,7 +361,7 @@ async function taskDetail(id) {
       const live=state.live && state.live.task_id===id ? state.live.meter : null;
       body.append(timeReport(live || t.metrics?.time, Boolean(live)));
     } else if (name==="对话") {
-      for (const e of d.events) body.append(el("p",{},[e.agent||e.kind,e.text||e.task||e.question||e.status].filter(Boolean).join(" · ")));
+      for (const e of d.events) body.append(el("p",{},[e.agent||e.kind,handoffKindText(e.handoff_kind,true),e.text||e.task||e.question||e.status].filter(Boolean).join(" · ")));
     } else {
       const pane=el("div",{},"正在读取诊断…");body.append(pane);
       const detail=await api("/tasks/"+id);
@@ -350,7 +391,8 @@ async function taskDetail(id) {
       const next=await api("/tasks/"+id+"?view=summary");
       if (!visible()) return;
       const changed=next.pausing!==d.pausing || next.task.status!==t.status || next.events.length!==d.events.length ||
-        next.has_snapshot!==d.has_snapshot || next.changes.length!==d.changes.length;
+        next.has_snapshot!==d.has_snapshot || next.changes.length!==d.changes.length ||
+        JSON.stringify(next.task.active_modes || {})!==JSON.stringify(t.active_modes || {});
       d=next;t=d.task;scope.files=fileIndex(d.changes);
       if (changed) {
         playbackState();

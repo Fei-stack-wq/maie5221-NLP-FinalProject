@@ -59,6 +59,14 @@
 .branches li:before { content: ""; width: 20px; position: absolute; left: -20px; top: 31px; border-top: 1px solid var(--cobalt-mid); }
 .branch { border: 1px solid var(--line); border-radius: 10px; padding: 10px 13px; background: var(--paper); }
 .tree-actor { font: 700 13px var(--serif); margin-right: 8px; color: var(--cobalt-deep); }
+.tree-kind-slot, .tree-mode-slot, .tree-root-kinds { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; vertical-align: middle; }
+.tree-kind-slot:not(:empty) { margin-right: 6px; }
+.tree-mode-slot:not(:empty), .tree-root-kinds { margin-left: 6px; }
+.tree-root .tree-mode { margin-left: 8px; }
+.tree-status { color: var(--muted); font: 11.5px var(--mono); }
+.tree-mode { font: 11px var(--mono); }
+.tree-bg-badge { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 0 7px; }
+.bench-kinds { margin-top: 2px; }
 .tree-brief { color: var(--muted); font-size: 13px; }
 .branch[open] .tree-brief { display: block; }
 summary { cursor: pointer; }

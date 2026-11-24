@@ -430,15 +430,20 @@ class BackgroundPauseTest(unittest.TestCase):
         modes = seen_live.get("active_modes") or {}
         self.assertEqual(modes.get("qa", {}).get("thinking"), "enabled")
         self.assertEqual(modes.get("qa", {}).get("reasoning_effort"), "high")
+        self.assertEqual(modes.get("qa", {}).get("handoff_kind"), "check")
+        self.assertNotIn("handoff_kind", modes.get("lead", {}))
 
         detail = self.studio.task_detail(tid)
         reports = {e["agent"]: e for e in detail["events"] if e["kind"] == "report"}
         self.assertEqual((reports["qa"].get("thinking"), reports["qa"].get("reasoning_effort")), ("enabled", "high"))
         self.assertEqual((reports["writer"].get("thinking"), reports["writer"].get("reasoning_effort")), ("disabled", None))
+        self.assertEqual((reports["qa"].get("handoff_kind"), reports["writer"].get("handoff_kind")), ("check", "adapt"))
 
         starts = {e["agent"]: e for e in detail["activity"] if e.get("type") == "start"}
         self.assertEqual((starts["qa"].get("thinking"), starts["qa"].get("reasoning_effort")), ("enabled", "high"))
         self.assertEqual((starts["writer"].get("thinking"), starts["writer"].get("reasoning_effort")), ("disabled", None))
+        self.assertEqual((starts["qa"].get("handoff_kind"), starts["writer"].get("handoff_kind")), ("check", "adapt"))
+        self.assertNotIn("handoff_kind", starts["lead"])
 
 
 if __name__ == "__main__":

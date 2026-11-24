@@ -368,3 +368,150 @@ class PlanLinksTest(unittest.TestCase):
         self.assertTrue(s1["completed"])
         self.assertEqual(s1["evidence"]["lead_work"]["files"][0]["path"], "docs/SPEC.md")
         self.assertEqual(s2["stage"], "completed")
+
+    def test_follow_up_with_overlapping_deliverable_auto_links_and_reopens_step(self):
+        entered, release = threading.Event(), threading.Event()
+        seen = {}
+
+        def dev_rework(_m):
+            entered.set()
+            release.wait(10)
+            return reply("", call("write_file", path="research/memo.md", content="# Memo v2"))
+
+        self.script.queues.update(lead=[
+            plan(step("Market research", id="research", owner="dev")),
+            reply("", call("delegate_task", assignee="dev", step="research", kind="research",
+                           deliverables=["research/memo.md"], task="Write the initial market research memo.")),
+            reply("", call("record_plan_result", step_ids=["research"], decision="accept", result="Initial memo accepted.")),
+            reply("", call("delegate_task", assignee="dev", kind="fix",
+                           inputs=["research/memo.md"], deliverables=["research/memo.md"],
+                           task="Patch missing citations in research/memo.md.")),
+            lambda m: (seen.__setitem__("rework_result", tool_results(m)[-1]), reply("Delivered updated memo."))[1],
+        ], dev=[
+            reply("", call("write_file", path="research/memo.md", content="# Memo v1")),
+            reply("Initial memo ready."),
+            dev_rework,
+            reply("Patched citations."),
+        ])
+        tid = self.studio.post(self.gid, "Prepare market memo", queue=True)["task_id"]
+        try:
+            self.assertTrue(entered.wait(5))
+            live_plan = (self.studio.state(self.gid)["live"] or {}).get("plan")
+            self.assertIsNotNone(live_plan)
+            self.assertEqual(live_plan["counts"]["in_progress"], 1)
+            self.assertEqual(live_plan["steps"][0]["stage"], "in_progress")
+            self.assertEqual(live_plan["unlinked"], [])
+        finally:
+            release.set()
+        finished(self.studio, self.gid)
+        detail = self.studio.task_detail(tid, include_activity=False)
+        delegations = [e for e in detail["events"] if e["kind"] == "delegation"]
+        self.assertEqual(len(delegations), 2)
+        self.assertEqual(delegations[1].get("step"), "research")
+        self.assertTrue(delegations[1].get("inferred_step"))
+        self.assertIn("automatically linked this follow-up to step 'research'", seen["rework_result"])
+        step_row = detail["plan_view"]["steps"][0]
+        self.assertEqual(step_row["stage"], "completed")
+        self.assertFalse(step_row["confirmed"])
+        self.assertEqual(detail["plan_view"]["unlinked"], [])
+
+    def test_inputs_only_overlap_directory_and_ambiguous_deliverables_stay_unlinked(self):
+        self.script.queues.update(lead=[
+            plan(step("Research", id="research", owner="dev"),
+                 step("Docs folder", id="docs", owner="dev"),
+                 step("Shared A", id="s1", owner="dev"),
+                 step("Shared B", id="s2", owner="dev")),
+            reply("", call("delegate_task", assignee="dev", step="research",
+                           deliverables=["research/memo.md"], task="Write research/memo.md.")),
+            reply("", call("record_plan_result", step_ids=["research"], decision="accept", result="Research confirmed.")),
+            reply("", call("delegate_task", assignee="dev", step="docs",
+                           deliverables=["docs/"], task="Prepare files under docs/.")),
+            reply("", call("delegate_task", assignee="dev", step="s1",
+                           deliverables=["shared.md"], task="Draft shared.md part 1.")),
+            reply("", call("delegate_task", assignee="dev", step="s2",
+                           deliverables=["shared.md"], task="Draft shared.md part 2.")),
+            # 1) Same assignee reads research/memo.md as input, writes a brand new deliverable: must NOT link to research.
+            reply("", call("delegate_task", assignee="dev", inputs=["research/memo.md"],
+                           deliverables=["slides/deck.md"], task="Build slides from research/memo.md.")),
+            # 2) File inside a directory deliverable ('docs/'): exact path match must NOT falsely link to docs.
+            reply("", call("delegate_task", assignee="dev", deliverables=["docs/extra.md"],
+                           task="Add an extra note under docs/extra.md.")),
+            # 3) Ambiguous deliverable touched by both s1 and s2: must NOT guess.
+            reply("", call("delegate_task", assignee="dev", deliverables=["shared.md"],
+                           task="Polish shared.md across sections.")),
+            reply("All done."),
+        ], dev=[
+            reply("", call("write_file", path="research/memo.md", content="memo")), reply("memo done"),
+            reply("docs done"),
+            reply("s1 done"),
+            reply("s2 done"),
+            reply("deck done"),
+            reply("extra done"),
+            reply("shared done"),
+        ])
+        tid = self.studio.post(self.gid, "Check link boundaries", queue=True)["task_id"]
+        finished(self.studio, self.gid)
+        view = self.studio.task_detail(tid, include_activity=False)["plan_view"]
+        rows = {s["id"]: s for s in view["steps"]}
+        self.assertTrue(rows["research"]["confirmed"], "downstream input overlap must not reopen confirmed step")
+        self.assertEqual(len(view["unlinked"]), 3)
+        self.assertTrue(all(item["stage"] == "completed" and not item["active"] for item in view["unlinked"]))
+
+    def test_running_unlinked_delegation_shows_active_state_in_plan_view_and_browser(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def qa_adhoc(_m):
+            entered.set()
+            release.wait(10)
+            return reply("Checked extra notes.")
+
+        self.script.queues.update(lead=[
+            plan(step("Draft", id="draft", owner="dev")),
+            reply("", call("delegate_task", assignee="dev", step="draft", kind="make",
+                           deliverables=["draft.md"], task="Write draft.md.")),
+            reply("", call("delegate_task", assignee="qa", kind="research",
+                           deliverables=["notes/adhoc.md"], task="Investigate an unscheduled side question.")),
+            reply("Delivered with ad-hoc check."),
+        ], dev=[
+            reply("", call("write_file", path="draft.md", content="# Draft")),
+            reply("Draft ready."),
+        ], qa=[qa_adhoc])
+        main, preview = serve(self.studio, 0)
+        try:
+            tid = self.studio.post(self.gid, "Draft and investigate", queue=True)["task_id"]
+            self.assertTrue(entered.wait(5))
+            live_plan = (self.studio.state(self.gid)["live"] or {}).get("plan")
+            self.assertEqual(live_plan["counts"]["in_progress"], 0)
+            self.assertEqual(len(live_plan["unlinked"]), 1)
+            self.assertEqual(live_plan["unlinked"][0]["stage"], "in_progress")
+            self.assertTrue(live_plan["unlinked"][0]["active"])
+            with sync_playwright() as pw:
+                chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+                with pw.chromium.launch(**({"executable_path": str(chrome)} if chrome.exists() else {})) as browser:
+                    page = browser.new_page(viewport={"width": 1280, "height": 850})
+                    errors = []
+                    page.on("pageerror", lambda err: errors.append(str(err)))
+                    page.goto(f"http://127.0.0.1:{main.server_port}/#{self.gid}")
+                    card = page.locator("#timeline .linked-plan")
+                    expect(card.locator(".plan-count")).to_have_text("已完成 1 / 1 · 已确认 0 / 1 · 进行中 0 · 计划外进行中 1")
+                    unlinked_box = card.locator("details.unlinked")
+                    expect(unlinked_box).to_have_attribute("open", "")
+                    expect(unlinked_box.locator("summary")).to_have_text("其他派工（1 · 1 进行中）")
+                    item = unlinked_box.locator(".unlinked-item.in_progress")
+                    expect(item).to_contain_text("@qa")
+                    expect(item.locator(".kind-badge")).to_have_text("调研 research")
+                    expect(item.locator(".unlinked-stage")).to_have_text("进行中")
+
+                    release.set()
+                    expect(card.locator(".plan-count")).to_have_text("已完成 1 / 1 · 已确认 0 / 1 · 进行中 0", timeout=10000)
+                    expect(unlinked_box.locator("summary")).to_have_text("其他派工（1）")
+                    self.assertEqual(errors, [])
+            final_view = self.studio.task_detail(tid, include_activity=False)["plan_view"]
+            self.assertEqual(final_view["unlinked"][0]["stage"], "completed")
+            self.assertFalse(final_view["unlinked"][0]["active"])
+            self.assertEqual(final_view["unlinked"][0]["status"], "completed")
+        finally:
+            release.set()
+            for server in (main, preview):
+                server.shutdown()
+                server.server_close()

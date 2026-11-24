@@ -148,7 +148,8 @@ async function tasksView() {
   for (const t of rows) {
     list.append(el("button",{type:"button",class:"bench-row","aria-label":(STATUS_LABEL[t.status]||t.status)+" · "+t.group_name+" · "+t.text,onclick:()=>taskDetail(t.id).catch(showError)},
       avatar(t.primary||t.group_id,t.primary||t.group_name,"sm"),
-      el("span",{class:"bench-row-main"},el("small",{},t.group_name+" · @"+(t.primary||"—")),el("strong",{},t.text)),
+      el("span",{class:"bench-row-main"},el("small",{},t.group_name+" · @"+(t.primary||"—")),el("strong",{},t.text),
+        kindSummaryChips(taskKindCounts(t),"bench-kinds")),
       statusChip(t.status),el("time",{},relativeTime(t.created_at))));
   }
   root.append(heading("任务记录","每个任务的派工、产物和轨迹。"),rows.length?list:el("div",{class:"empty-state"},"还没有任务。到任意群聊里发布第一项工作吧。"));

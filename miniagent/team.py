@@ -40,7 +40,7 @@ from typing import Any, Callable
 
 from .agent import FAILED_REQUEST_NOTE, Agent, AgentResult, AgentSession
 from .browser_evidence import format_report
-from .plan_view import identify_steps, plan_view
+from .plan_view import evidence_steps, identify_steps, plan_view
 from .review import VERDICT_LINE, review_verdict
 from .checkpoint import Continuation, PauseRequested
 from .config import FAST_SOFT_MINUTES, HANDOFF_KINDS, KIND_PROFILES, Settings, kind_settings
@@ -606,13 +606,20 @@ class TeamTask:
         event = {"task_id": self.task_id, **event}
         if event["type"] in ("start","resume"):
             self.channel.activate(event["agent"])
-            if "thinking" in event:
-                with self.lock:
-                    self.active_modes[event["agent"]] = {
+            with self.lock:
+                inflight = self.inflight.get(event["agent"])
+                handoff_kind = inflight.get("kind") if inflight else None
+                if handoff_kind:
+                    event["handoff_kind"] = handoff_kind
+                if "thinking" in event or handoff_kind:
+                    mode = {
                         "model": event.get("model"),
                         "thinking": event.get("thinking"),
                         "reasoning_effort": event.get("reasoning_effort"),
                     }
+                    if handoff_kind:
+                        mode["handoff_kind"] = handoff_kind
+                    self.active_modes[event["agent"]] = mode
                     self._update(active_modes=dict(self.active_modes))
         if event["type"] in ("start", "resume") and event.get("agent") == self.primary:
             self.lead_live = True
@@ -1321,11 +1328,66 @@ class TeamTask:
         finally:
             self._release(claim)
 
-    def _step_link(self, requested, extra=()):
+    def _infer_step_link(self, deliverables: list[str], valid_ids: set[str], *, review: bool = False) -> tuple[dict, str]:
+        """When the lead omits `step`/`step_ids` on a follow-up that rewrites an existing step's deliverable,
+        inherit that step ID if and only if exact normalized paths point unambiguously to one current plan step."""
+        if review or not (self.plan and self.plan.get("linked")) or not valid_ids or not deliverables:
+            return {}, ""
+        wanted = {_norm(p) for p in deliverables if _norm(p)}
+        if not wanted:
+            return {}, ""
+        events = [e for e in self.store.chat(self.trigger_seq - 1) if e.get("task_id") == self.task_id]
+        added: dict[int, list[str]] = {}
+        by_seq = {e["seq"]: e for e in events}
+        for e in events:
+            if e.get("kind") == "plan_evidence":
+                for item in e.get("links", []):
+                    step_ids = [s for s in item.get("step_ids", []) if s in valid_ids]
+                    if not step_ids:
+                        continue
+                    added.setdefault(item["source_seq"], []).extend(step_ids)
+                    source = by_seq.get(item["source_seq"], {})
+                    if source.get("kind") == "report" and source.get("assignment_seq"):
+                        added.setdefault(source["assignment_seq"], []).extend(step_ids)
+        delegation_steps: dict[int, list[str]] = {}
+        step_files: dict[str, set[str]] = {}
+        for e in events:
+            ekind = e.get("kind")
+            if ekind == "delegation":
+                steps = [s for s in dict.fromkeys(evidence_steps(e) + added.get(e["seq"], [])) if s in valid_ids]
+                delegation_steps[e["seq"]] = steps
+                if e.get("review"):
+                    continue
+                for s in steps:
+                    step_files.setdefault(s, set()).update(_norm(p) for p in e.get("deliverables") or [] if _norm(p))
+            elif ekind == "report":
+                if e.get("review"):
+                    continue
+                original = e.get("assignment_seq")
+                steps = [s for s in dict.fromkeys(
+                    evidence_steps(e) + added.get(e["seq"], []) + delegation_steps.get(original, [])
+                ) if s in valid_ids]
+                for s in steps:
+                    step_files.setdefault(s, set()).update(
+                        _norm(c.get("path", "")) for c in e.get("changes") or []
+                        if c.get("change") != "deleted" and _norm(c.get("path", ""))
+                    )
+        matched = {s for s, files in step_files.items() if files & wanted}
+        if len(matched) != 1:
+            return {}, ""
+        step_id = next(iter(matched))
+        overlap = sorted(step_files[step_id] & wanted)
+        note = (f"Plan: automatically linked this follow-up to step '{step_id}' via overlapping deliverables "
+                f"({', '.join(overlap[:5])}); pass `step` explicitly on future delegations.")
+        return {"step": step_id, "inferred_step": True}, note
+
+    def _step_link(self, requested, extra=(), *, deliverables=(), review: bool = False):
         if not (self.settings.team.plan_links and self.settings.team.plans):
             return {}, ""
         ids = [s["id"] for s in (self.plan or {}).get("steps", []) if s.get("id")]
         requested_ids = list(dict.fromkeys(([requested] if requested else []) + list(extra)))
+        if not requested_ids:
+            return self._infer_step_link(list(deliverables), set(ids), review=review)
         valid = [key for key in requested_ids if key in ids]
         invalid = [key for key in requested_ids if key not in ids]
         link = {"step": valid[0]} if valid else {}
@@ -1369,7 +1431,8 @@ class TeamTask:
             if missing:
                 task += ("\nNot in the project yet: " + ", ".join(missing)
                          + ". Say in your report if the work needed them.")
-        link, warning = self._step_link(args.get("step"), args.get("step_ids", []))
+        link, warning = self._step_link(args.get("step"), args.get("step_ids", []),
+                                        deliverables=deliverables, review=review)
         self._link_lead_prereq_publish(lead_id, link, inputs)
         unclosed = self._unclosed_lead_steps(lead_id, link)
         spec = {k: v for k, v in (("kind", kind), ("inputs", inputs or None)) if v}

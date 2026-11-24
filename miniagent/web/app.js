@@ -140,6 +140,78 @@ const STATUS_LABEL = {
   paused: "已暂停", pausing: "正在保存断点", stuck: "循环中止", budget: "预算用尽", error: "出错", queued: "排队中", interrupted: "已中断", running: "进行中",
 };
 
+const HANDOFF_KIND_ORDER = ["research", "make", "check", "fix", "adapt"];
+const HANDOFF_KIND_LABEL = { research: "调研", make: "制作", check: "检查", fix: "修改", adapt: "改写" };
+
+function handoffKindText(kind, withCode = false) {
+  const label = HANDOFF_KIND_LABEL[kind];
+  if (!label) return null;
+  return withCode ? `${label} (${kind})` : label;
+}
+
+function kindBadge(kind, { withCode = false, extraClass = "", title = null } = {}) {
+  const label = HANDOFF_KIND_LABEL[kind];
+  if (!label) return null;
+  const children = withCode ? [label, " ", el("span", { class: "kind-code" }, kind)] : [label];
+  return el(
+    "span",
+    {
+      class: ("kind-badge " + extraClass).trim(),
+      "data-kind": kind,
+      title: title || `任务类型：${label} (${kind})`,
+    },
+    ...children
+  );
+}
+
+function taskKindCounts(task, events = null) {
+  const counts = {};
+  if (events?.length) {
+    for (const e of events) {
+      if (e.kind === "delegation" && e.handoff_kind) counts[e.handoff_kind] = (counts[e.handoff_kind] || 0) + 1;
+    }
+    return counts;
+  }
+  if (task?.metrics?.handoff_kinds && Object.keys(task.metrics.handoff_kinds).length) {
+    Object.assign(counts, task.metrics.handoff_kinds);
+    return counts;
+  }
+  for (const a of task?.assignments || []) {
+    if (a.kind) counts[a.kind] = (counts[a.kind] || 0) + 1;
+  }
+  if (task?.active_modes && ["running", "queued", "paused"].includes(task.status)) {
+    for (const mode of Object.values(task.active_modes)) {
+      if (mode?.handoff_kind) counts[mode.handoff_kind] = (counts[mode.handoff_kind] || 0) + 1;
+    }
+  }
+  return counts;
+}
+
+function kindSummaryChips(counts, extraClass = "") {
+  const entries = HANDOFF_KIND_ORDER.filter((k) => counts?.[k]);
+  if (!entries.length) return null;
+  return el(
+    "span",
+    { class: ("kind-summary " + extraClass).trim() },
+    ...entries.map((k) => {
+      const label = HANDOFF_KIND_LABEL[k];
+      const n = counts[k];
+      return el(
+        "span",
+        {
+          class: "kind-badge kind-count",
+          "data-kind": k,
+          title: `任务类型：${label} (${k}) · ${n} 次`,
+        },
+        label,
+        " ",
+        el("span", { class: "kind-code" }, k),
+        n > 1 ? [" ", el("span", { class: "kind-mult" }, `×${n}`)] : null
+      );
+    })
+  );
+}
+
 function verdictChip(event) {
   if (!event.loop || event.loop.role !== "review") return null;
   const match = /VERDICT:\s*(APPROVED|CHANGES\s+REQUESTED)/i.exec((event.text || "").slice(0, 2000));
@@ -334,10 +406,12 @@ function renderEvent(event) {
     case "delegation": {
       const label = event.loop ? `评审循环 · 第 ${event.loop.round} 轮 · ${event.loop.role === "review" ? "评审" : "修改"}`
         : (event.reconcile ? "核对并行结果" : event.review ? "评审" : "派工");
-      const kindLabel = {research: "调研", make: "制作", check: "检查", fix: "修改", adapt: "改写"}[event.handoff_kind];
+      const kindTitle = event.handoff_kind && HANDOFF_KIND_LABEL[event.handoff_kind]
+        ? `派工类型：${HANDOFF_KIND_LABEL[event.handoff_kind]} (${event.handoff_kind}) · 决定思考、步数和工具`
+        : "派工类型：决定思考、步数和工具";
       const node = card("delegation" + (event.loop || event.review ? " review" : ""), event.agent,
         [el("b", {}, memberName(event.agent)), el("span",{class:"arrow"},"→"), el("b", {}, memberName(event.assignee)), el("span", {}, label),
-          kindLabel ? el("span", { class: "checks-count", title: "派工类型：决定思考、步数和工具" }, kindLabel) : null,
+          kindBadge(event.handoff_kind, { extraClass: "checks-count", title: kindTitle }),
           event.background ? el("span", { class: "checks-count", title: "后台运行，负责人继续工作" }, "后台") : null,
           event.checks && event.checks.length ? el("span", { class: "checks-count" }, `${event.checks.length} 项检查`) : null],
         markdown(event.task),
@@ -349,6 +423,7 @@ function renderEvent(event) {
       const level = event.status === "completed" ? "" : (event.status === "error" || event.status === "cancelled" ? "failed" : "incomplete");
       const node = card(`report ${level}`, event.agent,
         [el("b", {}, memberName(event.agent)), statusChip(event.status), verdictChip(event),
+          kindBadge(event.handoff_kind, { withCode: true }),
           event.background ? el("span", { class: "checks-count" }, "后台") : null,
           el("span", {}, `${event.steps || 0} 步 · ${event.tool_calls || 0} 次工具调用`)],
         markdown(event.text), checkResults(event.checks),
@@ -409,6 +484,10 @@ function renderEvent(event) {
       const parts = [STATUS_LABEL[event.status] || event.status];
       if (m.duration_s !== undefined) parts.push(fmtDuration(m.duration_s));
       if (m.delegations !== undefined) parts.push(`${m.delegations} 次派工`);
+      if (m.handoff_kinds && Object.keys(m.handoff_kinds).length) {
+        const kinds = HANDOFF_KIND_ORDER.filter((k) => m.handoff_kinds[k]).map((k) => `${HANDOFF_KIND_LABEL[k]}×${m.handoff_kinds[k]}`);
+        if (kinds.length) parts.push(kinds.join(" / "));
+      }
       if (m.steps !== undefined) parts.push(`${m.steps} 步`);
       if (m.prompt_tokens !== undefined) parts.push(`${Math.round((m.prompt_tokens + m.completion_tokens) / 1000)}k tokens`);
       if (event.error) parts.push(event.error);
@@ -597,9 +676,23 @@ function renderHead() {
   $("#room-avatars").replaceChildren(...g.members.slice(0, 6).map(m => avatar(m.id, m.name, "sm")));
   $("#member-panel").hidden = g.kind !== "group";
   const working = new Set(state.live?.active || []);
-  $("#room-members").replaceChildren(...g.members.map((m) =>
-    el("li", {title: m.prompt, class: working.has(m.id) ? "working" : ""}, avatar(m.id, m.name),
-      el("span", {}, el("strong", {}, m.name), el("small", {}, `@${m.id}${m.id === g.lead ? " · 负责人" : ""}`)))));
+  const liveModes = state.live?.active_modes || {};
+  $("#room-members").replaceChildren(...g.members.map((m) => {
+    const isWorking = working.has(m.id);
+    const mode = isWorking ? (liveModes[m.id] || state.modes?.[m.id]) : null;
+    const kindNode = isWorking && mode?.handoff_kind
+      ? kindBadge(mode.handoff_kind, { withCode: true, extraClass: "member-kind-badge" })
+      : null;
+    return el("li", {
+      title: m.prompt,
+      class: isWorking ? (kindNode ? "working has-kind" : "working") : "",
+      "data-member": m.id,
+    }, avatar(m.id, m.name),
+      el("span", {},
+        el("strong", {}, m.name),
+        el("small", {}, `@${m.id}${m.id === g.lead ? " · 负责人" : ""}`),
+        kindNode ? el("span", { class: "member-work-state" }, "执行中", kindNode) : null));
+  }));
   const template = state.templates.find((t) => t.name === g.name);
   const idle = !g.running;
   $("#task-buttons").replaceChildren(...(template && idle ? template.tasks.map((t, i) =>
@@ -655,8 +748,22 @@ function renderLive(live) {
   let last = null;
   for (const a of live.activity) {
     if (a.type === "step") steps[a.agent] = `${a.step}/${a.max_steps}`;
-    if (["start", "resume", "model_call"].includes(a.type) && a.thinking) {
-      modes[a.agent] = { model: a.model, thinking: a.thinking, reasoning_effort: a.reasoning_effort };
+    if (a.type === "start" || a.type === "resume") {
+      modes[a.agent] = {
+        model: a.model,
+        thinking: a.thinking,
+        reasoning_effort: a.reasoning_effort,
+        handoff_kind: a.handoff_kind || null,
+      };
+    } else if (a.type === "model_call" && a.thinking) {
+      modes[a.agent] = {
+        ...(modes[a.agent] || {}),
+        model: a.model,
+        thinking: a.thinking,
+        reasoning_effort: a.reasoning_effort,
+      };
+    } else if (a.type === "end") {
+      delete modes[a.agent];
     }
     if (["tool_call", "say", "delta", "question"].includes(a.type)) last = a;
   }
@@ -665,7 +772,8 @@ function renderLive(live) {
   const active = (live.active && live.active.length ? live.active : [live.primary]);
   const current = active[active.length - 1];
   const step = steps[current] ? ` · 第 ${steps[current]} 步` : "";
-  const mode = (live.active_modes && live.active_modes[current]) || modes[current];
+  const modeFor = (id) => (live.active_modes && live.active_modes[id]) || modes[id];
+  const mode = modeFor(current);
   const thinkingTag = mode?.thinking === "enabled"
     ? ` · 思考(${mode.reasoning_effort || "默认"})`
     : mode?.thinking === "disabled" ? " · 关闭思考" : "";
@@ -678,10 +786,23 @@ function renderLive(live) {
   const [done, total] = (steps[current] || "").split("/").map(Number);
   const bar = el("span", { class: "steps", title: steps[current] ? `第 ${steps[current]} 步` : "" }, el("i"));
   bar.firstChild.style.width = total ? Math.min(100, Math.round(done / total * 100)) + "%" : "8%";
+  const actorNodes = [];
+  active.forEach((id, idx) => {
+    if (idx > 0) actorNodes.push(" › ");
+    actorNodes.push(memberName(id));
+    const kind = modeFor(id)?.handoff_kind;
+    if (kind) actorNodes.push(" ", kindBadge(kind, { withCode: true, extraClass: "live-kind-badge" }));
+  });
+  const qKind = live.question ? modeFor(live.question.agent)?.handoff_kind : null;
+  const statusText = live.question
+    ? el("span", { class: "text" },
+        memberName(live.question.agent),
+        qKind ? [" ", kindBadge(qKind, { withCode: true, extraClass: "live-kind-badge" })] : null,
+        " 在等你回答")
+    : el("span", { class: "text" }, ...actorNodes, ` 正在工作${step}${thinkingTag}${doing}`);
   $("#live-status").replaceChildren(live.question ? el("span", { class: "dot waiting" }) : el("span", { class: "spinner" }),
     ...active.slice(-2).map(id => avatar(id, memberName(id), "sm")),
-    el("span", { class: "text" }, live.question ? `${memberName(live.question.agent)} 在等你回答` :
-      `${active.map(memberName).join(" › ")} 正在工作${step}${thinkingTag}${doing}`), bar);
+    statusText, bar);
   const meter = $("#live-meter");
   const line = meterLine(live.meter);
   meter.hidden = !line;
@@ -766,7 +887,13 @@ function renderActivity(items) {
   for (const a of items) {
     let line = null;
     const who = el("span", { class: "agent" }, `[${a.agent}] `);
-    if (a.type === "tool_call") line = el("div", { class: "a" }, who, `→ ${a.tool} ${JSON.stringify(a.arguments).slice(0, 400)}`);
+    if (a.type === "start" || a.type === "resume") {
+      const parts = [a.type === "resume" ? "恢复执行" : "开始执行"];
+      if (a.handoff_kind) parts.push(`类型：${handoffKindText(a.handoff_kind, true)}`);
+      if (a.thinking === "enabled") parts.push(`思考(${a.reasoning_effort || "默认"})`);
+      else if (a.thinking === "disabled") parts.push("关闭思考");
+      line = el("div", { class: "a" }, who, parts.join(" · "));
+    } else if (a.type === "tool_call") line = el("div", { class: "a" }, who, `→ ${a.tool} ${JSON.stringify(a.arguments).slice(0, 400)}`);
     else if (a.type === "tool_result" && a.browser_report) line = el("div",{class:"a"},who,browserCheckCard(a.browser_report));
     else if (a.type === "tool_result") line = el("div", { class: "a" }, who, el("span", { class: a.ok ? "ok" : "err" }, a.ok ? "✓ " : "✗ "), (a.preview || "").slice(0, 500));
     else if (a.type === "say") line = el("div", { class: "a say" }, who, a.text);
