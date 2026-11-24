@@ -147,6 +147,37 @@ class HandoffKindsUITest(unittest.TestCase):
                     server.server_close()
                 studio.close()
 
+    def test_the_chat_says_when_a_hand_off_waits_and_why(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Script(
+                lead=[reply("", call("delegate_task", assignee="dev", task="Build the export button in app.py.",
+                                     deliverables=["app.py"], kind="make"),
+                            call("delegate_task", assignee="qa", task="Test the export button.",
+                                 deliverables=["QA.md"], inputs=["app.py"], kind="check")),
+                      reply("Shipped.")],
+                dev=[reply("", call("write_file", path="app.py", content="print('export')")), reply("built")],
+                qa=[reply("tested")])
+            provider = FakeProvider(script)
+            studio = Studio(settings(Path(tmp)), provider_factory=lambda _: provider)
+            gid = studio.create_group("Release", TEAM4, "lead", "autonomous")["id"]
+            studio.post(gid, "Ship the export", queue=True)
+            self.assertEqual(finished(studio, gid)["status"], "completed")
+            main, preview = serve(studio, 0)
+            try:
+                chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+                with sync_playwright() as pw, pw.chromium.launch(**({"executable_path": str(chrome)}
+                                                                     if chrome.exists() else {})) as browser:
+                    page = browser.new_page()
+                    page.goto(f"http://127.0.0.1:{main.server_port}/#{gid}")
+                    note = page.locator(".divider", has_text="完成后开始")
+                    expect(note).to_have_text("Tester 等 Developer 完成后开始 · 要读的 app.py 还在由对方产出")
+                    expect(page.locator(".delegation")).to_have_count(2)
+            finally:
+                for server in (main, preview):
+                    server.shutdown()
+                    server.server_close()
+                studio.close()
+
 
 if __name__ == "__main__":
     unittest.main()

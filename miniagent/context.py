@@ -137,7 +137,11 @@ def prune_tool_outputs(messages: list[dict[str, Any]], *, protect_from: int, kee
 
 
 def _transcript(messages: list[dict[str, Any]], limit_chars: int = 400_000) -> str:
-    """Render messages as plain text for the summarizer (no reasoning, bounded)."""
+    """Render messages as plain text for the summarizer (no reasoning, bounded).
+
+    The caller scales ``limit_chars`` with the compaction threshold (4 characters per token, as ``estimate_text_tokens`` counts), so the
+    summary sees the whole span it replaces; like Pi ``serializeConversation`` only single tool results are cut.
+    """
     lines = []
     for message in messages:
         role = message.get("role")
@@ -234,7 +238,7 @@ class ContextManager:
         previous = self.summary
         prompt_messages = [
             {"role": "system", "content": "You condense an agent's working history into a precise checkpoint."},
-            {"role": "user", "content": _transcript(span)},
+            {"role": "user", "content": _transcript(span, max(400_000, 4 * self.compact_at_tokens))},
             {"role": "user", "content": UPDATE_PROMPT.format(previous=previous) if previous else SUMMARIZATION_PROMPT},
         ]
         try:

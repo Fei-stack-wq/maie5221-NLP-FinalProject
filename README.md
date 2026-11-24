@@ -66,7 +66,7 @@ python -m miniagent report                    # 完成率、耗时、步数、�
 | `MA_LEAD_MAX_STEPS` | 80 | 负责人每个任务的步数上限 |
 | `MA_MAX_DELEGATIONS` | 24 | 每个任务的派工上限 |
 | `MA_MAX_SECONDS` | 0 | 每次智能体运行的时间上限，0 表示只受步数约束 |
-| `MA_COMPACT_AT_TOKENS` | 110000 | 达到此请求规模时开始压缩 |
+| `MA_COMPACT_AT_TOKENS` | 500000 | 达到此请求规模时开始压缩（上下文窗口较小时自动降到窗口减 16384） |
 | `MA_INTERACTION_MODE` | `interactive` | 新群默认的协作方式 |
 
 ## 代码地图

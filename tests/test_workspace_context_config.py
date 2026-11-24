@@ -97,6 +97,22 @@ class ContextTest(unittest.TestCase):
         self.assertIn("<previous-summary>", seen["prompt"])
         self.assertEqual(sum(1 for m in messages if (m.get("content") or "").startswith(SUMMARY_PREFIX)), 1)
 
+    def test_summary_sees_the_whole_span_at_a_high_threshold(self):
+        # At 500k a compacted span can far exceed the old fixed 400,000-character transcript; it is not cut.
+        messages = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+        for i in range(120):
+            messages.append({"role": "user", "content": f"note {i} " + "x" * 5000})
+        messages.append({"role": "user", "content": "latest"})
+        manager = ContextManager(compact_at_tokens=150_000, keep_recent_tokens=1000)
+        seen = {}
+        def summarize(prompt):
+            seen["transcript"] = prompt[1]["content"]
+            return "## Goal\nsummary", None
+        self.assertEqual(manager.maybe_compact(messages, None, summarize).method, "summary")
+        self.assertGreater(len(seen["transcript"]), 400_000)
+        self.assertNotIn("middle omitted", seen["transcript"])
+        self.assertIn("note 60 ", seen["transcript"])
+
     def test_failed_summary_falls_back_to_pruning(self):
         messages = self.history(30)
         manager = ContextManager(compact_at_tokens=5000, keep_recent_tokens=2000)
@@ -118,6 +134,13 @@ class ConfigTest(unittest.TestCase):
             TeamLimits(lead_max_steps=0)
         with self.assertRaises(ValueError):
             Limits(max_steps=5000)
+
+    def test_compaction_starts_at_half_the_window_unless_the_window_is_small(self):
+        self.assertEqual(Settings.from_env({}).compact_at_tokens, 500_000)
+        self.assertEqual(Settings.from_env({"MA_CONTEXT_WINDOW_TOKENS": "128000"}).compact_at_tokens, 128_000 - 16_384)
+        self.assertEqual(Settings.from_env({"MA_COMPACT_AT_TOKENS": "110000"}).compact_at_tokens, 110_000)
+        with self.assertRaises(ValueError):
+            Settings.from_env({"MA_CONTEXT_WINDOW_TOKENS": "128000", "MA_COMPACT_AT_TOKENS": "500000"})
 
     def test_env_file_literals_and_legacy_unlimited_steps_ignored(self):
         tmp = Path(tempfile.mkdtemp())

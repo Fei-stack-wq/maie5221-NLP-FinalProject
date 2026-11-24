@@ -6,6 +6,7 @@ members and the chat saw.
 """
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -122,6 +123,7 @@ class CollaborationTest(unittest.TestCase):
         studio, gid, _ = self.studio(script)
         studio.post(gid, "go", queue=True)
         task = finished(studio, gid)
+        self.pair = studio, gid
         return order, seen["results"], task
 
     def test_a_hand_off_that_reads_another_ones_output_waits_for_it(self):
@@ -130,15 +132,55 @@ class CollaborationTest(unittest.TestCase):
             call("delegate_task", assignee="qa", task="Test the backend and write qa/report.md.",
                  deliverables=["qa/report.md"], inputs=["api/server.py"]))
         self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
-        self.assertIn("Waited for dev to finish before starting: it reads api/server.py, which dev produces.", results[1])
+        # The lead reads why first, not after the whole report.
+        self.assertTrue(results[1].startswith(
+            "Waited for dev to finish before starting: it reads api/server.py, which dev produces."), results[1][:200])
 
-    def test_a_brief_that_names_another_assignment_waits_for_it(self):
-        order, results, _ = self.run_pair(
+    def test_a_wait_shows_in_the_chat_and_the_trace_when_it_starts(self):
+        # 24 Nov runs: two hand-offs sent together, the second waited 7–10 minutes and nothing said so.
+        _, _, task = self.run_pair(
             call("delegate_task", assignee="dev", task="Write the backend in api/server.py.", deliverables=["api/server.py"]),
-            call("delegate_task", assignee="qa", task="Test api/server.py and write qa/report.md.",
-                 deliverables=["qa/report.md"]))
-        self.assertEqual(order, ["dev start", "dev end", "qa start", "qa end"])
-        self.assertIn("its brief names api/server.py, which dev produces", results[1])
+            call("delegate_task", assignee="qa", task="Test the backend and write qa/report.md.",
+                 deliverables=["qa/report.md"], inputs=["api/server.py"]))
+        studio, gid = self.pair
+        waits = kinds(studio, gid, "handoff_waiting")
+        self.assertEqual([(w["assignees"], w["waiting_for"], w["reason"], w["path"]) for w in waits],
+                         [(["qa"], ["dev"], "read", "api/server.py")])
+        qa_start = next(d["seq"] for d in kinds(studio, gid, "delegation") if d["assignee"] == "qa")
+        self.assertLess(waits[0]["seq"], qa_start)
+        trace = [json.loads(line) for line in
+                 (studio.group(gid).task_dir(task["id"]) / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+        marks = [e for e in trace if e["type"] in ("handoff_wait", "handoff_wait_end")]
+        self.assertEqual([e["type"] for e in marks], ["handoff_wait", "handoff_wait_end"])
+        self.assertGreaterEqual(marks[1]["seconds"], 0)
+
+    def test_a_brief_that_only_names_another_hand_offs_file_does_not_wait(self):
+        # S3T2 24 Nov: "fund_research covers demand in research/…md — do not duplicate that scope" held the second
+        # researcher for 10 minutes. Naming a file marks a boundary; only `inputs` make a hand-off wait.
+        barrier = threading.Barrier(2, timeout=5)
+        together = []
+
+        def researcher(name, path):
+            def start(messages):
+                barrier.wait()
+                together.append(name)
+                return reply("", call("write_file", path=path, content=name))
+            return [start, reply(f"{name} done")]
+
+        script = Script(lead=[reply("", call("delegate_task", assignee="dev", kind="research",
+                                             task="Research demand drivers; write research/demand.md.",
+                                             deliverables=["research/demand.md"]),
+                                    call("delegate_task", assignee="qa", kind="research",
+                                         task="Research policy risk. dev covers demand in research/demand.md — do "
+                                              "not duplicate that scope. Write research/risk.md.",
+                                         deliverables=["research/risk.md"])),
+                              reply("done")],
+                        dev=researcher("dev", "research/demand.md"), qa=researcher("qa", "research/risk.md"))
+        studio, gid, _ = self.studio(script)
+        studio.post(gid, "Research", queue=True)
+        self.assertEqual(finished(studio, gid)["status"], "completed")
+        self.assertEqual(sorted(together), ["dev", "qa"])
+        self.assertEqual(kinds(studio, gid, "handoff_waiting"), [])
 
     def test_a_file_both_would_write_makes_the_second_wait(self):
         order, results, _ = self.run_pair(
@@ -162,9 +204,11 @@ class CollaborationTest(unittest.TestCase):
 
     def test_hand_offs_without_declared_files_are_not_held_up(self):
         barrier = threading.Barrier(2, timeout=5)
+        together = []
 
         def first(messages):
-            barrier.wait()
+            barrier.wait()  # raises after 5 s unless both are running at once
+            together.append(1)
             return reply("noted")
 
         script = Script(lead=[reply("", call("delegate_task", assignee="dev", task="Summarise the API options."),
@@ -174,6 +218,7 @@ class CollaborationTest(unittest.TestCase):
         studio, gid, _ = self.studio(script)
         studio.post(gid, "Summaries", queue=True)
         self.assertEqual(finished(studio, gid)["status"], "completed")
+        self.assertEqual(len(together), 2)
 
     def test_a_plan_update_or_a_file_in_the_same_response_comes_before_the_hand_offs(self):
         # S1T1-v3.6: a record_plan_result in the same response as the hand-offs. Here the lead even lists the

@@ -391,6 +391,12 @@ function renderEvent(event) {
       return el("div",{class:"msg user"},el("div",{class:"chips"},...(event.attachments||[]).map(a=>el("span",{class:"chip"},icon("clip"),a.name))));
     case "queued_message":
       return el("div",{class:"divider"},el("span",{},"已排队，当前任务结束后开始 · "+event.text));
+    case "handoff_waiting": {
+      // A hand-off sent together with others waits for one it conflicts with; say for whom and why.
+      const names=ids=>(ids||[]).map(memberName).join("、");
+      const why={member:"同一成员一次只做一项任务",write:`两项都要写 ${event.path}`,read:`要读的 ${event.path} 还在由对方产出`}[event.reason]||"";
+      return el("div",{class:"divider"},el("span",{},`${names(event.assignees)} 等 ${names(event.waiting_for)} 完成后开始`+(why?" · "+why:"")));
+    }
     case "task_paused":
     case "task_resumed":
       return el("div",{class:"divider"},el("span",{},event.kind==="task_paused"?"任务已暂停 · 断点已保存":"任务从断点继续"));

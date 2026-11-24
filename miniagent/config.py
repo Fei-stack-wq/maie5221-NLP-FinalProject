@@ -19,6 +19,8 @@ DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_MAX_OUTPUT_TOKENS = 300_000
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 180.0
 DEFAULT_REQUEST_DEADLINE_SECONDS = 900.0
+COMPACT_RESERVE_TOKENS = 16_384
+"""Room left below the context window when it, not ``compact_at_tokens``, sets the limit (Pi ``reserveTokens``)."""
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 SUPPORTED_MODELS = frozenset({"deepseek-flash", "deepseek-v4-pro"})
 
@@ -212,8 +214,9 @@ class Settings:
     max_retries: int = 3
     context_window_tokens: int = 1_000_000
     """Provider context window. Compaction starts long before it (see below)."""
-    compact_at_tokens: int = 110_000
-    """Estimated request size that triggers compaction of older turns."""
+    compact_at_tokens: int = 500_000
+    """Estimated request size that triggers compaction of older turns: half the 1M window, so a long run rarely
+    compacts while no step resends a near-full window. A smaller MA_CONTEXT_WINDOW_TOKENS lowers the default."""
     keep_recent_tokens: int = 32_000
     """Recent conversation kept verbatim when compacting (Pi's keepRecentTokens)."""
     max_output_recovery_attempts: int = 2
@@ -299,8 +302,9 @@ class Settings:
             request_timeout_seconds=number("DEEPSEEK_TIMEOUT", DEFAULT_REQUEST_TIMEOUT_SECONDS),
             request_deadline_seconds=number("DEEPSEEK_DEADLINE", DEFAULT_REQUEST_DEADLINE_SECONDS),
             max_retries=integer("DEEPSEEK_MAX_RETRIES", base.max_retries),
-            context_window_tokens=integer("MA_CONTEXT_WINDOW_TOKENS", base.context_window_tokens),
-            compact_at_tokens=integer("MA_COMPACT_AT_TOKENS", base.compact_at_tokens),
+            context_window_tokens=(window := integer("MA_CONTEXT_WINDOW_TOKENS", base.context_window_tokens)),
+            compact_at_tokens=integer("MA_COMPACT_AT_TOKENS", min(base.compact_at_tokens,
+                                                                  max(2048, window - COMPACT_RESERVE_TOKENS))),
             keep_recent_tokens=integer("MA_KEEP_RECENT_TOKENS", base.keep_recent_tokens),
             max_output_recovery_attempts=integer("MA_OUTPUT_RECOVERY_ATTEMPTS", 2),
             interaction_mode=env.get("MA_INTERACTION_MODE", "interactive"),

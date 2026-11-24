@@ -88,7 +88,8 @@ class PlanOverlapTest(unittest.TestCase):
         self.assertIn("notes drafted", writer_result)
         self.assertEqual((len(provider.for_agent("qa")), len(provider.for_agent("writer"))), (2, 2), "no follow-up turn")
 
-    def test_a_check_that_names_a_batch_mates_file_waits_for_it(self):
+    def test_a_check_that_lists_a_batch_mates_file_in_inputs_waits_for_it(self):
+        # Only declared inputs hold a hand-off back; a brief that merely names the file does not (24 Nov runs).
         seen = {}
 
         def qa_first(messages):
@@ -101,7 +102,7 @@ class PlanOverlapTest(unittest.TestCase):
             lead=[reply("", call("delegate_task", assignee="writer", task="Write release notes for v1.",
                                  deliverables=["RELEASE_NOTES.md"], kind="make"),
                         call("delegate_task", assignee="qa", task="Check RELEASE_NOTES.md for accuracy.",
-                             deliverables=["docs/QA.md"], kind="check")),
+                             deliverables=["docs/QA.md"], inputs=["RELEASE_NOTES.md"], kind="check")),
                   reply("done")],
             writer=[reply("notes written")], qa=[qa_first])
         studio, gid, _ = self.studio(script)

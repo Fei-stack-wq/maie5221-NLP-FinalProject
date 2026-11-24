@@ -143,6 +143,11 @@ def _print_event(event: dict, names: dict) -> None:
         print(f"\n[{name(event['agent'])}] {event['text']}")
     elif kind == "delegation":
         print(f"\n[{name(event['agent'])} → {name(event['assignee'])}] {event['task']}")
+    elif kind == "handoff_waiting":
+        who = lambda ids: ", ".join(name(i) for i in ids)  # noqa: E731
+        why = {"member": "one assignment at a time", "write": f"both write {event.get('path')}",
+               "read": f"reads {event.get('path')}"}.get(event.get("reason"), "")
+        print(f"\n[{who(event['assignees'])} waits for {who(event['waiting_for'])}] {why}")
     elif kind == "report":
         files = ", ".join(c["path"] for c in event.get("changes", []))
         print(f"\n[{name(event['agent'])} report · {event['status']}] {event['text']}" + (f"\n  files: {files}" if files else ""))

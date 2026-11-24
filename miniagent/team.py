@@ -70,17 +70,17 @@ class Claim:
     """One hand-off's hold on its teammates and files, from dispatch until it reports.
 
     Every hand-off in a response starts at once. A hand-off waits only for an earlier, unfinished one
-    that it conflicts with: the same teammate, a file both would write, or a file the earlier one
-    produces that this one reads (declared in ``inputs`` or named in the brief). Earlier means
-    registered earlier, so the waits form no cycle.
+    that it conflicts with: the same teammate, a file both would write, or a file listed in this one's
+    ``inputs`` that the earlier one produces. Only declared files count — a brief that names another
+    hand-off's file (often to mark a boundary: "X covers that in a.md, do not duplicate it") does not
+    make it wait. Earlier means registered earlier, so the waits form no cycle.
     """
 
-    def __init__(self, label: str, members, writes, reads, text: str, background: bool = False):
+    def __init__(self, label: str, members, writes, reads, background: bool = False):
         self.label = label
         self.members = set(members)
         self.writes = [p for p in (_norm(w) for w in writes) if p]
         self.reads = [p for p in (_norm(r) for r in reads) if p]
-        self.text = text
         self.background = background
         self.started = False
         self.taken = True
@@ -90,21 +90,24 @@ class Claim:
         """A background hand-off: its run, not its tool call, releases the claim."""
         self.done = threading.Event()
 
-    def conflict(self, later: "Claim") -> str:
-        """Why ``later`` must wait for this claim, or "" when they may overlap."""
+    def conflict(self, later: "Claim") -> tuple[str, str] | None:
+        """Why ``later`` must wait for this claim — ``("member", ids)``, ``("write", path)`` or
+        ``("read", path)`` — or None when they may overlap."""
         shared = sorted(self.members & later.members)
         if shared:
-            return f"{', '.join(shared)} works on one assignment at a time"
+            return "member", ", ".join(shared)
         clash = next((w for w in later.writes for mine in self.writes if _overlaps(w, mine)), None)
         if clash:
-            return f"both write {clash}"
+            return "write", clash
         read = next((r for r in later.reads for mine in self.writes if _overlaps(r, mine)), None)
         if read:
-            return f"it reads {read}, which {self.label} produces"
-        named = next((mine for mine in self.writes if _mentions(later.text, mine)), None)
-        if named:
-            return f"its brief names {named}, which {self.label} produces"
-        return ""
+            return "read", read
+        return None
+
+    def why(self, reason: str, subject: str) -> str:
+        return {"member": f"{subject} works on one assignment at a time",
+                "write": f"both write {subject}",
+                "read": f"it reads {subject}, which {self.label} produces"}[reason]
 
 
 ANNOUNCE_GRACE = 5.0
@@ -149,11 +152,6 @@ def check_lines(evaluation: dict) -> list[str]:
 
 def _norm(path: Any) -> str:
     return str(path).strip().removeprefix("./").rstrip("/")
-
-
-def _mentions(text: str, name: str) -> bool:
-    """``name`` (a path or a teammate id) appears in ``text`` as a whole word or path, not inside another."""
-    return re.search(r"(?<![\w./-])" + re.escape(name) + r"(?![\w-])", text) is not None
 
 
 def _overlaps(a: str, b: str) -> bool:
@@ -216,9 +214,10 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
             parts.append(
                 "- Work that can overlap goes in one response: every `delegate_task` and `review_loop` you send in "
                 "the same response starts at once. Studio makes one wait only when it must — the same teammate, a "
-                "file both would write, or a file it reads (its `inputs`, or a path named in its brief) that another "
-                "one in progress produces — and its result says what it waited for. So declare `deliverables` and "
-                "`inputs`. Good to overlap: release notes, a user guide or a test plan drafted while the build or the "
+                "file both would write, or a file in its `inputs` that another one in progress produces — and the "
+                "chat and its result say what it waited for. So declare `deliverables`, and list in `inputs` what a "
+                "hand-off needs to read; a file only named in the brief (to mark a boundary, say) does not hold it "
+                "up. Good to overlap: release notes, a user guide or a test plan drafted while the build or the "
                 "tests run; QA testing a finished build while the docs are written from it; separate research topics "
                 "for separate researchers. Not: anything that reviews, summarises, prices or presents work that does "
                 "not exist yet — a risk review before the research, an outline before the reporting, client material "
@@ -803,7 +802,8 @@ class TeamTask:
             "review": {"type": "boolean",
                        "description": "True when this assignment reviews or tests someone else's work"},
             "inputs": {"type": "array", "items": {"type": "string"}, "maxItems": 40,
-                       "description": "Project-relative files or folders this assignment reads or builds on"},
+                       "description": ("Project-relative files or folders this assignment reads or builds on; it "
+                                       "waits for another hand-off in progress that produces one of them")},
         }
         if team.plans and team.plan_links:
             properties["step"] = {"type": "string", "description": "Primary plan step this hand-off advances"}
@@ -828,7 +828,7 @@ class TeamTask:
                          "private copy of the team project; their file changes are published to the project when "
                          "they finish. Returns their report, the published files and the results of any checks."
                          + (" Hand-offs in one response start together; one waits only for another it conflicts "
-                            "with (same teammate, a file both write, or a file it reads that the other produces)."
+                            "with (same teammate, a file both write, or a file in its inputs that the other produces)."
                             if team.parallel_delegations else "")
                          + (" With background: true it returns at once and the report arrives later."
                             if team.background_handoffs else "")),
@@ -1050,7 +1050,7 @@ class TeamTask:
         assignee = entry["assignee"]
         if claim is None:  # a resumed task: the hand-off holds its teammate and files again
             claim = self._register(Claim(assignee, [assignee], entry["run"]["deliverables"], entry.get("inputs") or [],
-                                         entry["run"]["task"], background=True))
+                                         background=True))
         claim.started = True
         claim.in_thread = True
         self.bg_claims[assignee] = claim
@@ -1238,11 +1238,10 @@ class TeamTask:
         """The claim a hand-off call holds: its teammates, the files it writes and the files it reads."""
         if name == "review_loop":
             members = [str(args.get(k, "")).strip() for k in ("author", "reviewer")]
-            return Claim(" and ".join(members), members, args.get("deliverables") or [], [],
-                         str(args.get("work", "")))
+            return Claim(" and ".join(members), members, args.get("deliverables") or [], [])
         assignee = str(args.get("assignee", "")).strip()
         return Claim(assignee, [assignee], args.get("deliverables") or [], args.get("inputs") or [],
-                     str(args.get("task", "")), background=self._wants_background(args))
+                     background=self._wants_background(args))
 
     def _register(self, claim: Claim) -> Claim:
         with self.lock:
@@ -1292,7 +1291,10 @@ class TeamTask:
                 self.waiting_turns += 1
         waited = []
         try:
-            for other, why in blockers:
+            for other, (reason, subject) in blockers:
+                began, waits = time.monotonic(), not other.done.is_set()
+                if waits:
+                    self._waiting(claim, other, reason, subject)
                 while not other.done.wait(0.5):
                     self.control.boundary()
                     if self.should_cancel():
@@ -1301,7 +1303,14 @@ class TeamTask:
                         self._drop_announced(other)  # its call never ran (refused before dispatch or interrupted)
                         break
                 else:
-                    waited.append(f"Waited for {other.label} to finish before starting: {why}.")
+                    if waits:
+                        waited.append(f"Waited for {other.label} to finish before starting: "
+                                      f"{other.why(reason, subject)}.")
+                if waits:
+                    self.store.trace(self.task_id, {"task_id": self.task_id, "type": "handoff_wait_end",
+                                                    "agent": self.primary, "assignees": sorted(claim.members),
+                                                    "waiting_for": sorted(other.members),
+                                                    "seconds": round(time.monotonic() - began, 1)})
                 # A hand-off stopped by a pause also ends its claim; this one pauses too instead of starting.
                 self.control.boundary()
         finally:
@@ -1310,6 +1319,14 @@ class TeamTask:
                     self.waiting_turns -= 1
         claim.started = True
         return waited
+
+    def _waiting(self, claim: Claim, other: Claim, reason: str, subject: str) -> None:
+        """Show in the chat and the trace that a hand-off waits, for whom and why (Codex CollabWaitingBegin)."""
+        fields = {"assignees": sorted(claim.members), "waiting_for": sorted(other.members), "reason": reason,
+                  "path": subject if reason != "member" else ""}
+        self.store.append("handoff_waiting", task_id=self.task_id, agent=self.primary, **fields)
+        self.store.trace(self.task_id, {"task_id": self.task_id, "type": "handoff_wait", "agent": self.primary,
+                                        **fields})
 
     def _delegate(self, lead_id: str, args: dict) -> ToolResult:
         claim = self._take_claim("delegate_task", args)
@@ -1457,7 +1474,7 @@ class TeamTask:
                 lines.append(unclosed)
             lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
             return ToolResult(ok=True, content="\n".join(lines))
-        lines = self._report_lines(outcome)
+        lines = waited + self._report_lines(outcome)
         if warning:
             lines.insert(0, warning)
         if missing:
@@ -1465,7 +1482,6 @@ class TeamTask:
                          + ". If the work depended on them, run it again after the step that produces them.")
         if unclosed:
             lines.append(unclosed)
-        lines.extend(waited)
         if ready := self._ready_note():
             lines.append(ready)
         lines.append(f"Delegations used: {self.delegations}/{self.settings.team.max_delegations}.")
