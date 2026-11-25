@@ -9,9 +9,11 @@ through one explicit channel — the team *project*:
 * ``publish(workspace, baseline)`` copies what that agent created, changed or
   deleted back into the project when the assignment ends.
 
-Assignments run one at a time, so a publish never races another agent. If the
-project nevertheless changed under an agent (e.g. the lead edited the same
-file), the agent's version wins and the conflict is reported, never hidden.
+Assignments may run in parallel when declared independent; publishes are
+serialized by the project lock. If the project changed under an agent (for
+example, a parallel teammate edited the same shared file), the replaced version
+is saved outside the project under ``conflicts_dir`` and recorded in the change
+log so one teammate can merge both versions explicitly instead of losing work.
 
 Unlike the previous implementation there are no review gates, credential
 heuristics or file-type allow-lists on publishing: whatever the agent produced
@@ -44,6 +46,8 @@ class Change:
     sha256: str = ""
     size: int = 0
     conflict: bool = False
+    conflict_copy: str = ""
+    replaced_author: str = ""
 
     def as_dict(self) -> dict:
         data = {"path": self.path, "change": self.change}
@@ -51,6 +55,10 @@ class Change:
             data.update(sha256=self.sha256, size=self.size)
         if self.conflict:
             data["conflict"] = True
+        if self.conflict_copy:
+            data["conflict_copy"] = self.conflict_copy
+        if self.replaced_author:
+            data["replaced_author"] = self.replaced_author
         return data
 
 
@@ -103,6 +111,17 @@ def _remove(path: Path, stop: Path) -> None:
         parent = parent.parent
 
 
+def _save_conflict_copy(src: Path, conflicts_dir: Path | None, rel: str) -> str:
+    if conflicts_dir is None or not src.is_file():
+        return ""
+    n = 1
+    while (conflicts_dir / str(n) / rel).exists():
+        n += 1
+    dst = conflicts_dir / str(n) / rel
+    _copy(src, dst)
+    return str(dst)
+
+
 class Project:
     """The team's published file tree plus an append-only change log."""
 
@@ -111,6 +130,25 @@ class Project:
         self.log_path = log_path
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+
+    def _last_author(self, rel: str, *, exclude: str = "") -> str:
+        if not self.log_path.exists():
+            return ""
+        fallback = ""
+        for line in reversed(self.log_path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if any(c.get("path") == rel for c in entry.get("changes") or ()):
+                who = entry.get("author", "")
+                if who and who != exclude:
+                    return who
+                if who and not fallback:
+                    fallback = who
+        return fallback
 
     def manifest(self) -> dict[str, str]:
         with self._lock:
@@ -128,36 +166,81 @@ class Project:
             workspace.mkdir(parents=True, exist_ok=True)
             project, _ = scan(self.root)
             local, _ = scan(workspace)
-            for rel, sha in project.items():
-                if local.get(rel) != sha:
-                    _copy(self.root / rel, workspace / rel)
-            for rel in local.keys() - project.keys():
+            # Remove stale workspace files first so folder/file name swaps clear cleanly.
+            for rel in sorted(local.keys() - project.keys()):
                 _remove(workspace / rel, workspace)
+            for rel, sha in sorted(project.items()):
+                dst = workspace / rel
+                if local.get(rel) != sha or dst.is_dir():
+                    if dst.is_dir() and not dst.is_symlink():
+                        # Cache folders (SKIP_DIRS) inside a directory replaced by a file are also removed.
+                        shutil.rmtree(dst)
+                    for parent in dst.parents:
+                        if parent == workspace:
+                            break
+                        if parent.is_file() or parent.is_symlink():
+                            parent.unlink()
+                    _copy(self.root / rel, dst)
             return dict(project)
 
     def publish(self, workspace: Path, baseline: dict[str, str], *, author: str, task_id: str,
-                note: str = "") -> tuple[list[Change], list[str]]:
+                note: str = "", conflicts_dir: Path | None = None) -> tuple[list[Change], list[str]]:
         """Apply the workspace's changes since ``baseline``; return (changes, skipped)."""
         with self._lock:
             local, skipped = scan(workspace)
             project, _ = scan(self.root)
             changes: list[Change] = []
+            deletions: list[tuple[str, str]] = []
+            writes: list[tuple[str, str | None, str]] = []
             for rel in sorted(local.keys() | baseline.keys()):
                 before, after = baseline.get(rel), local.get(rel)
                 if before == after:
                     continue
-                conflict = project.get(rel) != before
                 if after is None:
-                    if rel in project:
-                        _remove(self.root / rel, self.root)
-                    changes.append(Change(rel, "deleted", conflict=conflict))
+                    deletions.append((rel, before))
                 else:
-                    _copy(workspace / rel, self.root / rel)
-                    kind = "added" if before is None else "modified"
-                    changes.append(Change(rel, kind, after, (workspace / rel).stat().st_size, conflict))
+                    writes.append((rel, before, after))
+
+            # Apply deletions before copies so a folder->file or file->folder swap clears its old paths first.
+            for rel, before in deletions:
+                conflict = project.get(rel) != before
+                replaced_author = self._last_author(rel, exclude=author) if conflict else ""
+                conflict_copy = _save_conflict_copy(self.root / rel, conflicts_dir, rel) if conflict else ""
+                if rel in project:
+                    _remove(self.root / rel, self.root)
+                changes.append(Change(rel, "deleted", conflict=conflict,
+                                      conflict_copy=conflict_copy, replaced_author=replaced_author))
+
+            for rel, before, after in writes:
+                dst = self.root / rel
+                if dst.is_dir() and not dst.is_symlink():
+                    has_files = any(p.is_file() or p.is_symlink() for p in dst.rglob("*"))
+                    if has_files:
+                        copy_path = _save_conflict_copy(workspace / rel, conflicts_dir, rel)
+                        suffix = f"; saved copy at {copy_path}" if copy_path else ""
+                        skipped.append(f"{rel} (conflict: directory exists in project{suffix})")
+                        continue
+                    shutil.rmtree(dst)
+                blocking_parent = next(
+                    (p for p in dst.parents if p != self.root and self.root in p.parents and p.is_file()),
+                    None,
+                )
+                if blocking_parent is not None:
+                    copy_path = _save_conflict_copy(workspace / rel, conflicts_dir, rel)
+                    suffix = f"; saved copy at {copy_path}" if copy_path else ""
+                    skipped.append(f"{rel} (conflict: parent path is a file in project{suffix})")
+                    continue
+                conflict = project.get(rel) != before
+                replaced_author = self._last_author(rel, exclude=author) if conflict else ""
+                conflict_copy = _save_conflict_copy(dst, conflicts_dir, rel) if conflict else ""
+                _copy(workspace / rel, dst)
+                kind = "added" if before is None else "modified"
+                changes.append(Change(rel, kind, after, (workspace / rel).stat().st_size,
+                                      conflict, conflict_copy, replaced_author))
+
             if changes:
                 entry = {"time": time.time(), "author": author, "task_id": task_id, "note": note[:500],
-                         "project_scope":os.path.relpath(self.root, self.log_path.parent),
+                         "project_scope": os.path.relpath(self.root, self.log_path.parent),
                          "changes": [c.as_dict() for c in changes]}
                 self.log_path.parent.mkdir(parents=True, exist_ok=True)
                 with self.log_path.open("a", encoding="utf-8") as stream:

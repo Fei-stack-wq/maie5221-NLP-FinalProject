@@ -19,7 +19,7 @@ from tests.test_team import finished
 
 PLAN = [{"id": "pick", "step": "Choose the story", "status": "completed", "owner": "lead", "on_delivery": False},
         {"id": "brief", "step": "Write the editorial brief", "status": "in_progress", "owner": "lead",
-         "outputs": ["plan/editorial_brief.md"], "after": ["pick"]},
+         "lead_outputs": ["plan/editorial_brief.md"], "after": ["pick"]},
         {"id": "report", "step": "Report the story", "status": "pending", "owner": "dev", "after": ["brief"]}]
 
 
@@ -71,11 +71,11 @@ class LeadStepsTest(unittest.TestCase):
         studio, gid, _ = self.studio(script)
         studio.post(gid, "Cover the story", queue=True)
         finished(studio, gid)
-        self.assertIn("brief Write the editorial brief (outputs: plan/editorial_brief.md)", seen["plan"])
+        self.assertIn("brief Write the editorial brief (lead_outputs: plan/editorial_brief.md)", seen["plan"])
         self.assertIn("Plan: this hand-off follows your own step brief (Write the editorial brief; expects "
                       "plan/editorial_brief.md, which is not in the project), which the plan does not show as done. "
                       "Files you published since the plan was written: news/brief.md. Close the step with "
-                      "record_plan_result, or correct its outputs with update_plan.", seen["result"])
+                      "record_plan_result, or correct its lead_outputs with update_plan.", seen["result"])
 
     def test_no_reminder_once_the_step_is_done(self):
         seen = {}

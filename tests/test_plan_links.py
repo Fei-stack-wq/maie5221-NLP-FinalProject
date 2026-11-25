@@ -77,7 +77,7 @@ class PlanLinksTest(unittest.TestCase):
 
     def test_lead_work_and_two_steps_share_one_retest(self):
         self.script.queues.update(lead=[
-            plan(step("Design", id="design", outputs=["design.md"]), step("Choose format", id="format"),
+            plan(step("Design", id="design", lead_outputs=["design.md"]), step("Choose format", id="format"),
                  step("Fix", id="fix", owner="dev"), step("Retest", id="retest", owner="qa"),
                  step("Deliver notes", id="ship", on_delivery=True)),
             reply("", call("write_file", path="design.md", content="Format spec")),
@@ -215,7 +215,8 @@ class PlanLinksTest(unittest.TestCase):
         check(False, False)
 
     def test_publication_must_cover_all_outputs_and_deletion_reopens(self):
-        steps = [step("Design", id="spec", owner="lead", outputs=["api.md", "data.md"]),
+        steps = [step("Design", id="spec", owner="lead", lead_outputs=["api.md", "data.md"]),
+                 step("Legacy", id="legacy", owner="lead", outputs=["old.md"]),
                  step("Other", id="other", owner="lead")]
         record = {"id":"t", "primary":"lead", "status":"completed", "plan":{"linked":True, "steps":steps}}
         events = []
@@ -224,12 +225,13 @@ class PlanLinksTest(unittest.TestCase):
             events.append(dict(kind="publish", task_id="t", time=seq, seq=seq, agent="lead",
                                changes=[dict(path=path, change=change)]))
             return [r["completed"] for r in plan_view(record, events)["steps"]]
-        self.assertEqual(publish("api.md", "added"), [False, False])
-        self.assertEqual(publish("data.md", "added"), [True, False])
-        self.assertEqual(publish("api.md", "deleted"), [False, False])
-        self.assertEqual(publish("api.md", "added"), [True, False])
-        events.append(dict(kind="final", task_id="t", seq=5, time=5, agent="lead", status="completed", text="Done"))
-        self.assertEqual(plan_view(record, events)["counts"]["completed"], 1)
+        self.assertEqual(publish("api.md", "added"), [False, False, False])
+        self.assertEqual(publish("data.md", "added"), [True, False, False])
+        self.assertEqual(publish("api.md", "deleted"), [False, False, False])
+        self.assertEqual(publish("api.md", "added"), [True, False, False])
+        self.assertEqual(publish("old.md", "added"), [True, True, False])
+        events.append(dict(kind="final", task_id="t", seq=6, time=6, agent="lead", status="completed", text="Done"))
+        self.assertEqual(plan_view(record, events)["counts"]["completed"], 2)
 
     def test_qualified_review_returns_to_lead_without_accepting_or_ordering_a_fix(self):
         self.script.queues.update(lead=[

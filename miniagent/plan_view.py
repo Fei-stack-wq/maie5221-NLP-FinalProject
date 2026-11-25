@@ -118,7 +118,7 @@ def _linked_work(record, events):
                     else:
                         publications[path] = change
                 for step in steps:
-                    outputs = step.get("outputs", [])
+                    outputs = step.get("lead_outputs") or step.get("outputs") or []
                     if (step.get("owner") == record["primary"] and changes.keys() & set(outputs)
                             and step["id"] not in ids):
                         files = [publications[path] for path in outputs if path in publications]

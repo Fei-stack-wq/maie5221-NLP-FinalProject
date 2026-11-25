@@ -62,8 +62,9 @@ def lead_guidance(*, kinds: bool, background: bool) -> list[str]:
             "findings from a check; `adapt` turns finished, checked work into other material (release notes, a "
             "summary, social posts, a client introduction). Studio sets thinking, step budget and tools by kind "
             "— only `check` reasons at full effort, `adapt` works without thinking or a browser — and gives "
-            "check, fix and adapt hand-offs the earlier reports and check results. List the files a hand-off "
-            "builds on in `inputs`: Studio includes their contents, so the teammate starts at once.")
+            "check, fix and adapt hand-offs the earlier reports and check results. List hard prerequisite files "
+            "a hand-off must wait for in `inputs`, and background context files to read as-is without waiting in "
+            "`reference_files`: Studio preloads both, and only `inputs` holds up parallel work.")
     if background:
         parts.append(
             "- `background: true` starts a hand-off and returns at once, so you can keep working. Its report "

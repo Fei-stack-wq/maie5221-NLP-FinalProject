@@ -102,8 +102,14 @@ function planCard(plan, scope) {
     const latest = step.history.at(-1);
     const decision = step.decision;
     const signedBy = decision?.agent && (decision.source === "review" ? "评审 @" : "负责人 @") + decision.agent;
+    const stepKind = step.evidence?.assigned?.handoff_kind
+      || step.evidence?.submitted?.handoff_kind
+      || [...(step.history || [])].reverse().find(h => h.handoff_kind)?.handoff_kind
+      || null;
     const content = el("div",{class:"plan-step-content"},
-      el("div",{},el("span",{class:"plan-text"},step.step), el("small",{class:"plan-stage"},stages[step.stage]),
+      el("div",{},el("span",{class:"plan-text"},step.step),
+        stepKind ? kindBadge(stepKind, { withCode: true }) : null,
+        el("small",{class:"plan-stage"},stages[step.stage]),
         el("small",{class:"plan-confirmation"},step.confirmed ? "已确认" : "未确认"),
         signedBy ? el("small",{class:"plan-owner"},signedBy) : null,
         step.owner ? el("span",{class:"plan-owner"},"@"+step.owner) : null,

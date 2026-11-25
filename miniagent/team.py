@@ -215,8 +215,9 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
                 "- Work that can overlap goes in one response: every `delegate_task` and `review_loop` you send in "
                 "the same response starts at once. Studio makes one wait only when it must — the same teammate, a "
                 "file both would write, or a file in its `inputs` that another one in progress produces — and the "
-                "chat and its result say what it waited for. So declare `deliverables`, and list in `inputs` what a "
-                "hand-off needs to read; a file only named in the brief (to mark a boundary, say) does not hold it "
+                "chat and its result say what it waited for. So declare `deliverables`, list hard prerequisites in "
+                "`inputs`, and put non-blocking background files in `reference_files` (preloaded without waiting); "
+                "a file only named in the brief (to mark a boundary, say) does not hold it "
                 "up. Good to overlap: release notes, a user guide or a test plan drafted while the build or the "
                 "tests run; QA testing a finished build while the docs are written from it; separate research topics "
                 "for separate researchers. Not: anything that reviews, summarises, prices or presents work that does "
@@ -235,7 +236,7 @@ def lead_prompt(me: Member, members: list[Member], settings: Settings, interacti
                 "the reviewer's findings go straight to the author's continued session, and you receive the final "
                 "verdict, the last review and the files changed.")
         if settings.team.plans and settings.team.plan_links:
-            parts.append("- Write the plan once. For your own steps, bind outputs or on_delivery. Pass the covered "
+            parts.append("- Write the plan once. For your own steps, bind lead_outputs or on_delivery. Pass the covered "
                          "step IDs on handoffs and retest_steps for post-fix reviews. Use record_plan_result for a decision "
                          "on individual steps. Give a step `after` (earlier step IDs or numbers) when it needs earlier steps; steps "
                          "whose `after` steps are done can be started together, and Studio names them when a report "
@@ -802,8 +803,11 @@ class TeamTask:
             "review": {"type": "boolean",
                        "description": "True when this assignment reviews or tests someone else's work"},
             "inputs": {"type": "array", "items": {"type": "string"}, "maxItems": 40,
-                       "description": ("Project-relative files or folders this assignment reads or builds on; it "
-                                       "waits for another hand-off in progress that produces one of them")},
+                       "description": ("Project-relative files or folders this assignment depends on for their latest "
+                                       "version; it waits for any in-progress hand-off that produces one of them and preloads them")},
+            "reference_files": {"type": "array", "items": {"type": "string"}, "maxItems": 40,
+                                "description": ("Project-relative background files or folders to preload as-is without "
+                                                "waiting on other in-progress hand-offs")},
         }
         if team.plans and team.plan_links:
             properties["step"] = {"type": "string", "description": "Primary plan step this hand-off advances"}
@@ -904,7 +908,7 @@ class TeamTask:
                     continue
                 prereq = rows[dep - 1]
                 if (not prereq.get("completed") and prereq.get("stage") not in ("completed", "submitted")
-                        and prereq.get("owner") in (None, lead_id) and not prereq.get("outputs")):
+                        and prereq.get("owner") in (None, lead_id) and not (prereq.get("lead_outputs") or prereq.get("outputs"))):
                     candidates[prereq["id"]] = prereq
         if len(candidates) != 1:
             return
@@ -943,7 +947,7 @@ class TeamTask:
         manifest = self.store.project.manifest()
         parts = []
         for row in open_steps:
-            absent = [path for path in row.get("outputs") or [] if not _present(path, manifest)]
+            absent = [path for path in (row.get("lead_outputs") or row.get("outputs") or []) if not _present(path, manifest)]
             detail = f"; expects {', '.join(absent)}, which is not in the project" if absent else ""
             parts.append(f"{row['id']} ({_clip(row['step'], 70)}{detail})")
         events = self.store.chat(self.trigger_seq - 1)
@@ -956,7 +960,7 @@ class TeamTask:
                 + (", which the plan does not show as done." if len(parts) == 1 else ". The plan shows none of them as done."))
         if published:
             line += " Files you published since the plan was written: " + ", ".join(published[:8]) + "."
-        line += " Close the step with record_plan_result, or correct its outputs with update_plan."
+        line += " Close the step with record_plan_result, or correct its lead_outputs with update_plan."
         return line
 
     def _ready_note(self) -> str:
@@ -986,12 +990,19 @@ class TeamTask:
             return ""
         names = "; ".join(f"{n} {row.get('id', '')} ({row.get('owner') or 'no owner'})".replace("  ", " ")
                           for n, row in ready)
-        ways = []
-        if team.parallel_delegations:
-            ways.append("by sending all of them in one response, each with its own deliverables")
-        if team.background_handoffs:
-            ways.append("start one with `background: true` and keep working")
-        how = (" Start them " + ", or ".join(ways) + ".") if ways else ""
+        has_lead = any(row.get("owner") == self.primary for _, row in ready)
+        has_member = any(row.get("owner") not in (None, "", self.primary) for _, row in ready)
+        if has_lead and has_member and team.background_handoffs:
+            how = (" Delegate the teammate step(s) with `background: true` first, then work on your own step "
+                   "while they run (put non-blocking background files in `reference_files`, not `inputs`).")
+        else:
+            ways = []
+            if team.parallel_delegations:
+                ways.append("by sending all of them in one response, each with its own deliverables")
+            if team.background_handoffs:
+                ways.append("start one with `background: true` and keep working")
+            how = (" Start them " + ", or ".join(ways) + " — put non-blocking background files in `reference_files` "
+                   "so they preload without waiting.") if ways else ""
         return f"Plan: steps {names} can start now — their dependencies are done and none needs another.{how}"
 
     def lead_suspended(self) -> bool:
@@ -1040,7 +1051,8 @@ class TeamTask:
             self.lead_stale = False
             workspace = self.store.workspace(self.primary)
             own, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
-                                                task_id=self.task_id, note="lead edits before a background report")
+                                                task_id=self.task_id, note="lead edits before a background report",
+                                                conflicts_dir=self.store.task_dir(self.task_id) / "conflicts")
             if own:
                 self.store.append("publish", task_id=self.task_id, agent=self.primary,
                                   changes=[c.as_dict() for c in own])
@@ -1218,9 +1230,9 @@ class TeamTask:
                 "steps": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
                     "type": "object", "properties": {
                         **({"id": {"type": "string", "description": "Stable step ID. Assigned when omitted."},
-                            "outputs": {"type":"array","items":{"type":"string"},"maxItems":40,
-                                        "description":"For your own work: exact project paths whose publication completes this step"},
-                            "on_delivery": {"type":"boolean","description":"Your final answer itself delivers this step"}}
+                            "lead_outputs": {"type":"array","items":{"type":"string"},"maxItems":40,
+                                             "description":"For your own (lead-owned) steps only: exact project paths whose publication completes this step (teammate files go in delegate_task deliverables)"},
+                            "on_delivery": {"type":"boolean","description":"For your own (lead-owned) steps only: your final answer itself delivers this step"}}
                            if linked else {}),
                         "step": {"type": "string"},
                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"] + (["rework"] if linked else [])},
@@ -1437,6 +1449,7 @@ class TeamTask:
         except ValueError as exc:
             return ToolResult.failure(f"Invalid checks: {exc}")
         inputs = [str(p).strip() for p in args.get("inputs") or [] if str(p).strip()][:40]
+        reference_files = [str(p).strip() for p in args.get("reference_files") or [] if str(p).strip()][:40]
         missing = []
         # The lead's files go to the project first: inputs it just wrote are present, and the plan sees its outputs.
         self._publish_lead(lead_id)
@@ -1452,7 +1465,8 @@ class TeamTask:
                                         deliverables=deliverables, review=review)
         self._link_lead_prereq_publish(lead_id, link, inputs)
         unclosed = self._unclosed_lead_steps(lead_id, link)
-        spec = {k: v for k, v in (("kind", kind), ("inputs", inputs or None)) if v}
+        spec = {k: v for k, v in (("kind", kind), ("inputs", inputs or None),
+                                  ("reference_files", reference_files or None)) if v}
         if background:
             spec["background"] = True
         outcome = self._assign(lead_id, assignee, task, deliverables=deliverables, max_steps=args.get("max_steps"),
@@ -1536,7 +1550,8 @@ class TeamTask:
         with self.lock:
             lead_workspace = self.store.workspace(lead_id)
             own, _ = self.store.project.publish(lead_workspace, self.lead_baseline, author=lead_id,
-                                                task_id=self.task_id, note="lead edits before delegation")
+                                                task_id=self.task_id, note="lead edits before delegation",
+                                                conflicts_dir=self.store.task_dir(self.task_id) / "conflicts")
             if own:
                 self.store.append("publish", task_id=self.task_id, agent=lead_id, changes=[c.as_dict() for c in own])
                 self.lead_baseline = self.store.project.checkout(lead_workspace)
@@ -1565,11 +1580,12 @@ class TeamTask:
         spec = spec or {}
         extra = {k: v for k, v in (("review", review or None), ("loop", loop), ("checks", checks or None),
                                    ("handoff_kind", spec.get("kind")), ("background", spec.get("background")),
-                                   ("inputs", spec.get("inputs"))) if v}
+                                   ("inputs", spec.get("inputs")),
+                                   ("reference_files", spec.get("reference_files"))) if v}
         event = self.store.append("delegation", task_id=self.task_id, agent=lead_id, assignee=assignee,
                                   task=task, deliverables=deliverables, **extra, **(link or {}))
         entry = {"assignee": assignee, "seq": event["seq"], **(link or {}),
-                 **{k: v for k, v in spec.items() if k in ("kind", "inputs", "background", "run", "evidence")}}
+                 **{k: v for k, v in spec.items() if k in ("kind", "inputs", "reference_files", "background", "run", "evidence")}}
         with self.lock:
             self.inflight[assignee] = entry
         return entry
@@ -1634,7 +1650,8 @@ class TeamTask:
             lines.append(f"Session: {'continued their earlier session in this task' if result.resumed else 'new session'}.")
         if changes:
             lines.append("Published to the team project: " + ", ".join(
-                f"{c.path} ({c.change}{', overwrote a concurrent change' if c.conflict else ''})" for c in changes))
+                f"{c.path} ({c.change}{', overwrote a concurrent change' + (f' [saved copy: {c.conflict_copy}]' if c.conflict_copy else '') if c.conflict else ''})"
+                for c in changes))
         else:
             lines.append("No files were changed by this assignment.")
         if outcome["missing"]:
@@ -1774,13 +1791,13 @@ class TeamTask:
                 row["id"] = item["id"]
             if item.get("owner"):
                 row["owner"] = str(item["owner"]).strip()[:60]
-            if self.settings.team.plan_links and (item.get("outputs") or item.get("on_delivery")):
+            if self.settings.team.plan_links and (item.get("lead_outputs") or item.get("on_delivery")):
                 if row.setdefault("owner", lead_id) != lead_id:
-                    return ToolResult.failure("Direct publication and final delivery evidence belong to the task lead.")
-                if outputs := item.get("outputs"):
-                    if any(not p.strip() or p.startswith("/") or any(part in ("", ".", "..") for part in p.split("/")) for p in outputs):
+                    return ToolResult.failure("lead_outputs and on_delivery belong to lead-owned steps only; declare teammate files in delegate_task deliverables.")
+                if lead_outputs := item.get("lead_outputs"):
+                    if any(not p.strip() or p.startswith("/") or any(part in ("", ".", "..") for part in p.split("/")) for p in lead_outputs):
                         return ToolResult.failure("Use exact project-relative output paths.")
-                    row["outputs"] = list(dict.fromkeys(outputs))
+                    row["lead_outputs"] = list(dict.fromkeys(lead_outputs))
                 if item.get("on_delivery"):
                     row["on_delivery"] = True
             after = item.get("after") or []
@@ -1828,7 +1845,7 @@ class TeamTask:
         ready = [str(i + 1) for i, row in enumerate(visible) if stages[i] == "pending"
                  and all(stages[n - 1] == "completed" for n in row.get("after", []))]
         hint = f" Ready to start: steps {', '.join(ready)}." if len(ready) > 1 else ""
-        ids = (" Steps: " + ", ".join(f"{s['id']} {s['step']}" + (f" (outputs: {', '.join(s['outputs'])})" if s.get("outputs") else "")
+        ids = (" Steps: " + ", ".join(f"{s['id']} {s['step']}" + (f" (lead_outputs: {', '.join(s['lead_outputs'])})" if s.get("lead_outputs") else "")
                                       for s in steps) if self.settings.team.plan_links else "")
         kept_note = (f" Kept the dependencies of {kept} step(s) that omitted `after` (pass `after: []` to clear them)."
                      if kept else "")
@@ -1879,15 +1896,16 @@ class TeamTask:
             assignment += ("\n\nThis assignment is a review or test: you own the verification of this work. Check "
                            "the real behaviour end to end and report concrete evidence.")
         if not reconcile and not rejoining:
-            if entry.get("inputs") and self.settings.team.preload_inputs:
-                block = handoffs.preload(workspace, entry["inputs"])
+            preload_paths = list(dict.fromkeys(list(entry.get("inputs") or []) + list(entry.get("reference_files") or [])))
+            if preload_paths and self.settings.team.preload_inputs:
+                block = handoffs.preload(workspace, preload_paths)
                 if block:
                     assignment += "\n\n" + block
             if kind and self.settings.team.handoff_evidence and entry.get("evidence", True):
                 with self.lock:
                     rows = [row for row in self.evidence if row["seq"] < trigger_seq]
                 block = handoffs.evidence_block(rows, kind=kind, member=member.id, continuing=continuing,
-                                                paths=list(entry.get("inputs") or []) + list(deliverables))
+                                                paths=preload_paths + list(deliverables))
                 if block:
                     assignment += "\n\n" + block
         entry["runtime"] = {
@@ -1941,7 +1959,8 @@ class TeamTask:
                 self.active.remove(member.id)
                 self._update(active=list(self.active))
         changes, skipped = self.store.project.publish(workspace, baseline, author=member.id, task_id=self.task_id,
-                                                      note=task[:300])
+                                                      note=task[:300],
+                                                      conflicts_dir=self.store.task_dir(self.task_id) / "conflicts")
         with self.lock:
             if session is not None:
                 self.session_marks[key] = {"manifest": self.store.project.manifest(), "seq": trigger_seq}
@@ -2061,7 +2080,8 @@ class TeamTask:
         self.consults.close()
         self.channel.finish()
         changes, _ = self.store.project.publish(workspace, self.lead_baseline, author=self.primary,
-                                                task_id=self.task_id, note="final edits")
+                                                task_id=self.task_id, note="final edits",
+                                                conflicts_dir=self.store.task_dir(self.task_id) / "conflicts")
         if changes:
             self.store.append("publish", task_id=self.task_id, agent=self.primary,
                               changes=[c.as_dict() for c in changes])

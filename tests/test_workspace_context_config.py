@@ -47,9 +47,80 @@ class ProjectTest(unittest.TestCase):
         baseline = self.project.checkout(ws)
         (self.project.root / "a.txt").write_text("someone else")
         (ws / "a.txt").write_text("mine")
-        changes, _ = self.project.publish(ws, baseline, author="dev", task_id="t")
+        conflicts = self.tmp / "conflicts"
+        changes, _ = self.project.publish(ws, baseline, author="dev", task_id="t", conflicts_dir=conflicts)
         self.assertTrue(changes[0].conflict)
         self.assertEqual((self.project.root / "a.txt").read_text(), "mine")
+        self.assertTrue(changes[0].conflict_copy)
+        self.assertEqual(Path(changes[0].conflict_copy).read_text(), "someone else")
+
+    def test_concurrent_delete_saves_replaced_copy(self):
+        (self.project.root / "a.txt").write_text("v1")
+        ws = self.tmp / "ws"
+        baseline = self.project.checkout(ws)
+        (self.project.root / "a.txt").write_text("teammate v2")
+        (ws / "a.txt").unlink()
+        conflicts = self.tmp / "conflicts"
+        changes, _ = self.project.publish(ws, baseline, author="dev", task_id="t", conflicts_dir=conflicts)
+        self.assertEqual(changes[0].change, "deleted")
+        self.assertTrue(changes[0].conflict)
+        self.assertEqual(Path(changes[0].conflict_copy).read_text(), "teammate v2")
+
+    def test_publish_and_checkout_handle_file_folder_name_swaps(self):
+        # 1. publish: folder -> file
+        (self.project.root / "docs").mkdir()
+        (self.project.root / "docs" / "a.md").write_text("x")
+        ws = self.tmp / "ws1"
+        base = self.project.checkout(ws)
+        (ws / "docs" / "a.md").unlink()
+        (ws / "docs").rmdir()
+        (ws / "docs").write_text("now a file")
+        changes, skipped = self.project.publish(ws, base, author="a", task_id="t1")
+        self.assertEqual(skipped, [])
+        self.assertTrue((self.project.root / "docs").is_file())
+        self.assertEqual((self.project.root / "docs").read_text(), "now a file")
+
+        # 2. checkout: workspace has folder, project has file
+        ws2 = self.tmp / "ws2"
+        (ws2 / "docs").mkdir(parents=True)
+        (ws2 / "docs" / "stale.md").write_text("old")
+        self.project.checkout(ws2)
+        self.assertTrue((ws2 / "docs").is_file())
+        self.assertEqual((ws2 / "docs").read_text(), "now a file")
+
+        # 3. publish: file -> folder
+        base2 = self.project.checkout(ws2)
+        (ws2 / "docs").unlink()
+        (ws2 / "docs").mkdir()
+        (ws2 / "docs" / "b.md").write_text("in folder")
+        changes, skipped = self.project.publish(ws2, base2, author="a", task_id="t2")
+        self.assertEqual(skipped, [])
+        self.assertEqual((self.project.root / "docs" / "b.md").read_text(), "in folder")
+
+        # 4. checkout: workspace has file, project has folder
+        ws3 = self.tmp / "ws3"
+        ws3.mkdir()
+        (ws3 / "docs").write_text("was file")
+        self.project.checkout(ws3)
+        self.assertEqual((ws3 / "docs" / "b.md").read_text(), "in folder")
+
+    def test_publish_folder_to_file_conflict_preserves_teammate_file(self):
+        (self.project.root / "docs").mkdir()
+        (self.project.root / "docs" / "a.md").write_text("x")
+        ws = self.tmp / "ws"
+        base = self.project.checkout(ws)
+        # Teammate adds docs/b.md in the project while this member replaces docs/ with a file.
+        (self.project.root / "docs" / "b.md").write_text("teammate")
+        (ws / "docs" / "a.md").unlink()
+        (ws / "docs").rmdir()
+        (ws / "docs").write_text("now a file")
+        conflicts = self.tmp / "conflicts"
+        changes, skipped = self.project.publish(ws, base, author="a", task_id="t", conflicts_dir=conflicts)
+        self.assertEqual((self.project.root / "docs" / "b.md").read_text(), "teammate")
+        self.assertTrue(any("docs" in item and "conflict" in item for item in skipped))
+        saved = list(conflicts.rglob("docs"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_text(), "now a file")
 
     def test_resolve_refuses_escape(self):
         with self.assertRaises(ValueError):

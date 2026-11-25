@@ -123,6 +123,51 @@ class PlanOverlapTest(unittest.TestCase):
         finished(studio, gid)
         self.assertNotIn("can start now", seen["build"])
 
+    def test_ready_note_prompts_background_when_lead_and_member_steps_are_ready(self):
+        seen = {}
+        steps = [
+            {"id": "risk", "step": "Risk check", "status": "in_progress", "owner": "qa"},
+            {"id": "client", "step": "Client intro", "status": "pending", "owner": "writer", "after": ["risk"]},
+            {"id": "proposal", "step": "Final proposal", "status": "pending", "owner": "lead", "after": ["risk"]},
+        ]
+        script = Script(
+            lead=[reply("", call("update_plan", steps=steps)),
+                  reply("", call("delegate_task", assignee="qa", task="Review the model.", step="risk", kind="check")),
+                  lambda m: (seen.__setitem__("risk", tool_results(m)[-1]), reply("done"))[1]],
+            qa=[reply("VERDICT: APPROVED")])
+        studio, gid, _ = self.studio(script)
+        studio.post(gid, "Deliver", queue=True)
+        finished(studio, gid)
+        self.assertIn("Plan: steps 2 client (writer); 3 proposal (lead) can start now", seen["risk"])
+        self.assertIn("Delegate the teammate step(s) with `background: true` first, then work on your own step while they run", seen["risk"])
+
+    def test_reference_files_preload_without_blocking_parallel_batch(self):
+        barrier = threading.Barrier(2, timeout=5)
+        together = {}
+
+        def first(name):
+            def respond(messages):
+                together[name] = barrier.wait() is not None
+                return reply(f"{name} done")
+            return respond
+
+        script = Script(
+            lead=[reply("", call("write_file", path="notes.md", content="Existing baseline notes.\n")),
+                  reply("", call("delegate_task", assignee="writer", task="Refine notes.md.",
+                                 deliverables=["notes.md"], kind="fix"),
+                        call("delegate_task", assignee="qa", task="Draft client intro using current notes.",
+                             deliverables=["client.md"], reference_files=["notes.md"], kind="adapt")),
+                  reply("done")],
+            writer=[first("writer")],
+            qa=[first("qa")])
+        studio, gid, provider = self.studio(script)
+        studio.post(gid, "Work in parallel", queue=True)
+        finished(studio, gid)
+        self.assertEqual(together, {"writer": True, "qa": True})
+        qa_prompt = next(m["content"] for m in provider.for_agent("qa")[0]["messages"]
+                         if m["role"] == "user" and "Assignment from" in m["content"])
+        self.assertIn("=== notes.md ===\nExisting baseline notes.", qa_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
